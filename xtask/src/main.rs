@@ -14,12 +14,13 @@ const CHECKS: [&[&str]; 3] = [
     &[
         "clippy",
         "--locked",
+        "--workspace",
         "--all-targets",
         "--",
         "-D",
         "warnings",
     ],
-    &["test", "--locked"],
+    &["test", "--locked", "--workspace"],
 ];
 
 const USAGE: &str = "usage: cargo xtask check";
