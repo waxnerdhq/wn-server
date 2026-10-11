@@ -68,7 +68,7 @@ Portability rules in code:
 - Signals: `tokio::signal::ctrl_c()` everywhere; `#[cfg(unix)]` SIGTERM; `#[cfg(windows)]` `ctrl_break`, `ctrl_close`, `ctrl_shutdown`.
 - File modes: `#[cfg(unix)]` only (`std::os::unix::fs::PermissionsExt`). Tests of modes are `#[cfg(unix)]`.
 - Relative paths are built from `Path::components()` joined with `/`, stored and compared in that form on every OS. The absolute path is rebuilt with `folder.join(components)`.
-- Config paths are written as TOML literal strings (`'C:\Music'`) so backslashes survive.
+- Folder paths in the config are written as TOML literal strings (`'C:\Music'`) so backslashes survive. A literal string cannot hold a single quote or a control character other than tab, so a folder path with one of those is written in the string form the `toml` crate chooses for it: `"/music/Guns N' Roses"` is a basic string, and `'''C:\Music\Guns N' Roses'''` is a multi-line literal string because the path also has a backslash. Every form reads back as the same path. `transcoding.ffmpeg` is written in the form the `toml` crate chooses, which is a literal string when the value has a backslash and no single quote.
 - `transcoding.ffmpeg` is a program name or a path; Rust resolves `ffmpeg` to `ffmpeg.exe` through `PATH` on Windows. Arguments are passed as argv, never through a shell, so paths with spaces work.
 - `kill_on_drop` is `TerminateProcess` on Windows and SIGKILL on Unix.
 - Atomic cache writes use temp file plus rename. On Windows the rename fails with a sharing violation while another request reads the destination; a failed rename whose destination exists is treated as success.

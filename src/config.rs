@@ -62,7 +62,7 @@ pub enum ConfigError {
     #[error("{key}: {reason}")]
     Invalid { key: &'static str, reason: String },
     /// A path cannot be made absolute.
-    #[error("cannot make the path {path:?} absolute: {source}")]
+    #[error("cannot make the path {} absolute: {source}", path.display())]
     Absolute { path: PathBuf, source: io::Error },
     /// No data directory was named and the platform has no default, because
     /// the home directory is unknown.
@@ -244,7 +244,9 @@ impl Config {
 
     /// Renders the config as TOML with every key present. Folder paths are
     /// TOML literal strings, so a backslash in a Windows path is kept as
-    /// written.
+    /// written. A folder path with a single quote or a control character
+    /// other than tab is written in another TOML string form and reads back
+    /// unchanged.
     pub fn to_toml(&self) -> Result<String, ConfigError> {
         self.render(false)
     }
@@ -673,7 +675,14 @@ mdns = true
             },
             discovery: Discovery { mdns: false },
         };
-        let (_dir, path) = config_file(&config.to_toml().expect("to_toml"));
+        let text = config.to_toml().expect("to_toml");
+        // The `toml` crate writes a string with a backslash as a literal
+        // string, so the ffmpeg path keeps its backslashes as written.
+        assert!(
+            text.contains(r"ffmpeg = 'C:\Program Files\ffmpeg\bin\ffmpeg.exe'"),
+            "{text}"
+        );
+        let (_dir, path) = config_file(&text);
         assert_eq!(Config::load(&path).expect("load"), config);
     }
 
@@ -719,6 +728,31 @@ mdns = true
             PathBuf::from(r"C:\Music\Guns N' Roses"),
         ];
         let text = Config::template(&folders, DEFAULT_PORT).expect("template");
+        // A literal string cannot hold a single quote. The first path becomes
+        // a basic string. The second has backslashes too and becomes a
+        // multi-line literal string, which keeps them as written.
+        assert!(
+            text.contains(r#"folders = ["/music/Guns N' Roses", '''C:\Music\Guns N' Roses''']"#),
+            "{text}"
+        );
+        let config = Config::parse(&text).expect("parse");
+        assert_eq!(config.library.folders, folders);
+    }
+
+    #[test]
+    fn folder_with_a_control_character_round_trips() {
+        let folders = vec![
+            PathBuf::from("/music/bell\u{7}"),
+            PathBuf::from("/music/two\nlines"),
+            PathBuf::from("/music/tab\there"),
+        ];
+        let text = Config::template(&folders, DEFAULT_PORT).expect("template");
+        // A tab is allowed in a literal string. The bell character is not,
+        // and that path is a basic string with an escape. The `toml` crate
+        // chooses the form of the path with a line break; the comparison
+        // below checks that it reads back.
+        assert!(text.contains(r#""/music/bell\u0007""#), "{text}");
+        assert!(text.contains("'/music/tab\there'"), "{text}");
         let config = Config::parse(&text).expect("parse");
         assert_eq!(config.library.folders, folders);
     }
