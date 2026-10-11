@@ -1,7 +1,7 @@
 CREATE TABLE users (
   id          INTEGER PRIMARY KEY,
   name        TEXT NOT NULL UNIQUE COLLATE NOCASE,
-  role        TEXT NOT NULL DEFAULT 'owner',   -- 'owner' now; 'guest' later
+  role        TEXT NOT NULL,                   -- 'owner' now; 'guest' later; no default
   password    TEXT NOT NULL,                   -- plain text; token auth needs it recoverable
   created_at  INTEGER NOT NULL,
   updated_at  INTEGER NOT NULL
@@ -9,7 +9,7 @@ CREATE TABLE users (
 
 CREATE TABLE folders (
   id    INTEGER PRIMARY KEY,
-  path  TEXT NOT NULL UNIQUE,                   -- absolute, as written in config after std::path::absolute
+  path  TEXT NOT NULL UNIQUE,                   -- absolute, components joined, no trailing separator
   name  TEXT NOT NULL
 );
 
@@ -121,6 +121,7 @@ CREATE TABLE play_queue_tracks (
   track_id  TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
   PRIMARY KEY (user_id, position)
 );
+CREATE INDEX play_queue_tracks_track ON play_queue_tracks(track_id);
 
 CREATE TABLE scans (
   id             INTEGER PRIMARY KEY,

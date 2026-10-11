@@ -188,13 +188,13 @@ IDs are opaque strings of a two-letter prefix, a hyphen and 32 lower-case hex ch
 
 Pragmas: `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, `busy_timeout=5000`. Migrations are numbered SQL files applied in one transaction each, tracked with `PRAGMA user_version`. `Db::open` returns an error for a database whose `user_version` is negative or greater than the number of migrations in the build.
 
-`Db` holds one writer `Connection` behind a `tokio::sync::Mutex` and four reader connections, each opened read-only behind its own `tokio::sync::Mutex`. Async callers use `db.read(|conn| ..)` and `db.write(|conn| ..)`, which run the closure on `spawn_blocking`. Blocking-thread callers (the scanner) use `db.with_writer(|conn| ..)` and `db.with_reader(..)`, which take the lock with `blocking_lock`. The closures return `Result<T, DbError>`. `db.close().await` waits for the running reads and writes of the handle and runs `PRAGMA wal_checkpoint(TRUNCATE)`; it returns an error when a connection of another process blocks the checkpoint. The connections close when the last clone of the handle is dropped. Tests use `Db::open_memory()` (one shared connection) or a temp file.
+`Db` holds one writer `Connection` behind a `tokio::sync::Mutex` and four reader connections, each opened read-only behind its own `tokio::sync::Mutex`. Async callers use `db.read(|conn| ..)` and `db.write(|conn| ..)`, which run the closure on `spawn_blocking`. Blocking-thread callers (the scanner) use `db.with_writer(|conn| ..)` and `db.with_reader(..)`, which take the lock with `blocking_lock`. The closures return `Result<T, DbError>`. `db.close().await` waits for the running reads and writes of the handle and runs `PRAGMA wal_checkpoint(TRUNCATE)`; it returns an error when a connection outside the handle blocks the checkpoint. The connections close when the last clone of the handle is dropped. Tests use `Db::open_memory()` (one shared connection) or a temp file.
 
 ```sql
 CREATE TABLE users (
   id          INTEGER PRIMARY KEY,
   name        TEXT NOT NULL UNIQUE COLLATE NOCASE,
-  role        TEXT NOT NULL DEFAULT 'owner',   -- 'owner' now; 'guest' later
+  role        TEXT NOT NULL,                   -- 'owner' now; 'guest' later; no default
   password    TEXT NOT NULL,                   -- plain text; token auth needs it recoverable
   created_at  INTEGER NOT NULL,
   updated_at  INTEGER NOT NULL
@@ -202,7 +202,7 @@ CREATE TABLE users (
 
 CREATE TABLE folders (
   id    INTEGER PRIMARY KEY,
-  path  TEXT NOT NULL UNIQUE,                   -- absolute, as written in config after std::path::absolute
+  path  TEXT NOT NULL UNIQUE,                   -- absolute, components joined, no trailing separator
   name  TEXT NOT NULL
 );
 
@@ -314,6 +314,7 @@ CREATE TABLE play_queue_tracks (
   track_id  TEXT NOT NULL REFERENCES tracks(id) ON DELETE CASCADE,
   PRIMARY KEY (user_id, position)
 );
+CREATE INDEX play_queue_tracks_track ON play_queue_tracks(track_id);
 
 CREATE TABLE scans (
   id             INTEGER PRIMARY KEY,
@@ -328,9 +329,9 @@ CREATE TABLE scans (
 );
 ```
 
-Genres are derived with `GROUP BY genre`. Cascades from `tracks` to `playlist_tracks` and `play_queue_tracks` are correct because a track row is deleted only when its file is gone and no new file carries its fingerprint, and never for a folder that is unreadable or newly empty.
+Genres are derived with `GROUP BY genre`. Cascades from `tracks` to `playlist_tracks` and `play_queue_tracks` are correct because a track row is deleted only when its file is gone and no new file carries its fingerprint, and never for a folder that is unreadable or newly empty. Both child tables index `track_id`, so the deletion of a track does not scan them.
 
-Multi-user readiness: every per-user table carries `user_id`; `users.role` separates the owner from future guests; the CLI finds the owner with `WHERE role = 'owner'`.
+Multi-user readiness: every per-user table carries `user_id`; `users.role` separates the owner from future guests and has no default, so every insert names the role; the CLI finds the owner with `WHERE role = 'owner'`.
 
 ### 3.5 Data directory and config
 
@@ -460,7 +461,7 @@ First-scan cost: the fingerprint reads up to 128 KiB per new file (12.8 GB for 1
 
 Cancellation is checked between batches. `ScanController` in `AppState` runs at most one scan at a time; `startScan` during a scan returns the running status. A periodic task starts a scan every `rescan_interval_minutes` when the value is non-zero.
 
-Folder sync at `run` and `scan`: folders from config are upserted by path, and the name of a folder is the last component of its path (the whole path for a root such as `/` or `C:\`); a folder removed from config has its tracks deleted (tracks of a folder whose path changed are relinked by fingerprint into the new folder row before the old row is removed, because deletion happens after matching).
+Folder sync at `run` and `scan`: folders from config are upserted by path. The stored path is rebuilt from `Path::components()`, so a trailing separator, a `.` component or a repeated separator does not make a second row for one directory; `..` components are kept, as `std::path::absolute` keeps them. The name of a folder is the last component of its path (the whole path for a root such as `/` or `C:\`). A folder removed from config has its tracks deleted (tracks of a folder whose path changed are relinked by fingerprint into the new folder row before the old row is removed, because deletion happens after matching).
 
 ### 3.11 Cover art
 

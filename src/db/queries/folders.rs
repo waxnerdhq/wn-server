@@ -11,7 +11,8 @@ use crate::db::{DbError, Result};
 pub struct Folder {
     /// The integer ID that Subsonic clients see.
     pub id: i64,
-    /// The absolute path of the folder.
+    /// The absolute path of the folder in its stored form: the components
+    /// joined with the separator of the OS, without a trailing separator.
     pub path: PathBuf,
     /// The display name: the last component of the path, or the whole path
     /// when it has none.
@@ -21,6 +22,10 @@ pub struct Folder {
 /// Inserts a row for each path that has none and returns the rows of `paths`
 /// in the order of first occurrence. A path that already has a row keeps its
 /// ID.
+///
+/// A path is stored as its components joined with the separator of the OS.
+/// Spellings of one directory that differ by a trailing separator, a `.`
+/// component or a repeated separator share a row.
 ///
 /// Rows of other paths stay in the table. The scanner deletes them after it
 /// has matched moved tracks.
@@ -35,15 +40,24 @@ pub fn sync_folders(conn: &Connection, paths: &[PathBuf]) -> Result<Vec<Folder>>
     )?;
     let mut folders: Vec<Folder> = Vec::with_capacity(paths.len());
     for path in paths {
-        let text = path
+        let stored = stored_form(path);
+        let text = stored
             .to_str()
             .ok_or_else(|| DbError::NonUnicodePath(path.clone()))?;
-        let folder = upsert.query_row([text, display_name(path, text)], folder_from_row)?;
+        let folder = upsert.query_row([text, display_name(&stored, text)], folder_from_row)?;
         if !folders.iter().any(|known| known.id == folder.id) {
             folders.push(folder);
         }
     }
     Ok(folders)
+}
+
+/// Rebuilds `path` from its components. The result has no trailing
+/// separator, no repeated separator and no `.` component, except a `.` that
+/// starts a relative path. `..` components stay, because removing one changes
+/// the directory when the component before it is a symlink.
+fn stored_form(path: &Path) -> PathBuf {
+    path.components().collect()
 }
 
 /// Returns every folder row in ID order.
@@ -94,6 +108,17 @@ mod tests {
     fn sync(db: &Db, texts: &[&str]) -> Vec<Folder> {
         let paths = paths(texts);
         db.with_writer(|conn| sync_folders(conn, &paths)).unwrap()
+    }
+
+    /// Returns the path text of a row. `PathBuf` equality ignores a trailing
+    /// separator, so tests of the stored form compare text.
+    fn stored_text(folder: &Folder) -> String {
+        folder.path.to_str().unwrap().to_string()
+    }
+
+    /// Returns `text`, which uses `/`, with the separator of this OS.
+    fn os_text(text: &str) -> String {
+        text.replace('/', std::path::MAIN_SEPARATOR_STR)
     }
 
     #[test]
@@ -164,11 +189,53 @@ mod tests {
     }
 
     #[test]
+    fn sync_folders_stores_one_row_for_spellings_of_one_directory() {
+        let (_dir, dbs) = both_dbs();
+        for db in dbs {
+            let spellings = [
+                "/music/jazz/",
+                "/music/jazz",
+                "/music/./jazz",
+                "/music//jazz",
+                "/music/jazz/.",
+            ];
+            let folders = sync(&db, &spellings);
+            assert_eq!(folders.len(), 1);
+            assert_eq!(folders[0].id, 1);
+            assert_eq!(stored_text(&folders[0]), os_text("/music/jazz"));
+            assert_eq!(folders[0].name, "jazz");
+            assert_eq!(db.with_reader(list).unwrap(), folders);
+        }
+    }
+
+    #[test]
+    fn sync_folders_keeps_the_row_when_a_trailing_separator_is_added() {
+        let (_dir, dbs) = both_dbs();
+        for db in dbs {
+            let first = sync(&db, &["/music/jazz"]);
+            let second = sync(&db, &["/music/jazz/"]);
+            assert_eq!(second, first);
+            assert_eq!(db.with_reader(list).unwrap(), first);
+        }
+    }
+
+    #[test]
+    fn sync_folders_keeps_parent_components() {
+        let db = Db::open_memory().unwrap();
+        let folders = sync(&db, &["/music/rock/../jazz", "/music/jazz"]);
+        let texts: Vec<String> = folders.iter().map(stored_text).collect();
+        assert_eq!(
+            texts,
+            [os_text("/music/rock/../jazz"), os_text("/music/jazz")]
+        );
+    }
+
+    #[test]
     fn folder_name_is_the_last_component_or_the_whole_path() {
         let db = Db::open_memory().unwrap();
         let folders = sync(&db, &["/music/Rock Albums", "/music/jazz/", "/"]);
         let names: Vec<&str> = folders.iter().map(|folder| folder.name.as_str()).collect();
-        assert_eq!(names, ["Rock Albums", "jazz", "/"]);
+        assert_eq!(names, ["Rock Albums", "jazz", os_text("/").as_str()]);
     }
 
     #[test]
@@ -177,11 +244,18 @@ mod tests {
         for db in dbs {
             sync(&db, &["/music/b", "/music/a", "/music/c"]);
             let listed = db.with_reader(list).unwrap();
-            let seen: Vec<(i64, &str)> = listed
+            let seen: Vec<(i64, String)> = listed
                 .iter()
-                .map(|folder| (folder.id, folder.path.to_str().unwrap()))
+                .map(|folder| (folder.id, stored_text(folder)))
                 .collect();
-            assert_eq!(seen, [(1, "/music/b"), (2, "/music/a"), (3, "/music/c")]);
+            assert_eq!(
+                seen,
+                [
+                    (1, os_text("/music/b")),
+                    (2, os_text("/music/a")),
+                    (3, os_text("/music/c")),
+                ]
+            );
         }
     }
 

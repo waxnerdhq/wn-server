@@ -30,8 +30,11 @@ const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
 pub enum DbError {
     #[error(transparent)]
     Sqlite(#[from] rusqlite::Error),
-    #[error("cannot create the database file: {0}")]
-    Io(#[from] std::io::Error),
+    #[error("cannot create the database file {}: {source}", .path.display())]
+    CreateFile {
+        path: PathBuf,
+        source: std::io::Error,
+    },
     #[error(
         "the database has schema version {found}; this build supports versions 0 to {supported}"
     )]
@@ -78,7 +81,10 @@ impl Db {
         // File modes exist on Unix only. On Windows the ACL of the user
         // profile protects the data directory.
         #[cfg(unix)]
-        create_owner_only(path)?;
+        create_owner_only(path).map_err(|source| DbError::CreateFile {
+            path: path.to_path_buf(),
+            source,
+        })?;
 
         let mut writer = Connection::open(path)?;
         configure(&writer)?;
@@ -347,12 +353,13 @@ mod tests {
         "users",
     ];
 
-    const INDEXES: [&str; 11] = [
+    const INDEXES: [&str; 12] = [
         "albums_created",
         "albums_genre",
         "albums_key",
         "albums_year",
         "annotations_starred",
+        "play_queue_tracks_track",
         "playlist_tracks_track",
         "tracks_album",
         "tracks_artist",
@@ -569,6 +576,55 @@ mod tests {
     }
 
     #[test]
+    fn a_user_insert_that_omits_the_role_fails() {
+        let (_dir, dbs) = both_dbs();
+        for db in dbs {
+            let error = db
+                .with_writer(|c| {
+                    Ok(c.execute(
+                        "INSERT INTO users (name, password, created_at, updated_at)
+                         VALUES ('adnan', 'secret', 0, 0)",
+                        [],
+                    )?)
+                })
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("NOT NULL constraint failed: users.role"),
+                "{error}"
+            );
+
+            let inserted = db
+                .with_writer(|c| {
+                    Ok(c.execute(
+                        "INSERT INTO users (name, role, password, created_at, updated_at)
+                         VALUES ('adnan', 'owner', 'secret', 0, 0)",
+                        [],
+                    )?)
+                })
+                .unwrap();
+            assert_eq!(inserted, 1);
+        }
+    }
+
+    #[test]
+    fn open_in_a_missing_directory_is_an_error() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("missing").join("library.db");
+        let error = Db::open(&path).unwrap_err();
+        // On Unix the file is created before SQLite opens it. On other
+        // systems SQLite reports the failure.
+        #[cfg(unix)]
+        assert!(
+            matches!(&error, DbError::CreateFile { path: failed, .. } if *failed == path),
+            "{error}"
+        );
+        #[cfg(not(unix))]
+        assert!(matches!(error, DbError::Sqlite(_)), "{error}");
+    }
+
+    #[test]
     fn file_database_connections_have_the_pragmas() {
         let (_dir, _path, db) = temp_db();
         let writer = db.inner.writer.blocking_lock();
@@ -630,7 +686,7 @@ mod tests {
             .collect();
         // The limit ends the test when the reads wait for the write. It does
         // not delay a passing run.
-        let counts = tokio::time::timeout(Duration::from_secs(10), async {
+        let counts = tokio::time::timeout(Duration::from_secs(2), async {
             let mut counts = Vec::new();
             for read in reads {
                 counts.push(read.await.unwrap().unwrap());
