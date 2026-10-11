@@ -6,18 +6,20 @@ wn-server is a headless music server for OpenSubsonic clients. The design is des
 
 | Command | Effect |
 |---|---|
-| `wn-server init [--folder PATH]... [--port N]` | Creates the data directory and writes `config.toml`. |
+| `wn-server init [--folder PATH]... [--port N] [--username NAME] [--password-stdin]` | Creates the data directory, `config.toml`, `instance.id`, the database and the owner account. |
+| `wn-server user show` | Prints the name, the role and the creation date of the owner account. |
+| `wn-server user set-password [--username NAME] [--password-stdin]` | Stores a new password for the owner account, or for the account `--username` names. |
 | `wn-server config path` | Prints the path of the config file. |
 | `wn-server config show` | Prints the effective config: the values of the file and the default of every key the file omits. |
 | `wn-server --version` | Prints the version. |
 
-`run`, `scan`, `user show` and `user set-password` print `not implemented yet` and exit with status 2.
+`run` and `scan` print `not implemented yet` and exit with status 2.
 
 Every command accepts `--data-dir DIR` before or after the subcommand. A command that fails prints `wn-server: <error>` to stderr and exits with status 1. A usage error exits with status 2.
 
 ## Data directory
 
-The data directory holds `config.toml`. The first of these that is present names it:
+The data directory holds `config.toml`, the database `library.db` and `instance.id`. The first of these that is present names it:
 
 1. The `--data-dir` option.
 2. The `WN_SERVER_DATA_DIR` environment variable. An empty value counts as unset.
@@ -31,12 +33,42 @@ The data directory holds `config.toml`. The first of these that is present names
 wn-server init --folder /path/to/music
 ```
 
-`init` checks that each `--folder` is an existing directory, creates the data directory and writes `config.toml` with every key. `--folder` may be repeated. `--port` sets `server.port`.
+`init` checks that each `--folder` is an existing directory, creates the data directory and writes `config.toml` with every key. `--folder` may be repeated. `--port` sets `server.port`. `init` then writes `instance.id`, creates the database `library.db` and creates the owner account.
 
 - Folders are written as absolute paths.
 - An existing `config.toml` is not overwritten. `init` fails and leaves the file as it is.
+- An existing owner account is not replaced. `init` fails when `library.db` already has one, and removes the `config.toml` and the `instance.id` it wrote in that run.
+- `instance.id` holds a random UUID that identifies this server to clients on the network. An existing `instance.id` is kept.
 - Without `--folder`, `init` writes `folders = []`. A folder must be added to the file before another command loads it.
-- On Unix, `init` creates the data directory with mode 0700. It does not change the mode of a directory that already exists.
+- On Unix, `init` creates the data directory with mode 0700 and `library.db` with mode 0600. It does not change the mode of a directory that already exists.
+
+## Owner account
+
+The server has one account, the owner. A client signs in with the name and the password of that account. `--username` sets the name at `init`. The default name is `owner`.
+
+`init` takes the password from the first of these that is present:
+
+1. The `--password-stdin` option. The password is the first line of stdin, without the line ending. An empty line is an error.
+2. The `WN_SERVER_PASSWORD` environment variable. An empty value counts as unset.
+3. Neither. `init` generates a password and prints it once:
+
+```
+Password for owner (shown once): xxxxx-xxxxx-xxxxx-xxxxx
+```
+
+A generated password is four groups of five characters from the lower-case letters without `i`, `l` and `o` and the digits `2` to `9`. No command shows a password again. A password that the owner supplied is not printed. There is no interactive prompt.
+
+```
+wn-server init --folder /path/to/music --password-stdin < password-file
+```
+
+`wn-server user set-password` stores a new password. It takes the password from the same three sources and prints a generated password once. `--username` names the account. Without it the account is the owner.
+
+`wn-server user show` prints the name, the role and the creation date of the owner account. The date is in UTC.
+
+The `user` commands need `library.db` and its owner account, and only `init` creates them. When `library.db` is missing or has no owner account and `config.toml` exists, move `config.toml` away, run `wn-server init`, and move the saved file back over the `config.toml` that `init` wrote.
+
+The password is stored in plain text in `library.db`. Subsonic token authentication needs the password itself, so the server cannot store a hash. Anyone who can read the data directory can read the password. Do not use a password that protects anything else. On Windows the access control list of the user profile protects the data directory.
 
 ## Configuration
 

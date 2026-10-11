@@ -1,22 +1,52 @@
-//! Runs the `wn-server` binary for the commands that work without a database:
-//! `init`, `config path` and `config show`.
+//! Runs the `wn-server` binary for the commands that work without a server:
+//! `init`, `user show`, `user set-password`, `config path` and `config show`.
 
 use std::fs;
+use std::io::Write;
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tempfile::TempDir;
+use wn_server::auth::verify_password;
+use wn_server::cli::PASSWORD_ENV;
 use wn_server::config::{Config, DATA_DIR_ENV};
+use wn_server::db::Db;
+use wn_server::db::queries::users::{self, UserRow};
 
-/// The binary, without the data directory variable of the developer's shell.
+/// The line `init` and `user set-password` print after they store a password.
+const NOTICE: &str =
+    "The password is stored in plain text in the data directory. Do not reuse it elsewhere.";
+
+/// The binary, without the data directory variable and the password variable
+/// of the developer's shell.
 fn binary() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_wn-server"));
     command.env_remove(DATA_DIR_ENV);
+    command.env_remove(PASSWORD_ENV);
     command
 }
 
+/// Runs the command with an empty stdin.
 fn run(command: &mut Command) -> Output {
     command.output().expect("run wn-server")
+}
+
+/// Runs the command with `input` on stdin.
+fn run_with_stdin(command: &mut Command, input: &str) -> Output {
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("start wn-server");
+    let mut stdin = child.stdin.take().expect("stdin is piped");
+    // The write fails when the command exits without reading stdin. The
+    // assertions of the test on the exit code and on stderr report that case.
+    let _ = stdin.write_all(input.as_bytes());
+    // The command sees the end of the input when the pipe closes.
+    drop(stdin);
+    child.wait_with_output().expect("wait for wn-server")
 }
 
 fn stdout(output: &Output) -> String {
@@ -46,6 +76,79 @@ fn init(data_dir: &Path, folder: &Path) -> Output {
         .arg(folder))
 }
 
+/// `init` for the data directory `data_dir` without a music folder.
+fn init_command(data_dir: &Path) -> Command {
+    let mut command = binary();
+    command.arg("init").arg("--data-dir").arg(data_dir);
+    command
+}
+
+/// `user set-password` for the data directory `data_dir`.
+fn set_password_command(data_dir: &Path) -> Command {
+    let mut command = binary();
+    command
+        .args(["user", "set-password", "--data-dir"])
+        .arg(data_dir);
+    command
+}
+
+/// Runs `init` for the data directory `data_dir` with the password in the
+/// variable, and checks that it succeeded.
+fn init_with_password(data_dir: &Path, password: &str) {
+    let output = run(init_command(data_dir).env(PASSWORD_ENV, password));
+    assert!(output.status.success(), "{}", stderr(&output));
+}
+
+/// The row of the owner account in the database of `data_dir`.
+fn owner_row(data_dir: &Path) -> UserRow {
+    let db = Db::open(data_dir.join("library.db")).expect("open the database");
+    db.with_reader(users::get_owner)
+        .expect("read the owner")
+        .expect("an owner account")
+}
+
+/// The lines `init` prints for the data directory `data_dir` without a music
+/// folder, before the lines about the password.
+fn init_lines(data_dir: &Path) -> String {
+    format!(
+        "wrote {}\nno music folder is configured; add one to library.folders in that file\n",
+        data_dir.join("config.toml").display()
+    )
+}
+
+/// The password on the line `Password for <name> (shown once): <password>`
+/// of `text`. Panics unless exactly one line starts that way.
+fn printed_password(text: &str, name: &str) -> String {
+    let start = format!("Password for {name} (shown once): ");
+    let mut passwords = text.lines().filter_map(|line| line.strip_prefix(&start));
+    let password = passwords.next().expect("a password line");
+    assert!(passwords.next().is_none(), "one password line");
+    password.to_string()
+}
+
+/// Checks that `password` is four groups of five characters from `a-z` and
+/// `2-9` without `i`, `l` and `o`, separated by hyphens.
+fn assert_generated_shape(password: &str) {
+    let groups: Vec<&str> = password.split('-').collect();
+    assert_eq!(groups.len(), 4);
+    for group in groups {
+        assert_eq!(group.len(), 5);
+        assert!(
+            group
+                .chars()
+                .all(|character| matches!(character, 'a'..='z' | '2'..='9')
+                    && !matches!(character, 'i' | 'l' | 'o'))
+        );
+    }
+}
+
+fn unix_now() -> i64 {
+    let elapsed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the clock is after 1970");
+    i64::try_from(elapsed.as_secs()).expect("seconds fit")
+}
+
 #[test]
 fn init_writes_a_config_that_loads() {
     let dir = temp_dir();
@@ -55,9 +158,10 @@ fn init_writes_a_config_that_loads() {
     let output = init(&data_dir, music.path());
     assert!(output.status.success(), "{}", stderr(&output));
     let config_path = data_dir.join("config.toml");
+    let text = stdout(&output);
     assert_eq!(
-        stdout(&output),
-        format!("wrote {}\n", config_path.display())
+        text.lines().next(),
+        Some(format!("wrote {}", config_path.display()).as_str())
     );
 
     // On Windows the temp directory path has backslashes, so this is also the
@@ -133,6 +237,8 @@ fn init_does_not_overwrite_an_existing_config() {
         fs::read_to_string(&config_path).expect("read config"),
         "# kept\n"
     );
+    assert!(!dir.path().join("library.db").exists());
+    assert!(!dir.path().join("instance.id").exists());
 }
 
 #[test]
@@ -229,6 +335,607 @@ fn init_keeps_the_mode_of_an_existing_data_directory() {
         .permissions()
         .mode();
     assert_eq!(mode & 0o777, 0o750);
+}
+
+// Unix only, for the same reason.
+#[cfg(unix)]
+#[test]
+fn init_creates_a_0700_data_directory_and_a_0600_database() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = temp_dir();
+    let data_dir = dir.path().join("data");
+
+    let output = run(&mut init_command(&data_dir));
+    assert!(output.status.success(), "{}", stderr(&output));
+    let mode = |path: &Path| fs::metadata(path).expect("metadata").permissions().mode() & 0o777;
+    assert_eq!(mode(&data_dir), 0o700);
+    assert_eq!(mode(&data_dir.join("library.db")), 0o600);
+}
+
+#[test]
+fn init_generates_a_password_prints_it_once_and_stores_it() {
+    let dir = temp_dir();
+    let data_dir = dir.path().join("data");
+
+    let output = run(&mut init_command(&data_dir));
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    let password = printed_password(&text, "owner");
+    assert_generated_shape(&password);
+    assert_eq!(
+        text,
+        format!(
+            "{}Password for owner (shown once): {password}\n{NOTICE}\n",
+            init_lines(&data_dir)
+        )
+    );
+    assert_eq!(text.matches(&password).count(), 1);
+    assert!(stderr(&output).is_empty());
+
+    let row = owner_row(&data_dir);
+    assert_eq!(row.user.name, "owner");
+    assert_eq!(row.user.role, "owner");
+    assert!(verify_password(&row.password, &password));
+}
+
+#[test]
+fn init_stores_the_password_of_the_variable_and_does_not_print_it() {
+    for password in ["x", "from the variable ☃"] {
+        let dir = temp_dir();
+        let data_dir = dir.path().join("data");
+
+        let output = run(init_command(&data_dir).env(PASSWORD_ENV, password));
+        assert!(output.status.success(), "{}", stderr(&output));
+        // The output is the lines about the config and the notice, so no line
+        // shows the password.
+        assert_eq!(
+            stdout(&output),
+            format!("{}{NOTICE}\n", init_lines(&data_dir))
+        );
+        assert!(stderr(&output).is_empty());
+
+        let row = owner_row(&data_dir);
+        assert_eq!(row.password, password);
+        assert!(verify_password(&row.password, password));
+    }
+}
+
+#[test]
+fn init_reads_the_password_from_the_first_line_of_stdin() {
+    for (input, password) in [
+        ("from stdin\n", "from stdin"),
+        ("from stdin\r\n", "from stdin"),
+        ("from stdin", "from stdin"),
+        (" first \nsecond\n", " first "),
+    ] {
+        let dir = temp_dir();
+        let data_dir = dir.path().join("data");
+
+        let output = run_with_stdin(init_command(&data_dir).arg("--password-stdin"), input);
+        assert!(output.status.success(), "{input:?}: {}", stderr(&output));
+        assert_eq!(
+            stdout(&output),
+            format!("{}{NOTICE}\n", init_lines(&data_dir)),
+            "{input:?}"
+        );
+        assert!(stderr(&output).is_empty(), "{input:?}");
+
+        let row = owner_row(&data_dir);
+        assert_eq!(row.password, password, "{input:?}");
+        assert!(verify_password(&row.password, password), "{input:?}");
+    }
+}
+
+#[test]
+fn init_password_stdin_wins_over_the_variable() {
+    let dir = temp_dir();
+    let data_dir = dir.path().join("data");
+
+    let output = run_with_stdin(
+        init_command(&data_dir)
+            .arg("--password-stdin")
+            .env(PASSWORD_ENV, "from the variable"),
+        "from stdin\n",
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        stdout(&output),
+        format!("{}{NOTICE}\n", init_lines(&data_dir))
+    );
+
+    let row = owner_row(&data_dir);
+    assert!(verify_password(&row.password, "from stdin"));
+    assert!(!verify_password(&row.password, "from the variable"));
+}
+
+#[test]
+fn init_without_a_password_on_stdin_fails_and_creates_nothing() {
+    for input in ["", "\n", "\r\n"] {
+        let dir = temp_dir();
+        let data_dir = dir.path().join("data");
+
+        // The variable does not replace the missing line.
+        let output = run_with_stdin(
+            init_command(&data_dir)
+                .arg("--password-stdin")
+                .env(PASSWORD_ENV, "from the variable"),
+            input,
+        );
+        assert_eq!(output.status.code(), Some(1), "{input:?}");
+        assert!(stdout(&output).is_empty(), "{input:?}");
+        let message = stderr(&output);
+        assert!(message.contains("--password-stdin"), "{message}");
+        assert!(!message.contains("from the variable"), "{message}");
+        assert!(!data_dir.exists(), "{input:?}");
+    }
+}
+
+#[test]
+fn init_with_an_empty_variable_generates_a_password() {
+    let dir = temp_dir();
+    let data_dir = dir.path().join("data");
+
+    let output = run(init_command(&data_dir).env(PASSWORD_ENV, ""));
+    assert!(output.status.success(), "{}", stderr(&output));
+    let password = printed_password(&stdout(&output), "owner");
+    assert_generated_shape(&password);
+    assert!(verify_password(&owner_row(&data_dir).password, &password));
+}
+
+// Unix only: a variable that is not valid Unicode is built from raw bytes,
+// which only Unix environments allow.
+#[cfg(unix)]
+#[test]
+fn init_rejects_a_variable_that_is_not_unicode_unless_stdin_supplies_the_password() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let not_unicode = OsStr::from_bytes(b"sesame\xff");
+    let dir = temp_dir();
+    let data_dir = dir.path().join("data");
+
+    let output = run(init_command(&data_dir).env(PASSWORD_ENV, not_unicode));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).is_empty());
+    let message = stderr(&output);
+    assert!(
+        message.contains("WN_SERVER_PASSWORD is not valid Unicode"),
+        "{message}"
+    );
+    assert!(!message.contains("sesame"), "{message}");
+    assert!(!data_dir.exists());
+
+    let output = run_with_stdin(
+        init_command(&data_dir)
+            .arg("--password-stdin")
+            .env(PASSWORD_ENV, not_unicode),
+        "from stdin\n",
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert!(verify_password(
+        &owner_row(&data_dir).password,
+        "from stdin"
+    ));
+}
+
+#[test]
+fn init_names_the_owner_account_after_the_username_option() {
+    let dir = temp_dir();
+    let data_dir = dir.path().join("data");
+
+    let output = run(init_command(&data_dir).args(["--username", "Adnan"]));
+    assert!(output.status.success(), "{}", stderr(&output));
+    let password = printed_password(&stdout(&output), "Adnan");
+
+    let row = owner_row(&data_dir);
+    assert_eq!(row.user.name, "Adnan");
+    assert_eq!(row.user.role, "owner");
+    assert!(verify_password(&row.password, &password));
+}
+
+#[test]
+fn a_second_init_refuses_and_keeps_the_account() {
+    let dir = temp_dir();
+    let data_dir = dir.path().join("data");
+    init_with_password(&data_dir, "first");
+    let config_path = data_dir.join("config.toml");
+    let config = fs::read_to_string(&config_path).expect("read config");
+    let instance_id = fs::read_to_string(data_dir.join("instance.id")).expect("read instance.id");
+
+    let output = run(init_command(&data_dir)
+        .args(["--username", "other", "--port", "4321"])
+        .env(PASSWORD_ENV, "second"));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).is_empty());
+    let message = stderr(&output);
+    assert!(message.contains("already exists"), "{message}");
+    assert!(
+        message.contains(&config_path.display().to_string()),
+        "{message}"
+    );
+    assert!(!message.contains("second"), "{message}");
+
+    let row = owner_row(&data_dir);
+    assert_eq!(row.user.name, "owner");
+    assert!(verify_password(&row.password, "first"));
+    assert_eq!(
+        fs::read_to_string(&config_path).expect("read config"),
+        config
+    );
+    assert_eq!(
+        fs::read_to_string(data_dir.join("instance.id")).expect("read instance.id"),
+        instance_id
+    );
+}
+
+#[test]
+fn init_refuses_a_database_that_has_an_owner_and_removes_the_files_it_wrote() {
+    for instance_id_exists in [true, false] {
+        let dir = temp_dir();
+        let data_dir = dir.path().join("data");
+        init_with_password(&data_dir, "first");
+        let config_path = data_dir.join("config.toml");
+        let instance_id_path = data_dir.join("instance.id");
+        let instance_id = fs::read_to_string(&instance_id_path).expect("read instance.id");
+        fs::remove_file(&config_path).expect("remove config");
+        if !instance_id_exists {
+            fs::remove_file(&instance_id_path).expect("remove instance.id");
+        }
+
+        let output = run(init_command(&data_dir)
+            .args(["--username", "other"])
+            .env(PASSWORD_ENV, "second"));
+        assert_eq!(output.status.code(), Some(1));
+        assert!(stdout(&output).is_empty());
+        let message = stderr(&output);
+        assert!(
+            message.contains("already has an owner account"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&data_dir.join("library.db").display().to_string()),
+            "{message}"
+        );
+        assert!(!message.contains("second"), "{message}");
+
+        // The refused run wrote a config file, and an instance ID when the
+        // directory had none. It removed what it wrote. An instance ID from
+        // before the run is kept.
+        assert!(!config_path.exists());
+        if instance_id_exists {
+            assert_eq!(
+                fs::read_to_string(&instance_id_path).expect("read instance.id"),
+                instance_id
+            );
+        } else {
+            assert!(!instance_id_path.exists());
+        }
+
+        let row = owner_row(&data_dir);
+        assert_eq!(row.user.name, "owner");
+        assert!(verify_password(&row.password, "first"));
+    }
+}
+
+#[test]
+fn init_writes_a_version_4_uuid_to_instance_id() {
+    let first = temp_dir();
+    let second = temp_dir();
+    let mut ids = Vec::new();
+    for dir in [&first, &second] {
+        let output = run(&mut init_command(dir.path()));
+        assert!(output.status.success(), "{}", stderr(&output));
+        let text = fs::read_to_string(dir.path().join("instance.id")).expect("read instance.id");
+        let id = text.strip_suffix('\n').expect("a line").to_string();
+
+        let groups: Vec<&str> = id.split('-').collect();
+        let lengths: Vec<usize> = groups.iter().map(|group| group.len()).collect();
+        assert_eq!(lengths, [8, 4, 4, 4, 12], "{id}");
+        assert!(
+            id.chars()
+                .all(|character| matches!(character, '0'..='9' | 'a'..='f' | '-')),
+            "{id}"
+        );
+        // The version digit is 4 and the variant digit is 8, 9, a or b.
+        assert!(groups[2].starts_with('4'), "{id}");
+        assert!(matches!(&groups[3][..1], "8" | "9" | "a" | "b"), "{id}");
+        ids.push(id);
+    }
+    assert_ne!(ids[0], ids[1]);
+}
+
+#[test]
+fn init_keeps_an_existing_instance_id() {
+    let dir = temp_dir();
+    let instance_id_path = dir.path().join("instance.id");
+    fs::write(&instance_id_path, "kept\n").expect("write instance.id");
+
+    let output = run(&mut init_command(dir.path()));
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(
+        fs::read_to_string(&instance_id_path).expect("read instance.id"),
+        "kept\n"
+    );
+}
+
+#[test]
+fn user_show_prints_the_name_the_role_and_the_creation_date() {
+    let dir = temp_dir();
+    let data_dir = dir.path().join("data");
+    let before = unix_now();
+    let output = run(init_command(&data_dir)
+        .args(["--username", "adnan"])
+        .env(PASSWORD_ENV, "sesame-secret"));
+    assert!(output.status.success(), "{}", stderr(&output));
+    let after = unix_now();
+    let created_at = owner_row(&data_dir).created_at;
+    assert!((before..=after).contains(&created_at), "{created_at}");
+
+    let show = || {
+        let output = run(binary().args(["user", "show", "--data-dir"]).arg(&data_dir));
+        assert!(output.status.success(), "{}", stderr(&output));
+        assert!(stderr(&output).is_empty());
+        stdout(&output)
+    };
+    let text = show();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 3, "{text}");
+    assert_eq!(lines[0], "name: adnan");
+    assert_eq!(lines[1], "role: owner");
+    let date = lines[2].strip_prefix("created: ").expect("a created line");
+    let digits: Vec<&str> = date.split('-').collect();
+    let lengths: Vec<usize> = digits.iter().map(|part| part.len()).collect();
+    assert_eq!(lengths, [4, 2, 2], "{date}");
+    assert!(
+        digits
+            .iter()
+            .all(|part| part.chars().all(|character| character.is_ascii_digit())),
+        "{date}"
+    );
+    assert!(!text.contains("sesame-secret"), "{text}");
+
+    // The date follows the stored creation time. 951782400 is
+    // 2000-02-29T00:00:00Z.
+    let db = Db::open(data_dir.join("library.db")).expect("open the database");
+    db.with_writer(|conn| {
+        conn.execute("UPDATE users SET created_at = 951782400", [])?;
+        Ok(())
+    })
+    .expect("set the creation time");
+    drop(db);
+    assert_eq!(show(), "name: adnan\nrole: owner\ncreated: 2000-02-29\n");
+}
+
+#[test]
+fn user_set_password_generates_a_password_prints_it_once_and_stores_it() {
+    let dir = temp_dir();
+    let data_dir = dir.path().join("data");
+    init_with_password(&data_dir, "first");
+
+    let output = run(&mut set_password_command(&data_dir));
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
+    let password = printed_password(&text, "owner");
+    assert_generated_shape(&password);
+    assert_eq!(
+        text,
+        format!("Password for owner (shown once): {password}\n{NOTICE}\n")
+    );
+    assert!(stderr(&output).is_empty());
+
+    let row = owner_row(&data_dir);
+    assert!(verify_password(&row.password, &password));
+    assert!(!verify_password(&row.password, "first"));
+
+    // Each run generates another password.
+    let output = run(&mut set_password_command(&data_dir));
+    assert!(output.status.success(), "{}", stderr(&output));
+    let next = printed_password(&stdout(&output), "owner");
+    assert_ne!(next, password);
+    let row = owner_row(&data_dir);
+    assert!(verify_password(&row.password, &next));
+    assert!(!verify_password(&row.password, &password));
+}
+
+#[test]
+fn user_set_password_stores_a_supplied_password_and_does_not_print_it() {
+    let dir = temp_dir();
+    let data_dir = dir.path().join("data");
+    init_with_password(&data_dir, "first");
+
+    let output = run(set_password_command(&data_dir).env(PASSWORD_ENV, "from the variable"));
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), format!("{NOTICE}\n"));
+    assert!(stderr(&output).is_empty());
+    let row = owner_row(&data_dir);
+    assert!(verify_password(&row.password, "from the variable"));
+    assert!(!verify_password(&row.password, "first"));
+
+    let output = run_with_stdin(
+        set_password_command(&data_dir).arg("--password-stdin"),
+        "from stdin\r\n",
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), format!("{NOTICE}\n"));
+    assert!(stderr(&output).is_empty());
+    assert!(verify_password(
+        &owner_row(&data_dir).password,
+        "from stdin"
+    ));
+
+    // The option wins over the variable.
+    let output = run_with_stdin(
+        set_password_command(&data_dir)
+            .arg("--password-stdin")
+            .env(PASSWORD_ENV, "from the variable"),
+        "from stdin again\n",
+    );
+    assert!(output.status.success(), "{}", stderr(&output));
+    assert_eq!(stdout(&output), format!("{NOTICE}\n"));
+    assert!(verify_password(
+        &owner_row(&data_dir).password,
+        "from stdin again"
+    ));
+}
+
+#[test]
+fn user_set_password_finds_the_account_by_name_without_case() {
+    let dir = temp_dir();
+    let data_dir = dir.path().join("data");
+    let output = run(init_command(&data_dir)
+        .args(["--username", "Adnan"])
+        .env(PASSWORD_ENV, "first"));
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let output = run(set_password_command(&data_dir).args(["--username", "adnan"]));
+    assert!(output.status.success(), "{}", stderr(&output));
+    // The line shows the name as it is stored.
+    let password = printed_password(&stdout(&output), "Adnan");
+    let row = owner_row(&data_dir);
+    assert_eq!(row.user.name, "Adnan");
+    assert!(verify_password(&row.password, &password));
+}
+
+#[test]
+fn user_set_password_names_an_unknown_user_and_changes_nothing() {
+    let dir = temp_dir();
+    let data_dir = dir.path().join("data");
+    init_with_password(&data_dir, "first");
+
+    let output = run(set_password_command(&data_dir)
+        .args(["--username", "nobody"])
+        .env(PASSWORD_ENV, "second"));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).is_empty());
+    let message = stderr(&output);
+    assert!(message.contains("no user is named nobody"), "{message}");
+    assert!(!message.contains("second"), "{message}");
+    assert!(verify_password(&owner_row(&data_dir).password, "first"));
+}
+
+#[test]
+fn user_set_password_without_a_password_on_stdin_changes_nothing() {
+    let dir = temp_dir();
+    let data_dir = dir.path().join("data");
+    init_with_password(&data_dir, "first");
+
+    let output = run_with_stdin(set_password_command(&data_dir).arg("--password-stdin"), "");
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).is_empty());
+    assert!(
+        stderr(&output).contains("--password-stdin"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(verify_password(&owner_row(&data_dir).password, "first"));
+}
+
+#[test]
+fn user_commands_without_a_database_name_init_and_create_nothing() {
+    for args in [&["user", "show"][..], &["user", "set-password"]] {
+        let dir = temp_dir();
+        let data_dir = dir.path().join("data");
+
+        let output = run(binary().args(args).arg("--data-dir").arg(&data_dir));
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(stdout(&output).is_empty(), "{args:?}");
+        let message = stderr(&output);
+        assert!(
+            message.contains(&data_dir.join("library.db").display().to_string()),
+            "{message}"
+        );
+        assert!(message.contains("wn-server init"), "{message}");
+        assert!(
+            message.contains("init does not overwrite config.toml, so move that file away first"),
+            "{message}"
+        );
+        assert!(!data_dir.exists(), "{args:?}");
+    }
+}
+
+/// The recovery that the errors of the `user` commands state, for a data
+/// directory whose database is missing and for one whose database has no
+/// owner account.
+#[test]
+fn init_creates_the_owner_again_after_the_config_is_moved_away() {
+    for (database_without_owner, error) in
+        [(false, "does not exist"), (true, "has no owner account")]
+    {
+        let dir = temp_dir();
+        let data_dir = dir.path().join("data");
+        init_with_password(&data_dir, "first");
+        let config_path = data_dir.join("config.toml");
+        let saved_path = data_dir.join("config.toml.saved");
+        let instance_id_path = data_dir.join("instance.id");
+        let instance_id = fs::read_to_string(&instance_id_path).expect("read instance.id");
+        fs::write(&config_path, "# edited by the owner\n").expect("edit config");
+
+        // The owner deletes the database and the files SQLite keeps next to
+        // it.
+        for name in ["library.db", "library.db-wal", "library.db-shm"] {
+            let path = data_dir.join(name);
+            if path.exists() {
+                fs::remove_file(&path).expect("remove a database file");
+            }
+        }
+        if database_without_owner {
+            drop(Db::open(data_dir.join("library.db")).expect("create the database"));
+        }
+
+        let show = || run(binary().args(["user", "show", "--data-dir"]).arg(&data_dir));
+        let output = show();
+        assert_eq!(output.status.code(), Some(1), "{error}");
+        let message = stderr(&output);
+        assert!(message.contains(error), "{message}");
+        assert!(message.contains("move that file away first"), "{message}");
+        let output = run(init_command(&data_dir).env(PASSWORD_ENV, "second"));
+        assert_eq!(output.status.code(), Some(1), "{error}");
+        assert!(
+            stderr(&output).contains("already exists"),
+            "{}",
+            stderr(&output)
+        );
+
+        // The steps the error states: move the config file away and run
+        // `init`.
+        fs::rename(&config_path, &saved_path).expect("move config away");
+        let output = run(init_command(&data_dir).env(PASSWORD_ENV, "second"));
+        assert!(output.status.success(), "{error}: {}", stderr(&output));
+        assert!(verify_password(&owner_row(&data_dir).password, "second"));
+        assert_eq!(
+            fs::read_to_string(&instance_id_path).expect("read instance.id"),
+            instance_id
+        );
+
+        // The saved file replaces the config file that `init` wrote.
+        fs::rename(&saved_path, &config_path).expect("move config back");
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("read config"),
+            "# edited by the owner\n"
+        );
+        let output = show();
+        assert!(output.status.success(), "{error}: {}", stderr(&output));
+        assert!(stdout(&output).starts_with("name: owner\n"), "{error}");
+    }
+}
+
+#[test]
+fn user_commands_on_a_database_without_an_owner_fail() {
+    for args in [&["user", "show"][..], &["user", "set-password"]] {
+        let dir = temp_dir();
+        drop(Db::open(dir.path().join("library.db")).expect("create the database"));
+
+        let output = run(binary().args(args).arg("--data-dir").arg(dir.path()));
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(stdout(&output).is_empty(), "{args:?}");
+        let message = stderr(&output);
+        assert!(message.contains("has no owner account"), "{message}");
+        assert!(
+            message.contains("init does not overwrite config.toml, so move that file away first"),
+            "{message}"
+        );
+    }
 }
 
 #[test]
@@ -473,12 +1180,7 @@ fn platform_default_is_roaming_app_data_on_windows() {
 
 #[test]
 fn commands_of_later_issues_print_not_implemented_and_exit_2() {
-    for args in [
-        &["run"][..],
-        &["scan"],
-        &["user", "show"],
-        &["user", "set-password"],
-    ] {
+    for args in [&["run"][..], &["scan"]] {
         let output = run(binary().args(args));
         assert_eq!(output.status.code(), Some(2), "{args:?}");
         assert_eq!(stderr(&output), "not implemented yet\n", "{args:?}");
