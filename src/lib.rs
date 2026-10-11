@@ -1,6 +1,8 @@
 //! The wn-server library. The binary and the integration tests use this crate.
 
 pub mod api;
+pub mod cli;
+pub mod config;
 pub mod db;
 pub mod ids;
 
