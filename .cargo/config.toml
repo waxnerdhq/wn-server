@@ -1,0 +1,2 @@
+[alias]
+xtask = "run -q --locked -p xtask --"
