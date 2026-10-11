@@ -12,6 +12,7 @@ use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard};
 /// Query functions, one module per group of tables.
 pub mod queries {
     pub mod folders;
+    pub mod users;
 }
 
 /// The migrations in order. Migration `n` (counted from 1) moves the schema

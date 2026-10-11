@@ -47,7 +47,8 @@ Owner upload, multiple users, waxnerd-cloud registration, relay, guests, billing
 - Transcoded streams are not cached and do not support Range (`Accept-Ranges: none`). Seeking uses `timeOffset`.
 - Transcode concurrency: `transcoding.max_concurrent` (default 2). A request past the limit waits up to 5 s, then returns HTTP 503 with `Retry-After: 5`.
 - The owner password is stored as plain text in the database. Token auth (`t = md5(password + s)`) requires a recoverable password. Anyone who can read the data directory can read the password, so it must not be reused anywhere else. On Unix, `init` creates the data directory with mode 0700 and the database with mode 0600; on Windows, the user-profile ACL protects the directory.
-- `init` and `user set-password` generate the password by default and print it once: four groups of five characters separated by hyphens (`xxxxx-xxxxx-xxxxx-xxxxx`), drawn with a cryptographic RNG from the 31-character alphabet `abcdefghjkmnpqrstuvwxyz23456789` (no `i`, `l`, `o`, `0`, `1`), which gives 99 bits of entropy and types easily on a phone. The owner may supply a password instead through `--password-stdin` (one line on stdin) or the `WN_SERVER_PASSWORD` environment variable; the flag wins over the variable. There is no interactive prompt.
+- `init` and `user set-password` generate the password by default and print it once: four groups of five characters separated by hyphens (`xxxxx-xxxxx-xxxxx-xxxxx`), drawn from the operating system's random generator (`rand::rngs::SysRng`) from the 31-character alphabet `abcdefghjkmnpqrstuvwxyz23456789` (no `i`, `l`, `o`, `0`, `1`), which gives 99 bits of entropy and types easily on a phone. Random bytes of 248 and above are discarded, so every character is equally likely. The owner may supply a password instead through `--password-stdin` (the first line of stdin, without its line ending; an empty line is an error) or the `WN_SERVER_PASSWORD` environment variable (an empty value counts as unset); the flag wins over the variable. A supplied password is not printed. There is no interactive prompt.
+- A password is never logged and never part of an error message or of a `Debug` output. The types that hold one (`cli::PasswordSource`, `users::UserRow`) leave it out of their `Debug` output.
 - Default port 4200, bind `0.0.0.0`.
 - Search is case-insensitive substring match (SQL `LIKE` with `ESCAPE '\'`) over lower-cased name columns. An empty query returns everything, paged.
 - API errors use HTTP 200 and the Subsonic error envelope. Unknown `/rest/*` methods return error 0 with message `unknown endpoint`. Paths outside `/rest/` return 404.
@@ -160,7 +161,7 @@ All dependencies are declared in the root `Cargo.toml` from the start and `Cargo
 | gethostname | 1 | Apache-2.0 | default instance name |
 | md-5 | 0.11 | MIT/Apache-2.0 | Subsonic token check |
 | sha2, hex | 0.11 / 0.4 | MIT/Apache-2.0 | fingerprints |
-| rand | 0.10 | MIT/Apache-2.0 | surrogate IDs |
+| rand | 0.10 | MIT/Apache-2.0 | surrogate IDs, generated passwords, the instance UUID |
 | unicode-normalization | 0.1 | MIT/Apache-2.0 | natural keys |
 | image | 0.25 (`jpeg`, `png`, `webp` only) | MIT/Apache-2.0 | cover resize |
 | walkdir | 2 | MIT/Unlicense | scanner |
@@ -386,7 +387,7 @@ wn-server init  [--data-dir D] [--folder PATH]... [--username NAME] [--port N] [
                 WN_SERVER_PASSWORD supplies one
 wn-server run   [--data-dir D]                 runs the server in the foreground
 wn-server scan  [--data-dir D] [--full]        runs one scan and exits; --full re-reads every tag
-wn-server user show                            prints the owner's name and creation date
+wn-server user show                            prints the owner's name, role and creation date (UTC)
 wn-server user set-password [--username NAME] [--password-stdin]
                 generates a new password and prints it once, or stores the supplied one
 wn-server config path                          prints the resolved config path
@@ -396,6 +397,12 @@ wn-server --version
 
 `--data-dir` is accepted before and after the subcommand. `init` checks that each `--folder` is an existing directory and writes it as an absolute path. Without `--folder` it writes `folders = []`, and the commands that load the config fail until the owner adds a folder. `init` does not overwrite an existing `config.toml`. On Unix it creates the directories that are missing with mode 0700 and leaves the mode of an existing data directory unchanged. `--port 0` is rejected.
 
+`init` works in this order: it checks the folders, refuses an existing `config.toml`, obtains the password, creates the data directory, writes `config.toml`, writes `instance.id` when the file is missing, opens the database and inserts the owner. `--username` names the owner; the default is `owner`. The insert does nothing when an owner row exists, and `init` then fails. When a step after the config write fails, `init` removes the `config.toml` it wrote, so the command can run again. An existing `instance.id` is kept.
+
+`init` and `user set-password` print `Password for <name> (shown once): <password>` when they generated the password, and then `The password is stored in plain text in the data directory. Do not reuse it elsewhere.` Both checkpoint the write-ahead log with `Db::close` before they print, so the stored password is on disk; a checkpoint that another process blocks is not an error.
+
+`user set-password --username NAME` selects the account by name; without the option the account is the owner. The `user` commands fail when `library.db` does not exist and do not create it.
+
 A command that fails prints `wn-server: <error>` to stderr and exits with 1. A usage error exits with 2.
 
 `scan` while `run` is active works through WAL and `busy_timeout`; `getScanStatus` reports only scans the server process started.
@@ -404,8 +411,8 @@ A command that fails prints `wn-server: <error>` to stderr and exits with 1. A u
 
 `auth::verify(user, params) -> Result<(), ApiError>`:
 
-- `p` present, `t` and `s` absent: compare with the stored password (constant time); `enc:` prefix means hex-decoded.
-- `t` and `s` present, `p` absent: `md5(password + s)` as lower-case hex equals `t`.
+- `p` present, `t` and `s` absent: compare with the stored password (constant time); `enc:` prefix means hex-decoded. A value with the prefix and invalid hex matches nothing (`auth::verify_password`).
+- `t` and `s` present, `p` absent: `md5(password + s)` as lower-case hex equals `t`, compared in constant time; upper-case hex does not match (`auth::verify_token`).
 - `apiKey` present: error 42. `apiKey` with `u`: error 43. `p` with `t`: error 43. Nothing: error 10. Unknown user or wrong credential: error 40.
 
 `Authed(User)` is an axum extractor over `Params`. With `auth.disabled_unsafe = true` it returns the owner without checks and `run` logs a warning at startup. `getOpenSubsonicExtensions` is public. Failed attempts are logged with username and client, never the credential.
@@ -547,7 +554,7 @@ Amperfy calls `ping, getOpenSubsonicExtensions, getMusicFolders, getIndexes, get
 - `tests/common/mod.rs`: `LibraryBuilder` copies fixtures into a temp directory as `<Artist>/<Album>/<nn> <Title>.<ext>` and writes tags with lofty; `LibraryBuilder::standard()` builds 3 artists, 4 albums, 10 tracks (one compilation, one album with `cover.jpg`, one with embedded art, one track with a lyrics tag, one album with tracks on two discs). Names are valid on Windows and differ by more than case. `TestServer` builds the router over a scanned standard library and offers `get_json(method, params)`, `get_xml`, `get_raw`, `post_form`.
 - Unit tests sit next to the code: IDs and fingerprints, tag mapping, `decide`, envelope and XML rendering, config, auth verification, LRC parsing, cover resize, argv builders.
 - Router tests in `tests/` call the router in-process with `tower::ServiceExt::oneshot`. Every endpoint has a JSON test; the envelope has XML tests.
-- `tests/cli.rs` runs the binary with `std::process::Command` for `init`, `config path` and `config show`. Every run that writes names a temp data directory.
+- `tests/cli.rs` runs the binary with `std::process::Command` for `init`, `user show`, `user set-password`, `config path` and `config show`. Every run that writes names a temp data directory. The password tests read the stored password from the database and check it with `auth::verify_password`.
 - `tests/tags.rs` reads tracks that `LibraryBuilder` tagged, in the five fixture formats, through `library::tags`. The unit tests in `src/library/tags.rs` cover the mapping rules, unreadable files, and WAV and AIFF files that the tests build in memory.
 - Transcoding: the default suite uses `FakeTranscoder`, which returns known bytes and records the job. One `#[ignore]` test runs real ffmpeg.
 - One test (`tests/shutdown.rs`) binds `127.0.0.1:0` to exercise graceful shutdown; it is the only socket in the suite.
