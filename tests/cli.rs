@@ -1,5 +1,6 @@
-//! Runs the `wn-server` binary for the commands that work without a server:
-//! `init`, `user show`, `user set-password`, `config path` and `config show`.
+//! Runs the `wn-server` binary for the commands that work without a socket:
+//! `init`, `user show`, `user set-password`, `config path`, `config show`, and
+//! `run` up to the point where it loads the config.
 
 use std::fs;
 use std::io::Write;
@@ -1179,13 +1180,27 @@ fn platform_default_is_roaming_app_data_on_windows() {
 }
 
 #[test]
-fn commands_of_later_issues_print_not_implemented_and_exit_2() {
-    for args in [&["run"][..], &["scan"]] {
-        let output = run(binary().args(args));
-        assert_eq!(output.status.code(), Some(2), "{args:?}");
-        assert_eq!(stderr(&output), "not implemented yet\n", "{args:?}");
-        assert!(stdout(&output).is_empty(), "{args:?}");
-    }
+fn scan_prints_not_implemented_and_exits_2() {
+    let output = run(binary().arg("scan"));
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(stderr(&output), "not implemented yet\n");
+    assert!(stdout(&output).is_empty());
+}
+
+#[test]
+fn run_without_a_config_names_the_config_path_and_exits_1() {
+    let dir = temp_dir();
+
+    let output = run(binary().arg("run").arg("--data-dir").arg(dir.path()));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).is_empty());
+    let message = stderr(&output);
+    assert!(message.starts_with("wn-server: "), "{message}");
+    assert!(
+        message.contains(&dir.path().join("config.toml").display().to_string()),
+        "{message}"
+    );
+    assert!(message.contains("wn-server init"), "{message}");
 }
 
 #[test]

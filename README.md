@@ -7,13 +7,14 @@ wn-server is a headless music server for OpenSubsonic clients. The design is des
 | Command | Effect |
 |---|---|
 | `wn-server init [--folder PATH]... [--port N] [--username NAME] [--password-stdin]` | Creates the data directory, `config.toml`, `instance.id`, the database and the owner account. |
+| `wn-server run` | Runs the server in the foreground until Ctrl-C. |
 | `wn-server user show` | Prints the name, the role and the creation date of the owner account. |
 | `wn-server user set-password [--username NAME] [--password-stdin]` | Stores a new password for the owner account, or for the account `--username` names. |
 | `wn-server config path` | Prints the path of the config file. |
 | `wn-server config show` | Prints the effective config: the values of the file and the default of every key the file omits. |
 | `wn-server --version` | Prints the version. |
 
-`run` and `scan` print `not implemented yet` and exit with status 2.
+`scan` prints `not implemented yet` and exits with status 2.
 
 Every command accepts `--data-dir DIR` before or after the subcommand. A command that fails prints `wn-server: <error>` to stderr and exits with status 1. A usage error exits with status 2.
 
@@ -100,3 +101,22 @@ folders = ['C:\Music', 'D:\More Music']
 ```
 
 A relative folder path resolves against the working directory of the command.
+
+## Running
+
+```
+wn-server run
+```
+
+`run` loads `config.toml`, listens on `server.bind` and `server.port` (`0.0.0.0:4200` by default) and logs the address. Ctrl-C stops the server. Requests that are in progress are answered first.
+
+Logs go to stderr. `server.log_level` is the log filter, for example `info` or `warn,wn_server=debug`. The `RUST_LOG` environment variable replaces it when it is set and not empty. The log names the method, the client (`c`) and the user (`u`) of a request, each cut to 64 characters. It never holds the query string or the form body.
+
+## API
+
+The server answers OpenSubsonic requests at `/rest/<method>` and `/rest/<method>.view`, for GET and POST. A POST may carry parameters in an `application/x-www-form-urlencoded` body of up to 8 MiB. When a parameter is in the query string and in the body, the values of the query string come first. Any other path returns HTTP 404.
+
+- `f=json` selects JSON. `f=xml` or no `f` selects XML. Any other value, `jsonp` included, returns error 0 in XML.
+- An API error is an HTTP 200 response with the status `failed` and an `error` element that holds the Subsonic error code and a message.
+- The server does not check the credentials of a request.
+- A method of the OpenSubsonic API that the server does not serve returns error 0 with the message `not supported`. A name that is not an OpenSubsonic method returns error 0 with the message `unknown endpoint`.

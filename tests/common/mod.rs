@@ -6,14 +6,25 @@
 #![allow(dead_code)]
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
+use axum::Router;
+use axum::body::Body;
+use axum::http::{Request, StatusCode, header};
+use axum::response::Response;
 use image::{Rgb, RgbImage};
 use lofty::config::WriteOptions;
 use lofty::file::FileType;
 use lofty::picture::{MimeType, Picture, PictureType};
 use lofty::tag::{ItemKey, Tag, TagExt};
+use serde_json::Value;
 use tempfile::TempDir;
+use tower::ServiceExt;
+use wn_server::api::{self, AppState};
+use wn_server::config::Config;
 
 /// The picture that [`LibraryBuilder::picture`] embeds: a 2×2 PNG, 8-bit RGB,
 /// with one red, one green, one blue and one white pixel.
@@ -332,4 +343,217 @@ fn write_tags(path: &Path, track: &TrackSpec) {
     }
     tag.save_to_path(path, WriteOptions::default())
         .unwrap_or_else(|error| panic!("write the tag of {}: {error}", path.display()));
+}
+
+/// The server under test: the router of `wn_server::api`, called in the test
+/// process. No socket is opened.
+pub struct TestServer {
+    router: Router,
+}
+
+impl TestServer {
+    /// A server with the state that `config` gives and nothing else. The
+    /// music folders of `config` are not read.
+    pub fn bare(config: Config) -> Self {
+        // The fields follow the layout rule in the module comment of
+        // `wn_server::api`.
+        #[rustfmt::skip]
+        let state = AppState {
+            config: Arc::new(config),
+
+            // db
+
+            // covers
+
+            // transcoder
+
+            // scan
+
+            // cancel
+
+            started_at: Instant::now(),
+        };
+        Self {
+            router: api::build_router(state),
+        }
+    }
+
+    /// Sends `request` to the router and returns the response.
+    pub async fn request(&self, request: Request<Body>) -> Response {
+        match self.router.clone().oneshot(request).await {
+            Ok(response) => response,
+            Err(never) => match never {},
+        }
+    }
+
+    /// Sends `GET <path>`. `path` is the path and the query string as the
+    /// request line holds them.
+    pub async fn get_path(&self, path: &str) -> Response {
+        let request = Request::get(path)
+            .body(Body::empty())
+            .unwrap_or_else(|error| panic!("GET {path}: {error}"));
+        self.request(request).await
+    }
+
+    /// Sends `GET /rest/<method>` with `params` in the query string.
+    pub async fn get_raw(&self, method: &str, params: &[(&str, &str)]) -> Response {
+        let query = urlencode(params);
+        if query.is_empty() {
+            self.get_path(&format!("/rest/{method}")).await
+        } else {
+            self.get_path(&format!("/rest/{method}?{query}")).await
+        }
+    }
+
+    /// Sends `GET /rest/<method>` with `params` and `f=json`. Checks that the
+    /// response is HTTP 200 with the JSON content type. Returns the value of
+    /// `subsonic-response`.
+    pub async fn get_json(&self, method: &str, params: &[(&str, &str)]) -> Value {
+        let mut params = params.to_vec();
+        params.push(("f", "json"));
+        let response = self.get_raw(method, &params).await;
+        assert_eq!(response.status(), StatusCode::OK, "{method}");
+        assert_eq!(content_type(&response), "application/json", "{method}");
+        subsonic_response(&body_string(response).await)
+    }
+
+    /// Sends `GET /rest/<method>` with `params`. Checks that the response is
+    /// HTTP 200 with the XML content type. Returns the body.
+    pub async fn get_xml(&self, method: &str, params: &[(&str, &str)]) -> String {
+        let response = self.get_raw(method, params).await;
+        assert_eq!(response.status(), StatusCode::OK, "{method}");
+        assert_eq!(content_type(&response), "application/xml", "{method}");
+        body_string(response).await
+    }
+
+    /// Sends `POST /rest/<method>` with `params` as the form body.
+    pub async fn post_form(&self, method: &str, params: &[(&str, &str)]) -> Response {
+        let request = Request::post(format!("/rest/{method}"))
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(urlencode(params)))
+            .unwrap_or_else(|error| panic!("POST {method}: {error}"));
+        self.request(request).await
+    }
+}
+
+/// The value of the `Content-Type` header of `response`. An empty string when
+/// the header is absent.
+pub fn content_type(response: &Response) -> String {
+    response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .map(|value| value.to_str().expect("an ASCII content type").to_owned())
+        .unwrap_or_default()
+}
+
+/// Reads the body of `response` as UTF-8 text.
+pub async fn body_string(response: Response) -> String {
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .expect("read the response body");
+    String::from_utf8(bytes.to_vec()).expect("the response body is UTF-8")
+}
+
+/// Parses a JSON response body and returns the value of `subsonic-response`,
+/// which is the only key of the document.
+pub fn subsonic_response(body: &str) -> Value {
+    let document: Value =
+        serde_json::from_str(body).unwrap_or_else(|error| panic!("{error}: {body}"));
+    let Value::Object(mut document) = document else {
+        panic!("the body is not a JSON object: {body}");
+    };
+    assert_eq!(
+        document.keys().collect::<Vec<_>>(),
+        ["subsonic-response"],
+        "{body}"
+    );
+    document["subsonic-response"].take()
+}
+
+/// Encodes `params` as `application/x-www-form-urlencoded` data, which is
+/// also the form of a query string. Every byte outside the unreserved set of
+/// RFC 3986 is written as a percent escape.
+pub fn urlencode(params: &[(&str, &str)]) -> String {
+    let encode = |text: &str| -> String {
+        text.bytes()
+            .map(|byte| match byte {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                    char::from(byte).to_string()
+                }
+                _ => format!("%{byte:02X}"),
+            })
+            .collect()
+    };
+    params
+        .iter()
+        .map(|(name, value)| format!("{}={}", encode(name), encode(value)))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+/// The log of the test process. [`captured_log`] returns it.
+#[derive(Clone, Default)]
+pub struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl LogBuffer {
+    /// Everything that was logged so far.
+    pub fn text(&self) -> String {
+        let bytes = self.0.lock().expect("the log buffer lock");
+        String::from_utf8(bytes.clone()).expect("the log is UTF-8")
+    }
+
+    /// The lines logged so far that contain `text`.
+    pub fn lines_with(&self, text: &str) -> Vec<String> {
+        self.text()
+            .lines()
+            .filter(|line| line.contains(text))
+            .map(str::to_owned)
+            .collect()
+    }
+}
+
+impl io::Write for LogBuffer {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        self.0
+            .lock()
+            .expect("the log buffer lock")
+            .extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Captures the log of the test process, down to the `trace` level and
+/// without colours, and returns the buffer that holds it. The first call
+/// starts the capture. Every call returns the same buffer.
+///
+/// The subscriber is the global default of the process, so the buffer holds
+/// the log of every test of the test binary. A test finds its own lines by a
+/// value that only it sends.
+///
+/// A subscriber that is the default of one thread
+/// (`tracing::subscriber::set_default`) is not used, because it loses events
+/// when tests run on several threads. tracing caches for each log statement
+/// whether a subscriber wants it. While one subscriber exists, tracing asks
+/// the default of the thread that reaches the statement first. When that is a
+/// thread of another test, it has no subscriber, and the statement stays off
+/// for the thread that captures.
+pub fn captured_log() -> LogBuffer {
+    static LOG: OnceLock<LogBuffer> = OnceLock::new();
+    LOG.get_or_init(|| {
+        let buffer = LogBuffer::default();
+        let writer = buffer.clone();
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_ansi(false)
+            .with_writer(move || writer.clone())
+            .finish();
+        tracing::subscriber::set_global_default(subscriber)
+            .expect("the test process has no other global subscriber");
+        buffer
+    })
+    .clone()
 }
