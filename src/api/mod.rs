@@ -11,9 +11,13 @@
 //!
 //! A change that adds an entry replaces the line of that entry and keeps the
 //! blank lines. Two changes then never touch neighbouring lines, and git
-//! merges them without a conflict. rustfmt removes blank lines inside a list,
-//! so these items carry `#[rustfmt::skip]`. The two places that build an
-//! `AppState` follow the same rule.
+//! merges them without a conflict. The two places that build an `AppState`,
+//! `server::run_server` and the test server, follow the same rule.
+//!
+//! rustfmt removes the blank lines inside an array, and in a struct it
+//! removes the blank line between a comment and the field after it. The
+//! arrays, the struct and the statements that build the struct therefore
+//! carry `#[rustfmt::skip]`.
 
 pub mod envelope;
 pub mod model;
