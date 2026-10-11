@@ -570,35 +570,52 @@ fn a_second_init_refuses_and_keeps_the_account() {
 }
 
 #[test]
-fn init_refuses_a_database_that_has_an_owner_and_leaves_no_config() {
-    let dir = temp_dir();
-    let data_dir = dir.path().join("data");
-    init_with_password(&data_dir, "first");
-    let config_path = data_dir.join("config.toml");
-    fs::remove_file(&config_path).expect("remove config");
+fn init_refuses_a_database_that_has_an_owner_and_removes_the_files_it_wrote() {
+    for instance_id_exists in [true, false] {
+        let dir = temp_dir();
+        let data_dir = dir.path().join("data");
+        init_with_password(&data_dir, "first");
+        let config_path = data_dir.join("config.toml");
+        let instance_id_path = data_dir.join("instance.id");
+        let instance_id = fs::read_to_string(&instance_id_path).expect("read instance.id");
+        fs::remove_file(&config_path).expect("remove config");
+        if !instance_id_exists {
+            fs::remove_file(&instance_id_path).expect("remove instance.id");
+        }
 
-    let output = run(init_command(&data_dir)
-        .args(["--username", "other"])
-        .env(PASSWORD_ENV, "second"));
-    assert_eq!(output.status.code(), Some(1));
-    assert!(stdout(&output).is_empty());
-    let message = stderr(&output);
-    assert!(
-        message.contains("already has an owner account"),
-        "{message}"
-    );
-    assert!(
-        message.contains(&data_dir.join("library.db").display().to_string()),
-        "{message}"
-    );
-    assert!(!message.contains("second"), "{message}");
-    // The config file that the refused run wrote is gone, so the directory is
-    // as it was before the run.
-    assert!(!config_path.exists());
+        let output = run(init_command(&data_dir)
+            .args(["--username", "other"])
+            .env(PASSWORD_ENV, "second"));
+        assert_eq!(output.status.code(), Some(1));
+        assert!(stdout(&output).is_empty());
+        let message = stderr(&output);
+        assert!(
+            message.contains("already has an owner account"),
+            "{message}"
+        );
+        assert!(
+            message.contains(&data_dir.join("library.db").display().to_string()),
+            "{message}"
+        );
+        assert!(!message.contains("second"), "{message}");
 
-    let row = owner_row(&data_dir);
-    assert_eq!(row.user.name, "owner");
-    assert!(verify_password(&row.password, "first"));
+        // The refused run wrote a config file, and an instance ID when the
+        // directory had none. It removed what it wrote. An instance ID from
+        // before the run is kept.
+        assert!(!config_path.exists());
+        if instance_id_exists {
+            assert_eq!(
+                fs::read_to_string(&instance_id_path).expect("read instance.id"),
+                instance_id
+            );
+        } else {
+            assert!(!instance_id_path.exists());
+        }
+
+        let row = owner_row(&data_dir);
+        assert_eq!(row.user.name, "owner");
+        assert!(verify_password(&row.password, "first"));
+    }
 }
 
 #[test]
@@ -829,7 +846,77 @@ fn user_commands_without_a_database_name_init_and_create_nothing() {
             "{message}"
         );
         assert!(message.contains("wn-server init"), "{message}");
+        assert!(
+            message.contains("init does not overwrite config.toml, so move that file away first"),
+            "{message}"
+        );
         assert!(!data_dir.exists(), "{args:?}");
+    }
+}
+
+/// The recovery that the errors of the `user` commands state, for a data
+/// directory whose database is missing and for one whose database has no
+/// owner account.
+#[test]
+fn init_creates_the_owner_again_after_the_config_is_moved_away() {
+    for (database_without_owner, error) in
+        [(false, "does not exist"), (true, "has no owner account")]
+    {
+        let dir = temp_dir();
+        let data_dir = dir.path().join("data");
+        init_with_password(&data_dir, "first");
+        let config_path = data_dir.join("config.toml");
+        let saved_path = data_dir.join("config.toml.saved");
+        let instance_id_path = data_dir.join("instance.id");
+        let instance_id = fs::read_to_string(&instance_id_path).expect("read instance.id");
+        fs::write(&config_path, "# edited by the owner\n").expect("edit config");
+
+        // The owner deletes the database and the files SQLite keeps next to
+        // it.
+        for name in ["library.db", "library.db-wal", "library.db-shm"] {
+            let path = data_dir.join(name);
+            if path.exists() {
+                fs::remove_file(&path).expect("remove a database file");
+            }
+        }
+        if database_without_owner {
+            drop(Db::open(data_dir.join("library.db")).expect("create the database"));
+        }
+
+        let show = || run(binary().args(["user", "show", "--data-dir"]).arg(&data_dir));
+        let output = show();
+        assert_eq!(output.status.code(), Some(1), "{error}");
+        let message = stderr(&output);
+        assert!(message.contains(error), "{message}");
+        assert!(message.contains("move that file away first"), "{message}");
+        let output = run(init_command(&data_dir).env(PASSWORD_ENV, "second"));
+        assert_eq!(output.status.code(), Some(1), "{error}");
+        assert!(
+            stderr(&output).contains("already exists"),
+            "{}",
+            stderr(&output)
+        );
+
+        // The steps the error states: move the config file away and run
+        // `init`.
+        fs::rename(&config_path, &saved_path).expect("move config away");
+        let output = run(init_command(&data_dir).env(PASSWORD_ENV, "second"));
+        assert!(output.status.success(), "{error}: {}", stderr(&output));
+        assert!(verify_password(&owner_row(&data_dir).password, "second"));
+        assert_eq!(
+            fs::read_to_string(&instance_id_path).expect("read instance.id"),
+            instance_id
+        );
+
+        // The saved file replaces the config file that `init` wrote.
+        fs::rename(&saved_path, &config_path).expect("move config back");
+        assert_eq!(
+            fs::read_to_string(&config_path).expect("read config"),
+            "# edited by the owner\n"
+        );
+        let output = show();
+        assert!(output.status.success(), "{error}: {}", stderr(&output));
+        assert!(stdout(&output).starts_with("name: owner\n"), "{error}");
     }
 }
 
@@ -844,6 +931,10 @@ fn user_commands_on_a_database_without_an_owner_fail() {
         assert!(stdout(&output).is_empty(), "{args:?}");
         let message = stderr(&output);
         assert!(message.contains("has no owner account"), "{message}");
+        assert!(
+            message.contains("init does not overwrite config.toml, so move that file away first"),
+            "{message}"
+        );
     }
 }
 

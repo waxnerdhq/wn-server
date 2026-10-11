@@ -397,11 +397,11 @@ wn-server --version
 
 `--data-dir` is accepted before and after the subcommand. `init` checks that each `--folder` is an existing directory and writes it as an absolute path. Without `--folder` it writes `folders = []`, and the commands that load the config fail until the owner adds a folder. `init` does not overwrite an existing `config.toml`. On Unix it creates the directories that are missing with mode 0700 and leaves the mode of an existing data directory unchanged. `--port 0` is rejected.
 
-`init` works in this order: it checks the folders, refuses an existing `config.toml`, obtains the password, creates the data directory, writes `config.toml`, writes `instance.id` when the file is missing, opens the database and inserts the owner. `--username` names the owner; the default is `owner`. The insert does nothing when an owner row exists, and `init` then fails. When a step after the config write fails, `init` removes the `config.toml` it wrote, so the command can run again. An existing `instance.id` is kept.
+`init` works in this order: it checks the folders, refuses an existing `config.toml`, obtains the password, creates the data directory, writes `config.toml`, writes `instance.id` when the file is missing, opens the database and inserts the owner. `--username` names the owner; the default is `owner`. The insert does nothing when an owner row exists, and `init` then fails. When a step after the config write fails, `init` removes the `config.toml` and the `instance.id` it wrote in that run, so the command can run again. An existing `instance.id` is kept.
 
 `init` and `user set-password` print `Password for <name> (shown once): <password>` when they generated the password, and then `The password is stored in plain text in the data directory. Do not reuse it elsewhere.` Both checkpoint the write-ahead log with `Db::close` before they print, so the stored password is on disk; a checkpoint that another process blocks is not an error.
 
-`user set-password --username NAME` selects the account by name; without the option the account is the owner. The `user` commands fail when `library.db` does not exist and do not create it.
+`user set-password --username NAME` selects the account by name; without the option the account is the owner. The `user` commands fail when `library.db` does not exist or has no owner row, and do not create either. Only `init` creates them, and `init` refuses a data directory that has a `config.toml`, so the error states the recovery: move `config.toml` away and run `init`.
 
 A command that fails prints `wn-server: <error>` to stderr and exits with 1. A usage error exits with 2.
 

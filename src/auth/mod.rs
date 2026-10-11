@@ -105,10 +105,12 @@ fn alphabet_char(byte: u8) -> Option<char> {
 /// Returns whether `given` equals `secret`.
 ///
 /// The loop reads every byte of `given` and does not stop at the first byte
-/// that differs, so the time of a call depends on the length of `given` and
-/// not on the position of a wrong byte or on the length of `secret`.
-/// `black_box` asks the compiler not to replace the loop with a comparison
-/// that stops early.
+/// that differs, so the time of a call does not depend on the position of a
+/// wrong byte or on the value of any byte. The time can depend on the two
+/// lengths: the loop runs once for each byte of `given`, and the read of
+/// `secret` takes another branch past its end. A caller learns at most the
+/// length of `secret` from the time. `black_box` asks the compiler not to
+/// replace the loop with a comparison that stops early.
 fn constant_time_eq(secret: &[u8], given: &[u8]) -> bool {
     let mut difference = u8::from(secret.len() != given.len());
     for (index, byte) in given.iter().enumerate() {

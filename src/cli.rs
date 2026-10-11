@@ -33,6 +33,12 @@ pub const DEFAULT_USERNAME: &str = "owner";
 const PLAIN_TEXT_NOTICE: &str =
     "The password is stored in plain text in the data directory. Do not reuse it elsewhere.";
 
+/// The end of the error of a `user` command that finds no database or no
+/// owner account. `init` creates both and refuses a data directory that has a
+/// config file, so the text names the step that makes `init` run.
+const INIT_RECOVERY: &str = "`wn-server init` creates it. init does not overwrite config.toml, \
+     so move that file away first when it exists";
+
 /// A headless music server for OpenSubsonic clients.
 #[derive(Debug, Parser)]
 #[command(name = "wn-server", version = crate::VERSION)]
@@ -147,7 +153,7 @@ enum CliError {
     Stdout(#[from] io::Error),
     #[error(transparent)]
     Db(#[from] DbError),
-    #[error("the database {} does not exist; `wn-server init` creates it", .0.display())]
+    #[error("the database {} does not exist; {INIT_RECOVERY}", .0.display())]
     NoDatabase(PathBuf),
     #[error(
         "the database {} already has an owner account; init does not replace it. \
@@ -155,7 +161,7 @@ enum CliError {
         .0.display()
     )]
     OwnerExists(PathBuf),
-    #[error("the database {} has no owner account; `wn-server init` creates it", .0.display())]
+    #[error("the database {} has no owner account; {INIT_RECOVERY}", .0.display())]
     NoOwner(PathBuf),
     #[error("no user is named {0}")]
     NoUser(String),
@@ -273,7 +279,8 @@ fn execute(cli: &Cli, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<()
 /// Nothing is created when a folder fails its check, when `config.toml`
 /// exists or when no password can be read. An existing `config.toml` and an
 /// existing owner account are errors and are left as they are. An existing
-/// `instance.id` is kept.
+/// `instance.id` is kept. When a step after the config write fails, the
+/// `config.toml` and the `instance.id` that this run wrote are removed.
 fn init(
     data_dir: &DataDir,
     args: &InitArgs,
@@ -304,13 +311,18 @@ fn init(
     if !write_new_file(&config_path, &text)? {
         return Err(CliError::ConfigExists(config_path));
     }
-    let (db, owner) = match create_owner(data_dir, &args.username, &password.text) {
+    // The files this run wrote. An `instance.id` from before the run is not
+    // in the list.
+    let mut written = vec![config_path.clone()];
+    let (db, owner) = match create_owner(data_dir, &args.username, &password.text, &mut written) {
         Ok(created) => created,
         Err(error) => {
             // `init` refuses a data directory that has a config file. The
-            // file this run wrote is removed, so that `init` can run again
+            // files this run wrote are removed, so that `init` can run again
             // when the cause of the error is gone.
-            let _ = fs::remove_file(&config_path);
+            for path in &written {
+                let _ = fs::remove_file(path);
+            }
             return Err(error);
         }
     };
@@ -331,12 +343,18 @@ fn init(
 
 /// Writes `instance.id` when it is missing, creates the database when it is
 /// missing and inserts the owner account. A database that already has an
-/// owner account is an error.
-fn create_owner(data_dir: &DataDir, name: &str, password: &str) -> Result<(Db, User), CliError> {
-    write_new_file(
-        &data_dir.instance_id_path(),
-        &format!("{}\n", new_instance_id()),
-    )?;
+/// owner account is an error. The path of an `instance.id` that this call
+/// wrote is added to `written`.
+fn create_owner(
+    data_dir: &DataDir,
+    name: &str,
+    password: &str,
+    written: &mut Vec<PathBuf>,
+) -> Result<(Db, User), CliError> {
+    let instance_id_path = data_dir.instance_id_path();
+    if write_new_file(&instance_id_path, &format!("{}\n", new_instance_id()))? {
+        written.push(instance_id_path);
+    }
 
     let db_path = data_dir.db_path();
     let db = Db::open(&db_path)?;
