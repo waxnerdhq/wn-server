@@ -6,12 +6,10 @@
 //! the format when the content does not. The suffix and the content type of a
 //! track come from the extension alone.
 //!
-//! A file can hold several tags, such as ID3v2 and ID3v1. A field is the
-//! first value among the tags that is not blank. The tag of the format's
-//! primary type is searched first.
+//! Fields come from the tag of the format's primary type, or from the first
+//! tag when the file has none.
 
 use std::error::Error;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use lofty::config::ParseOptions;
@@ -96,11 +94,11 @@ pub struct TrackMeta {
     pub bit_depth: Option<u8>,
     /// The number of channels.
     pub channels: Option<u8>,
-    /// Whether a tag holds a picture. It is true exactly when
+    /// Whether the tag holds a picture. It is true exactly when
     /// [`read_front_picture`] returns a picture.
     pub has_picture: bool,
-    /// Whether a tag holds lyrics or the file `<stem>.lrc` exists next to the
-    /// audio file.
+    /// Whether the tag holds lyrics or the file `<stem>.lrc` exists next to
+    /// the audio file.
     pub has_lyrics: bool,
     /// The extension of the file in lower case.
     pub suffix: String,
@@ -145,34 +143,34 @@ pub fn read(path: &Path) -> Result<TrackMeta, TagError> {
         path: path.to_owned(),
         source,
     })?;
-    let tags = ordered_tags(&parsed.file);
+    let tag = main_tag(&parsed.file);
     let properties = parsed.file.properties();
 
-    let title = match text(&tags, ItemKey::TrackTitle) {
+    let title = match text(tag, ItemKey::TrackTitle) {
         Some(title) => title.to_owned(),
         None => path
             .file_stem()
             .map(|stem| stem.to_string_lossy().into_owned())
             .unwrap_or_default(),
     };
-    let artist = text(&tags, ItemKey::TrackArtist).unwrap_or(UNKNOWN_ARTIST);
-    let flag = text(&tags, ItemKey::FlagCompilation).is_some_and(is_set);
+    let artist = text(tag, ItemKey::TrackArtist).unwrap_or(UNKNOWN_ARTIST);
+    let flag = text(tag, ItemKey::FlagCompilation).is_some_and(is_set);
     let (album_artist, compilation) =
-        resolve_album_artist(text(&tags, ItemKey::AlbumArtist), artist, flag);
+        resolve_album_artist(text(tag, ItemKey::AlbumArtist), artist, flag);
 
     Ok(TrackMeta {
         title,
         artist: artist.to_owned(),
         album_artist,
-        album: text(&tags, ItemKey::AlbumTitle)
+        album: text(tag, ItemKey::AlbumTitle)
             .unwrap_or(UNKNOWN_ALBUM)
             .to_owned(),
-        track_no: text(&tags, ItemKey::TrackNumber).and_then(parse_number),
-        disc_no: text(&tags, ItemKey::DiscNumber).and_then(parse_number),
+        track_no: text(tag, ItemKey::TrackNumber).and_then(parse_number),
+        disc_no: text(tag, ItemKey::DiscNumber).and_then(parse_number),
         year: [ItemKey::RecordingDate, ItemKey::Year]
             .into_iter()
-            .find_map(|key| text(&tags, key).and_then(parse_year)),
-        genre: text(&tags, ItemKey::Genre).map(str::to_owned),
+            .find_map(|key| text(tag, key).and_then(parse_year)),
+        genre: text(tag, ItemKey::Genre).map(str::to_owned),
         compilation,
         duration_ms: u64::try_from(properties.duration().as_millis()).unwrap_or(u64::MAX),
         bitrate_kbps: positive(properties.audio_bitrate())
@@ -180,8 +178,8 @@ pub fn read(path: &Path) -> Result<TrackMeta, TagError> {
         sample_rate: positive(properties.sample_rate()),
         bit_depth: positive(properties.bit_depth()),
         channels: positive(properties.channels()),
-        has_picture: front_picture(&tags).is_some(),
-        has_lyrics: sidecar(path).is_file() || tag_lyrics(&tags).is_some(),
+        has_picture: front_picture(tag).is_some(),
+        has_lyrics: sidecar(path).is_file() || tag_lyrics(tag).is_some(),
         suffix: suffix.to_owned(),
         content_type: content_type.to_owned(),
         lossless: is_lossless(suffix, parsed.alac),
@@ -201,29 +199,21 @@ pub fn read(path: &Path) -> Result<TrackMeta, TagError> {
 pub fn read_front_picture(path: &Path) -> Option<(Vec<u8>, String)> {
     format_of(path)?;
     let parsed = parse(path, ParseOptions::new().read_properties(false)).ok()?;
-    let picture = front_picture(&ordered_tags(&parsed.file))?;
+    let picture = front_picture(main_tag(&parsed.file))?;
     Some((picture.data().to_vec(), picture_content_type(picture)))
 }
 
-/// Returns the lyrics of the file at `path`: the text of the file
-/// `<stem>.lrc` in the same directory, or the lyrics tag when that file does
-/// not exist. The text is returned as stored, so it holds LRC time stamps
-/// when the source has them.
+/// Returns the lyrics tag of the file at `path`. The file `<stem>.lrc` counts
+/// for [`TrackMeta::has_lyrics`] and is not read here.
 ///
-/// Returns `None` when neither source exists or the audio file cannot be
-/// read.
+/// Returns `None` when the file has no lyrics tag or cannot be read.
 pub fn read_lyrics(path: &Path) -> Option<String> {
     format_of(path)?;
-    if let Ok(bytes) = fs::read(sidecar(path)) {
-        let text = String::from_utf8_lossy(&bytes);
-        // Editors on Windows start a UTF-8 file with a byte order mark.
-        return Some(text.strip_prefix('\u{feff}').unwrap_or(&text).to_owned());
-    }
     let options = ParseOptions::new()
         .read_properties(false)
         .read_cover_art(false);
     let parsed = parse(path, options).ok()?;
-    tag_lyrics(&ordered_tags(&parsed.file)).map(str::to_owned)
+    tag_lyrics(main_tag(&parsed.file)).map(str::to_owned)
 }
 
 /// A parsed audio file.
@@ -264,39 +254,36 @@ fn parse(path: &Path, options: ParseOptions) -> Result<Parsed, FileParseError> {
     }
 }
 
-/// Returns the tags of `file`. The tag of the format's primary type is first.
-fn ordered_tags(file: &TaggedFile) -> Vec<&Tag> {
-    let primary = file.primary_tag_type();
-    let mut tags: Vec<&Tag> = file.tags().iter().collect();
-    // The sort is stable and `false` orders before `true`.
-    tags.sort_by_key(|tag| tag.tag_type() != primary);
-    tags
+/// Returns the tag that the fields of `file` come from: the tag of the
+/// format's primary type, or the first tag when the file has none of that
+/// type. Returns `None` for a file without a tag.
+fn main_tag(file: &TaggedFile) -> Option<&Tag> {
+    file.primary_tag().or_else(|| file.first_tag())
 }
 
-/// Returns the first value of `key` among `tags` that is not blank, without
-/// the surrounding white space.
-fn text<'a>(tags: &[&'a Tag], key: ItemKey) -> Option<&'a str> {
-    tags.iter()
-        .filter_map(|tag| tag.get_string(key))
+/// Returns the value of `key` in `tag` without the surrounding white space.
+/// Returns `None` for a value that is absent or blank.
+fn text(tag: Option<&Tag>, key: ItemKey) -> Option<&str> {
+    tag?.get_string(key)
         .map(str::trim)
-        .find(|value| !value.is_empty())
+        .filter(|value| !value.is_empty())
 }
 
-/// Returns the lyrics tag. lofty reports the lyrics of an M4A file under
+/// Returns the lyrics of `tag`. lofty reports the lyrics of an M4A file under
 /// `ItemKey::Lyrics` and those of an MP3 file under `ItemKey::UnsyncLyrics`.
 /// Vorbis comments have a field for each key.
-fn tag_lyrics<'a>(tags: &[&'a Tag]) -> Option<&'a str> {
-    text(tags, ItemKey::UnsyncLyrics).or_else(|| text(tags, ItemKey::Lyrics))
+fn tag_lyrics(tag: Option<&Tag>) -> Option<&str> {
+    text(tag, ItemKey::UnsyncLyrics).or_else(|| text(tag, ItemKey::Lyrics))
 }
 
-/// Returns the front cover among the pictures of `tags`, or the first picture
+/// Returns the front cover among the pictures of `tag`, or the first picture
 /// when none has that type.
-fn front_picture<'a>(tags: &[&'a Tag]) -> Option<&'a Picture> {
-    let mut pictures = tags.iter().flat_map(|tag| tag.pictures());
+fn front_picture(tag: Option<&Tag>) -> Option<&Picture> {
+    let pictures = tag?.pictures();
     pictures
-        .clone()
+        .iter()
         .find(|picture| picture.pic_type() == PictureType::CoverFront)
-        .or_else(|| pictures.next())
+        .or_else(|| pictures.first())
 }
 
 /// Returns the content type of `picture`.
@@ -389,6 +376,8 @@ fn causes(error: &dyn Error) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+
     use lofty::properties::FileProperties;
     use lofty::tag::TagType;
 
@@ -632,66 +621,67 @@ mod tests {
                 .mime_type(MimeType::Png)
                 .build()
         };
-        let mut first = Tag::new(TagType::Id3v2);
-        first.push_picture(picture(PictureType::Artist, 1));
-        first.push_picture(picture(PictureType::CoverBack, 2));
-        let mut second = Tag::new(TagType::Ape);
-        second.push_picture(picture(PictureType::CoverFront, 3));
+        let mut without_front = Tag::new(TagType::Id3v2);
+        without_front.push_picture(picture(PictureType::Artist, 1));
+        without_front.push_picture(picture(PictureType::CoverBack, 2));
+        let mut with_front = without_front.clone();
+        with_front.push_picture(picture(PictureType::CoverFront, 3));
 
-        assert_eq!(front_picture(&[]).map(Picture::data), None);
+        assert_eq!(front_picture(None).map(Picture::data), None);
         assert_eq!(
-            front_picture(&[&first]).map(Picture::data),
+            front_picture(Some(&Tag::new(TagType::Id3v2))).map(Picture::data),
+            None
+        );
+        assert_eq!(
+            front_picture(Some(&without_front)).map(Picture::data),
             Some(&[1u8][..])
         );
         assert_eq!(
-            front_picture(&[&first, &second]).map(Picture::data),
+            front_picture(Some(&with_front)).map(Picture::data),
             Some(&[3u8][..])
         );
     }
 
     #[test]
-    fn primary_tag_is_ordered_first() {
-        let tag_types = |file_type, tags: &[TagType]| -> Vec<TagType> {
+    fn fields_come_from_the_primary_tag_or_the_first_tag() {
+        let tag_type = |file_type, tags: &[TagType]| -> Option<TagType> {
             let file = TaggedFile::new(
                 file_type,
                 FileProperties::default(),
                 tags.iter().map(|tag_type| Tag::new(*tag_type)).collect(),
             );
-            ordered_tags(&file).into_iter().map(Tag::tag_type).collect()
+            main_tag(&file).map(Tag::tag_type)
         };
 
         assert_eq!(
-            tag_types(
+            tag_type(
                 FileType::Mpeg,
                 &[TagType::Id3v1, TagType::Ape, TagType::Id3v2]
             ),
-            [TagType::Id3v2, TagType::Id3v1, TagType::Ape]
+            Some(TagType::Id3v2)
         );
         assert_eq!(
-            tag_types(FileType::Wav, &[TagType::RiffInfo, TagType::Id3v2]),
-            [TagType::Id3v2, TagType::RiffInfo]
+            tag_type(FileType::Wav, &[TagType::RiffInfo, TagType::Id3v2]),
+            Some(TagType::Id3v2)
         );
-        // A file without its primary tag keeps the order of the other tags.
+        // A file without a tag of its primary type.
         assert_eq!(
-            tag_types(FileType::Mpeg, &[TagType::Id3v1, TagType::Ape]),
-            [TagType::Id3v1, TagType::Ape]
+            tag_type(FileType::Mpeg, &[TagType::Id3v1, TagType::Ape]),
+            Some(TagType::Id3v1)
         );
-        assert_eq!(tag_types(FileType::Flac, &[]), []);
+        assert_eq!(tag_type(FileType::Flac, &[]), None);
     }
 
     #[test]
-    fn blank_value_is_missing_and_the_first_tag_wins() {
-        let mut first = Tag::new(TagType::Id3v2);
-        first.insert_text(ItemKey::TrackTitle, "  Title  ".to_owned());
-        first.insert_text(ItemKey::TrackArtist, "   ".to_owned());
-        let mut second = Tag::new(TagType::Id3v1);
-        second.insert_text(ItemKey::TrackTitle, "Other Title".to_owned());
-        second.insert_text(ItemKey::TrackArtist, "Artist".to_owned());
-        let tags = [&first, &second];
+    fn blank_value_is_missing() {
+        let mut tag = Tag::new(TagType::Id3v2);
+        tag.insert_text(ItemKey::TrackTitle, "  Title  ".to_owned());
+        tag.insert_text(ItemKey::TrackArtist, "   ".to_owned());
 
-        assert_eq!(text(&tags, ItemKey::TrackTitle), Some("Title"));
-        assert_eq!(text(&tags, ItemKey::TrackArtist), Some("Artist"));
-        assert_eq!(text(&tags, ItemKey::AlbumTitle), None);
+        assert_eq!(text(Some(&tag), ItemKey::TrackTitle), Some("Title"));
+        assert_eq!(text(Some(&tag), ItemKey::TrackArtist), None);
+        assert_eq!(text(Some(&tag), ItemKey::AlbumTitle), None);
+        assert_eq!(text(None, ItemKey::TrackTitle), None);
     }
 
     #[test]
@@ -763,8 +753,6 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(read_front_picture(&path), None);
-        // A lyrics file next to an unsupported file is not read.
-        fs::write(path.with_extension("lrc"), "[00:01.00]Line").expect("write the lyrics file");
         assert_eq!(read_lyrics(&path), None);
     }
 

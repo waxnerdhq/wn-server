@@ -280,42 +280,10 @@ fn sidecar_lrc_sets_has_lyrics() {
         }
 
         assert!(read(&library.files[0]).has_lyrics, "{}", format.ext);
-        assert_eq!(
-            tags::read_lyrics(&library.files[0]).as_deref(),
-            Some(LRC),
-            "{}",
-            format.ext
-        );
-        // The lyrics file is read before the tag.
         assert!(read(&library.files[1]).has_lyrics, "{}", format.ext);
-        assert_eq!(
-            tags::read_lyrics(&library.files[1]).as_deref(),
-            Some(LRC),
-            "{}",
-            format.ext
-        );
         // The lyrics file of another track does not count.
         assert!(!read(&library.files[2]).has_lyrics, "{}", format.ext);
-        assert_eq!(tags::read_lyrics(&library.files[2]), None, "{}", format.ext);
     }
-}
-
-#[test]
-fn sidecar_lrc_is_read_without_the_byte_order_mark() {
-    let library = LibraryBuilder::new()
-        .track("Artist", "Album", "Title", 1, "flac")
-        .build();
-    let sidecar = library.files[0].with_extension("lrc");
-
-    fs::write(&sidecar, format!("\u{feff}{LRC}")).expect("write the lyrics file");
-    assert_eq!(tags::read_lyrics(&library.files[0]).as_deref(), Some(LRC));
-
-    // A byte that is not valid UTF-8 becomes the replacement character.
-    fs::write(&sidecar, b"[00:01.00]Caf\xe9\n").expect("write the lyrics file");
-    assert_eq!(
-        tags::read_lyrics(&library.files[0]).as_deref(),
-        Some("[00:01.00]Caf\u{fffd}\n")
-    );
 }
 
 #[test]
@@ -384,44 +352,6 @@ fn year_tag_is_read_when_the_date_has_no_year() {
 
     assert_eq!(read(&library.files[0]).year, Some(1999));
     assert_eq!(read(&library.files[1]).year, Some(1999));
-}
-
-#[test]
-fn id3v1_tag_fills_the_fields_the_id3v2_tag_lacks() {
-    let library = LibraryBuilder::new()
-        .track("Artist", "Album", "Title", 1, "mp3")
-        .build();
-    let path = &library.files[0];
-
-    // An ID3v1.1 tag is the last 128 bytes of the file.
-    let mut trailer = b"TAG".to_vec();
-    for field in ["Old Title", "Old Artist", "Old Album"] {
-        let mut bytes = [0u8; 30];
-        bytes[..field.len()].copy_from_slice(field.as_bytes());
-        trailer.extend(bytes);
-    }
-    trailer.extend(b"1988");
-    trailer.extend([0u8; 28]); // comment
-    trailer.extend([0, 9]); // track number
-    trailer.push(17); // genre: Rock
-    assert_eq!(trailer.len(), 128);
-    let mut bytes = fs::read(path).expect("read the track");
-    bytes.extend(trailer);
-    fs::write(path, bytes).expect("write the track");
-
-    // ID3v2 is the primary tag of an MP3 file, so its fields win.
-    let meta = read(path);
-    assert_eq!(
-        (
-            meta.title.as_str(),
-            meta.artist.as_str(),
-            meta.album.as_str()
-        ),
-        ("Title", "Artist", "Album")
-    );
-    assert_eq!(meta.track_no, Some(1));
-    assert_eq!(meta.year, Some(1988));
-    assert_eq!(meta.genre.as_deref(), Some("Rock"));
 }
 
 #[test]
