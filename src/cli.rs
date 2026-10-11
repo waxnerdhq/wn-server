@@ -36,10 +36,10 @@ const PLAIN_TEXT_NOTICE: &str =
     "The password is stored in plain text in the data directory. Do not reuse it elsewhere.";
 
 /// The end of the error of a `user` command that finds no database or no
-/// owner account. `init` creates both and refuses a data directory that has a
-/// config file, so the text names the step that makes `init` run.
-const INIT_RECOVERY: &str = "`wn-server init` creates it. init does not overwrite config.toml, \
-     so move that file away first when it exists";
+/// owner account. `init` creates both in a data directory that has no
+/// database, and leaves the config file of that directory as it is.
+const INIT_RECOVERY: &str = "`wn-server init` creates the database and the owner account \
+     and keeps an existing config.toml";
 
 /// The environment variable that holds the log filter. When it is set and not
 /// empty it replaces `server.log_level`.
@@ -175,7 +175,10 @@ enum CliError {
         .0.display()
     )]
     OwnerExists(PathBuf),
-    #[error("the database {} has no owner account; {INIT_RECOVERY}", .0.display())]
+    #[error(
+        "the database {} has no owner account; remove that file, then {INIT_RECOVERY}",
+        .0.display()
+    )]
     NoOwner(PathBuf),
     #[error("no user is named {0}")]
     NoUser(String),
@@ -351,11 +354,15 @@ fn init_tracing(log_level: &str) -> Result<(), CliError> {
 /// path. The password comes from the source that [`password_source`] picks. A
 /// generated password is printed once.
 ///
-/// Nothing is created when a folder fails its check, when `config.toml`
-/// exists or when no password can be read. An existing `config.toml` and an
-/// existing owner account are errors and are left as they are. An existing
-/// `instance.id` is kept. When a step after the config write fails, the
-/// `config.toml` and the `instance.id` that this run wrote are removed.
+/// A data directory that has `config.toml` and no database gets the database
+/// and the owner account again. `config.toml` is left as it is, and the
+/// folders and the port of `args` are not applied.
+///
+/// Nothing is created when a folder fails its check, when `config.toml` and
+/// the database both exist or when no password can be read. An existing owner
+/// account is an error and is left as it is. An existing `instance.id` is
+/// kept. When a later step fails, the files that this run wrote are removed:
+/// `config.toml` or the database, and `instance.id`.
 fn init(
     data_dir: &DataDir,
     args: &InitArgs,
@@ -371,30 +378,44 @@ fn init(
     let text = Config::template(&folders, args.port)?;
 
     let config_path = data_dir.config_path();
-    // This check runs before the password is read, so a second `init` does
-    // not wait for a line on stdin. The write below refuses an existing file
+    let db_path = data_dir.db_path();
+    // A data directory with a config file and no database has lost its
+    // database. This run keeps the config file and creates the database
     // again.
-    if config_path.exists() {
+    let keeps_config = config_path.exists();
+    // This check runs before the password is read, so a second `init` does
+    // not wait for a line on stdin. The writes below refuse an existing file
+    // again.
+    if keeps_config && db_path.exists() {
         return Err(CliError::ConfigExists(config_path));
     }
     let password = new_password(args.password_stdin, input)?;
 
-    create_data_dir(data_dir.path()).map_err(|source| CliError::CreateDataDir {
-        path: data_dir.path().to_path_buf(),
-        source,
-    })?;
-    if !write_new_file(&config_path, &text)? {
-        return Err(CliError::ConfigExists(config_path));
-    }
     // The files this run wrote. An `instance.id` from before the run is not
     // in the list.
-    let mut written = vec![config_path.clone()];
+    let mut written = Vec::new();
+    if keeps_config {
+        if !create_db_file(&db_path)? {
+            return Err(CliError::ConfigExists(config_path));
+        }
+        written.push(db_path.clone());
+    } else {
+        create_data_dir(data_dir.path()).map_err(|source| CliError::CreateDataDir {
+            path: data_dir.path().to_path_buf(),
+            source,
+        })?;
+        if !write_new_file(&config_path, &text)? {
+            return Err(CliError::ConfigExists(config_path));
+        }
+        written.push(config_path.clone());
+    }
     let (db, owner) = match create_owner(data_dir, &args.username, &password.text, &mut written) {
         Ok(created) => created,
         Err(error) => {
-            // `init` refuses a data directory that has a config file. The
-            // files this run wrote are removed, so that `init` can run again
-            // when the cause of the error is gone.
+            // `init` refuses a data directory that has a config file and a
+            // database. The files this run wrote are removed, so that `init`
+            // can run again when the cause of the error is gone. The database
+            // is closed here, because Windows does not delete an open file.
             for path in &written {
                 let _ = fs::remove_file(path);
             }
@@ -405,12 +426,21 @@ fn init(
     // in place, and `user set-password` sets a password that was not printed.
     close_db(db)?;
 
-    writeln!(out, "wrote {}", config_path.display())?;
-    if folders.is_empty() {
+    if keeps_config {
         writeln!(
             out,
-            "no music folder is configured; add one to library.folders in that file"
+            "kept {}; --folder and --port do not change it",
+            config_path.display()
         )?;
+        writeln!(out, "created {}", db_path.display())?;
+    } else {
+        writeln!(out, "wrote {}", config_path.display())?;
+        if folders.is_empty() {
+            writeln!(
+                out,
+                "no music folder is configured; add one to library.folders in that file"
+            )?;
+        }
     }
     print_password(out, &owner.name, &password)?;
     Ok(())
@@ -641,6 +671,33 @@ fn create_data_dir(path: &Path) -> io::Result<()> {
         builder.mode(0o700);
     }
     builder.create(path)
+}
+
+/// Creates an empty database file at `path` and returns `true`. Returns
+/// `false` and changes nothing when a file exists at `path`.
+///
+/// `Db::open` does not report whether it created the file. `init` creates the
+/// file here, so a database that it removes after an error is one that this
+/// run created.
+fn create_db_file(path: &Path) -> Result<bool, CliError> {
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    // Unix: the database holds the owner password in plain text, so the file
+    // is mode 0600, as `Db::open` creates it. On Windows the ACL of the user
+    // profile protects the data directory.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    match options.open(path) {
+        Ok(_) => Ok(true),
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(false),
+        Err(source) => Err(CliError::WriteFile {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 /// Writes `text` to a new file at `path` and returns `true`. Returns `false`

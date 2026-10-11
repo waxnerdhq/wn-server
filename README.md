@@ -6,7 +6,7 @@ wn-server is a headless music server for OpenSubsonic clients. The design is des
 
 | Command | Effect |
 |---|---|
-| `wn-server init [--folder PATH]... [--port N] [--username NAME] [--password-stdin]` | Creates the data directory, `config.toml`, `instance.id`, the database and the owner account. |
+| `wn-server init [--folder PATH]... [--port N] [--username NAME] [--password-stdin]` | Creates the data directory, `config.toml`, `instance.id`, the database and the owner account. With a `config.toml` and no database, keeps `config.toml` and creates the database and the owner account again. |
 | `wn-server run` | Runs the server in the foreground until Ctrl-C. |
 | `wn-server user show` | Prints the name, the role and the creation date of the owner account. |
 | `wn-server user set-password [--username NAME] [--password-stdin]` | Stores a new password for the owner account, or for the account `--username` names. |
@@ -37,7 +37,7 @@ wn-server init --folder /path/to/music
 `init` checks that each `--folder` is an existing directory, creates the data directory and writes `config.toml` with every key. `--folder` may be repeated. `--port` sets `server.port`. `init` then writes `instance.id`, creates the database `library.db` and creates the owner account.
 
 - Folders are written as absolute paths.
-- An existing `config.toml` is not overwritten. `init` fails and leaves the file as it is.
+- An existing `config.toml` is not overwritten. When `library.db` exists as well, `init` fails and changes nothing. When `library.db` is missing, `init` creates the database and the owner account again (see [Owner account](#owner-account)).
 - An existing owner account is not replaced. `init` fails when `library.db` already has one, and removes the `config.toml` and the `instance.id` it wrote in that run.
 - `instance.id` holds a random UUID that identifies this server to clients on the network. An existing `instance.id` is kept.
 - Without `--folder`, `init` writes `folders = []`. A folder must be added to the file before another command loads it.
@@ -67,7 +67,7 @@ wn-server init --folder /path/to/music --password-stdin < password-file
 
 `wn-server user show` prints the name, the role and the creation date of the owner account. The date is in UTC.
 
-The `user` commands need `library.db` and its owner account, and only `init` creates them. When `library.db` is missing or has no owner account and `config.toml` exists, move `config.toml` away, run `wn-server init`, and move the saved file back over the `config.toml` that `init` wrote.
+The `user` commands need `library.db` and its owner account, and only `init` creates them. When `library.db` is missing and `config.toml` exists, `wn-server init` creates the database, the owner account and a missing `instance.id`. It leaves `config.toml` as it is and does not apply `--folder` and `--port`. It takes the password from the same three sources, and `--username` names the account. The new database is empty; nothing of the lost database is restored. When `library.db` exists and has no owner account, remove `library.db` and run `wn-server init`.
 
 The password is stored in plain text in `library.db`. Subsonic token authentication needs the password itself, so the server cannot store a hash. Anyone who can read the data directory can read the password. Do not use a password that protects anything else. On Windows the access control list of the user profile protects the data directory.
 
