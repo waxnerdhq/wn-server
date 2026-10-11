@@ -176,7 +176,7 @@ ffmpeg is an external program found on `PATH` or named by `transcoding.ffmpeg`. 
 
 ### 3.3 Identity
 
-IDs are opaque strings of a two-letter prefix, a hyphen and 32 lower-case hex characters: `tr-`, `al-`, `ar-`, `pl-`. `ids::parse` accepts exactly that shape and returns the kind; anything else is rejected before it reaches SQL or the filesystem. Music folder IDs are the integer `folders.id`, which Subsonic clients expect as a number. Cover-art IDs are an album ID (album art) or a track ID (embedded art).
+IDs are opaque strings of a two-letter prefix, a hyphen and 32 lower-case hex characters: `tr-`, `al-`, `ar-`, `pl-`. `ids::parse` accepts exactly that shape and returns the kind and the 32 hex characters; anything else is rejected before it reaches SQL or the filesystem. Music folder IDs are the integer `folders.id`, which Subsonic clients expect as a number. Cover-art IDs are an album ID (album art) or a track ID (embedded art).
 
 - Track: `tr-` + 16 random bytes, assigned on first sight. `(folder_id, rel_path)` is the locator; it is unique and it changes when the file moves.
 - Fingerprint: `size` in bytes, a colon, and the first 16 bytes hex of SHA-256 over the first 64 KiB of the file followed by the last 64 KiB (the whole file when it is 128 KiB or smaller). A pure move, rename or copy keeps the fingerprint. A tag edit changes it, because tags live in the head (ID3v2, Vorbis comments, MP4 atoms) or the tail (ID3v1, APE). Two identical files share a fingerprint.
@@ -186,9 +186,9 @@ IDs are opaque strings of a two-letter prefix, a hyphen and 32 lower-case hex ch
 
 ### 3.4 SQLite schema
 
-Pragmas: `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, `busy_timeout=5000`. Migrations are numbered SQL files applied in one transaction each, tracked with `PRAGMA user_version`.
+Pragmas: `journal_mode=WAL`, `synchronous=NORMAL`, `foreign_keys=ON`, `busy_timeout=5000`. Migrations are numbered SQL files applied in one transaction each, tracked with `PRAGMA user_version`. `Db::open` returns an error for a database whose `user_version` is negative or greater than the number of migrations in the build.
 
-`Db` holds one writer `Connection` behind a `tokio::sync::Mutex` and four reader connections. Async callers use `db.read(|conn| ..)` and `db.write(|conn| ..)`, which run the closure on `spawn_blocking`. Blocking-thread callers (the scanner) use `db.with_writer(|conn| ..)` and `db.with_reader(..)`, which take the lock with `blocking_lock`. Tests use `Db::open_memory()` (one shared connection) or a temp file.
+`Db` holds one writer `Connection` behind a `tokio::sync::Mutex` and four reader connections, each opened read-only behind its own `tokio::sync::Mutex`. Async callers use `db.read(|conn| ..)` and `db.write(|conn| ..)`, which run the closure on `spawn_blocking`. Blocking-thread callers (the scanner) use `db.with_writer(|conn| ..)` and `db.with_reader(..)`, which take the lock with `blocking_lock`. The closures return `Result<T, DbError>`. `db.close().await` waits for the running reads and writes of the handle and runs `PRAGMA wal_checkpoint(TRUNCATE)`; it returns an error when a connection of another process blocks the checkpoint. The connections close when the last clone of the handle is dropped. Tests use `Db::open_memory()` (one shared connection) or a temp file.
 
 ```sql
 CREATE TABLE users (
@@ -460,7 +460,7 @@ First-scan cost: the fingerprint reads up to 128 KiB per new file (12.8 GB for 1
 
 Cancellation is checked between batches. `ScanController` in `AppState` runs at most one scan at a time; `startScan` during a scan returns the running status. A periodic task starts a scan every `rescan_interval_minutes` when the value is non-zero.
 
-Folder sync at `run` and `scan`: folders from config are upserted by path; a folder removed from config has its tracks deleted (tracks of a folder whose path changed are relinked by fingerprint into the new folder row before the old row is removed, because deletion happens after matching).
+Folder sync at `run` and `scan`: folders from config are upserted by path, and the name of a folder is the last component of its path (the whole path for a root such as `/` or `C:\`); a folder removed from config has its tracks deleted (tracks of a folder whose path changed are relinked by fingerprint into the new folder row before the old row is removed, because deletion happens after matching).
 
 ### 3.11 Cover art
 
