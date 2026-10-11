@@ -26,9 +26,10 @@ Owner upload, multiple users, waxnerd-cloud registration, relay, guests, billing
 
 ### 1.3 Decisions
 
-- Supported audio extensions: `flac mp3 m4a aac ogg opus wav aif aiff`. Other files are ignored.
+- Supported audio extensions: `flac mp3 m4a aac ogg opus wav aif aiff`, matched without regard to case. Other files are ignored. The extension in lower case is the track's suffix and selects the content type: `audio/flac`, `audio/mpeg` for `mp3`, `audio/mp4` for `m4a`, `audio/aac`, `audio/ogg` for `ogg` and `opus`, `audio/wav`, and `audio/aiff` for `aif` and `aiff`. A track is lossless when the suffix is `flac`, `wav`, `aif` or `aiff`, and when the suffix is `m4a` and the codec is ALAC.
+- Tag reading (`library::tags`): lofty detects the format from the file content, and from the extension when the content does not decide it, so an Opus stream in a `.ogg` file is read. A file can hold several tags. A field is the first value among them that is not blank, and the tag of the format's primary type is searched first (ID3v2 before ID3v1 in an MP3 file). A missing title is the file stem, a missing artist is `[Unknown Artist]` and a missing album is `[Unknown Album]`. The year is the leading four digits of the recording date, or of the year tag when the date has none; `0000` is no year. A track or disc number such as `3/12` is 3. The values `1` and `true` set the compilation flag. A file that lofty cannot parse yields an error and no metadata.
 - Library model: artists, albums, songs (the ID3 model). Folder-style browsing (`getIndexes`, `getMusicDirectory`) is simulated from the same data. One music folder per configured directory.
-- Album identity: (album artist, album title), normalised (§3.3). Album artist falls back to the track artist. When the `compilation` flag is set and no album-artist tag exists, or the album artist is "Various Artists" (case-insensitive), the album artist is "Various Artists". Disc numbers do not split albums.
+- Album identity: (album artist, album title), normalised (§3.3). Album artist falls back to the track artist. When the `compilation` flag is set and no album-artist tag exists, or the album artist is "Various Artists" (case-insensitive), the album artist is "Various Artists". A track whose album artist is "Various Artists" has the compilation flag. Disc numbers do not split albums.
 - Artist identity: the album artist name, normalised. Track artists that differ from the album artist are stored as text on the track and do not create artist rows.
 - Track identity is a surrogate ID assigned once. The scanner matches a vanished track to a newly seen file by fingerprint, so a rename, a move between directories, a move between music folders, and a change of a music folder's path keep the track's ID and everything attached to it. A retag that changes the file's first or last 64 KiB in the same scan interval as a move is treated as a deletion plus a new track (§3.3).
 - Album and artist rows have surrogate IDs looked up by natural key. Retagging an album title or album artist makes a new album (and artist) row with a new ID; annotations attached to the old album or artist ID are deleted when the row disappears. Track annotations are unaffected.
@@ -37,6 +38,7 @@ Owner upload, multiple users, waxnerd-cloud registration, relay, guests, billing
 - A music folder whose root cannot be read, or that previously held tracks and now yields no supported file, never causes deletions; the scan records an error naming the folder.
 - Cover art sources, in order: a file in the album's directory named `cover`, `folder`, `front` or `album` with extension `jpg`, `jpeg`, `png` or `webp` (case-insensitive); then the embedded picture of the album's first track. Artists have no image.
 - `getCoverArt?size=N` returns a JPEG whose longer side is at most N pixels (N clamped to 2000). Without `size`, the original bytes and content type are returned.
+- Lyrics sources, in order: the file `<stem>.lrc` next to the audio file, then the lyrics tag (`USLT` in ID3v2, `©lyr` in MP4, `UNSYNCEDLYRICS` and then `LYRICS` in Vorbis comments). A track has lyrics when either source exists. The `.lrc` file is read as UTF-8; a leading byte order mark is dropped and an invalid byte becomes U+FFFD.
 - Annotations (star, rating, play count) are per user and keyed by item ID in one table.
 - Playlists belong to the owner. `public` is stored and has no effect with one user.
 - One play queue per user; `savePlayQueue` replaces it.
@@ -472,6 +474,7 @@ Folder sync at `run` and `scan`: folders from config are upserted by path. The s
 `library::covers::Covers { cache_dir, db }` with `get(id, size: Option<u32>) -> Result<Option<Cover>>`:
 
 - `al-` → `albums.cover_source`; `tr-` → the track's embedded picture when `has_picture`. Any other ID shape → `None`.
+- The embedded picture of a track is its first picture of the type front cover, or its first picture when none has that type; M4A stores no picture type. Its MIME type is the one the tag names when that is JPEG, PNG, TIFF, BMP or GIF. Otherwise the type is detected from the first bytes of the picture, and it is `application/octet-stream` when they are not a known image format.
 - No `size`: file bytes with the type from the extension, or the embedded picture with its MIME.
 - `size`: look up `cache/covers/<id>-<size>-<cover_mtime>.jpg`; on miss decode with `image`, `thumbnail(size, size)`, encode JPEG quality 85, write temp file plus rename, return. Decode and encode run on `spawn_blocking`. A corrupt image logs a warning and returns `None` for sized requests and raw bytes for unsized ones.
 
@@ -545,6 +548,7 @@ Amperfy calls `ping, getOpenSubsonicExtensions, getMusicFolders, getIndexes, get
 - Unit tests sit next to the code: IDs and fingerprints, tag mapping, `decide`, envelope and XML rendering, config, auth verification, LRC parsing, cover resize, argv builders.
 - Router tests in `tests/` call the router in-process with `tower::ServiceExt::oneshot`. Every endpoint has a JSON test; the envelope has XML tests.
 - `tests/cli.rs` runs the binary with `std::process::Command` for `init`, `config path` and `config show`. Every run that writes names a temp data directory.
+- `tests/tags.rs` reads tracks that `LibraryBuilder` tagged, in the five fixture formats, through `library::tags`. The unit tests in `src/library/tags.rs` cover the mapping rules, unreadable files, and WAV and AIFF files that the tests build in memory.
 - Transcoding: the default suite uses `FakeTranscoder`, which returns known bytes and records the job. One `#[ignore]` test runs real ffmpeg.
 - One test (`tests/shutdown.rs`) binds `127.0.0.1:0` to exercise graceful shutdown; it is the only socket in the suite.
 - Unix-only tests (file modes) are `#[cfg(unix)]`.
