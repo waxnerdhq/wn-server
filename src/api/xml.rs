@@ -310,6 +310,26 @@ mod tests {
     }
 
     #[test]
+    fn keys_are_written_in_byte_order_and_array_items_in_their_order() {
+        let payload = json!({ "song": {
+            "year": 1999,
+            "id": "tr-1",
+            "Year": 2000,
+            "genre": [{ "name": "b" }, { "name": "a" }],
+            "album": { "id": "al-1" },
+        }});
+        assert_eq!(
+            content(payload),
+            concat!(
+                r#"<song Year="2000" id="tr-1" year="1999">"#,
+                r#"<album id="al-1"/>"#,
+                r#"<genre name="b"/><genre name="a"/>"#,
+                r#"</song>"#
+            )
+        );
+    }
+
+    #[test]
     fn objects_become_child_elements() {
         let payload = json!({ "album": {
             "id": "al-1",
