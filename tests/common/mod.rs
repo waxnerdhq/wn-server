@@ -1,6 +1,10 @@
 //! Test support shared by the integration tests. A test file includes it with
 //! `mod common;`.
 
+// Each test binary compiles this module separately and uses a subset of it.
+// The items one binary does not use are not dead code.
+#![allow(dead_code)]
+
 use std::fs;
 use std::path::{Path, PathBuf};
 
