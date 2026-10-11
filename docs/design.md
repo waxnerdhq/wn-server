@@ -61,7 +61,7 @@ Owner upload, multiple users, waxnerd-cloud registration, relay, guests, billing
 | OS | Build and run | Verified by |
 |---|---|---|
 | Linux | native | CI: `cargo xtask check` (fmt, clippy `-D warnings`, full test suite) in a `rust:1.98.1-bookworm` container on the Woodpecker Kubernetes agent |
-| Windows | native (MSVC or GNU host toolchain; `rusqlite` `bundled` needs the Visual Studio Build Tools or mingw) | CI: `cargo clippy --locked --all-targets --target x86_64-pc-windows-gnu -- -D warnings` in the same container with `gcc-mingw-w64-x86-64`; compiles every crate, every test and every build script for Windows. Tests do not run in CI. Native test runs are a manual step recorded in the end-to-end verification until a Windows agent exists |
+| Windows | native (MSVC or GNU host toolchain; `rusqlite` `bundled` needs the Visual Studio Build Tools or mingw) | CI: `cargo clippy --locked --all-targets --target x86_64-pc-windows-gnu -- -D warnings` in the same container with `gcc-mingw-w64-x86-64`; compiles the `wn-server` package with every dependency, every test and every build script for Windows. The command has no `--workspace`, so `xtask` is not compiled for Windows. Tests do not run in CI. Native test runs are a manual step recorded in the end-to-end verification until a Windows agent exists |
 | macOS | native | Not verified by CI. Developers work on macOS and run `cargo xtask check` before every push; that run is the macOS verification |
 
 Woodpecker has one Linux Kubernetes agent, container steps and no build cache. Packages installed in one step are gone in the next, so each pipeline step installs what it needs.
