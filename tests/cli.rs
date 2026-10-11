@@ -13,6 +13,7 @@ use wn_server::auth::verify_password;
 use wn_server::cli::PASSWORD_ENV;
 use wn_server::config::{Config, DATA_DIR_ENV};
 use wn_server::db::Db;
+use wn_server::db::queries::folders::{self, Folder};
 use wn_server::db::queries::users::{self, UserRow};
 
 /// The line `init` and `user set-password` print after they store a password.
@@ -125,13 +126,19 @@ fn data_dir_without_a_database(data_dir: &Path) -> Vec<u8> {
 }
 
 /// The lines `init` prints before the lines about the password when it keeps
-/// the config file of `data_dir` and creates the database.
-fn recreate_lines(data_dir: &Path) -> String {
+/// the config file of `data_dir`. `database` is `created` or `kept`.
+fn kept_config_lines(data_dir: &Path, database: &str) -> String {
     format!(
-        "kept {}; --folder and --port do not change it\ncreated {}\n",
+        "kept {}\n{database} {}\n",
         data_dir.join("config.toml").display(),
         data_dir.join("library.db").display()
     )
+}
+
+/// The rows of the `folders` table in the database of `data_dir`.
+fn folder_rows(data_dir: &Path) -> Vec<Folder> {
+    let db = Db::open(data_dir.join("library.db")).expect("open the database");
+    db.with_reader(folders::list).expect("read the folders")
 }
 
 /// The lines `init` prints for the data directory `data_dir` without a music
@@ -245,37 +252,19 @@ fn init_writes_the_commented_template() {
 }
 
 #[test]
-fn init_refuses_a_config_and_a_database_without_an_owner_until_the_database_is_removed() {
+fn init_creates_the_owner_in_a_database_that_has_none_and_keeps_its_rows() {
     let dir = temp_dir();
     let music = temp_dir();
     let config_path = dir.path().join("config.toml");
-    let db_path = dir.path().join("library.db");
     fs::write(&config_path, "# kept\n").expect("write config");
-    drop(Db::open(&db_path).expect("create the database"));
-
-    let output = init(dir.path(), music.path());
-    assert_eq!(output.status.code(), Some(1));
-    assert!(stdout(&output).is_empty());
-    let message = stderr(&output);
-    assert!(message.contains("already exists"), "{message}");
-    assert!(
-        message.contains(&config_path.display().to_string()),
-        "{message}"
-    );
-    assert_eq!(
-        fs::read_to_string(&config_path).expect("read config"),
-        "# kept\n"
-    );
-    assert!(!dir.path().join("instance.id").exists());
-    let db = Db::open(&db_path).expect("open the database");
-    assert_eq!(
-        db.with_reader(users::get_owner).expect("read the owner"),
-        None
-    );
+    let db = Db::open(dir.path().join("library.db")).expect("create the database");
+    db.with_writer(|conn| folders::sync_folders(conn, &[music.path().to_path_buf()]))
+        .expect("insert a folder");
     drop(db);
+    let rows = folder_rows(dir.path());
+    assert_eq!(rows.len(), 1);
 
-    // The error of the `user` commands states the step that makes `init`
-    // run.
+    // The error of the `user` commands names the command that follows.
     let show = || {
         run(binary()
             .args(["user", "show", "--data-dir"])
@@ -285,24 +274,43 @@ fn init_refuses_a_config_and_a_database_without_an_owner_until_the_database_is_r
     assert_eq!(output.status.code(), Some(1));
     let message = stderr(&output);
     assert!(
-        message.contains("has no owner account; remove that file, then `wn-server init`"),
+        message.contains("has no owner account; `wn-server init` creates the account"),
         "{message}"
     );
-    fs::remove_file(&db_path).expect("remove the database");
 
     let output = run(init_command(dir.path()).env(PASSWORD_ENV, "sesame-secret"));
     assert!(output.status.success(), "{}", stderr(&output));
-    assert!(verify_password(
-        &owner_row(dir.path()).password,
-        "sesame-secret"
-    ));
+    assert_eq!(
+        stdout(&output),
+        format!("{}{NOTICE}\n", kept_config_lines(dir.path(), "kept"))
+    );
+    assert!(stderr(&output).is_empty());
+    let row = owner_row(dir.path());
+    assert_eq!(row.user.name, "owner");
+    assert!(verify_password(&row.password, "sesame-secret"));
+    assert_eq!(folder_rows(dir.path()), rows);
     assert_eq!(
         fs::read_to_string(&config_path).expect("read config"),
         "# kept\n"
     );
+    assert!(dir.path().join("instance.id").exists());
     let output = show();
     assert!(output.status.success(), "{}", stderr(&output));
     assert!(stdout(&output).starts_with("name: owner\n"));
+
+    // The database has an owner now, and `init` refuses it.
+    let output = run(init_command(dir.path()).env(PASSWORD_ENV, "second"));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        stderr(&output).contains("already exists"),
+        "{}",
+        stderr(&output)
+    );
+    assert!(verify_password(
+        &owner_row(dir.path()).password,
+        "sesame-secret"
+    ));
+    assert_eq!(folder_rows(dir.path()), rows);
 }
 
 #[test]
@@ -911,7 +919,7 @@ fn user_commands_without_a_database_name_init_and_create_nothing() {
         );
         assert!(
             message.contains(
-                "does not exist; `wn-server init` creates the database and the owner account \
+                "does not exist; `wn-server init` creates it and the owner account \
                  and keeps an existing config.toml"
             ),
             "{message}"
@@ -938,15 +946,39 @@ fn init_with_a_config_and_no_database_creates_the_database_and_the_owner() {
         "{message}"
     );
 
+    // `--folder` and `--port` do not change a config file that exists, so
+    // `init` refuses them. It does so before it reads the password.
+    for options in [
+        &["--folder", music.path().to_str().expect("a Unicode path")][..],
+        &["--port", "4000"],
+    ] {
+        let output = run_with_stdin(
+            init_command(&data_dir)
+                .args(options)
+                .arg("--password-stdin"),
+            "",
+        );
+        assert_eq!(output.status.code(), Some(1), "{options:?}");
+        assert!(stdout(&output).is_empty(), "{options:?}");
+        let message = stderr(&output);
+        assert!(
+            message.contains(&format!(
+                "{} exists; --folder and --port do not change it",
+                config_path.display()
+            )),
+            "{message}"
+        );
+        assert!(!data_dir.join("library.db").exists(), "{options:?}");
+        assert_eq!(fs::read(&config_path).expect("read config"), config);
+    }
+
     let output = run(init_command(&data_dir)
-        .arg("--folder")
-        .arg(music.path())
-        .args(["--port", "4000", "--username", "Adnan"])
+        .args(["--username", "Adnan"])
         .env(PASSWORD_ENV, "second"));
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(
         stdout(&output),
-        format!("{}{NOTICE}\n", recreate_lines(&data_dir))
+        format!("{}{NOTICE}\n", kept_config_lines(&data_dir, "created"))
     );
     assert!(stderr(&output).is_empty());
     assert_eq!(fs::read(&config_path).expect("read config"), config);
@@ -989,7 +1021,7 @@ fn init_generates_the_password_of_the_owner_it_creates_again_and_prints_it_once(
         text,
         format!(
             "{}Password for owner (shown once): {password}\n{NOTICE}\n",
-            recreate_lines(&data_dir)
+            kept_config_lines(&data_dir, "created")
         )
     );
     assert_eq!(text.matches(&password).count(), 1);
@@ -1028,7 +1060,7 @@ fn init_reads_the_password_of_the_owner_it_creates_again_from_stdin() {
     assert!(output.status.success(), "{}", stderr(&output));
     assert_eq!(
         stdout(&output),
-        format!("{}{NOTICE}\n", recreate_lines(&data_dir))
+        format!("{}{NOTICE}\n", kept_config_lines(&data_dir, "created"))
     );
     assert!(stderr(&output).is_empty());
     assert!(verify_password(
@@ -1089,14 +1121,13 @@ fn init_creates_the_database_again_with_mode_0600() {
 // empty database, and the Unix call that removes a file fails on a directory.
 #[cfg(unix)]
 #[test]
-fn init_removes_the_database_and_the_instance_id_it_wrote_when_the_database_does_not_open() {
+fn init_that_keeps_the_config_removes_no_file_when_it_fails_and_runs_again() {
     for instance_id_exists in [true, false] {
         let dir = temp_dir();
         let data_dir = dir.path().join("data");
         let config_path = data_dir.join("config.toml");
         let config = data_dir_without_a_database(&data_dir);
         let instance_id_path = data_dir.join("instance.id");
-        let instance_id = fs::read_to_string(&instance_id_path).expect("read instance.id");
         if !instance_id_exists {
             fs::remove_file(&instance_id_path).expect("remove instance.id");
         }
@@ -1110,22 +1141,25 @@ fn init_removes_the_database_and_the_instance_id_it_wrote_when_the_database_does
         assert_eq!(output.status.code(), Some(1));
         assert!(stdout(&output).is_empty());
         assert!(!stderr(&output).contains("second"), "{}", stderr(&output));
-        assert!(!data_dir.join("library.db").exists());
         assert_eq!(fs::read(&config_path).expect("read config"), config);
-        if instance_id_exists {
-            assert_eq!(
-                fs::read_to_string(&instance_id_path).expect("read instance.id"),
-                instance_id
-            );
-        } else {
-            assert!(!instance_id_path.exists());
-        }
+        // The failed run wrote a missing instance ID and left it.
+        let instance_id = fs::read_to_string(&instance_id_path).expect("read instance.id");
 
-        // The cause of the error is gone, and `init` runs again.
+        // The cause of the error is gone. `init` runs again and uses the
+        // database file and the instance ID that the failed run left.
         fs::remove_dir(&log_path).expect("remove the directory");
         let output = run(init_command(&data_dir).env(PASSWORD_ENV, "second"));
         assert!(output.status.success(), "{}", stderr(&output));
+        assert_eq!(
+            stdout(&output),
+            format!("{}{NOTICE}\n", kept_config_lines(&data_dir, "kept"))
+        );
         assert!(verify_password(&owner_row(&data_dir).password, "second"));
+        assert_eq!(
+            fs::read_to_string(&instance_id_path).expect("read instance.id"),
+            instance_id
+        );
+        assert_eq!(fs::read(&config_path).expect("read config"), config);
     }
 }
 
@@ -1141,8 +1175,8 @@ fn user_commands_on_a_database_without_an_owner_fail() {
         let message = stderr(&output);
         assert!(
             message.contains(
-                "has no owner account; remove that file, then `wn-server init` creates the \
-                 database and the owner account and keeps an existing config.toml"
+                "has no owner account; `wn-server init` creates the account \
+                 and keeps the database and an existing config.toml"
             ),
             "{message}"
         );
