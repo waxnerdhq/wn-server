@@ -1,5 +1,7 @@
 //! The wn-server library. The binary and the integration tests use this crate.
 
+pub mod api;
+
 /// The version of this crate, taken from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
