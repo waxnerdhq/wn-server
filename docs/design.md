@@ -104,7 +104,7 @@ wn-server/
   examples/make-library.rs    writes the standard test library to a directory
   src/
     main.rs                   clap entry
-    lib.rs                    module tree, build_router, run_server
+    lib.rs                    module tree
     cli.rs                    init, run, scan, user, config
     config.rs                 Config, defaults, validation, DataDir
     db/mod.rs                 Db handle, migrations, pragmas
@@ -171,7 +171,7 @@ All dependencies are declared in the root `Cargo.toml` from the start and `Cargo
 | thiserror | 2 | MIT/Apache-2.0 | errors |
 | dev: tempfile 3 | | MIT/Apache-2.0 | temp directories in tests |
 
-Two small helpers are written in the crate rather than added as dependencies: the instance UUID is formatted from 16 random bytes with the version-4 and variant bits set, and the `filename*=UTF-8''` percent-encoding for `Content-Disposition` is a short function over the unreserved set.
+Three small helpers are written in the crate rather than added as dependencies: the instance UUID is formatted from 16 random bytes with the version-4 and variant bits set, the `filename*=UTF-8''` percent-encoding for `Content-Disposition` is a short function over the unreserved set, and `Params` parses `application/x-www-form-urlencoded` data by the rules of the URL standard, because axum offers its parser only through the `Query` and `Form` extractors.
 
 `sqlx` is not used: an async API adds nothing for a single-writer embedded database, its query macros need a database at compile time, and its tree is larger. `symphonia` is not used: ffmpeg decodes; `lofty` reads tags. `argon2` is not used: the password must be recoverable.
 
@@ -421,15 +421,16 @@ Remote-mode seam: `users.role` and `auth::verify` are the only places that turn 
 
 ### 3.8 Request pipeline and envelope
 
-- Routes `/rest/{method}` and `/rest/{method}.view` for GET and POST, one route with a path parameter. A static method table maps every name in §4 to a handler; names not yet implemented map to `not_implemented`, which returns error 0 with message `not supported`. Unknown names return error 0 with `unknown endpoint`. Paths outside `/rest/` return 404.
+- Routes `/rest/{method}` and `/rest/{method}.view` for GET and POST, one route with a path parameter. A static method table maps every name in §4 to a handler; names not yet implemented map to `not_implemented`, which returns error 0 with message `not supported`. Unknown names return error 0 with `unknown endpoint`. Paths outside `/rest/` return 404. Another HTTP method on the route returns 405.
 - `AppState { config, db, covers, transcoder, scan, cancel, started_at }` is shared through `State`.
-- `Params` is a multimap of query-string and form-body fields (`application/x-www-form-urlencoded` on POST; body values append to query values). `req_str`, `opt_i64`, `opt_bool`, `all(name) -> Vec<&str>`. A missing required parameter maps to error 10 naming the parameter.
-- Handlers return `Result<Payload, ApiError>`; `Payload` is a key plus a serialisable value, or empty. `Format` is parsed from `f` before dispatch so errors use the requested format: `json` selects JSON, and `xml` or an absent `f` selects XML. Any other value, `jsonp` included, returns error 0 with message `unsupported format`, rendered in XML.
+- `Params` is a multimap of query-string and form-body fields (`application/x-www-form-urlencoded` on POST; body values append to query values). A form body larger than 8 MiB returns error 0, which bounds the memory a request takes before it is authenticated; a POST body of another content type is not read. `req_str`, `opt_str`, `opt_i64`, `opt_u32` and `opt_bool` read the first value of a name; `all(name) -> Vec<&str>` returns every value. A missing required parameter maps to error 10 naming the parameter. For the typed getters an empty value counts as absent and a value of the wrong type returns error 0 naming the parameter; `opt_bool` accepts `true` and `false` in any letter case.
+- A handler is an axum handler function. Its arguments are extractors (`Params`, `State<AppState>`, `Authed`), and the method table holds it through the `handler!` macro. Handlers return `Result<Payload, ApiError>`; `Payload` is a key plus a serialisable value, or empty. Neither knows the format, so the router renders the envelope after the handler returns. `Format` is parsed from `f` before dispatch so errors use the requested format: `json` selects JSON, and `xml` or an absent `f` selects XML. Any other value, `jsonp` included, returns error 0 with message `unsupported format`, rendered in XML.
 - JSON envelope: `{"subsonic-response": {"status":"ok","version":"1.16.1","type":"wn-server","serverVersion":"<crate version>","openSubsonic":true, "<key>": ...}}`, with content type `application/json`. XML: the declaration `<?xml version="1.0" encoding="UTF-8"?>` followed by `<subsonic-response xmlns="http://subsonic.org/restapi" status="ok" version="1.16.1" type="wn-server" serverVersion="..." openSubsonic="true"><key .../></subsonic-response>`, with content type `application/xml`. The envelope fields are written in this order in both formats.
 - XML rendering: the payload is serialised to `serde_json::Value` and walked: scalars become attributes, objects become child elements, arrays become repeated child elements named after the key, and a scalar field named `value` becomes text content. A scalar array item becomes an element with the item as text content (`"versions": [1]` renders `<versions>1</versions>`). Attribute values and text are escaped. Characters outside the XML 1.0 `Char` production (U+0000 to U+001F other than tab, line feed and carriage return; U+FFFE; U+FFFF) are dropped from attribute values and text, because a strict parser rejects a document that holds one, escaped or not. One set of `#[derive(Serialize)] #[serde(rename_all = "camelCase")]` models serves both formats. `None` fields are skipped; empty arrays are `[]` in JSON and absent in XML.
 - Payload key order: `serde_json` is built without `preserve_order`, so the keys of every payload object are sorted by their bytes in both formats (upper-case letters sort before lower-case letters). In XML that is the order of the attributes and of the child elements. Array items keep their order.
 - Errors: HTTP 200, `status: "failed"`, `error: {code, message}`. `ApiError` variants: `MissingParam` 10, `BadCredentials` 40, `AuthUnsupported` 42, `AuthConflict` 43, `Forbidden` 50, `NotFound` 70, `Other(msg)` 0.
 - `EXTENSIONS: &[(&str, &[u32])]` holds the advertised extensions, one entry per line.
+- The method table, `EXTENSIONS`, the fields of `AppState` (in its definition and where it is built) and the list of handler modules in `src/api/mod.rs` hold one line for each entry that this document names, and a blank line follows every entry. An entry that is not built is a comment line with its name, or a method table line that maps to `not_implemented`. A change that builds an entry replaces that line and keeps the blank lines, so two changes never touch neighbouring lines and git merges them without a conflict. These items carry `#[rustfmt::skip]`, because rustfmt removes blank lines inside a list.
 - Request log: method name, `c`, `u`, status, duration; never the query string. `stream` and `getCoverArt` log at `debug`.
 - Binary endpoints (`stream`, `getCoverArt`) bypass the envelope on success and use it on error.
 - Model constructors `model::child(&Track, Option<&Annotation>)`, `model::album(..)`, `model::artist(..)` are the only way a handler builds a response object; the caller passes the user's annotations from `annotations::get_many(user, ids)`.
@@ -497,7 +498,7 @@ No DNS-SD type exists for Subsonic servers; the server registers its own and the
 
 ### 3.13 Logging and shutdown
 
-`tracing_subscriber::fmt` to stderr with an env filter from `RUST_LOG`, else `server.log_level`. No log files.
+`tracing_subscriber::fmt` to stderr with an env filter from `RUST_LOG`, else `server.log_level`. An empty `RUST_LOG` counts as unset. Colours are written only when stderr is a terminal. No log files.
 
 One `CancellationToken` in `AppState`. `ctrl_c`, SIGTERM (Unix) and `ctrl_close`/`ctrl_shutdown` (Windows) cancel it. `axum::serve(..).with_graceful_shutdown(token.cancelled())` with a 10 s grace, after which the process exits. On cancel: the scanner stops between batches, the mDNS daemon unregisters, transcode children die with their bodies, and the database runs `PRAGMA wal_checkpoint(TRUNCATE)`.
 

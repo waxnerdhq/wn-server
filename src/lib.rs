@@ -8,6 +8,9 @@ pub mod db;
 pub mod ids;
 pub mod library;
 
+// The server composes the modules above.
+pub mod server;
+
 /// The version of this crate, taken from `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 

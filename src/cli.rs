@@ -1,5 +1,4 @@
-//! The command line: the clap tree and the commands that need only the
-//! config, the data directory and the database.
+//! The command line: the clap tree and the commands.
 //!
 //! `init` and `user set-password` handle the owner password. It is written to
 //! the database and, when the command generated it, to stdout once. It is not
@@ -8,18 +7,21 @@
 use std::env;
 use std::fmt;
 use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use clap::builder::NonEmptyStringValueParser;
 use clap::{Args, Parser, Subcommand};
 use thiserror::Error;
+use tokio_util::sync::CancellationToken;
+use tracing_subscriber::EnvFilter;
 
 use crate::auth;
 use crate::config::{self, Config, ConfigError, DataDir};
 use crate::db::queries::users::{self, User, UserRow};
 use crate::db::{Db, DbError};
+use crate::server::{self, ServerError};
 
 /// The environment variable that supplies the password to `init` and
 /// `user set-password`.
@@ -38,6 +40,10 @@ const PLAIN_TEXT_NOTICE: &str =
 /// config file, so the text names the step that makes `init` run.
 const INIT_RECOVERY: &str = "`wn-server init` creates it. init does not overwrite config.toml, \
      so move that file away first when it exists";
+
+/// The environment variable that holds the log filter. When it is set and not
+/// empty it replaces `server.log_level`.
+const LOG_FILTER_ENV: &str = "RUST_LOG";
 
 /// A headless music server for OpenSubsonic clients.
 #[derive(Debug, Parser)]
@@ -143,6 +149,14 @@ enum CliError {
     NotImplemented,
     #[error(transparent)]
     Config(#[from] ConfigError),
+    #[error("the log filter `{filter}` is not valid: {reason}")]
+    LogFilter { filter: String, reason: String },
+    #[error("cannot start logging: {0}")]
+    Logging(String),
+    #[error("cannot start the runtime that runs the server: {0}")]
+    ServerRuntime(io::Error),
+    #[error(transparent)]
+    Server(#[from] ServerError),
     #[error("cannot create the data directory {}: {source}", path.display())]
     CreateDataDir { path: PathBuf, source: io::Error },
     #[error("{} already exists; init does not overwrite it", .0.display())]
@@ -218,8 +232,8 @@ struct NewPassword {
 }
 
 /// Runs the command and returns the exit code of the process. A command that
-/// fails prints its error to stderr and exits with 1. `run` and `scan` print
-/// `not implemented yet` to stderr and exit with 2.
+/// fails prints its error to stderr and exits with 1. `scan` prints
+/// `not implemented yet` to stderr and exits with 2.
 pub fn run(cli: &Cli) -> ExitCode {
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
@@ -240,7 +254,11 @@ pub fn run(cli: &Cli) -> ExitCode {
 /// a command that got `--password-stdin`.
 fn execute(cli: &Cli, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<(), CliError> {
     match &cli.command {
-        Command::Run | Command::Scan => Err(CliError::NotImplemented),
+        Command::Scan => Err(CliError::NotImplemented),
+        Command::Run => {
+            let data_dir = DataDir::resolve(cli.data_dir.as_deref())?;
+            serve(&data_dir)
+        }
         Command::Init(args) => {
             let data_dir = DataDir::resolve(cli.data_dir.as_deref())?;
             init(&data_dir, args, input, out)
@@ -266,6 +284,63 @@ fn execute(cli: &Cli, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<()
             Ok(())
         }
     }
+}
+
+/// Loads the config, starts logging to stderr and runs the server in the
+/// foreground. Ctrl-C stops the server, and the command then succeeds.
+fn serve(data_dir: &DataDir) -> Result<(), CliError> {
+    let config = Config::load(&data_dir.config_path())?;
+    init_tracing(&config.server.log_level)?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(CliError::ServerRuntime)?;
+    runtime.block_on(async {
+        let cancel = CancellationToken::new();
+        tokio::spawn(cancel_on_ctrl_c(cancel.clone()));
+        server::run_server(config, cancel).await
+    })?;
+    Ok(())
+}
+
+/// Cancels `cancel` when the process receives Ctrl-C.
+async fn cancel_on_ctrl_c(cancel: CancellationToken) {
+    match tokio::signal::ctrl_c().await {
+        Ok(()) => {
+            tracing::info!("received Ctrl-C, stopping");
+            cancel.cancel();
+        }
+        Err(error) => tracing::warn!("cannot wait for Ctrl-C: {error}"),
+    }
+}
+
+/// The log filter: the value of `RUST_LOG` when it is set and not empty,
+/// otherwise `server.log_level`.
+fn log_filter(variable: Option<String>, log_level: &str) -> String {
+    variable
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| log_level.to_owned())
+}
+
+/// Parses a log filter such as `info` or `warn,wn_server=debug`.
+fn parse_log_filter(filter: &str) -> Result<EnvFilter, CliError> {
+    EnvFilter::try_new(filter).map_err(|error| CliError::LogFilter {
+        filter: filter.to_owned(),
+        reason: error.to_string(),
+    })
+}
+
+/// Starts logging to stderr. The filter is `RUST_LOG`, or `log_level` when
+/// that variable is unset. Colours are written only when stderr is a
+/// terminal.
+fn init_tracing(log_level: &str) -> Result<(), CliError> {
+    let filter = parse_log_filter(&log_filter(env::var(LOG_FILTER_ENV).ok(), log_level))?;
+    tracing_subscriber::fmt()
+        .with_writer(io::stderr)
+        .with_ansi(io::stderr().is_terminal())
+        .with_env_filter(filter)
+        .try_init()
+        .map_err(|error| CliError::Logging(error.to_string()))
 }
 
 /// Creates the data directory, `config.toml`, `instance.id`, the database and
@@ -740,15 +815,13 @@ mod tests {
     }
 
     #[test]
-    fn commands_of_later_issues_are_not_implemented() {
-        for args in [&["run"][..], &["scan"]] {
-            let cli = parse(args).expect("arguments");
-            let mut out = Vec::new();
-            let error = execute(&cli, &mut io::empty(), &mut out).expect_err("not implemented");
-            assert!(matches!(error, CliError::NotImplemented), "{args:?}");
-            assert_eq!(error.to_string(), "not implemented yet");
-            assert!(out.is_empty());
-        }
+    fn scan_is_not_implemented() {
+        let cli = parse(&["scan"]).expect("arguments");
+        let mut out = Vec::new();
+        let error = execute(&cli, &mut io::empty(), &mut out).expect_err("not implemented");
+        assert!(matches!(error, CliError::NotImplemented), "{error}");
+        assert_eq!(error.to_string(), "not implemented yet");
+        assert!(out.is_empty());
     }
 
     #[test]
@@ -931,5 +1004,42 @@ mod tests {
         ] {
             assert_eq!(utc_date(unix_seconds), date, "{unix_seconds}");
         }
+    }
+
+    #[test]
+    fn log_filter_is_the_variable_when_it_is_set() {
+        assert_eq!(
+            log_filter(Some("wn_server=debug".to_owned()), "info"),
+            "wn_server=debug"
+        );
+    }
+
+    #[test]
+    fn log_filter_falls_back_to_the_config_level() {
+        assert_eq!(log_filter(None, "warn"), "warn");
+        assert_eq!(
+            log_filter(Some(String::new()), "warn"),
+            "warn",
+            "an empty variable is unset"
+        );
+    }
+
+    #[test]
+    fn log_filter_parses_levels_and_targets() {
+        for filter in [
+            "info",
+            "debug",
+            "warn,wn_server=debug",
+            "wn_server::api=trace",
+        ] {
+            parse_log_filter(filter).unwrap_or_else(|error| panic!("{filter}: {error}"));
+        }
+    }
+
+    #[test]
+    fn log_filter_that_does_not_parse_is_named() {
+        let error = parse_log_filter("wn_server=loud").expect_err("an invalid level");
+        assert!(matches!(error, CliError::LogFilter { .. }), "{error}");
+        assert!(error.to_string().contains("wn_server=loud"), "{error}");
     }
 }
