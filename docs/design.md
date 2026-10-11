@@ -171,7 +171,7 @@ All dependencies are declared in the root `Cargo.toml` from the start and `Cargo
 | thiserror | 2 | MIT/Apache-2.0 | errors |
 | dev: tempfile 3 | | MIT/Apache-2.0 | temp directories in tests |
 
-Three small helpers are written in the crate rather than added as dependencies: the instance UUID is formatted from 16 random bytes with the version-4 and variant bits set, the `filename*=UTF-8''` percent-encoding for `Content-Disposition` is a short function over the unreserved set, and `Params` parses `application/x-www-form-urlencoded` data by the rules of the URL standard, because axum offers its parser only through the `Query` and `Form` extractors.
+Three small helpers are written in the crate rather than added as dependencies: the instance UUID is formatted from 16 random bytes with the version-4 and variant bits set, the `filename*=UTF-8''` percent-encoding for `Content-Disposition` is a short function over the unreserved set, and `Params` parses `application/x-www-form-urlencoded` data by the rules of the URL standard. axum's `Query` and `Form` extractors parse the same data and are not used: one function in `Params` parses the query string and the form body, the router applies its own content-type rule and the 8 MiB limit, and every failure is an `ApiError` in the requested format.
 
 `sqlx` is not used: an async API adds nothing for a single-writer embedded database, its query macros need a database at compile time, and its tree is larger. `symphonia` is not used: ffmpeg decodes; `lofty` reads tags. `argon2` is not used: the password must be recoverable.
 
@@ -431,7 +431,7 @@ Remote-mode seam: `users.role` and `auth::verify` are the only places that turn 
 - Errors: HTTP 200, `status: "failed"`, `error: {code, message}`. `ApiError` variants: `MissingParam` 10, `BadCredentials` 40, `AuthUnsupported` 42, `AuthConflict` 43, `Forbidden` 50, `NotFound` 70, `Other(msg)` 0.
 - `EXTENSIONS: &[(&str, &[u32])]` holds the advertised extensions, one entry per line.
 - The method table, `EXTENSIONS`, the fields of `AppState` (in its definition and where it is built) and the list of handler modules in `src/api/mod.rs` hold one line for each entry that this document names, and a blank line follows every entry. An entry that is not built is a comment line with its name, or a method table line that maps to `not_implemented`. A change that builds an entry replaces that line and keeps the blank lines, so two changes never touch neighbouring lines and git merges them without a conflict. The arrays, the struct and the statements that build the struct carry `#[rustfmt::skip]`, because rustfmt removes the blank lines inside an array and the blank line between a comment and the struct field after it.
-- Request log: method name, `c`, `u`, status, duration; never the query string. `stream` and `getCoverArt` log at `debug`.
+- Request log: method name, `c`, `u`, status, duration; never the query string. The method name, `c` and `u` are cut to 64 characters, because the client chooses them. `stream` and `getCoverArt` log at `debug`.
 - Binary endpoints (`stream`, `getCoverArt`) bypass the envelope on success and use it on error.
 - Model constructors `model::child(&Track, Option<&Annotation>)`, `model::album(..)`, `model::artist(..)` are the only way a handler builds a response object; the caller passes the user's annotations from `annotations::get_many(user, ids)`.
 

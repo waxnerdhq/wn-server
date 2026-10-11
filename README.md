@@ -110,7 +110,7 @@ wn-server run
 
 `run` loads `config.toml`, listens on `server.bind` and `server.port` (`0.0.0.0:4200` by default) and logs the address. Ctrl-C stops the server. Requests that are in progress are answered first.
 
-Logs go to stderr. `server.log_level` is the log filter, for example `info` or `warn,wn_server=debug`. The `RUST_LOG` environment variable replaces it when it is set and not empty. The log names the method, the client (`c`) and the user (`u`) of a request. It never holds the query string or the form body.
+Logs go to stderr. `server.log_level` is the log filter, for example `info` or `warn,wn_server=debug`. The `RUST_LOG` environment variable replaces it when it is set and not empty. The log names the method, the client (`c`) and the user (`u`) of a request, each cut to 64 characters. It never holds the query string or the form body.
 
 ## API
 
@@ -119,4 +119,4 @@ The server answers OpenSubsonic requests at `/rest/<method>` and `/rest/<method>
 - `f=json` selects JSON. `f=xml` or no `f` selects XML. Any other value, `jsonp` included, returns error 0 in XML.
 - An API error is an HTTP 200 response with the status `failed` and an `error` element that holds the Subsonic error code and a message.
 - The server does not check the credentials of a request.
-- `ping`, `getLicense` and `getOpenSubsonicExtensions` are served. Every other method of the OpenSubsonic API returns error 0 with the message `not supported`. A name that is not an OpenSubsonic method returns error 0 with the message `unknown endpoint`.
+- A method of the OpenSubsonic API that the server does not serve returns error 0 with the message `not supported`. A name that is not an OpenSubsonic method returns error 0 with the message `unknown endpoint`.

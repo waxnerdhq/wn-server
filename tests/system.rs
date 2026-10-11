@@ -7,7 +7,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use serde_json::{Value, json};
 use wn_server::VERSION;
-use wn_server::api::METHODS;
+use wn_server::api::{EXTENSIONS, METHODS};
 use wn_server::config::Config;
 
 use common::{TestServer, body_string, captured_log, content_type, subsonic_response, urlencode};
@@ -140,25 +140,43 @@ async fn get_license_returns_a_valid_license() {
 }
 
 #[tokio::test]
-async fn get_open_subsonic_extensions_returns_an_empty_list() {
+async fn get_open_subsonic_extensions_returns_the_entries_of_extensions() {
+    // The expected list follows `EXTENSIONS`, so the test holds for every
+    // set of extensions. A server that advertises none returns `[]`.
+    let expected = Value::Array(
+        EXTENSIONS
+            .iter()
+            .map(|(name, versions)| json!({ "name": name, "versions": versions }))
+            .collect(),
+    );
+
     let server = server();
     let response = server.get_json("getOpenSubsonicExtensions", &[]).await;
     assert_eq!(response["status"], "ok");
-    assert_eq!(response["openSubsonicExtensions"], json!([]));
+    assert_eq!(response["openSubsonicExtensions"], expected);
 
     let response = server
         .get_raw("getOpenSubsonicExtensions", &[("f", "json")])
         .await;
     assert_eq!(
         body_string(response).await,
-        json_document("ok", r#","openSubsonicExtensions":[]"#)
+        json_document("ok", &format!(r#","openSubsonicExtensions":{expected}"#))
     );
 
-    // An empty array has no element in XML.
+    // XML has one element for each extension, and none for an empty list.
+    let xml = server.get_xml("getOpenSubsonicExtensions", &[]).await;
     assert_eq!(
-        server.get_xml("getOpenSubsonicExtensions", &[]).await,
-        xml_document("ok", "/>")
+        xml.matches("<openSubsonicExtensions ").count(),
+        EXTENSIONS.len(),
+        "{xml}"
     );
+    for (name, _) in EXTENSIONS {
+        let element = format!(r#"<openSubsonicExtensions name="{name}">"#);
+        assert!(xml.contains(&element), "{element}: {xml}");
+    }
+    if EXTENSIONS.is_empty() {
+        assert_eq!(xml, xml_document("ok", "/>"));
+    }
 }
 
 #[tokio::test]
@@ -214,28 +232,27 @@ async fn every_listed_method_is_routed() {
     let server = server();
     for (method, _) in METHODS {
         for name in [(*method).to_owned(), format!("{method}.view")] {
+            // A routed method answers `ok`, or it fails for a reason of its
+            // own, such as a missing parameter. Only a name that is not
+            // routed fails with `unknown endpoint`.
             let response = server.get_json(&name, &[]).await;
-            match response["status"].as_str() {
-                Some("ok") => {}
-                Some("failed") => {
-                    assert_eq!(response["error"], error_0("not supported"), "{name}");
-                }
-                other => panic!("{name}: status {other:?}"),
-            }
+            let status = response["status"].as_str();
+            assert!(
+                matches!(status, Some("ok" | "failed")),
+                "{name}: {status:?}"
+            );
+            assert_ne!(response["error"]["message"], "unknown endpoint", "{name}");
         }
     }
 }
 
 #[tokio::test]
-async fn system_methods_are_the_methods_with_a_handler() {
+async fn system_methods_answer_ok() {
     let server = server();
-    let mut served = Vec::new();
-    for (method, _) in METHODS {
-        if server.get_json(method, &[]).await["status"] == "ok" {
-            served.push(*method);
-        }
+    for method in ["ping", "getLicense", "getOpenSubsonicExtensions"] {
+        let response = server.get_json(method, &[]).await;
+        assert_eq!(response["status"], "ok", "{method}");
     }
-    assert_eq!(served, ["ping", "getLicense", "getOpenSubsonicExtensions"]);
 }
 
 #[tokio::test]
@@ -282,7 +299,7 @@ async fn api_error_is_http_200() {
     let server = server();
     for (method, params) in [
         ("nope", &[("f", "json")][..]),
-        ("getPodcasts", &[]),
+        ("tokenInfo", &[]),
         ("ping", &[("f", "yaml")]),
     ] {
         let response = server.get_raw(method, params).await;
@@ -416,6 +433,30 @@ async fn request_log_names_client_and_user_of_a_form_body_without_the_body() {
     }
     let text = log.text();
     assert!(!text.contains("form-secret-"), "{text}");
+}
+
+#[tokio::test]
+async fn request_log_cuts_method_client_and_user_to_64_characters() {
+    captured_log();
+    let method = format!("log-cut-method-{}", "m".repeat(100));
+    let client = format!("log-cut-client-{}", "c".repeat(100));
+    let user = format!("log-cut-user-{}", "u".repeat(100));
+    let response = server()
+        .get_raw(
+            &method,
+            &[("c", client.as_str()), ("u", user.as_str()), ("f", "json")],
+        )
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // The closing quote follows the 64th character of each value.
+    let line = finished_line(&client[..64]);
+    for field in [
+        format!(r#"method="{}""#, &method[..64]),
+        format!(r#"u="{}""#, &user[..64]),
+    ] {
+        assert!(line.contains(&field), "{field}: {line}");
+    }
 }
 
 #[tokio::test]

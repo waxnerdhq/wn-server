@@ -84,6 +84,11 @@ const FORM_BODY_LIMIT: usize = 8 * 1024 * 1024;
 /// The content type of a form body.
 const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
 
+/// The longest value that the span of a request holds for the method name,
+/// `c` or `u`, in characters. The client chooses these values, and every log
+/// line of the request repeats them.
+const LOG_FIELD_CHARS: usize = 64;
+
 /// The state that the handlers share. `docs/design.md` section 3.8 names the
 /// fields, and they are in that order here.
 #[derive(Clone)]
@@ -382,9 +387,10 @@ pub fn build_router(state: AppState) -> Router {
 }
 
 /// The span of one request. [`respond`] records the method name and the
-/// client and user parameters when it has read them, and [`record_response`]
-/// records the status. The span has no field for the URI, so the query string
-/// with the credentials is not logged.
+/// client and user parameters when it has read them, each cut to
+/// [`LOG_FIELD_CHARS`] characters, and [`record_response`] records the
+/// status. The span has no field for the URI, so the query string with the
+/// credentials is not logged.
 fn request_span<B>(_request: &http::Request<B>) -> Span {
     tracing::info_span!(
         "request",
@@ -449,12 +455,12 @@ async fn respond<S>(
     };
 
     let span = Span::current();
-    span.record("method", name);
+    span.record("method", log_field(name));
     if let Some(client) = params.opt_str("c") {
-        span.record("c", client);
+        span.record("c", log_field(client));
     }
     if let Some(user) = params.opt_str("u") {
-        span.record("u", user);
+        span.record("u", log_field(user));
     }
 
     let format = match Format::parse(params.opt_str("f")) {
@@ -474,6 +480,14 @@ async fn respond<S>(
     match response.extensions_mut().remove::<SubsonicResponse>() {
         Some(envelope) => render(&envelope, format),
         None => response,
+    }
+}
+
+/// The first [`LOG_FIELD_CHARS`] characters of `value`.
+fn log_field(value: &str) -> &str {
+    match value.char_indices().nth(LOG_FIELD_CHARS) {
+        Some((end, _)) => &value[..end],
+        None => value,
     }
 }
 
@@ -763,6 +777,20 @@ mod tests {
             response.extensions().get::<SubsonicResponse>(),
             Some(&SubsonicResponse::error(70, "not found"))
         );
+    }
+
+    #[test]
+    fn log_field_is_at_most_64_characters() {
+        assert_eq!(log_field(""), "");
+        assert_eq!(log_field("Symfonium"), "Symfonium");
+        let exact = "a".repeat(64);
+        assert_eq!(log_field(&exact), exact);
+        assert_eq!(log_field(&"a".repeat(65)), exact);
+        assert_eq!(log_field(&"a".repeat(400_000)), exact);
+
+        // The cut is between characters, not inside the bytes of one.
+        let wide = "é".repeat(70);
+        assert_eq!(log_field(&wide), "é".repeat(64));
     }
 
     #[test]
