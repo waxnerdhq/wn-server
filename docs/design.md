@@ -335,7 +335,7 @@ Multi-user readiness: every per-user table carries `user_id`; `users.role` separ
 
 ### 3.5 Data directory and config
 
-Data directory, in order: `--data-dir`, `WN_SERVER_DATA_DIR`, then `directories::ProjectDirs::from("", "", "wn-server").data_dir()`: `~/Library/Application Support/wn-server` on macOS, `~/.local/share/wn-server` on Linux, `C:\Users\<user>\AppData\Roaming\wn-server\data` on Windows.
+Data directory, in order: `--data-dir`, `WN_SERVER_DATA_DIR`, then `directories::ProjectDirs::from("", "", "wn-server").data_dir()`: `~/Library/Application Support/wn-server` on macOS, `~/.local/share/wn-server` on Linux, `C:\Users\<user>\AppData\Roaming\wn-server\data` on Windows. An empty `WN_SERVER_DATA_DIR` counts as unset. The chosen path is made absolute with `std::path::absolute`.
 
 ```
 <data-dir>/
@@ -392,6 +392,10 @@ wn-server config show                          prints the effective config
 wn-server --version
 ```
 
+`--data-dir` is accepted before and after the subcommand. `init` checks that each `--folder` is an existing directory and writes it as an absolute path. Without `--folder` it writes `folders = []`, and the commands that load the config fail until the owner adds a folder. `init` does not overwrite an existing `config.toml`. On Unix it creates the directories that are missing with mode 0700 and leaves the mode of an existing data directory unchanged. `--port 0` is rejected.
+
+A command that fails prints `wn-server: <error>` to stderr and exits with 1. A usage error exits with 2.
+
 `scan` while `run` is active works through WAL and `busy_timeout`; `getScanStatus` reports only scans the server process started.
 
 ### 3.7 Authentication
@@ -423,7 +427,7 @@ Remote-mode seam: `users.role` and `auth::verify` are the only places that turn 
 
 ### 3.9 Streaming and transcoding
 
-`media::stream::decide(&Track, &StreamRequest, &TranscodingConfig) -> Result<StreamPlan, ApiError>` with `StreamPlan::Raw` or `StreamPlan::Transcode { target, bitrate_kbps, offset_s }`:
+`media::stream::decide(&Track, &StreamRequest, &config::Transcoding) -> Result<StreamPlan, ApiError>` with `StreamPlan::Raw` or `StreamPlan::Transcode { target, bitrate_kbps, offset_s }`:
 
 - `format=raw` → Raw. No `format` and `maxBitRate` absent or 0 → Raw.
 - `format=opus|mp3` → Transcode at `maxBitRate` when given, else the config bitrate for that target.
@@ -540,6 +544,7 @@ Amperfy calls `ping, getOpenSubsonicExtensions, getMusicFolders, getIndexes, get
 - `tests/common/mod.rs`: `LibraryBuilder` copies fixtures into a temp directory as `<Artist>/<Album>/<nn> <Title>.<ext>` and writes tags with lofty; `LibraryBuilder::standard()` builds 3 artists, 4 albums, 10 tracks (one compilation, one album with `cover.jpg`, one with embedded art, one track with a lyrics tag, one album with tracks on two discs). Names are valid on Windows and differ by more than case. `TestServer` builds the router over a scanned standard library and offers `get_json(method, params)`, `get_xml`, `get_raw`, `post_form`.
 - Unit tests sit next to the code: IDs and fingerprints, tag mapping, `decide`, envelope and XML rendering, config, auth verification, LRC parsing, cover resize, argv builders.
 - Router tests in `tests/` call the router in-process with `tower::ServiceExt::oneshot`. Every endpoint has a JSON test; the envelope has XML tests.
+- `tests/cli.rs` runs the binary with `std::process::Command` for `init`, `config path` and `config show`. Every run that writes names a temp data directory.
 - Transcoding: the default suite uses `FakeTranscoder`, which returns known bytes and records the job. One `#[ignore]` test runs real ffmpeg.
 - One test (`tests/shutdown.rs`) binds `127.0.0.1:0` to exercise graceful shutdown; it is the only socket in the suite.
 - Unix-only tests (file modes) are `#[cfg(unix)]`.
