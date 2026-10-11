@@ -5,12 +5,11 @@
 # - Linux: `cargo xtask check` runs natively in the container. It runs rustfmt,
 #   clippy with warnings as errors, and the test suite, each for the whole
 #   workspace.
-# - Windows: clippy compiles the `wn-server` package for the
-#   x86_64-pc-windows-gnu target. That covers the library, the binary, every
-#   test and example, every dependency and every build script. No test runs and
-#   no Windows binary is linked. `xtask` is not compiled for Windows, because
-#   the command has no `--workspace`. Nothing is compiled for the MSVC target.
-#   Tests run on Windows by hand until a Windows agent exists.
+# - Windows: clippy compiles the whole workspace for the
+#   x86_64-pc-windows-gnu target. That covers every crate, every test and
+#   example, every dependency and every build script. No test runs and no
+#   Windows binary is linked. Nothing is compiled for the MSVC target. Tests
+#   run on Windows by hand until a Windows agent exists.
 # - macOS: nothing. There is no macOS agent. A developer runs
 #   `cargo xtask check` on macOS before every push.
 when:
@@ -22,9 +21,10 @@ steps:
   # One step, because packages installed in one step are gone in the next.
   # The image tag matches the toolchain in rust-toolchain.toml.
   #
-  # Nothing is cached between runs. A run builds the dependency tree from
-  # nothing for the host, and again for the Windows target. Expect 15 to 25
-  # minutes on the 2 CPUs that the step requests.
+  # Nothing is cached between runs. A run is three builds: clippy for the
+  # host, the tests for the host, and clippy for the Windows target. The
+  # duration is not yet measured. The estimate is 15 to 25 minutes on the 2
+  # CPUs that the step requests.
   - name: check
     image: rust:1.98.1-bookworm
     commands:
@@ -41,14 +41,12 @@ steps:
       - rustup target add x86_64-pc-windows-gnu
       # Linux, native. xtask passes --locked and --workspace to cargo.
       - cargo xtask check
-      # Windows, cross build. Clippy compiles without running tests.
-      - cargo clippy --locked --all-targets --target x86_64-pc-windows-gnu -- -D warnings
+      # Windows, cross build. Clippy compiles the workspace without running
+      # tests.
+      - cargo clippy --locked --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings
     backend_options:
       kubernetes:
-        # The scheduler places the step on a node with 2 CPUs and 3 GiB free.
-        # The LimitRange of the CI namespace sets the limits of a step to the
-        # same amounts, so the step sets no limits. A request above a limit is
-        # rejected.
+        # The step sets requests only. Limits come from the namespace.
         resources:
           requests:
             cpu: "2"
