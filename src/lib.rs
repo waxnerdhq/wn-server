@@ -8,6 +8,7 @@ pub mod db;
 pub mod discovery;
 pub mod ids;
 pub mod library;
+pub mod media;
 
 // The server composes the modules above.
 pub mod server;
