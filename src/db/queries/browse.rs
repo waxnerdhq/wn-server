@@ -290,12 +290,15 @@ pub fn file_path(conn: &Connection, track: &Track) -> Result<Option<PathBuf>> {
 }
 
 /// Returns the end time of the scan that finished last, in Unix seconds, or
-/// `None` when no scan has finished. `getIndexes` reports it as the time the
-/// library last changed.
+/// `None` when no scan has finished.
 ///
 /// A scan that runs has no end time and does not count. A cancelled scan has
 /// one and counts, because it keeps the changes it stored.
 /// `scans::last_finished` returns the same time as ISO 8601 text.
+///
+/// The time changes with every scan, also with one that found nothing
+/// changed. `lastModified` of `getIndexes` is `indexes::last_modified`,
+/// which does not.
 pub fn last_scan_finished_at(conn: &Connection) -> Result<Option<i64>> {
     let finished_at = conn
         .prepare_cached("SELECT max(finished_at) FROM scans")?
