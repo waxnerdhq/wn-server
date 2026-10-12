@@ -369,7 +369,6 @@ async fn written(rows: Vec<Row>) -> TestServer {
                     bit_depth: Some(16),
                     channels: Some(2),
                     has_picture: false,
-                    has_lyrics: false,
                     suffix: "flac".to_owned(),
                     content_type: "audio/flac".to_owned(),
                     lossless: true,

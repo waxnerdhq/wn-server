@@ -720,7 +720,6 @@ mod tests {
             content_type: "audio/flac".to_owned(),
             lossless: true,
             has_picture: true,
-            has_lyrics: false,
             mtime: 1_600_000_000,
             created_at: CREATED,
             updated_at: CREATED + 60,

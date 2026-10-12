@@ -27,6 +27,4 @@ pub mod scan_controller;
 
 pub mod covers;
 
-// lyrics
-
 // The end of the list. A new entry goes above this line.

@@ -97,9 +97,6 @@ pub struct TrackMeta {
     /// Whether the tag holds a picture. It is true exactly when
     /// [`read_front_picture`] returns a picture.
     pub has_picture: bool,
-    /// Whether the tag holds lyrics or the file `<stem>.lrc` exists next to
-    /// the audio file.
-    pub has_lyrics: bool,
     /// The extension of the file in lower case.
     pub suffix: String,
     /// The content type that belongs to `suffix`.
@@ -179,7 +176,6 @@ pub fn read(path: &Path) -> Result<TrackMeta, TagError> {
         bit_depth: positive(properties.bit_depth()),
         channels: positive(properties.channels()),
         has_picture: front_picture(tag).is_some(),
-        has_lyrics: sidecar(path).is_file() || tag_lyrics(tag).is_some(),
         suffix: suffix.to_owned(),
         content_type: content_type.to_owned(),
         lossless: is_lossless(suffix, parsed.alac),
@@ -201,19 +197,6 @@ pub fn read_front_picture(path: &Path) -> Option<(Vec<u8>, String)> {
     let parsed = parse(path, ParseOptions::new().read_properties(false)).ok()?;
     let picture = front_picture(main_tag(&parsed.file))?;
     Some((picture.data().to_vec(), picture_content_type(picture)))
-}
-
-/// Returns the lyrics tag of the file at `path`. The file `<stem>.lrc` counts
-/// for [`TrackMeta::has_lyrics`] and is not read here.
-///
-/// Returns `None` when the file has no lyrics tag or cannot be read.
-pub fn read_lyrics(path: &Path) -> Option<String> {
-    format_of(path)?;
-    let options = ParseOptions::new()
-        .read_properties(false)
-        .read_cover_art(false);
-    let parsed = parse(path, options).ok()?;
-    tag_lyrics(main_tag(&parsed.file)).map(str::to_owned)
 }
 
 /// A parsed audio file.
@@ -269,13 +252,6 @@ fn text(tag: Option<&Tag>, key: ItemKey) -> Option<&str> {
         .filter(|value| !value.is_empty())
 }
 
-/// Returns the lyrics of `tag`. lofty reports the lyrics of an M4A file under
-/// `ItemKey::Lyrics` and those of an MP3 file under `ItemKey::UnsyncLyrics`.
-/// Vorbis comments have a field for each key.
-fn tag_lyrics(tag: Option<&Tag>) -> Option<&str> {
-    text(tag, ItemKey::UnsyncLyrics).or_else(|| text(tag, ItemKey::Lyrics))
-}
-
 /// Returns the front cover among the pictures of `tag`, or the first picture
 /// when none has that type.
 fn front_picture(tag: Option<&Tag>) -> Option<&Picture> {
@@ -300,12 +276,6 @@ fn picture_content_type(picture: &Picture) -> String {
         })
         .unwrap_or(UNKNOWN_PICTURE_TYPE)
         .to_owned()
-}
-
-/// Returns the path of the lyrics file of the audio file at `path`:
-/// `<stem>.lrc` in the same directory.
-fn sidecar(path: &Path) -> PathBuf {
-    path.with_extension("lrc")
 }
 
 /// Applies the album artist rule of `docs/design.md` section 1.3 and returns
@@ -718,7 +688,6 @@ mod tests {
             "{message}"
         );
         assert_eq!(read_front_picture(&path), None);
-        assert_eq!(read_lyrics(&path), None);
     }
 
     #[test]
@@ -740,7 +709,6 @@ mod tests {
         let error = read(&path).expect_err("the file does not exist");
         assert!(matches!(error, TagError::Read { .. }), "{error:?}");
         assert_eq!(read_front_picture(&path), None);
-        assert_eq!(read_lyrics(&path), None);
     }
 
     #[test]
@@ -753,7 +721,6 @@ mod tests {
             "{error:?}"
         );
         assert_eq!(read_front_picture(&path), None);
-        assert_eq!(read_lyrics(&path), None);
     }
 
     #[test]
@@ -787,7 +754,6 @@ mod tests {
                     bit_depth: Some(16),
                     channels: Some(1),
                     has_picture: false,
-                    has_lyrics: false,
                     suffix: suffix.to_owned(),
                     content_type: content_type.to_owned(),
                     lossless: true,

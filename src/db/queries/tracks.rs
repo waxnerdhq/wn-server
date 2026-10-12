@@ -22,6 +22,11 @@ pub struct IndexEntry {
 }
 
 /// A row of the `tracks` table.
+///
+/// The column `has_lyrics` has no field. The server has no lyrics
+/// (`docs/design.md` section 4), and no statement reads or writes the
+/// column. A row that is inserted holds the default of the schema, which
+/// is 0.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
     pub id: String,
@@ -52,7 +57,6 @@ pub struct Track {
     pub content_type: String,
     pub lossless: bool,
     pub has_picture: bool,
-    pub has_lyrics: bool,
     /// The modification time of the file in Unix seconds.
     pub mtime: i64,
     /// The time of the first scan that saw the track, in Unix seconds.
@@ -122,7 +126,7 @@ pub struct TrackContent<'a> {
 pub(super) const TRACK_COLUMNS: &str = "id, folder_id, rel_path, fingerprint, title, album_id, \
      artist_id, artist_name, album_name, track_no, disc_no, year, genre, duration_ms, \
      bitrate_kbps, sample_rate, bit_depth, channels, size, suffix, content_type, lossless, \
-     has_picture, has_lyrics, mtime, created_at, updated_at";
+     has_picture, mtime, created_at, updated_at";
 
 /// Returns the index entry of every track, in no particular order.
 pub fn load_index(conn: &Connection) -> Result<Vec<IndexEntry>> {
@@ -159,9 +163,9 @@ pub fn insert_track(
         "INSERT INTO tracks (id, folder_id, rel_path, fingerprint, title, title_lc, album_id,
            artist_id, artist_name, album_name, track_no, disc_no, year, genre, duration_ms,
            bitrate_kbps, sample_rate, bit_depth, channels, size, suffix, content_type, lossless,
-           has_picture, has_lyrics, mtime, created_at, updated_at)
+           has_picture, mtime, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-           ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, unixepoch(), unixepoch())",
+           ?19, ?20, ?21, ?22, ?23, ?24, ?25, unixepoch(), unixepoch())",
     )?
     .execute(params![
         id,
@@ -188,7 +192,6 @@ pub fn insert_track(
         meta.content_type,
         meta.lossless,
         meta.has_picture,
-        meta.has_lyrics,
         content.mtime,
     ])?;
     Ok(())
@@ -204,8 +207,7 @@ pub fn update_track_meta(conn: &Connection, id: &str, content: &TrackContent<'_>
            artist_id = ?6, artist_name = ?7, album_name = ?8, track_no = ?9, disc_no = ?10,
            year = ?11, genre = ?12, duration_ms = ?13, bitrate_kbps = ?14, sample_rate = ?15,
            bit_depth = ?16, channels = ?17, size = ?18, suffix = ?19, content_type = ?20,
-           lossless = ?21, has_picture = ?22, has_lyrics = ?23, mtime = ?24,
-           updated_at = unixepoch()
+           lossless = ?21, has_picture = ?22, mtime = ?23, updated_at = unixepoch()
          WHERE id = ?1",
     )?
     .execute(params![
@@ -231,7 +233,6 @@ pub fn update_track_meta(conn: &Connection, id: &str, content: &TrackContent<'_>
         meta.content_type,
         meta.lossless,
         meta.has_picture,
-        meta.has_lyrics,
         content.mtime,
     ])?;
     Ok(())
@@ -323,10 +324,9 @@ pub(super) fn track_from_row(row: &Row<'_>) -> rusqlite::Result<Track> {
         content_type: row.get(20)?,
         lossless: row.get(21)?,
         has_picture: row.get(22)?,
-        has_lyrics: row.get(23)?,
-        mtime: row.get(24)?,
-        created_at: row.get(25)?,
-        updated_at: row.get(26)?,
+        mtime: row.get(23)?,
+        created_at: row.get(24)?,
+        updated_at: row.get(25)?,
     })
 }
 
@@ -395,7 +395,6 @@ mod tests {
             bit_depth: Some(16),
             channels: Some(1),
             has_picture: true,
-            has_lyrics: true,
             suffix: "flac".to_owned(),
             content_type: "audio/flac".to_owned(),
             lossless: true,
@@ -421,7 +420,6 @@ mod tests {
             bit_depth: None,
             channels: None,
             has_picture: false,
-            has_lyrics: false,
             suffix: "mp3".to_owned(),
             content_type: "audio/mpeg".to_owned(),
             lossless: false,
@@ -526,7 +524,6 @@ mod tests {
                 content_type: "audio/flac".to_owned(),
                 lossless: true,
                 has_picture: true,
-                has_lyrics: true,
                 mtime: 1000,
                 created_at: track.created_at,
                 updated_at: track.created_at,
@@ -703,7 +700,6 @@ mod tests {
                 content_type: "audio/mpeg".to_owned(),
                 lossless: false,
                 has_picture: false,
-                has_lyrics: false,
                 mtime: 2000,
                 created_at: 10,
                 updated_at: track.updated_at,

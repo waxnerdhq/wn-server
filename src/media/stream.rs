@@ -524,7 +524,6 @@ mod tests {
             content_type: "audio/flac".to_owned(),
             lossless,
             has_picture: false,
-            has_lyrics: false,
             mtime: 1_700_000_000,
             created_at: 0,
             updated_at: 0,
