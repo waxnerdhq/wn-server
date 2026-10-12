@@ -1020,7 +1020,7 @@ mod tests {
         store("Phone", phone);
 
         let done = AtomicBool::new(false);
-        let reads = std::thread::scope(|scope| {
+        std::thread::scope(|scope| {
             let writers = [("Phone", phone), ("Desktop", desktop)].map(|(client, queue)| {
                 let store = &store;
                 scope.spawn(move || {
@@ -1032,8 +1032,10 @@ mod tests {
             let readers = [(); 2].map(|()| {
                 let (db, done, wholes) = (&library.db, &done, &wholes);
                 scope.spawn(move || {
-                    let mut reads = 0u32;
-                    while !done.load(Ordering::SeqCst) {
+                    // A reader reads until the writers have ended, and once
+                    // more after that.
+                    loop {
+                        let last = done.load(Ordering::SeqCst);
                         let queue = db
                             .with_reader(|conn| {
                                 // One transaction, as a handler reads.
@@ -1043,22 +1045,23 @@ mod tests {
                             .unwrap()
                             .expect("the owner has a row");
                         assert!(wholes.contains(&queue), "{queue:?}");
-                        reads += 1;
+                        if last {
+                            break;
+                        }
                     }
-                    reads
                 })
             });
             // The readers end when the writers have ended, also when a
             // writer failed.
             let written = writers.map(|writer| writer.join());
             done.store(true, Ordering::SeqCst);
-            let reads = readers.map(|reader| reader.join().expect("the reader does not panic"));
+            for reader in readers {
+                reader.join().expect("the reader does not panic");
+            }
             for result in written {
                 result.expect("the writer does not panic");
             }
-            reads
         });
-        assert!(reads.iter().all(|reads| *reads > 0), "{reads:?}");
 
         // The queue that is stored at the end is the queue of one client.
         let queue = library.get(owner);
