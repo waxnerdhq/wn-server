@@ -5230,4 +5230,44 @@ mod tests {
         assert_eq!(library.id_at("moved/b.wav"), Some(b));
         assert_eq!(library.index().len(), 4);
     }
+
+    /// The ten bytes of an ID3v2 header that declares a tag of 256 MiB,
+    /// which is over the tag bound.
+    const OVER_THE_TAG_BOUND: [u8; 10] = [b'I', b'D', b'3', 4, 0, 0, 0x7f, 0x7f, 0x7f, 0x7f];
+
+    #[test]
+    fn a_cancelled_scan_records_a_refused_file_only_when_it_read_the_file() {
+        // The database has no row, so the files are read in one batch, in
+        // the order of their paths. The read of the first file cancels the
+        // scan. The check before the next read stops the scan, so the file
+        // over the tag bound is not read and the scan has no error for it.
+        let library = Library::new(&[("a.wav", 100, 1)]);
+        fs::write(library.path("b.mp3"), OVER_THE_TAG_BOUND).unwrap();
+        library.cancel_at_tag_read.set(1);
+        let summary = library.scan_in_batches_of(5);
+
+        assert_eq!(summary.errors, [CANCELLED]);
+        assert_eq!(library.tag_reads.get(), 1);
+        assert_eq!(library.index(), []);
+
+        // Here the file over the bound is read first, and the read of the
+        // second file of three cancels the scan. The scan read and refused
+        // the file, so its error stays, although nothing of the batch is
+        // stored.
+        let library = Library::new(&[("b.wav", 100, 1), ("c.wav", 200, 2)]);
+        fs::write(library.path("a.mp3"), OVER_THE_TAG_BOUND).unwrap();
+        library.cancel_at_tag_read.set(2);
+        let summary = library.scan_in_batches_of(5);
+
+        assert_eq!(summary.errors.len(), 2, "{:?}", summary.errors);
+        assert!(
+            summary.errors[0].starts_with("\"a.mp3\" in music folder ")
+                && summary.errors[0].contains(" is refused: "),
+            "{:?}",
+            summary.errors
+        );
+        assert_eq!(summary.errors[1], CANCELLED);
+        assert_eq!(library.tag_reads.get(), 2);
+        assert_eq!(library.index(), []);
+    }
 }

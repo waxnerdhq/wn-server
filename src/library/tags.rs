@@ -1174,6 +1174,32 @@ mod tests {
     }
 
     #[test]
+    fn a_part_over_the_limit_of_lofty_and_within_the_bound_is_a_read_error() {
+        // A FLAC file that starts with the header of an ID3v2 tag of 17 MiB.
+        // The bound has room for the tag. lofty reads such a tag into one
+        // allocation and refuses an allocation of more than 16 MiB, so the
+        // file is a file that cannot be read, and not a file over the bound.
+        let size: u32 = 17 * 1024 * 1024;
+        let seven_bits = |shift: u32| ((size >> shift) & 0x7f) as u8;
+        let mut bytes = b"ID3\x04\0\0".to_vec();
+        bytes.extend([21, 14, 7, 0].map(seven_bits));
+
+        let (parsed, reader) = parse_counted(&bytes, "flac", MAX_TAG_BYTES);
+        assert!(
+            matches!(parsed, Err(ParseError::Read(_))),
+            "{:?}",
+            parsed.as_ref().err()
+        );
+        // lofty refused the allocation before it read a byte of the tag.
+        assert!(reader.bytes <= 4 * bytes.len() as u64, "{}", reader.bytes);
+
+        let (_dir, path) = write_file("large.flac", &bytes);
+        let error = read(&path).expect_err("lofty refuses the allocation");
+        assert!(matches!(error, TagError::Read { .. }), "{error:?}");
+        assert_eq!(read_front_picture(&path), None);
+    }
+
+    #[test]
     fn garbage_flac_is_an_error() {
         let garbage: Vec<u8> = (0..100u8)
             .map(|index| index.wrapping_mul(37).wrapping_add(11))
