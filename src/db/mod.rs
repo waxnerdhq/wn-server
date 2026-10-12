@@ -626,14 +626,12 @@ fn migrate_with(connection: &mut Connection, migrations: &[Migration]) -> Result
         if let Err(source) = apply_migration(connection, version, migration.sql) {
             // The transaction of the migration is rolled back. The version
             // is read again, so that the error states what the database
-            // holds now. When it cannot be read, the error of SQLite is
-            // returned alone.
-            let Ok(version) = user_version(connection) else {
-                return Err(source.into());
-            };
+            // holds now. When it cannot be read, the error names the version
+            // from before the migration, which is the one that the rollback
+            // leaves.
             return Err(DbError::Migration {
                 name: migration.name,
-                version,
+                version: user_version(connection).unwrap_or(version),
                 source,
             });
         }
