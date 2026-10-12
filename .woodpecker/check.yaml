@@ -1,4 +1,11 @@
-# Checks the workspace. Runs on every pull request and on every push to main.
+# Checks the workspace. Runs on pull requests only: when a pull request is
+# opened, and on every push to its branch.
+#
+# The pipeline does not run on pushes to main. The merge sequence in AGENTS.md
+# rebases a pull request on main, waits for this pipeline on the rebased head
+# commit, and squash-merges that commit only when it contains the head of
+# main. The merge commit on main therefore has the tree that this pipeline
+# checked.
 #
 # What the pipeline verifies for each OS:
 #
@@ -14,18 +21,30 @@
 #   `cargo xtask check` on macOS before every push.
 when:
   - event: pull_request
-  - event: push
-    branch: main
 
 steps:
   # One step, because packages installed in one step are gone in the next.
   # The image tag matches the toolchain in rust-toolchain.toml.
   #
-  # Nothing is cached between runs. A run is three builds: clippy for the
-  # host, the tests for the host, and clippy for the Windows target. A run
-  # takes about 4 minutes on the 2 CPUs that the step requests.
+  # Nothing is cached between runs. A run is three builds from an empty target
+  # directory: clippy for the host, the tests for the host, and clippy for the
+  # Windows target. A run takes several minutes on the 2 CPUs that the step
+  # requests.
   - name: check
     image: rust:1.98.1-bookworm
+    # Cargo settings for the builds of this pipeline. Cargo.toml does not hold
+    # them, so a local `cargo xtask check` runs with cargo's defaults.
+    environment:
+      # The target directory is empty at the start of every run, so nothing
+      # reads the data that incremental compilation writes.
+      CARGO_INCREMENTAL: "0"
+      # The dev profile carries line tables and no other debug information.
+      # The test profile inherits the setting. Each file in tests/ is one test
+      # binary, and each binary compiles and links faster with less debug
+      # information. The panic message of a failing test and the file and line
+      # of the failing assertion do not come from debug information, so the
+      # test output is the same. A backtrace keeps its file and line numbers.
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
     commands:
       # The MinGW-w64 C compiler. libsqlite3-sys compiles the bundled SQLite,
       # which is C, for the Windows target. The cc crate runs
