@@ -294,7 +294,8 @@ fn execute(cli: &Cli, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<()
 }
 
 /// Loads the config, starts logging to stderr and runs the server in the
-/// foreground. Ctrl-C stops the server, and the command then succeeds.
+/// foreground on the database of `data_dir`. Ctrl-C stops the server, and the
+/// command then succeeds.
 fn serve(data_dir: &DataDir) -> Result<(), CliError> {
     let config = Config::load(&data_dir.config_path())?;
     init_tracing(&config.server.log_level)?;
@@ -305,7 +306,7 @@ fn serve(data_dir: &DataDir) -> Result<(), CliError> {
     runtime.block_on(async {
         let cancel = CancellationToken::new();
         tokio::spawn(cancel_on_ctrl_c(cancel.clone()));
-        server::run_server(config, cancel).await
+        server::run_server(config, data_dir, cancel).await
     })?;
     Ok(())
 }

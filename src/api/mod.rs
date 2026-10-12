@@ -1,6 +1,13 @@
 //! The OpenSubsonic API: the router, the method table and the state that the
 //! handlers share (`docs/design.md` section 3.8).
 //!
+//! # Authentication
+//!
+//! The router authenticates a request before it calls the handler of the
+//! method. The methods of [`PUBLIC_METHODS`] are the exception. A method that
+//! a change adds to [`METHODS`] therefore needs a user without any step in
+//! its handler (`docs/design.md` section 3.7).
+//!
 //! # Lists that hold one line per entry
 //!
 //! The list of handler modules, [`AppState`], [`METHODS`] and [`EXTENSIONS`]
@@ -71,7 +78,9 @@ use tower_http::trace::TraceLayer;
 use tracing::Span;
 use tracing::field::Empty;
 
+use crate::auth::extract::{Authed, Authenticate};
 use crate::config::Config;
+use crate::db::Db;
 use envelope::{ApiError, Format, SubsonicResponse};
 use params::Params;
 
@@ -97,7 +106,8 @@ pub struct AppState {
     /// The configuration the server runs with.
     pub config: Arc<Config>,
 
-    // db
+    /// The library database. It holds the user accounts.
+    pub db: Db,
 
     // covers
 
@@ -178,9 +188,13 @@ pub type Handler<S = AppState> = fn(Request, S) -> HandlerFuture;
 /// Makes a [`Handler`] from an axum handler function: an `async fn` whose
 /// arguments are extractors and whose result implements `IntoResponse`.
 ///
-/// The extractors a handler uses are [`Params`] and `State<AppState>`. A
-/// handler that answers with the envelope returns [`ApiResult`]. A handler
-/// that answers with a body of its own returns `Result<Response, ApiError>`.
+/// The extractors a handler uses are [`Params`], `State<AppState>` and
+/// [`Authed`], which is the user of the request. A handler that answers with
+/// the envelope returns [`ApiResult`]. A handler that answers with a body of
+/// its own returns `Result<Response, ApiError>`.
+///
+/// The router authenticates the request before it calls the handler, whether
+/// the handler takes [`Authed`] or not.
 macro_rules! handler {
     ($function:path) => {
         |request, state| ::axum::handler::Handler::call($function, request, state)
@@ -361,12 +375,20 @@ pub const METHODS: &[(&str, Handler)] = &[
     ("getTranscodeStream", not_implemented),
 ];
 
+/// The methods that answer a request without a user. `docs/design.md`
+/// section 4 marks them `public`.
+///
+/// Every other method of [`METHODS`] is answered only for a request that the
+/// router has authenticated. A method needs no entry anywhere to be
+/// protected: a name that is absent from this list is not public.
+pub const PUBLIC_METHODS: &[&str] = &["getOpenSubsonicExtensions"];
+
 /// The OpenSubsonic extensions the server advertises: the name and the
 /// versions of each. `docs/design.md` section 4 names them, and they are in
 /// that order here.
 #[rustfmt::skip]
 pub const EXTENSIONS: &[(&str, &[u32])] = &[
-    // formPost
+    ("formPost", &[1]),
 
     // transcodeOffset
 
@@ -419,7 +441,7 @@ async fn dispatch(
     request: Request,
 ) -> Response {
     let name = name.map(|Path(name)| name).unwrap_or_default();
-    respond(METHODS, state, &name, request).await
+    respond(METHODS, PUBLIC_METHODS, state, &name, request).await
 }
 
 /// Answers one API request with the handler that `methods` holds for `name`.
@@ -430,8 +452,14 @@ async fn dispatch(
 /// parameter selects the format before the handler runs, so an error of the
 /// handler has the format of the request. A response of the handler that
 /// carries no envelope is returned as it is.
-async fn respond<S>(
+///
+/// `state` authenticates the request of every method that `public` does not
+/// name. The handler of such a method is called only when the request has a
+/// user, and it finds the user in the request as [`Authed`]. The check does
+/// not depend on the handler, so a handler cannot leave it out.
+async fn respond<S: Authenticate>(
     methods: &[(&str, Handler<S>)],
+    public: &[&str],
     state: S,
     name: &str,
     request: Request,
@@ -475,6 +503,15 @@ async fn respond<S>(
         return render(&failure(&error), format);
     };
 
+    if !public.contains(&name) {
+        match state.authenticate(&params).await {
+            Ok(user) => {
+                parts.extensions.insert(Authed(user));
+            }
+            Err(error) => return render(&failure(&error), format),
+        }
+    }
+
     parts.extensions.insert(params);
     let mut response = handler(Request::from_parts(parts, body), state).await;
     match response.extensions_mut().remove::<SubsonicResponse>() {
@@ -483,8 +520,9 @@ async fn respond<S>(
     }
 }
 
-/// The first [`LOG_FIELD_CHARS`] characters of `value`.
-fn log_field(value: &str) -> &str {
+/// The first [`LOG_FIELD_CHARS`] characters of `value`. A log line holds a
+/// value that the client chooses in this form.
+pub(crate) fn log_field(value: &str) -> &str {
     match value.char_indices().nth(LOG_FIELD_CHARS) {
         Some((end, _)) => &value[..end],
         None => value,
@@ -504,15 +542,19 @@ fn has_form_body(headers: &http::HeaderMap) -> bool {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use axum::http::StatusCode;
     use serde_json::{Value, json};
 
     use super::*;
+    use crate::auth::extract;
+    use crate::config;
+    use crate::db::queries::users::{self, User};
 
-    /// The method names of the table in `docs/design.md` section 4, in the
-    /// order of the table.
-    fn design_methods() -> Vec<&'static str> {
+    /// The rows of the table in `docs/design.md` section 4, in the order of
+    /// the table: the method names of a row and its status.
+    fn design_rows() -> Vec<(Vec<&'static str>, &'static str)> {
         const DESIGN: &str = include_str!("../../docs/design.md");
         let (_, rest) = DESIGN
             .split_once("\n## 4. OpenSubsonic coverage\n")
@@ -523,10 +565,51 @@ mod tests {
         section
             .lines()
             .filter_map(|line| line.strip_prefix("| "))
-            .filter_map(|row| row.split(" | ").next())
-            .filter(|cell| *cell != "Endpoint" && *cell != "Extensions advertised")
-            .flat_map(|cell| cell.split(", "))
+            .filter_map(|row| row.strip_suffix(" |"))
+            .filter_map(|row| row.split_once(" | "))
+            .filter(|(names, _)| *names != "Endpoint" && *names != "Extensions advertised")
+            .map(|(names, status)| (names.split(", ").collect(), status))
             .collect()
+    }
+
+    /// The method names of the table in `docs/design.md` section 4, in the
+    /// order of the table.
+    fn design_methods() -> Vec<&'static str> {
+        design_rows()
+            .into_iter()
+            .flat_map(|(names, _)| names)
+            .collect()
+    }
+
+    /// The state of the handlers that need no state. It authenticates no
+    /// request, so a test method runs with it only when the test names the
+    /// method as public.
+    impl Authenticate for () {
+        async fn authenticate(&self, _params: &Params) -> Result<User, ApiError> {
+            Err(ApiError::BadCredentials)
+        }
+    }
+
+    /// A state that holds the accounts of a database and authenticates as
+    /// the server does. It has no other part of [`AppState`].
+    #[derive(Clone)]
+    struct Accounts(Db);
+
+    impl Authenticate for Accounts {
+        async fn authenticate(&self, params: &Params) -> Result<User, ApiError> {
+            extract::authenticate(&config::Auth::default(), &self.0, params).await
+        }
+    }
+
+    /// The accounts of a memory database with the owner `owner` and the
+    /// password `sesame`.
+    async fn accounts() -> Accounts {
+        let db = Db::open_memory().expect("a memory database");
+        db.write(|conn| users::insert_owner(conn, "owner", "sesame"))
+            .await
+            .expect("insert the owner")
+            .expect("the database had no owner");
+        Accounts(db)
     }
 
     /// A handler that returns every value of `id` and the first value of
@@ -560,6 +643,10 @@ mod tests {
         ("bytes", handler!(bytes)),
     ];
 
+    /// The names of [`TEST_METHODS`]. The tests of the request pipeline call
+    /// them as public methods.
+    const TEST_PUBLIC: &[&str] = &["echo", "missing", "bytes"];
+
     fn get(uri: &str) -> Request {
         http::Request::get(uri)
             .body(Body::empty())
@@ -576,7 +663,12 @@ mod tests {
     /// Calls `respond` with the test methods. Returns the status, the content
     /// type and the body.
     async fn call(name: &str, request: Request) -> (StatusCode, String, String) {
-        let response = respond(TEST_METHODS, (), name, request).await;
+        let response = respond(TEST_METHODS, TEST_PUBLIC, (), name, request).await;
+        read(response).await
+    }
+
+    /// The status, the content type and the body of `response`.
+    async fn read(response: Response) -> (StatusCode, String, String) {
         let status = response.status();
         let content_type = response
             .headers()
@@ -608,6 +700,197 @@ mod tests {
         for (name, _) in METHODS {
             assert!(seen.insert(*name), "{name} is listed twice");
         }
+    }
+
+    #[test]
+    fn public_methods_are_the_methods_that_the_design_marks_public() {
+        let public: Vec<&str> = design_rows()
+            .into_iter()
+            .filter(|(_, status)| status.split(", ").any(|word| word == "public"))
+            .flat_map(|(names, _)| names)
+            .collect();
+        assert_eq!(PUBLIC_METHODS, public);
+        assert_eq!(PUBLIC_METHODS, ["getOpenSubsonicExtensions"]);
+    }
+
+    #[test]
+    fn public_methods_are_in_the_method_table() {
+        for name in PUBLIC_METHODS {
+            assert!(
+                METHODS.iter().any(|(method, _)| method == name),
+                "{name} is not a method"
+            );
+        }
+    }
+
+    /// The number of calls of [`unguarded`].
+    static UNGUARDED_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// A handler that takes no [`Authed`] and counts its calls.
+    async fn unguarded() -> ApiResult {
+        UNGUARDED_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(Payload::empty())
+    }
+
+    #[tokio::test]
+    async fn method_that_is_not_public_does_not_run_without_a_user() {
+        const UNGUARDED: &[(&str, Handler<()>)] = &[("unguarded", handler!(unguarded))];
+
+        // The state `()` authenticates no request.
+        for (name, uri, content_type) in [
+            ("unguarded", "/rest/unguarded?f=json", "application/json"),
+            ("unguarded", "/rest/unguarded", "application/xml"),
+            (
+                "unguarded.view",
+                "/rest/unguarded.view?f=json",
+                "application/json",
+            ),
+        ] {
+            let response = respond(UNGUARDED, &[], (), name, get(uri)).await;
+            let (status, found, body) = read(response).await;
+            assert_eq!(status, StatusCode::OK, "{uri}");
+            assert_eq!(found, content_type, "{uri}");
+            assert!(body.contains("wrong username or password"), "{body}");
+        }
+        assert_eq!(UNGUARDED_CALLS.load(Ordering::SeqCst), 0);
+
+        // The same handler runs when the method is public.
+        let uri = "/rest/unguarded?f=json";
+        let response = respond(UNGUARDED, &["unguarded"], (), "unguarded", get(uri)).await;
+        let (_, _, body) = read(response).await;
+        assert_eq!(json_response(&body)["status"], "ok");
+        assert_eq!(UNGUARDED_CALLS.load(Ordering::SeqCst), 1);
+    }
+
+    /// The number of calls of [`added_later`].
+    static ADDED_LATER_CALLS: AtomicUsize = AtomicUsize::new(0);
+
+    /// The handler of the method `addedLater`. It takes no [`Authed`] and
+    /// counts its calls.
+    async fn added_later(params: Params) -> ApiResult {
+        ADDED_LATER_CALLS.fetch_add(1, Ordering::SeqCst);
+        Ok(Payload::new("added", json!({ "id": params.opt_str("id") })))
+    }
+
+    /// The table of a server to which a change added the method `addedLater`.
+    /// The change wrote the handler and this one line, and nothing else.
+    const LATER_METHODS: &[(&str, Handler<Accounts>)] = &[
+        (
+            "getOpenSubsonicExtensions",
+            handler!(system::get_open_subsonic_extensions),
+        ),
+        ("addedLater", handler!(added_later)),
+    ];
+
+    /// Calls `method` of [`LATER_METHODS`] with the public methods of the
+    /// server. Returns the response object.
+    async fn call_later(state: &Accounts, method: &str, query: &str) -> Value {
+        let uri = format!("/rest/{method}?f=json&id=7&{query}");
+        let request = get(&uri);
+        let response = respond(
+            LATER_METHODS,
+            PUBLIC_METHODS,
+            state.clone(),
+            method,
+            request,
+        )
+        .await;
+        let (status, _, body) = read(response).await;
+        assert_eq!(status, StatusCode::OK, "{uri}");
+        json_response(&body)
+    }
+
+    #[tokio::test]
+    async fn method_added_to_the_table_is_protected_without_a_step_in_its_handler() {
+        let state = accounts().await;
+        for (query, code) in [
+            ("", 10),
+            ("v=1.16.1&c=test", 10),
+            ("v=1.16.1&c=test&u=owner", 10),
+            ("v=1.16.1&c=test&u=owner&p=wrong", 40),
+            ("v=1.16.1&c=test&u=nobody&p=sesame", 40),
+            ("v=1.16.1&c=test&u=owner&t=abc&s=def", 40),
+            ("v=1.16.1&c=test&apiKey=k", 42),
+            ("v=1.16.1&c=test&apiKey=k&u=owner", 43),
+            ("v=1.16.1&c=test&u=owner&p=sesame&t=abc", 43),
+        ] {
+            for method in ["addedLater", "addedLater.view"] {
+                let response = call_later(&state, method, query).await;
+                assert_eq!(response["status"], "failed", "{method} {query}");
+                assert_eq!(response["error"]["code"], code, "{method} {query}");
+                assert!(response.get("added").is_none(), "{method} {query}");
+            }
+        }
+        assert_eq!(ADDED_LATER_CALLS.load(Ordering::SeqCst), 0);
+
+        let response = call_later(&state, "addedLater", "v=1.16.1&c=test&u=owner&p=sesame").await;
+        assert_eq!(response["status"], "ok");
+        assert_eq!(response["added"], json!({ "id": "7" }));
+        assert_eq!(ADDED_LATER_CALLS.load(Ordering::SeqCst), 1);
+
+        // The public method of the same table needs no user.
+        let response = call_later(&state, "getOpenSubsonicExtensions", "").await;
+        assert_eq!(response["status"], "ok");
+    }
+
+    /// A handler that returns the name of the user of the request.
+    async fn who_am_i(Authed(user): Authed) -> ApiResult {
+        Ok(Payload::new("user", json!({ "name": user.name })))
+    }
+
+    #[tokio::test]
+    async fn handler_receives_the_user_that_the_router_authenticated() {
+        const WHO_AM_I: &[(&str, Handler<Accounts>)] = &[("whoAmI", handler!(who_am_i))];
+        let state = accounts().await;
+        let call = |public: &'static [&'static str], query: &'static str| {
+            let state = state.clone();
+            async move {
+                let uri = format!("/rest/whoAmI?f=json&v=1.16.1&c=test&{query}");
+                let response = respond(WHO_AM_I, public, state, "whoAmI", get(&uri)).await;
+                let (_, _, body) = read(response).await;
+                json_response(&body)
+            }
+        };
+
+        // The stored name is returned, not the spelling of the request.
+        let response = call(&[], "u=OWNER&p=sesame").await;
+        assert_eq!(response["user"], json!({ "name": "owner" }));
+
+        // A handler that takes `Authed` needs a user when its method is
+        // public as well.
+        let response = call(&["whoAmI"], "u=owner&p=wrong").await;
+        assert_eq!(response["error"]["code"], 40);
+        let response = call(&["whoAmI"], "u=owner&p=sesame").await;
+        assert_eq!(response["user"], json!({ "name": "owner" }));
+    }
+
+    #[tokio::test]
+    async fn format_body_and_method_name_are_checked_before_the_user() {
+        // The state `()` authenticates no request, and no method is public.
+        let call = |name: &'static str, request: Request| async move {
+            read(respond(TEST_METHODS, &[], (), name, request).await).await
+        };
+
+        let (_, content_type, body) = call("echo", get("/rest/echo?f=jsonp")).await;
+        assert_eq!(content_type, "application/xml");
+        assert!(body.contains("unsupported format"), "{body}");
+
+        let request = post(
+            "/rest/echo?f=json",
+            FORM_CONTENT_TYPE,
+            vec![b'a'; FORM_BODY_LIMIT + 1],
+        );
+        let (_, _, body) = call("echo", request).await;
+        assert_eq!(
+            json_response(&body)["error"]["message"],
+            "cannot read the form body"
+        );
+
+        let (_, _, body) = call("nope", get("/rest/nope?f=json")).await;
+        assert_eq!(json_response(&body)["error"]["message"], "unknown endpoint");
+
+        let (_, _, body) = call("echo", get("/rest/echo?f=json")).await;
+        assert_eq!(json_response(&body)["error"]["code"], 40);
     }
 
     #[tokio::test]

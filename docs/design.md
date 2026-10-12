@@ -52,7 +52,7 @@ Owner upload, multiple users, waxnerd-cloud registration, relay, guests, billing
 - Default port 4200, bind `0.0.0.0`.
 - Search is case-insensitive substring match (SQL `LIKE` with `ESCAPE '\'`) over lower-cased name columns. An empty query returns everything, paged.
 - API errors use HTTP 200 and the Subsonic error envelope. Unknown `/rest/*` methods return error 0 with message `unknown endpoint`. Paths outside `/rest/` return 404.
-- `v` and `c` are required (error 10 when absent). The value of `v` is not compared; errors 20 and 30 are never produced.
+- `v` and `c` are required by every method except the public `getOpenSubsonicExtensions` (error 10 when absent), also when authentication is disabled. The value of `v` is not compared; errors 20 and 30 are never produced.
 - Music folder paths are absolute (`std::path::absolute`, no symlink resolution, no `\\?\` prefix). Symlinks inside folders are followed. Entries whose name starts with `.` are skipped on every OS; the Windows hidden attribute is not checked. A file name that is not valid Unicode is skipped with a warning.
 - `jsonp` is not supported; `f=jsonp` returns error 0 in XML.
 
@@ -114,7 +114,7 @@ wn-server/
     library/scanner.rs        walk, diff, move detection, upsert, delete, aggregate
     library/covers.rs         cover resolution, resize, disk cache
     auth/mod.rs               verify password and token
-    auth/extract.rs           Authed(User) extractor
+    auth/extract.rs           authenticate, Authed(User) extractor
     api/mod.rs                Router, /rest/{method} table, AppState
     api/params.rs             Params multimap and typed getters
     api/envelope.rs           SubsonicResponse, Format, ApiError
@@ -410,22 +410,35 @@ A command that fails prints `wn-server: <error>` to stderr and exits with 1. A u
 
 `scan` while `run` is active works through WAL and `busy_timeout`; `getScanStatus` reports only scans the server process started.
 
+`run` opens `library.db` and needs its owner account, because every request acts as a user. It creates neither. When the file does not exist or has no owner row, `run` fails before it binds the address, and the error names `wn-server init`, which creates what is missing and keeps `config.toml`.
+
 ### 3.7 Authentication
 
-`auth::verify(user, params) -> Result<(), ApiError>`:
+Every method needs a user, except `getOpenSubsonicExtensions`, which is public. The router authenticates a request before it calls the handler of the method (§3.8). The check does not depend on the handler, so a method that a change adds to the method table is protected without any step in that change. `api::PUBLIC_METHODS` lists the public methods, and a test compares it with the rows that §4 marks `public`.
 
-- `p` present, `t` and `s` absent: compare with the stored password (constant time); `enc:` prefix means hex-decoded. A value with the prefix and invalid hex matches nothing (`auth::verify_password`).
-- `t` and `s` present, `p` absent: `md5(password + s)` as lower-case hex equals `t`, compared in constant time; upper-case hex does not match (`auth::verify_token`).
-- `apiKey` present: error 42. `apiKey` with `u`: error 43. `p` with `t`: error 43. Nothing: error 10. Unknown user or wrong credential: error 40.
+`auth::extract::authenticate(auth, db, params) -> Result<User, ApiError>` applies these rules in this order:
 
-`Authed(User)` is an axum extractor over `Params`. With `auth.disabled_unsafe = true` it returns the owner without checks and `run` logs a warning at startup. `getOpenSubsonicExtensions` is public. Failed attempts are logged with username and client, never the credential.
+1. `v` and `c` are required: error 10 naming the parameter. The value of `v` is not compared.
+2. With `auth.disabled_unsafe = true` the user is the owner, and no other parameter is read.
+3. `apiKey` alone: error 42. `apiKey` with `u`, `p`, `t` or `s`: error 43. `p` with `t` or `s`: error 43.
+4. `u` absent: error 10 naming `u`. None of `p`, `t` and `s`: error 10 naming `p, or t and s`. `t` without `s`, or `s` without `t`: error 10 naming the absent one.
+5. The account is looked up by `u` without regard to ASCII case. `p` is compared with the stored password in constant time; an `enc:` prefix means hex-encoded, and a value with the prefix and invalid hex matches nothing (`auth::verify_password`). `t` must equal `md5(password + s)` as lower-case hex, compared in constant time; upper-case hex does not match (`auth::verify_token`). An unknown name and a wrong credential are both error 40 with the same message. The credential of an unknown name is checked against an empty password, so both cases run the same steps.
 
-Remote-mode seam: `users.role` and `auth::verify` are the only places that turn parameters into a `User`. Guests and API keys extend that function and add a table.
+Rules 1, 3 and 4 read no account, so their answers do not depend on the accounts of the server. An empty value is a value: `p=` is a password and `apiKey=` is an API key.
+
+`Authed(User)` is the axum extractor through which a handler receives the user. It returns the user that the router stored in the request. For a request that the router did not authenticate it applies the rules itself, so a handler that takes `Authed` never runs without a user.
+
+A request that breaks a rule is logged at `info` with the values of `u` and `c`, each cut to 64 characters, and the error code. The values of `p`, `t`, `s` and `apiKey` are never logged and are never part of an error message: an error names a parameter and holds no value of the request.
+
+With `auth.disabled_unsafe = true`, `run` logs a warning at startup that names the key and says that the setting is unsafe. Every request that has `v` and `c` then acts as the owner.
+
+Remote-mode seam: `users.role` and `auth::extract::authenticate` are the only places that turn parameters into a `User`. Guests and API keys extend that function and add a table.
 
 ### 3.8 Request pipeline and envelope
 
 - Routes `/rest/{method}` and `/rest/{method}.view` for GET and POST, one route with a path parameter. A static method table maps every name in §4 to a handler; names not yet implemented map to `not_implemented`, which returns error 0 with message `not supported`. Unknown names return error 0 with `unknown endpoint`. Paths outside `/rest/` return 404. Another HTTP method on the route returns 405.
 - `AppState { config, db, covers, transcoder, scan, cancel, started_at }` is shared through `State`.
+- The router handles a request in this order: it reads the parameters, selects the format, looks up the method, authenticates the request unless the method is public (§3.7), and calls the handler. An unsupported format, a form body that cannot be read and an unknown method name are therefore answered without a user. Every other response of a method that is not public needs one, including the `not supported` error of a method without a handler.
 - `Params` is a multimap of query-string and form-body fields (`application/x-www-form-urlencoded` on POST; body values append to query values). A form body larger than 8 MiB returns error 0, which bounds the memory a request takes before it is authenticated; a POST body of another content type is not read. `req_str`, `opt_str`, `opt_i64`, `opt_u32` and `opt_bool` read the first value of a name; `all(name) -> Vec<&str>` returns every value. A missing required parameter maps to error 10 naming the parameter. For the typed getters an empty value counts as absent and a value of the wrong type returns error 0 naming the parameter; `opt_bool` accepts `true` and `false` in any letter case.
 - A handler is an axum handler function. Its arguments are extractors (`Params`, `State<AppState>`, `Authed`), and the method table holds it through the `handler!` macro. Handlers return `Result<Payload, ApiError>`; `Payload` is a key plus a serialisable value, or empty. Neither knows the format, so the router renders the envelope after the handler returns. `Format` is parsed from `f` before dispatch so errors use the requested format: `json` selects JSON, and `xml` or an absent `f` selects XML. Any other value, `jsonp` included, returns error 0 with message `unsupported format`, rendered in XML.
 - JSON envelope: `{"subsonic-response": {"status":"ok","version":"1.16.1","type":"wn-server","serverVersion":"<crate version>","openSubsonic":true, "<key>": ...}}`, with content type `application/json`. XML: the declaration `<?xml version="1.0" encoding="UTF-8"?>` followed by `<subsonic-response xmlns="http://subsonic.org/restapi" status="ok" version="1.16.1" type="wn-server" serverVersion="..." openSubsonic="true"><key .../></subsonic-response>`, with content type `application/xml`. The envelope fields are written in this order in both formats.
@@ -509,7 +522,7 @@ One `CancellationToken` in `AppState`. `ctrl_c`, SIGTERM (Unix) and `ctrl_close`
 
 1. `server::run` owns the single `TcpListener`; remote mode adds a TLS-terminating listener fed by the relay and tags its connections.
 2. `media::stream::decide` gains a connection-kind argument; it is the only function that decides lossy versus lossless.
-3. `users.role` and `auth::verify` extend to guests and API keys.
+3. `users.role` and `auth::extract::authenticate` extend to guests and API keys.
 4. The cloud client attaches as a new module with its own background task started from `server::run`.
 5. `annotations`, `playlists` and `play_queue` already carry `user_id`.
 
@@ -555,9 +568,10 @@ Amperfy calls `ping, getOpenSubsonicExtensions, getMusicFolders, getIndexes, get
 
 - `cargo xtask check` runs `cargo fmt --all -- --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings` and `cargo test --locked --workspace`. The default suite finishes in under 30 s after compiling, in a debug build, on every OS. No network, no audio hardware, no ffmpeg, real SQLite (memory or temp file), no mocks of the database. No test sleeps or polls for more than 1 s; timing values are fields of config structs that tests set to tens of milliseconds.
 - Fixtures: `tests/fixtures/audio/` holds `a.flac`, `a.mp3`, `a.m4a`, `a.ogg`, `a.opus`, generated by `scripts/make-fixtures.sh` from a 0.5 s mono 440 Hz sine. The sample rate is 22.05 kHz, except for `a.opus`, which is 24 kHz because libopus does not accept 22.05 kHz. The files total about 24 KB and each is under 16 KB; a test enforces a 64 KB budget. They carry no tag fields.
-- `tests/common/mod.rs`: `LibraryBuilder` copies fixtures into a temp directory as `<Artist>/<Album>/<nn> <Title>.<ext>` and writes tags with lofty; `LibraryBuilder::standard()` builds 3 artists, 4 albums, 10 tracks (one compilation, one album with `cover.jpg`, one with embedded art, one track with a lyrics tag, one album with tracks on two discs). Names are valid on Windows and differ by more than case. `TestServer` builds the router over a scanned standard library and offers `get_json(method, params)`, `get_xml`, `get_raw`, `post_form`.
+- `tests/common/mod.rs`: `LibraryBuilder` copies fixtures into a temp directory as `<Artist>/<Album>/<nn> <Title>.<ext>` and writes tags with lofty; `LibraryBuilder::standard()` builds 3 artists, 4 albums, 10 tracks (one compilation, one album with `cover.jpg`, one with embedded art, one track with a lyrics tag, one album with tracks on two discs). Names are valid on Windows and differ by more than case. `TestServer` builds the router over a scanned standard library and offers `get_json(method, params)`, `get_xml`, `get_raw`, `post_form`. Its database is in memory and holds the owner `owner` with the password `sesame`. The four helpers add the auth defaults to the parameters of the caller: `u`, a token `t` with a new salt `s` for each request, `v` and `c`; a default whose name the caller passes is left out. `get_json_noauth` and `get_raw_noauth` send the parameters of the caller and no other.
 - Unit tests sit next to the code: IDs and fingerprints, tag mapping, `decide`, envelope and XML rendering, config, auth verification, LRC parsing, cover resize, argv builders.
 - Router tests in `tests/` call the router in-process with `tower::ServiceExt::oneshot`. Every endpoint has a JSON test; the envelope has XML tests.
+- `tests/auth.rs` covers every rule of §3.7. For every method of the table that is not public it checks that a request without a user gets the authentication error and does not reach the handler. A unit test in `api/mod.rs` adds a method whose handler takes no `Authed` to a table and checks the same. The log of the failed attempts is captured and holds no password, token or salt.
 - `tests/cli.rs` runs the binary with `std::process::Command` for `init`, `user show`, `user set-password`, `config path` and `config show`. Every run that writes names a temp data directory. The password tests read the stored password from the database and check it with `auth::verify_password`.
 - `tests/tags.rs` reads tracks that `LibraryBuilder` tagged, in the five fixture formats, through `library::tags`. The unit tests in `src/library/tags.rs` cover the mapping rules, unreadable files, and WAV and AIFF files that the tests build in memory.
 - Transcoding: the default suite uses `FakeTranscoder`, which returns known bytes and records the job. One `#[ignore]` test runs real ffmpeg.

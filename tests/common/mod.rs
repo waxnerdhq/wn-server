@@ -8,6 +8,7 @@
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Instant;
 
@@ -20,11 +21,14 @@ use lofty::config::WriteOptions;
 use lofty::file::FileType;
 use lofty::picture::{MimeType, Picture, PictureType};
 use lofty::tag::{ItemKey, Tag, TagExt};
+use md5::{Digest, Md5};
 use serde_json::Value;
 use tempfile::TempDir;
 use tower::ServiceExt;
 use wn_server::api::{self, AppState};
 use wn_server::config::Config;
+use wn_server::db::Db;
+use wn_server::db::queries::users;
 
 /// The picture that [`LibraryBuilder::picture`] embeds: a 2×2 PNG, 8-bit RGB,
 /// with one red, one green, one blue and one white pixel.
@@ -345,23 +349,96 @@ fn write_tags(path: &Path, track: &TrackSpec) {
         .unwrap_or_else(|error| panic!("write the tag of {}: {error}", path.display()));
 }
 
+/// The name of the owner account of a [`TestServer`].
+pub const OWNER: &str = "owner";
+
+/// The password of the owner account of a [`TestServer`].
+pub const OWNER_PASSWORD: &str = "sesame";
+
+/// The value of `v` in the auth defaults of a [`TestServer`].
+pub const API_VERSION: &str = "1.16.1";
+
+/// The value of `c` in the auth defaults of a [`TestServer`].
+pub const CLIENT: &str = "wn-server-tests";
+
+/// The Subsonic token of `password` for `salt`: the MD5 digest of the
+/// password followed by the salt, as lower-case hex.
+pub fn token(password: &str, salt: &str) -> String {
+    let mut hasher = Md5::new();
+    hasher.update(password.as_bytes());
+    hasher.update(salt.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+/// The parameters that authenticate one request as the owner of a
+/// [`TestServer`]: `u`, a token `t` with its salt `s`, `v` and `c`. Every
+/// value of this type has another salt.
+struct AuthDefaults {
+    salt: String,
+    token: String,
+}
+
+impl AuthDefaults {
+    fn new() -> Self {
+        static REQUESTS: AtomicU64 = AtomicU64::new(0);
+        let salt = format!("salt{:08x}", REQUESTS.fetch_add(1, Ordering::Relaxed));
+        let token = token(OWNER_PASSWORD, &salt);
+        Self { salt, token }
+    }
+
+    /// `params` followed by the defaults. A default whose name `params`
+    /// holds is left out.
+    fn after<'a>(&'a self, params: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+        let defaults = [
+            ("u", OWNER),
+            ("t", self.token.as_str()),
+            ("s", self.salt.as_str()),
+            ("v", API_VERSION),
+            ("c", CLIENT),
+        ];
+        let mut merged = params.to_vec();
+        for (name, value) in defaults {
+            if !params.iter().any(|(given, _)| *given == name) {
+                merged.push((name, value));
+            }
+        }
+        merged
+    }
+}
+
 /// The server under test: the router of `wn_server::api`, called in the test
 /// process. No socket is opened.
+///
+/// The database is in memory and holds the owner [`OWNER`] with the password
+/// [`OWNER_PASSWORD`].
+///
+/// `get_raw`, `get_json`, `get_xml` and `post_form` add the auth defaults to
+/// the parameters of the caller: `u`, a token `t` with a new salt `s`, `v` and
+/// `c`. A default whose name the caller passes is left out. `get_raw_noauth`,
+/// `get_json_noauth`, `get_path` and `request` add no auth default. A test
+/// that sends a password, an API key or no credential uses them.
 pub struct TestServer {
     router: Router,
 }
 
 impl TestServer {
-    /// A server with the state that `config` gives and nothing else. The
-    /// music folders of `config` are not read.
-    pub fn bare(config: Config) -> Self {
+    /// A server with the state that `config` gives, a database that holds
+    /// the owner account, and nothing else. The music folders of `config`
+    /// are not read.
+    pub async fn bare(config: Config) -> Self {
+        let db = Db::open_memory().expect("open a memory database");
+        db.write(|conn| users::insert_owner(conn, OWNER, OWNER_PASSWORD))
+            .await
+            .expect("insert the owner")
+            .expect("a new database has no owner");
+
         // The fields follow the layout rule in the module comment of
         // `wn_server::api`.
         #[rustfmt::skip]
         let state = AppState {
             config: Arc::new(config),
 
-            // db
+            db,
 
             // covers
 
@@ -395,8 +472,16 @@ impl TestServer {
         self.request(request).await
     }
 
-    /// Sends `GET /rest/<method>` with `params` in the query string.
+    /// Sends `GET /rest/<method>` with `params` and the auth defaults in the
+    /// query string.
     pub async fn get_raw(&self, method: &str, params: &[(&str, &str)]) -> Response {
+        let auth = AuthDefaults::new();
+        self.get_raw_noauth(method, &auth.after(params)).await
+    }
+
+    /// Sends `GET /rest/<method>` with `params` in the query string and no
+    /// other parameter.
+    pub async fn get_raw_noauth(&self, method: &str, params: &[(&str, &str)]) -> Response {
         let query = urlencode(params);
         if query.is_empty() {
             self.get_path(&format!("/rest/{method}")).await
@@ -405,20 +490,29 @@ impl TestServer {
         }
     }
 
-    /// Sends `GET /rest/<method>` with `params` and `f=json`. Checks that the
-    /// response is HTTP 200 with the JSON content type. Returns the value of
-    /// `subsonic-response`.
+    /// Sends `GET /rest/<method>` with `params`, the auth defaults and
+    /// `f=json`. Checks that the response is HTTP 200 with the JSON content
+    /// type. Returns the value of `subsonic-response`.
     pub async fn get_json(&self, method: &str, params: &[(&str, &str)]) -> Value {
+        let auth = AuthDefaults::new();
+        self.get_json_noauth(method, &auth.after(params)).await
+    }
+
+    /// Sends `GET /rest/<method>` with `params` and `f=json`, and no other
+    /// parameter. Checks that the response is HTTP 200 with the JSON content
+    /// type. Returns the value of `subsonic-response`.
+    pub async fn get_json_noauth(&self, method: &str, params: &[(&str, &str)]) -> Value {
         let mut params = params.to_vec();
         params.push(("f", "json"));
-        let response = self.get_raw(method, &params).await;
+        let response = self.get_raw_noauth(method, &params).await;
         assert_eq!(response.status(), StatusCode::OK, "{method}");
         assert_eq!(content_type(&response), "application/json", "{method}");
         subsonic_response(&body_string(response).await)
     }
 
-    /// Sends `GET /rest/<method>` with `params`. Checks that the response is
-    /// HTTP 200 with the XML content type. Returns the body.
+    /// Sends `GET /rest/<method>` with `params` and the auth defaults. Checks
+    /// that the response is HTTP 200 with the XML content type. Returns the
+    /// body.
     pub async fn get_xml(&self, method: &str, params: &[(&str, &str)]) -> String {
         let response = self.get_raw(method, params).await;
         assert_eq!(response.status(), StatusCode::OK, "{method}");
@@ -426,14 +520,23 @@ impl TestServer {
         body_string(response).await
     }
 
-    /// Sends `POST /rest/<method>` with `params` as the form body.
+    /// Sends `POST /rest/<method>` with `params` and the auth defaults as the
+    /// form body.
     pub async fn post_form(&self, method: &str, params: &[(&str, &str)]) -> Response {
-        let request = Request::post(format!("/rest/{method}"))
-            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-            .body(Body::from(urlencode(params)))
-            .unwrap_or_else(|error| panic!("POST {method}: {error}"));
+        let auth = AuthDefaults::new();
+        let request = form_request(&format!("/rest/{method}"), &auth.after(params));
         self.request(request).await
     }
+}
+
+/// A `POST <path>` request with `params` as the form body and no other
+/// parameter. `path` is the path and the query string as the request line
+/// holds them.
+pub fn form_request(path: &str, params: &[(&str, &str)]) -> Request<Body> {
+    Request::post(path)
+        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+        .body(Body::from(urlencode(params)))
+        .unwrap_or_else(|error| panic!("POST {path}: {error}"))
 }
 
 /// The value of the `Content-Type` header of `response`. An empty string when

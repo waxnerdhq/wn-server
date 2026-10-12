@@ -1,9 +1,11 @@
-//! Credential verification and password generation (`docs/design.md`
-//! sections 1.3 and 3.7).
+//! Credential verification, request authentication and password generation
+//! (`docs/design.md` sections 1.3 and 3.7).
 //!
 //! The password of a user is stored as plain text, because the Subsonic
 //! token check needs the password itself. No function of this module logs a
 //! password, a token or a salt, or puts one in an error or a panic message.
+
+pub mod extract;
 
 use std::hint::black_box;
 

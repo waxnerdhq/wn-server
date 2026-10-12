@@ -81,7 +81,7 @@ The password is stored in plain text in `library.db`. Subsonic token authenticat
 | `server.port` | `4200` | TCP port; not 0 |
 | `server.name` | the host name | instance name shown by discovery |
 | `server.log_level` | `"info"` | log filter; `RUST_LOG` overrides it when set |
-| `auth.disabled_unsafe` | `false` | `true` turns authentication off |
+| `auth.disabled_unsafe` | `false` | `true` turns authentication off; unsafe, see [Authentication](#authentication) |
 | `library.folders` | `[]` | music folders; at least one, and each is an existing directory |
 | `library.scan_on_start` | `true` | scan the folders when the server starts |
 | `library.rescan_interval_minutes` | `0` | minutes between periodic scans; 0 disables them |
@@ -110,13 +110,35 @@ wn-server run
 
 `run` loads `config.toml`, listens on `server.bind` and `server.port` (`0.0.0.0:4200` by default) and logs the address. Ctrl-C stops the server. Requests that are in progress are answered first.
 
+`run` opens `library.db` and needs the owner account in it. `run` creates neither and fails at startup when one is missing. `wn-server init` then creates what is missing and keeps `config.toml` (see [Owner account](#owner-account)).
+
 Logs go to stderr. `server.log_level` is the log filter, for example `info` or `warn,wn_server=debug`. The `RUST_LOG` environment variable replaces it when it is set and not empty. The log names the method, the client (`c`) and the user (`u`) of a request, each cut to 64 characters. It never holds the query string or the form body.
+
+## Authentication
+
+Every API method needs a user, except `getOpenSubsonicExtensions`. The server checks the request before the method runs. A client sends the name of the owner account in `u` and one of these credentials:
+
+- `p`: the password, as it is or as `enc:` followed by its hex encoding.
+- `t` and `s`: a token and its salt. The token is the MD5 digest of the password followed by the salt, in lower-case hex.
+
+`v` and `c` are required. The value of `v` is not compared. The name in `u` is matched without regard to ASCII case.
+
+| Request | Error |
+|---|---|
+| `v`, `c` or `u` is absent, or the request has no credential, or it has `t` without `s` or `s` without `t` | 10, naming the parameter |
+| the user is unknown, or the password or the token is wrong | 40 |
+| `apiKey` alone; the server has no API keys | 42 |
+| `apiKey` with `u`, `p`, `t` or `s`, or `p` with `t` or `s` | 43 |
+
+The response does not tell an unknown user from a wrong password. A failed attempt is logged at the `info` level with the values of `u` and `c`, each cut to 64 characters, and the error code. A password, a token or a salt is never logged and is never part of an error message.
+
+`auth.disabled_unsafe = true` turns authentication off. This is unsafe: every request that has `v` and `c` then acts as the owner without a password, for anyone who can reach the port. `run` logs a warning at startup while the setting is on.
 
 ## API
 
-The server answers OpenSubsonic requests at `/rest/<method>` and `/rest/<method>.view`, for GET and POST. A POST may carry parameters in an `application/x-www-form-urlencoded` body of up to 8 MiB. When a parameter is in the query string and in the body, the values of the query string come first. Any other path returns HTTP 404.
+The server answers OpenSubsonic requests at `/rest/<method>` and `/rest/<method>.view`, for GET and POST. A POST may carry parameters in an `application/x-www-form-urlencoded` body of up to 8 MiB, the credentials included; `getOpenSubsonicExtensions` lists this as the `formPost` extension. When a parameter is in the query string and in the body, the values of the query string come first. Any other path returns HTTP 404.
 
 - `f=json` selects JSON. `f=xml` or no `f` selects XML. Any other value, `jsonp` included, returns error 0 in XML.
 - An API error is an HTTP 200 response with the status `failed` and an `error` element that holds the Subsonic error code and a message.
-- The server does not check the credentials of a request.
+- The check of the user comes before the method. A request without a user gets the authentication error from every method except `getOpenSubsonicExtensions`, also from a method that the server does not serve.
 - A method of the OpenSubsonic API that the server does not serve returns error 0 with the message `not supported`. A name that is not an OpenSubsonic method returns error 0 with the message `unknown endpoint`.
