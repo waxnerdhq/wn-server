@@ -6,10 +6,11 @@
 # ci-wait.sh reported success for that commit.
 #
 # The script merges only when the PR is open, its head commit is
-# <expected-head-sha>, GitHub reports the merge state CLEAN, the combined
-# commit status of the head commit is success, and the PR title starts with
-# "<WAX-id>:". It then squash-merges with the subject "<title> (#<pr>)" and
-# deletes the remote branch.
+# <expected-head-sha>, GitHub reports the merge state CLEAN, the head commit
+# contains the head of main on GitHub, the combined commit status of the head
+# commit is success, and the PR title starts with "<WAX-id>:". It then
+# squash-merges with the subject "<title> (#<pr>)" and deletes the remote
+# branch.
 #
 # After the merge it removes the lane's worktree and local branches,
 # fast-forwards main in the main checkout, and moves the Linear issue to Done.
@@ -74,6 +75,14 @@ case "$MSS" in
     BEHIND | DIRTY) die "not clean: needs rebase" ;;
     *) die "not clean: merge state is $MSS" ;;
 esac
+# GitHub reports CLEAN for a branch that lacks commits of main and does not
+# conflict with them. The check pipeline runs on the head commit of the PR and
+# not on main, so the merge commit has a checked tree only when the head commit
+# contains the head of main. behind_by is the number of commits of main that
+# the head commit lacks. A read that fails leaves BEHIND empty and ends the
+# script like a value other than 0.
+BEHIND=$(gh api "repos/$REPO/compare/main...$HEAD" --jq .behind_by) || BEHIND=
+[ "$BEHIND" = 0 ] || die "not up to date with main: run prep-lane.sh"
 CI=$(gh api "repos/$REPO/commits/$HEAD/status" --jq '.state + " " + (.total_count|tostring)') || die "cannot read the commit status"
 if [ "${CI% *}" != success ] || [ "${CI#* }" = 0 ]; then
     die "ci not green: $CI"

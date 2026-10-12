@@ -3,8 +3,9 @@
 #
 # The pipeline does not run on pushes to main. The merge sequence in AGENTS.md
 # rebases a pull request on main, waits for this pipeline on the rebased head
-# commit, and squash-merges one pull request at a time. The merge commit on
-# main therefore has the tree that this pipeline checked.
+# commit, and squash-merges that commit only when it contains the head of
+# main. The merge commit on main therefore has the tree that this pipeline
+# checked.
 #
 # What the pipeline verifies for each OS:
 #
