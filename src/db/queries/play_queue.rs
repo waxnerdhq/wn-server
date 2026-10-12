@@ -18,6 +18,12 @@
 //! and so on. A request names the current song by its ID. When the queue
 //! holds that song several times, its first entry is the one at position 0.
 //!
+//! [`replace_without_current`] stores a queue that has entries and no current
+//! song. `play_queue.current_id` then holds no value, and the entries are at
+//! the positions 1, 2 and so on. No entry is at position 0, which is the
+//! place of the entry of a current song. [`get`] reports the first entry of
+//! such a queue as the current song, with the position 0.
+//!
 //! The deletion of a track row deletes the entries of the track (`ON DELETE
 //! CASCADE`) and writes no other row. The entries that are left keep their
 //! positions and so their order. `play_queue.current_id` has no foreign key
@@ -25,12 +31,27 @@
 //! followed the deleted one as the current song, which the stored positions
 //! name: it is the first entry at a position above 0.
 //!
+//! A queue whose current track was deleted and a queue that was stored
+//! without a current song are two states. The first has the ID of the
+//! deleted track in `current_id`, and [`get`] reports the entry that followed
+//! the deleted one. The second has no value there, and [`get`] reports its
+//! first entry, which after a deletion is the first of the entries that are
+//! left. [`get`] reads the column before the positions.
+//!
+//! The two states differ in the stored positions as well. The entries of the
+//! first lie around position 0, the place of the deleted track, and the
+//! entries of the second are at 1 and above. Two queues with the same tracks
+//! in the same order can therefore have two current songs. On the positions
+//! that [`replace_without_current`] stores, the first entry is also the
+//! first entry above position 0.
+//!
 //! # Writes
 //!
-//! [`replace`] and [`clear`] each run in one `IMMEDIATE` transaction.
-//! [`replace`] checks the whole request before its first write. A request
-//! that it refuses ([`Refusal`]) and a write that fails change nothing, and
-//! a reader finds the queue of one request and never rows of two.
+//! [`replace`], [`replace_without_current`] and [`clear`] each run in one
+//! `IMMEDIATE` transaction. The first two check the whole request before
+//! their first write. A request that they refuse ([`Refusal`]) and a write
+//! that fails change nothing, and a reader finds the queue of one request
+//! and never rows of two.
 //!
 //! Every value of a request is a parameter of a statement. The list of track
 //! IDs is one parameter, a JSON array that the statement reads with
@@ -51,6 +72,13 @@ use crate::db::Result;
 /// (`api::FORM_BODY_LIMIT`).
 pub const MAX_ENTRIES: usize = 100_000;
 
+/// The stored position of the first entry of a queue without a current song.
+///
+/// Position 0 is the place of the entry of a current song, and the positions
+/// below it are the places of the entries before that song. A queue without
+/// a current song has an entry at none of them.
+const FIRST_WITHOUT_CURRENT: i64 = 1;
+
 /// The play queue of one user.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Queue {
@@ -63,7 +91,8 @@ pub struct Queue {
     /// `None` for a queue without an entry.
     pub current: Option<String>,
     /// The position within the current song in milliseconds. 0 for a queue
-    /// without an entry.
+    /// without an entry and for a queue that was stored without a current
+    /// song.
     pub position_ms: u64,
     /// The time of the last request that stored the queue, in Unix seconds.
     /// The deletion of a track row does not change it. For a user that
@@ -74,7 +103,7 @@ pub struct Queue {
     pub changed_by: String,
 }
 
-/// Why [`replace`] changed nothing.
+/// Why [`replace`] or [`replace_without_current`] changed nothing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Refusal {
     /// The request holds more than [`MAX_ENTRIES`] track IDs.
@@ -85,8 +114,8 @@ pub enum Refusal {
     NoTrack,
 }
 
-/// What [`replace`] returns when the database answered: nothing, or the
-/// reason for which nothing was written.
+/// What [`replace`] and [`replace_without_current`] return when the database
+/// answered: nothing, or the reason for which nothing was written.
 pub type Outcome<T> = std::result::Result<T, Refusal>;
 
 /// Returns the play queue of the user `user_id`, or `None` when no user has
@@ -101,6 +130,10 @@ pub type Outcome<T> = std::result::Result<T, Refusal>;
 /// followed it, and the track of the last entry when none followed. The
 /// position is then 0, because the stored one is a position within the
 /// deleted track.
+///
+/// For a queue that [`replace_without_current`] stored, the current song is
+/// the track of the first entry, and the position is 0. After the deletion
+/// of track rows it is the track of the first entry that is left.
 ///
 /// The function runs two statements. The caller runs it in one transaction,
 /// so both read one state of the database.
@@ -172,17 +205,44 @@ pub fn replace<S: AsRef<str>>(
     }
     store_head(&tx, user_id, Some(current), position_ms, client, at)?;
     delete_entries(&tx, user_id)?;
-    // `key` is the index of an item in the JSON array, counted from 0, so
-    // the entry of the current song gets position 0.
-    tx.prepare_cached(
-        "INSERT INTO play_queue_tracks (user_id, position, track_id)
-         SELECT ?1, key - ?2, value FROM json_each(?3)",
-    )?
-    .execute(params![
-        user_id,
-        int::to_sql(current_place as u64)?,
-        json_array(track_ids)
-    ])?;
+    // The first entry is as far below 0 as the current song is from the
+    // start of the list, so the entry of the current song gets position 0.
+    insert_entries(&tx, user_id, track_ids, -int::to_sql(current_place as u64)?)?;
+    tx.commit()?;
+    Ok(Ok(()))
+}
+
+/// Replaces the play queue of the user `user_id` with one entry for each ID
+/// of `track_ids`, in that order, and without a current song. `client` is
+/// the name of the client that sends the request, and `at` the time of the
+/// request in Unix seconds. The queue then has the position 0.
+///
+/// `play_queue.current_id` gets no value, and the entries get the positions
+/// from [`FIRST_WITHOUT_CURRENT`] upwards. Without a track ID the function
+/// stores a queue without an entry, as [`clear`] does.
+///
+/// The request is refused, and the stored queue stays as it is, in these
+/// cases, which are checked in this order:
+///
+/// - [`Refusal::TooLong`]: `track_ids` holds more than [`MAX_ENTRIES`] IDs.
+/// - [`Refusal::NoTrack`]: an ID of `track_ids` is the ID of no track row.
+pub fn replace_without_current<S: AsRef<str>>(
+    conn: &mut Connection,
+    user_id: i64,
+    track_ids: &[S],
+    client: &str,
+    at: i64,
+) -> Result<Outcome<()>> {
+    if track_ids.len() > MAX_ENTRIES {
+        return Ok(Err(Refusal::TooLong));
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if !tracks_exist(&tx, track_ids)? {
+        return Ok(Err(Refusal::NoTrack));
+    }
+    store_head(&tx, user_id, None, 0, client, at)?;
+    delete_entries(&tx, user_id)?;
+    insert_entries(&tx, user_id, track_ids, FIRST_WITHOUT_CURRENT)?;
     tx.commit()?;
     Ok(Ok(()))
 }
@@ -204,6 +264,9 @@ pub fn clear(conn: &mut Connection, user_id: i64, client: &str, at: i64) -> Resu
 /// `play_queue` row, and `entries` the stored position and the track ID of
 /// each entry in the order of the positions.
 ///
+/// - Without a value of `stored`, the queue was stored without a current
+///   song. The result is the track of its first entry, whatever the stored
+///   positions are, and the position is 0.
 /// - While an entry holds the track `stored`, the result is the stored
 ///   values.
 /// - Otherwise the row of that track was deleted. The result is the track of
@@ -216,9 +279,11 @@ fn current_song(
     position_ms: u64,
     entries: &[(i64, String)],
 ) -> (Option<String>, u64) {
-    let queued = |id: &String| entries.iter().any(|(_, track_id)| track_id == id);
-    if let Some(id) = stored.filter(queued) {
-        return (Some(id), position_ms);
+    let Some(stored) = stored else {
+        return (entries.first().map(|(_, track_id)| track_id.clone()), 0);
+    };
+    if entries.iter().any(|(_, track_id)| *track_id == stored) {
+        return (Some(stored), position_ms);
     }
     let next = entries
         .iter()
@@ -286,6 +351,24 @@ fn store_head(
 fn delete_entries(conn: &Connection, user_id: i64) -> Result<()> {
     conn.prepare_cached("DELETE FROM play_queue_tracks WHERE user_id = ?1")?
         .execute([user_id])?;
+    Ok(())
+}
+
+/// Inserts one entry of the queue of the user `user_id` for each ID of
+/// `track_ids`, in that order. The first entry gets the position `first`,
+/// and each other entry the position after that of the entry before it.
+fn insert_entries<S: AsRef<str>>(
+    conn: &Connection,
+    user_id: i64,
+    track_ids: &[S],
+    first: i64,
+) -> Result<()> {
+    // `key` is the index of an item in the JSON array, counted from 0.
+    conn.prepare_cached(
+        "INSERT INTO play_queue_tracks (user_id, position, track_id)
+         SELECT ?1, ?2 + key, value FROM json_each(?3)",
+    )?
+    .execute(params![user_id, first, json_array(track_ids)])?;
     Ok(())
 }
 
@@ -394,6 +477,14 @@ mod tests {
         fn save(&self, user: i64, track_ids: &[&str], current: &str, client: &str) -> Outcome<()> {
             self.db
                 .with_writer(|conn| replace(conn, user, track_ids, current, 0, client, NOW))
+                .unwrap()
+        }
+
+        /// Stores a queue of `user` with `track_ids` and without a current
+        /// song, as the client `client` at [`NOW`].
+        fn save_without_current(&self, user: i64, track_ids: &[&str], client: &str) -> Outcome<()> {
+            self.db
+                .with_writer(|conn| replace_without_current(conn, user, track_ids, client, NOW))
                 .unwrap()
         }
 
@@ -986,6 +1077,304 @@ mod tests {
             Err(Refusal::TooLong)
         );
         assert_eq!(stored(), (limit, Some(1 - limit), Some(0)));
+    }
+
+    #[test]
+    fn replace_without_current_stores_no_current_song_and_get_reports_the_first_entry() {
+        let library = library();
+        let owner = library.owner;
+        // The queue before the request has a current song and a position.
+        let stored = library
+            .db
+            .with_writer(|conn| replace(conn, owner, &[T4, T1], T1, 777, "Phone", NOW))
+            .unwrap();
+        assert_eq!(stored, Ok(()));
+
+        let stored = library
+            .db
+            .with_writer(|conn| {
+                replace_without_current(conn, owner, &[T3, T1, T3, T2], "Tuner", LATER)
+            })
+            .unwrap();
+        assert_eq!(stored, Ok(()));
+
+        // The row has no current song and the position 0. The entries have
+        // the order of the request, and none is at position 0 or below it.
+        // The current song and the position of the queue before the request
+        // are not kept.
+        assert_eq!(
+            library.everything(),
+            [
+                format!("{owner}|NULL|0|{LATER}|Tuner"),
+                format!("{owner}|1|{T3}"),
+                format!("{owner}|2|{T1}"),
+                format!("{owner}|3|{T3}"),
+                format!("{owner}|4|{T2}"),
+            ]
+        );
+        assert_eq!(
+            library.get(owner),
+            Queue {
+                username: "owner".to_owned(),
+                track_ids: list_of(&[T3, T1, T3, T2]),
+                // The read reports the track of the first entry.
+                current: Some(T3.to_owned()),
+                position_ms: 0,
+                changed_at: LATER,
+                changed_by: "Tuner".to_owned(),
+            }
+        );
+
+        // The next request with a current song stores a queue as before.
+        assert_eq!(library.save(owner, &[T2, T4, T1], T4, "Phone"), Ok(()));
+        assert_eq!(library.entries(owner), around(1, &[T2, T4, T1]));
+        assert_eq!(library.get(owner).current.as_deref(), Some(T4));
+
+        // Without a track ID the queue has no entry, as after `clear`.
+        assert_eq!(library.save_without_current(owner, &[], "Tuner"), Ok(()));
+        assert_eq!(library.entries(owner), []);
+        assert_eq!(library.get(owner).current, None);
+        assert_eq!(
+            library.head(owner),
+            Some((None, 0, NOW, "Tuner".to_owned()))
+        );
+    }
+
+    #[test]
+    fn replace_without_current_writes_the_queue_of_its_user_only() {
+        let library = library();
+        let Library { owner, guest, .. } = library;
+        // The queue of the owner has entries, a current song and a position.
+        let stored = library
+            .db
+            .with_writer(|conn| replace(conn, owner, &[T1, T2, T3], T2, 777, "Phone", NOW))
+            .unwrap();
+        assert_eq!(stored, Ok(()));
+        let head_of_owner = format!("{owner}|'{T2}'|777|{NOW}|Phone");
+        let entries_of_owner = [
+            format!("{owner}|-1|{T1}"),
+            format!("{owner}|0|{T2}"),
+            format!("{owner}|1|{T3}"),
+        ];
+        let of_owner = library.get(owner);
+
+        // The guest has no row yet. The request writes the row and the
+        // entries of the guest, and no row of the owner.
+        assert_eq!(
+            library.save_without_current(guest, &[T4, T1], "Tablet"),
+            Ok(())
+        );
+        let mut rows = vec![
+            head_of_owner.clone(),
+            format!("{guest}|NULL|0|{NOW}|Tablet"),
+        ];
+        rows.extend(entries_of_owner.iter().cloned());
+        rows.extend([format!("{guest}|1|{T4}"), format!("{guest}|2|{T1}")]);
+        assert_eq!(library.everything(), rows);
+        // Each user reads the queue that this user stored.
+        assert_eq!(library.get(owner), of_owner);
+        let of_guest = library.get(guest);
+        assert_eq!(of_guest.username, "guest");
+        assert_eq!(of_guest.track_ids, [T4, T1]);
+        assert_eq!(of_guest.current.as_deref(), Some(T4));
+
+        // The guest has a row and entries now. A second request replaces
+        // them, and a refused request changes nothing. Both leave the rows
+        // of the owner.
+        let stored = library
+            .db
+            .with_writer(|conn| replace_without_current(conn, guest, &[T3], "Tablet", LATER))
+            .unwrap();
+        assert_eq!(stored, Ok(()));
+        assert_eq!(
+            library.save_without_current(guest, &[T2, UNKNOWN_TRACK], "Tablet"),
+            Err(Refusal::NoTrack)
+        );
+        let mut rows = vec![head_of_owner, format!("{guest}|NULL|0|{LATER}|Tablet")];
+        rows.extend(entries_of_owner);
+        rows.push(format!("{guest}|1|{T3}"));
+        assert_eq!(library.everything(), rows);
+        assert_eq!(library.get(owner), of_owner);
+
+        // The owner stores a queue without a current song while the queue
+        // of the guest has entries: the rows of the guest stay.
+        let rows_of_guest = (library.head(guest), library.entries(guest));
+        let of_guest = library.get(guest);
+        assert_eq!(
+            library.save_without_current(owner, &[T2, T4], "Phone"),
+            Ok(())
+        );
+        assert_eq!((library.head(guest), library.entries(guest)), rows_of_guest);
+        assert_eq!(library.get(guest), of_guest);
+        assert_eq!(
+            library.entries(owner),
+            [(1, T2.to_owned()), (2, T4.to_owned())]
+        );
+        assert_eq!(
+            library.head(owner),
+            Some((None, 0, NOW, "Phone".to_owned()))
+        );
+    }
+
+    #[test]
+    fn a_refused_replace_without_current_changes_nothing() {
+        let library = library();
+        let owner = library.owner;
+        assert_eq!(library.save(owner, &[T1, T2], T2, "Phone"), Ok(()));
+        let before = library.everything();
+        let save = |track_ids: &[&str]| {
+            library.db.with_writer(|conn| {
+                replace_without_current(conn, owner, track_ids, "Desktop", LATER)
+            })
+        };
+
+        // An unknown track as the first, a middle and the last value, and a
+        // value that is no ID.
+        for track_ids in [
+            [UNKNOWN_TRACK, T3, T4],
+            [T3, UNKNOWN_TRACK, T4],
+            [T3, T4, UNKNOWN_TRACK],
+            [T3, T4, "' OR 1=1 --"],
+        ] {
+            let stored = save(&track_ids).unwrap();
+            assert_eq!(stored, Err(Refusal::NoTrack), "{track_ids:?}");
+        }
+        // The length is checked before the tracks.
+        let too_long = vec![UNKNOWN_TRACK; MAX_ENTRIES + 1];
+        assert_eq!(save(&too_long).unwrap(), Err(Refusal::TooLong));
+        assert_eq!(library.everything(), before);
+
+        // The insert of an entry of `T4` fails. The statements before it
+        // have run then: the write of the `play_queue` row and the deletion
+        // of the old entries.
+        library
+            .db
+            .with_writer(|conn| {
+                conn.execute_batch(
+                    "CREATE TEMP TRIGGER refuse_t4 BEFORE INSERT ON play_queue_tracks
+                     WHEN NEW.track_id = 'tr-00000000000000000000000000000004'
+                     BEGIN SELECT RAISE(ABORT, 'the test refuses the entry'); END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let stored = save(&[T3, T4]);
+        assert!(stored.is_err(), "{stored:?}");
+        assert_eq!(library.everything(), before);
+
+        // The limit itself is accepted.
+        assert_eq!(save(&vec![T1; MAX_ENTRIES]).unwrap(), Ok(()));
+        let limit = MAX_ENTRIES as i64;
+        let positions: (i64, i64, i64) = library
+            .db
+            .with_reader(|conn| {
+                let sql = "SELECT count(*), min(position), max(position) FROM play_queue_tracks";
+                Ok(conn.query_row(sql, [], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?)
+            })
+            .unwrap();
+        assert_eq!(positions, (limit, 1, limit));
+        assert_eq!(library.get(owner).current.as_deref(), Some(T1));
+    }
+
+    #[test]
+    fn get_tells_a_queue_stored_without_a_current_song_from_one_whose_current_track_was_deleted() {
+        let library = library();
+        let Library { owner, guest, .. } = library;
+        let current = |user: i64| {
+            let queue = library.get(user);
+            (queue.track_ids, queue.current, queue.position_ms)
+        };
+        // The owner stores a queue without a current song. The guest stores
+        // the same tracks with `T3` as the current song.
+        let tracks = [T1, T2, T3, T4];
+        assert_eq!(
+            library.save_without_current(owner, &tracks, "Phone"),
+            Ok(())
+        );
+        let stored = library
+            .db
+            .with_writer(|conn| replace(conn, guest, &tracks, T3, 777, "Tablet", NOW))
+            .unwrap();
+        assert_eq!(stored, Ok(()));
+        assert_eq!(current(owner), (list_of(&tracks), Some(T1.to_owned()), 0));
+        assert_eq!(current(guest), (list_of(&tracks), Some(T3.to_owned()), 777));
+
+        library.delete_tracks(&[T3]);
+
+        // The rows tell the two states apart: the queue of the owner has no
+        // current song, and the queue of the guest has the ID of the deleted
+        // track.
+        assert_eq!(
+            library.head(owner),
+            Some((None, 0, NOW, "Phone".to_owned()))
+        );
+        assert_eq!(
+            library.head(guest),
+            Some((Some(T3.to_owned()), 777, NOW, "Tablet".to_owned()))
+        );
+        assert_eq!(
+            library.entries(owner),
+            [(1, T1.to_owned()), (2, T2.to_owned()), (4, T4.to_owned())]
+        );
+        assert_eq!(
+            library.entries(guest),
+            [(-2, T1.to_owned()), (-1, T2.to_owned()), (1, T4.to_owned())]
+        );
+
+        // Both queues hold the same tracks, and their current songs differ.
+        // The queue of the owner has its first entry, and the queue of the
+        // guest has the entry that followed the deleted one.
+        let left = list_of(&[T1, T2, T4]);
+        assert_eq!(current(owner), (left.clone(), Some(T1.to_owned()), 0));
+        assert_eq!(current(guest), (left, Some(T4.to_owned()), 0));
+
+        // The first track is deleted. The queue of the owner has the first
+        // entry that is left, and the queue of the guest keeps the entry
+        // that followed its deleted current song.
+        library.delete_tracks(&[T1]);
+        let left = list_of(&[T2, T4]);
+        assert_eq!(current(owner), (left.clone(), Some(T2.to_owned()), 0));
+        assert_eq!(current(guest), (left, Some(T4.to_owned()), 0));
+        // The deletions wrote no row of `play_queue`.
+        assert_eq!(
+            library.head(owner),
+            Some((None, 0, NOW, "Phone".to_owned()))
+        );
+
+        // A queue whose tracks are all deleted has no entry and no current
+        // song.
+        library.delete_tracks(&[T2, T4]);
+        assert_eq!(current(owner), (Vec::new(), None, 0));
+        assert_eq!(current(guest), (Vec::new(), None, 0));
+    }
+
+    #[test]
+    fn current_song_is_the_first_entry_for_a_queue_that_was_stored_without_one() {
+        let entries = |stored: &[(i64, &str)]| -> Vec<(i64, String)> {
+            stored
+                .iter()
+                .map(|(position, id)| (*position, (*id).to_owned()))
+                .collect()
+        };
+        let song = |id: &str| (Some(id.to_owned()), 0);
+
+        // The entries as they were stored, and those that a deletion left.
+        let queue = entries(&[(1, "a"), (2, "b"), (3, "c")]);
+        assert_eq!(current_song(None, 0, &queue), song("a"));
+        let queue = entries(&[(2, "b"), (3, "c")]);
+        assert_eq!(current_song(None, 0, &queue), song("b"));
+        // The position of the row is not read without a current song.
+        assert_eq!(current_song(None, 42, &queue), song("b"));
+
+        // The rule does not read the stored positions. For the same entries
+        // a row with the ID of a deleted track has the entry that followed
+        // it, and a row without a current song has the first entry.
+        let queue = entries(&[(-2, "a"), (-1, "b"), (1, "d")]);
+        assert_eq!(current_song(Some("c".to_owned()), 42, &queue), song("d"));
+        assert_eq!(current_song(None, 42, &queue), song("a"));
+        let queue = entries(&[(-2, "a"), (-1, "b")]);
+        assert_eq!(current_song(Some("c".to_owned()), 42, &queue), song("b"));
+        assert_eq!(current_song(None, 42, &queue), song("a"));
     }
 
     #[test]
