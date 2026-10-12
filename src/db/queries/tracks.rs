@@ -27,6 +27,9 @@ pub struct IndexEntry {
 /// (`docs/design.md` section 4), and no statement reads or writes the
 /// column. A row that is inserted holds the default of the schema, which
 /// is 0.
+///
+/// The columns `title_lc` and `album_artist_name` have no field either:
+/// statements compare them, and no caller reads them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
     pub id: String,
@@ -112,7 +115,10 @@ pub struct TrackContent<'a> {
     pub mtime: i64,
     /// The size of the file in bytes.
     pub size: u64,
-    /// The tags and the audio properties.
+    /// The tags and the audio properties. `meta.artist` is stored in the
+    /// column `artist_name` and `meta.album_artist` in the column
+    /// `album_artist_name`, which is the spelling that the track carries for
+    /// its artist row (`docs/design.md` section 3.3).
     pub meta: &'a TrackMeta,
     /// The ID of the artist row of `meta.album_artist`.
     pub artist_id: &'a str,
@@ -163,9 +169,9 @@ pub fn insert_track(
         "INSERT INTO tracks (id, folder_id, rel_path, fingerprint, title, title_lc, album_id,
            artist_id, artist_name, album_name, track_no, disc_no, year, genre, duration_ms,
            bitrate_kbps, sample_rate, bit_depth, channels, size, suffix, content_type, lossless,
-           has_picture, mtime, created_at, updated_at)
+           has_picture, mtime, album_artist_name, created_at, updated_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
-           ?19, ?20, ?21, ?22, ?23, ?24, ?25, unixepoch(), unixepoch())",
+           ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, unixepoch(), unixepoch())",
     )?
     .execute(params![
         id,
@@ -193,6 +199,7 @@ pub fn insert_track(
         meta.lossless,
         meta.has_picture,
         content.mtime,
+        meta.album_artist,
     ])?;
     Ok(())
 }
@@ -207,7 +214,8 @@ pub fn update_track_meta(conn: &Connection, id: &str, content: &TrackContent<'_>
            artist_id = ?6, artist_name = ?7, album_name = ?8, track_no = ?9, disc_no = ?10,
            year = ?11, genre = ?12, duration_ms = ?13, bitrate_kbps = ?14, sample_rate = ?15,
            bit_depth = ?16, channels = ?17, size = ?18, suffix = ?19, content_type = ?20,
-           lossless = ?21, has_picture = ?22, mtime = ?23, updated_at = unixepoch()
+           lossless = ?21, has_picture = ?22, mtime = ?23, album_artist_name = ?24,
+           updated_at = unixepoch()
          WHERE id = ?1",
     )?
     .execute(params![
@@ -234,6 +242,7 @@ pub fn update_track_meta(conn: &Connection, id: &str, content: &TrackContent<'_>
         meta.lossless,
         meta.has_picture,
         content.mtime,
+        meta.album_artist,
     ])?;
     Ok(())
 }
@@ -478,6 +487,18 @@ mod tests {
                 })
                 .unwrap()
         }
+
+        fn album_artist_name(&self, id: &str) -> Option<String> {
+            self.db
+                .with_reader(|conn| {
+                    Ok(conn.query_row(
+                        "SELECT album_artist_name FROM tracks WHERE id = ?1",
+                        [id],
+                        |row| row.get(0),
+                    )?)
+                })
+                .unwrap()
+        }
     }
 
     fn constraint_violation(error: DbError) -> String {
@@ -706,6 +727,78 @@ mod tests {
             }
         );
         assert_eq!(fixture.title_lc(FIRST), "étude");
+    }
+
+    #[test]
+    fn insert_and_update_store_the_album_artist_and_a_relink_keeps_it() {
+        let fixture = fixture();
+        // The album artist and the track artist of the file differ.
+        let mut meta = full_meta();
+        meta.artist = "Tessa Lund".to_owned();
+        meta.album_artist = "AURORA FIELD".to_owned();
+        let content = fixture.content(&meta, "100:aa", 1000, 100);
+        fixture
+            .db
+            .with_writer(|conn| insert_track(conn, FIRST, fixture.folders[0], "a.flac", &content))
+            .unwrap();
+        assert_eq!(
+            fixture.album_artist_name(FIRST).as_deref(),
+            Some("AURORA FIELD")
+        );
+        assert_eq!(fixture.get(FIRST).unwrap().artist_name, "Tessa Lund");
+
+        meta.album_artist = "Aurora Field".to_owned();
+        let content = fixture.content(&meta, "100:aa", 1000, 100);
+        fixture
+            .db
+            .with_writer(|conn| update_track_meta(conn, FIRST, &content))
+            .unwrap();
+        assert_eq!(
+            fixture.album_artist_name(FIRST).as_deref(),
+            Some("Aurora Field")
+        );
+        assert_eq!(fixture.get(FIRST).unwrap().artist_name, "Tessa Lund");
+
+        fixture
+            .db
+            .with_writer(|conn| relink_track(conn, FIRST, fixture.folders[1], "b.flac", 2000, 100))
+            .unwrap();
+        assert_eq!(
+            fixture.album_artist_name(FIRST).as_deref(),
+            Some("Aurora Field")
+        );
+    }
+
+    #[test]
+    fn a_row_without_an_album_artist_gets_it_when_its_content_is_stored_again() {
+        let fixture = fixture();
+        fixture.insert(FIRST, fixture.folders[0], "a.flac");
+        // The row is as the migration leaves a row of schema version 1.
+        fixture
+            .db
+            .with_writer(|conn| {
+                conn.execute("UPDATE tracks SET album_artist_name = NULL", [])?;
+                Ok(())
+            })
+            .unwrap();
+
+        // A relink reads no tag and leaves the column without a value.
+        fixture
+            .db
+            .with_writer(|conn| relink_track(conn, FIRST, fixture.folders[1], "b.flac", 2000, 100))
+            .unwrap();
+        assert_eq!(fixture.album_artist_name(FIRST), None);
+
+        let meta = full_meta();
+        let content = fixture.content(&meta, "100:aa", 2000, 100);
+        fixture
+            .db
+            .with_writer(|conn| update_track_meta(conn, FIRST, &content))
+            .unwrap();
+        assert_eq!(
+            fixture.album_artist_name(FIRST).as_deref(),
+            Some("Aurora Field")
+        );
     }
 
     #[test]
