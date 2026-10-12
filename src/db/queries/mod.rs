@@ -41,7 +41,7 @@ pub mod browse;
 
 pub mod lists;
 
-// search
+pub mod search;
 
 pub mod playlists;
 

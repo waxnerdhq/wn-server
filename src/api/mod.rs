@@ -42,7 +42,7 @@ pub mod browse;
 
 pub mod lists;
 
-// search
+pub mod search;
 
 pub mod annotate;
 
@@ -272,11 +272,11 @@ pub const METHODS: &[(&str, Handler)] = &[
 
     ("getStarred2", handler!(annotate::get_starred2)),
 
-    ("search", not_implemented),
+    ("search", handler!(search::search)),
 
-    ("search2", not_implemented),
+    ("search2", handler!(search::search2)),
 
-    ("search3", not_implemented),
+    ("search3", handler!(search::search3)),
 
     ("getPlaylists", handler!(playlists::get_playlists)),
 
