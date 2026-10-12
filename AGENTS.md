@@ -47,6 +47,16 @@ wn-server is a headless music server. It scans a local music collection into SQL
 - This repository is public. Details of the owner's CI infrastructure stay out of PRs, commit messages and anything public that an issue links to.
 - A commit message ends with the attribution line the environment provides.
 
+## Migrations
+
+- A schema change is a new numbered file in `migrations/` and one line in `MIGRATIONS` (`src/db/mod.rs`). `docs/design.md` section 3.4 describes how `Db::open` applies it.
+- A migration file that is on `main` is never edited. Databases exist that applied it, and they do not apply it again.
+- A new column is appended last, with `ALTER TABLE ... ADD COLUMN`, and is added to `ADDED_SINCE_V1` in the tests of `src/db/mod.rs` with the value that a row from before holds. A column that a migration removes goes into `REMOVED_SINCE_V1`, and a value that it multiplies into `MULTIPLIED_SINCE_V1`.
+- No query of the server uses `SELECT *`. A statement names its columns, so a migration that adds or removes a column changes no result. The row dumps of the migration tests read every column on purpose.
+- The issue and `docs/design.md` section 3.4 state what the migration does to the rows that exist.
+- A migration test starts from a database of the previous schema version with rows in every table, and checks that every row, every rowid and every ID is kept. The test from schema version 1 covers the new migration as well.
+- A migration that fails leaves the database at its version with its rows, and its error names the migration and that version. A test covers a failure after the first statements of the migration ran.
+
 ## Orchestration
 
 - The main session orchestrates and does not implement.

@@ -153,6 +153,13 @@ pub struct ScanSummary {
 /// resized covers of every track that has no row from the same directory.
 /// An album and an artist keep their ID while a track refers to them.
 ///
+/// The `scans` row of the scan stores whether the scan changed the library:
+/// it wrote a track row, an album row or an artist row, or it follows a scan
+/// that has no end time. A scan that found nothing changed, a cancellation
+/// and a path or a file that cannot be read do not count as a change.
+/// `getIndexes` reports the end time of the last scan that changed the
+/// library as `lastModified`.
+///
 /// The function blocks. An async caller runs it with
 /// `tokio::task::spawn_blocking`. `cancel` is checked during the walk,
 /// before each read of a fingerprint or of the tags of a file, and between
@@ -220,6 +227,7 @@ fn scan_with(
         configured,
         unconfigured,
         index,
+        after_open_scan,
     } = db.with_writer(|conn| begin(conn, folders))?;
     let mut scanner = Scanner {
         db,
@@ -231,8 +239,12 @@ fn scan_with(
         links: Links::default(),
         unread: Unread::default(),
         summary: ScanSummary::default(),
+        // The rows that a scan without an end time stored are in the
+        // database, and no `scans` row with an end time covers them.
+        changed_library: after_open_scan,
     };
     let outcome = scanner.run(&unconfigured, &index);
+    let changed_library = scanner.changed_library;
     let mut summary = scanner.summary;
 
     let error = match &outcome {
@@ -250,7 +262,12 @@ fn scan_with(
         moved: summary.moved,
         removed: summary.removed,
     };
-    let finished = db.with_writer(|conn| scans::finish(conn, scan_id, &counts, error.as_deref()));
+    // The flag covers what the scan committed, also when the scan was
+    // cancelled or a database error ended it. A cancellation, an unread
+    // path, an unread file and an error do not set it by themselves.
+    let finished = db.with_writer(|conn| {
+        scans::finish(conn, scan_id, &counts, changed_library, error.as_deref())
+    });
     // When the scan failed, its error is the one to return, also when the
     // `scans` row cannot be closed.
     outcome?;
@@ -277,6 +294,9 @@ struct Start {
     /// The folder rows that no configured folder owns.
     unconfigured: Vec<Folder>,
     index: Vec<IndexEntry>,
+    /// Whether the scan before this one has no end time
+    /// (`scans::previous_is_open`).
+    after_open_scan: bool,
 }
 
 /// Inserts the `scans` row, synchronises the folder rows with `paths` and
@@ -284,6 +304,7 @@ struct Start {
 fn begin(conn: &mut Connection, paths: &[PathBuf]) -> Result<Start> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let scan_id = scans::insert(&tx)?;
+    let after_open_scan = scans::previous_is_open(&tx, scan_id)?;
     let configured = folders::sync_folders(&tx, paths)?;
     let unconfigured = folders::list(&tx)?
         .into_iter()
@@ -296,6 +317,7 @@ fn begin(conn: &mut Connection, paths: &[PathBuf]) -> Result<Start> {
         configured,
         unconfigured,
         index,
+        after_open_scan,
     })
 }
 
@@ -662,6 +684,12 @@ struct Scanner<'a> {
     links: Links,
     unread: Unread,
     summary: ScanSummary,
+    /// Whether the scan changed the library, which the `scans` row of the
+    /// scan stores (`docs/design.md` section 3.10 step 7). The scan sets it
+    /// when a transaction of the track pass wrote a row, and when the
+    /// aggregation deleted or wrote an album row or an artist row. It starts
+    /// as `true` in a scan that follows a scan without an end time.
+    changed_library: bool,
 }
 
 impl Scanner<'_> {
@@ -814,6 +842,7 @@ impl Scanner<'_> {
             Outcome::Cancelled => None,
         };
         let aggregated = self.db.with_writer(|conn| aggregate(conn, seen.as_ref()))?;
+        self.changed_library |= aggregated.changed_library;
         self.summary.albums = aggregated.albums;
         self.summary.artists = aggregated.artists;
         // The transaction is committed and the write connection is free.
@@ -1300,7 +1329,11 @@ impl Scanner<'_> {
             }
         }
 
-        let counts = self.db.with_writer(|conn| store(conn, &writes))?;
+        let Stored {
+            counts,
+            changed_library,
+        } = self.db.with_writer(|conn| store(conn, &writes))?;
+        self.changed_library |= changed_library;
         self.summary.added += counts.added;
         self.summary.changed += counts.changed;
         self.summary.moved += counts.moved;
@@ -1391,6 +1424,8 @@ impl Scanner<'_> {
             tx.commit()?;
             Ok(removed)
         })?;
+        // The deletion of a folder row that has no track changes no artist.
+        self.changed_library |= removed > 0;
         self.summary.removed += removed;
         Ok(())
     }
@@ -1588,6 +1623,17 @@ fn rank<'a>(missing: &IndexEntry, file: &'a FoundFile) -> (bool, usize, &'a str,
     )
 }
 
+/// What [`store`] did with one batch.
+struct Stored {
+    /// The rows that were inserted, updated in place, relinked and deleted.
+    /// A row that was given its placeholder path and kept is in no count.
+    counts: ScanCounts,
+    /// Whether the transaction wrote a row: a track row that was inserted,
+    /// updated, relinked, deleted or given its placeholder path, and the
+    /// album rows and the artist rows that were made for a track.
+    changed_library: bool,
+}
+
 /// Stores the changes of one batch in one transaction and returns what it
 /// changed.
 ///
@@ -1596,8 +1642,12 @@ fn rank<'a>(missing: &IndexEntry, file: &'a FoundFile) -> (bool, usize, &'a str,
 /// have. Then the rows that move are given their new paths. In this order
 /// two rows can exchange paths, although SQLite checks the unique index on
 /// the locator after every statement.
-fn store(conn: &mut Connection, writes: &[Write<'_>]) -> Result<ScanCounts> {
+fn store(conn: &mut Connection, writes: &[Write<'_>]) -> Result<Stored> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    // SQLite counts every row that a statement of the connection inserts,
+    // updates or deletes. The statements of this function write rows of the
+    // library only.
+    let rows_written = tx.total_changes();
     let mut counts = ScanCounts::default();
 
     let deleted: Vec<&str> = writes
@@ -1676,8 +1726,12 @@ fn store(conn: &mut Connection, writes: &[Write<'_>]) -> Result<ScanCounts> {
             }
         }
     }
+    let changed_library = tx.total_changes() != rows_written;
     tx.commit()?;
-    Ok(counts)
+    Ok(Stored {
+        counts,
+        changed_library,
+    })
 }
 
 /// Upserts the artist row and the album row of `meta` and runs `write` with
@@ -1724,6 +1778,10 @@ struct Aggregated {
     /// The albums whose resized covers in the cache are stale: the deleted
     /// albums and the albums whose cover changed.
     stale_covers: Vec<String>,
+    /// Whether the step deleted or wrote an album row or an artist row. The
+    /// deletion of annotations does not count: it removes what was attached
+    /// to rows that are gone, and it changes no row of the library.
+    changed_library: bool,
 }
 
 /// Step 6 of the scan, in one transaction. It reads no file: the covers come
@@ -1749,9 +1807,13 @@ struct Aggregated {
 /// track may get a track from a file that the scan has not stored, and the
 /// rows may name paths that the walk saw no file at.
 ///
-/// A row that already has its values is not written.
+/// A row that already has its values is not written. The result says
+/// whether an album row or an artist row was deleted or written, which is
+/// the number of rows that SQLite counts for the statements before the
+/// deletion of annotations.
 fn aggregate(conn: &mut Connection, seen: Option<&Seen<'_>>) -> Result<Aggregated> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let rows_written = tx.total_changes();
     let mut stale_covers = Vec::new();
     if seen.is_some() {
         stale_covers = albums::delete_orphans(&tx)?;
@@ -1784,12 +1846,17 @@ fn aggregate(conn: &mut Connection, seen: Option<&Seen<'_>>) -> Result<Aggregate
             // and the removal.
             stale_covers.push(inputs.album_id);
         }
+    }
+    // Every statement so far writes album rows and artist rows only.
+    let changed_library = tx.total_changes() != rows_written;
+    if seen.is_some() {
         annotations::delete_orphans(&tx)?;
     }
     let aggregated = Aggregated {
         albums: albums::count(&tx)?,
         artists: artists::count(&tx)?,
         stale_covers,
+        changed_library,
     };
     tx.commit()?;
     Ok(aggregated)
@@ -4484,6 +4551,69 @@ mod tests {
         assert_eq!(counts(&summary), (0, 0, 1, 0));
         assert_eq!(library.id_at("moved/a.wav"), Some(a));
         assert_eq!(library.id_at("a.wav"), Some(placed));
+    }
+
+    #[test]
+    fn a_scan_whose_only_change_is_a_track_that_loses_its_file_changes_the_library() {
+        let library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2)]);
+        library.set_mtime("a.wav", 1_000);
+        library.scan();
+        let a = library.id_at("a.wav").unwrap();
+        assert!(library.latest_scan().changed_library);
+        assert_eq!(counts(&library.scan()), (0, 0, 0, 0));
+        let unchanged = library.latest_scan();
+        assert!(!unchanged.changed_library);
+
+        // The track moves and gets a new modification time, so its tags are
+        // read again, and they cannot be read. Another file takes its old
+        // path, and the tags of that file cannot be read either.
+        library.rename("a.wav", "moved/a.wav");
+        library.set_mtime("moved/a.wav", 2_000);
+        library.write("a.wav", 300, 3);
+        library.set_mtime("a.wav", 3_000);
+        for rel_path in ["moved/a.wav", "a.wav"] {
+            library
+                .untaggable
+                .borrow_mut()
+                .insert(library.path(rel_path));
+        }
+        let summary = library.scan();
+
+        // No row is inserted, updated in place, relinked or deleted. The
+        // one write gives the track its placeholder path, and no count
+        // holds it.
+        assert_eq!(counts(&summary), (0, 0, 0, 0));
+        assert_eq!(library.index().len(), 2);
+        assert_eq!(
+            library.id_at(&tracks::placeholder_path(&a)),
+            Some(a.clone())
+        );
+        assert_eq!(library.id_at("a.wav"), None);
+        assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+        let detached = library.latest_scan();
+        assert_eq!(
+            detached.counts,
+            ScanCounts {
+                seen: 3,
+                ..ScanCounts::default()
+            }
+        );
+        assert!(detached.changed_library);
+        assert!(detached.finished_at > unchanged.finished_at);
+
+        // The next scan finds the same files, reads the same tags in vain
+        // and writes nothing.
+        let summary = library.scan();
+        assert_eq!(counts(&summary), (0, 0, 0, 0));
+        assert_eq!(summary.errors, [""; 0]);
+        assert!(!library.latest_scan().changed_library);
+
+        // The tags can be read. The track follows its file and the other
+        // file gets a row.
+        library.untaggable.borrow_mut().clear();
+        assert_eq!(counts(&library.scan()), (1, 0, 1, 0));
+        assert!(library.latest_scan().changed_library);
+        assert_eq!(library.id_at("moved/a.wav"), Some(a));
     }
 
     #[test]

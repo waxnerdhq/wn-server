@@ -70,7 +70,7 @@ struct Indexes {
     /// separated by spaces.
     ignored_articles: String,
     /// The time at which the artists last changed, in milliseconds since
-    /// the Unix epoch. 0 when no scan has ended.
+    /// the Unix epoch. 0 when no scan that changed the library has ended.
     last_modified: i64,
     /// The artists in their indexes. `None` in the answer to a request
     /// whose `ifModifiedSince` is not before `last_modified`.
@@ -89,8 +89,8 @@ struct Indexes {
 ///   a file in that music folder. An ID that no music folder has gives an
 ///   answer without an index.
 /// - `lastModified` is `indexes::last_modified` in milliseconds: the end
-///   time of the last scan that can have changed the artists. It is 0 when
-///   no scan has ended.
+///   time of the last scan that changed the library. It is 0 when no such
+///   scan has ended.
 /// - `ifModifiedSince` is a time in milliseconds. When it is at or after
 ///   `lastModified`, the artists did not change since that time, and the
 ///   answer is `indexes` with `ignoredArticles` and `lastModified` and
@@ -165,9 +165,10 @@ pub async fn get_music_directory(
 /// gets the artists only when they can have changed.
 ///
 /// A request without `ifModifiedSince` always gets the artists. So does
-/// every request while no scan has ended, because there is no time to
-/// compare with, and while `scan_is_open`: a scan that has no end time can
-/// have stored changes that `last_modified` does not cover yet.
+/// every request while no scan that changed the library has ended, because
+/// there is no time to compare with, and while `scan_is_open`: a scan that
+/// has no end time can have stored changes that `last_modified` does not
+/// cover yet.
 fn is_unchanged(since: Option<i64>, last_modified: Option<i64>, scan_is_open: bool) -> bool {
     match (since, last_modified) {
         (Some(since), Some(last_modified)) => !scan_is_open && since >= last_modified,
@@ -410,7 +411,7 @@ mod tests {
                     added: 1,
                     ..ScanCounts::default()
                 };
-                scans::finish(conn, id, &counts, None)
+                scans::finish(conn, id, &counts, true, None)
             })?;
             Ok((
                 before,

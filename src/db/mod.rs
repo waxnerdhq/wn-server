@@ -13,6 +13,25 @@ use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard};
 // else. A change that adds a query module edits that file and not this one.
 pub mod queries;
 
+/// One migration: a file in `migrations/`.
+#[derive(Debug, Clone, Copy)]
+struct Migration {
+    /// The name of the file. The error of a migration that fails names it.
+    name: &'static str,
+    /// The statements of the file.
+    sql: &'static str,
+}
+
+/// Returns the migration in the file `migrations/<name>`.
+macro_rules! migration {
+    ($name:literal) => {
+        Migration {
+            name: $name,
+            sql: include_str!(concat!("../../migrations/", $name)),
+        }
+    };
+}
+
 /// The migrations in order. Migration `n` (counted from 1) moves the schema
 /// from version `n - 1` to version `n`. `PRAGMA user_version` holds the
 /// version of a database.
@@ -20,9 +39,10 @@ pub mod queries;
 /// A schema change is a new file with the next number and a new line here.
 /// A file that is on `main` is not edited: databases exist that applied it,
 /// and they do not apply it again (`docs/design.md` section 3.4).
-const MIGRATIONS: &[&str] = &[
-    include_str!("../../migrations/0001_init.sql"),
-    include_str!("../../migrations/0002_tracks_album_artist_name.sql"),
+const MIGRATIONS: &[Migration] = &[
+    migration!("0001_init.sql"),
+    migration!("0002_tracks_album_artist_name.sql"),
+    migration!("0003_scans_milliseconds_and_drop_has_lyrics.sql"),
 ];
 
 /// The number of read connections of a file database.
@@ -62,6 +82,17 @@ pub enum DbError {
         "the database has schema version {found}; this build supports versions 0 to {supported}"
     )]
     UnsupportedSchema { found: i64, supported: i64 },
+    /// A migration failed. `name` is the file of the migration, and
+    /// `version` is the schema version that the database has after the
+    /// failure.
+    #[error(
+        "migration {name} failed and the database was left at schema version {version}: {source}"
+    )]
+    Migration {
+        name: &'static str,
+        version: i64,
+        source: rusqlite::Error,
+    },
     #[error("the checkpoint did not finish because another connection uses the database")]
     CheckpointBusy,
     #[error("the runtime shut down before the database task ran")]
@@ -109,8 +140,13 @@ impl Db {
     /// Returns [`DbError::UnsupportedSchema`] for a database whose schema
     /// version is negative or greater than the number of migrations in this
     /// build, which is the case for a database that a newer build has
-    /// migrated. Returns the error of a migration that fails. In both cases
-    /// the database keeps its schema version and its rows.
+    /// migrated. The database keeps its schema version and its rows.
+    ///
+    /// Returns [`DbError::Migration`] for a migration that fails. The error
+    /// names the file of the migration and the schema version that the
+    /// database was left at. The migration is rolled back, so the database
+    /// has the schema and the rows of that version, and the migrations
+    /// before the one that failed stay applied.
     pub fn open(path: impl AsRef<Path>) -> Result<Db> {
         let path = path.as_ref();
         // File modes exist on Unix only. On Windows the ACL of the user
@@ -565,19 +601,42 @@ fn configure(connection: &Connection) -> rusqlite::Result<()> {
     connection.execute_batch("PRAGMA synchronous = NORMAL; PRAGMA foreign_keys = ON;")
 }
 
-/// Applies every migration that the database lacks, each in one transaction.
-///
-/// A migration that fails is rolled back, and the function returns its
-/// error: the database keeps the version and the content that it had before
-/// that migration. A database whose version this build does not know is an
-/// error, and nothing is applied to it.
+/// Applies every migration of this build that the database lacks
+/// ([`MIGRATIONS`]).
 fn migrate(connection: &mut Connection) -> Result<()> {
+    migrate_with(connection, MIGRATIONS)
+}
+
+/// Applies every migration of `migrations` that the database lacks, each in
+/// one transaction. `migrations` is the list of one build: [`MIGRATIONS`],
+/// or in a test the list of an earlier build or a list with a migration that
+/// fails.
+///
+/// A migration that fails is rolled back, and the function returns
+/// [`DbError::Migration`]: the database keeps the version and the content
+/// that it had before that migration. A database whose version is not one
+/// that `migrations` leads to or starts from is an error, and nothing is
+/// applied to it.
+fn migrate_with(connection: &mut Connection, migrations: &[Migration]) -> Result<()> {
     loop {
         let version = user_version(connection)?;
-        let Some(sql) = pending_migration(version)? else {
+        let Some(migration) = pending_migration(version, migrations)? else {
             return Ok(());
         };
-        apply_migration(connection, version, sql)?;
+        if let Err(source) = apply_migration(connection, version, migration.sql) {
+            // The transaction of the migration is rolled back. The version
+            // is read again, so that the error states what the database
+            // holds now. When it cannot be read, the error of SQLite is
+            // returned alone.
+            let Ok(version) = user_version(connection) else {
+                return Err(source.into());
+            };
+            return Err(DbError::Migration {
+                name: migration.name,
+                version,
+                source,
+            });
+        }
     }
 }
 
@@ -597,15 +656,16 @@ fn apply_migration(connection: &mut Connection, version: i64, sql: &str) -> rusq
     Ok(())
 }
 
-/// Returns the migration that moves a database from `version` to the next
-/// version, or `None` when `version` is the latest.
-fn pending_migration(version: i64) -> Result<Option<&'static str>> {
+/// Returns the migration of `migrations` that moves a database from
+/// `version` to the next version, or `None` when `version` is the latest
+/// version of `migrations`.
+fn pending_migration(version: i64, migrations: &[Migration]) -> Result<Option<Migration>> {
     match usize::try_from(version) {
-        Ok(applied) if applied <= MIGRATIONS.len() => Ok(MIGRATIONS.get(applied).copied()),
+        Ok(applied) if applied <= migrations.len() => Ok(migrations.get(applied).copied()),
         _ => Err(DbError::UnsupportedSchema {
             found: version,
             // The number of migrations is small, so the cast keeps its value.
-            supported: MIGRATIONS.len() as i64,
+            supported: migrations.len() as i64,
         }),
     }
 }
@@ -652,7 +712,7 @@ mod tests {
         "users",
     ];
 
-    const INDEXES: [&str; 12] = [
+    const INDEXES: [&str; 13] = [
         "albums_created",
         "albums_genre",
         "albums_key",
@@ -660,6 +720,7 @@ mod tests {
         "annotations_starred",
         "play_queue_tracks_track",
         "playlist_tracks_track",
+        "scans_changed",
         "tracks_album",
         "tracks_artist",
         "tracks_fingerprint",
@@ -855,8 +916,8 @@ mod tests {
 
         // The second connection read each version before the first one
         // applied the migration of that version.
-        for (version, sql) in (0..).zip(MIGRATIONS) {
-            apply_migration(&mut second, version, sql).unwrap();
+        for (version, migration) in (0..).zip(MIGRATIONS) {
+            apply_migration(&mut second, version, migration.sql).unwrap();
         }
         assert_eq!(pragma_i64(&second, "schema_version"), schema_changes);
         assert_eq!(user_version(&second).unwrap(), latest());
@@ -980,20 +1041,73 @@ mod tests {
           (2, 60, NULL, 3, 0, 1, 0, 0, 'cancelled');
     ";
 
-    /// The columns that the migrations after the first one add, as a table
-    /// and a column. SQLite adds a column after the columns that a table
-    /// has. A row that was written at schema version 1 holds NULL in each.
-    const ADDED_SINCE_V1: &[(&str, &str)] = &[("tracks", "album_artist_name")];
+    /// Rows that a build at schema version 2 stored in a database that holds
+    /// [`V1_ROWS`], in the columns of that version: the album artist of a
+    /// track whose file a scan read, a track with an album artist, what a
+    /// user attached to it, and three scans. The scans 3 and 4 ended in one
+    /// second, 2026-10-11T01:02:03Z, and the scan 5 has an error.
+    ///
+    /// Schema version 2 does not change, so this text does not change.
+    const V2_ROWS: &str = "
+        UPDATE tracks SET album_artist_name = 'Aurora Field'
+        WHERE id = 'tr-000000000000000000000000000000c1';
+        INSERT INTO tracks (id, folder_id, rel_path, fingerprint, title, title_lc, album_id,
+          artist_id, artist_name, album_name, track_no, disc_no, year, genre, duration_ms,
+          bitrate_kbps, sample_rate, bit_depth, channels, size, suffix, content_type,
+          lossless, has_picture, mtime, created_at, updated_at, album_artist_name) VALUES
+          ('tr-000000000000000000000000000000c4', 2, 'Night Bus.opus', '400:dd', 'Night Bus',
+           'night bus', 'al-000000000000000000000000000000b2',
+           'ar-000000000000000000000000000000a2', 'Nadia Ortiz', 'Summer Sampler', 3, NULL,
+           2021, 'Pop', 2000, 96, 24000, NULL, 2, 400, 'opus', 'audio/ogg', 0, 1, 703, 803,
+           903, 'Various Artists');
+        INSERT INTO annotations (user_id, item_id, item_type, starred_at, rating, play_count,
+          last_played_at) VALUES
+          (2, 'tr-000000000000000000000000000000c4', 'track', 1003, 3, 9, 2002);
+        INSERT INTO playlist_tracks (playlist_id, position, track_id) VALUES
+          ('pl-000000000000000000000000000000d1', 3, 'tr-000000000000000000000000000000c4');
+        INSERT INTO play_queue_tracks (user_id, position, track_id) VALUES
+          (1, 2, 'tr-000000000000000000000000000000c4');
+        INSERT INTO scans (id, started_at, finished_at, tracks_seen, tracks_added,
+          tracks_changed, tracks_moved, tracks_removed, error) VALUES
+          (3, 1791680400, 1791680523, 4, 1, 0, 0, 0, NULL),
+          (4, 1791680523, 1791680523, 4, 0, 0, 0, 0, NULL),
+          (5, 1791684000, 1791684123, 4, 0, 1, 0, 0, 'a path could not be read');
+    ";
 
-    /// The rows of every table: for each row in rowid order, the name and
-    /// the value of every column.
+    /// The columns that the migrations after the first one add: the schema
+    /// version that has the column first, the table, the column, and the
+    /// value that a row from before that version holds in it. SQLite adds a
+    /// column after the columns that a table has.
+    const ADDED_SINCE_V1: &[(i64, &str, &str, Value)] = &[
+        (2, "tracks", "album_artist_name", Value::Null),
+        (3, "scans", "changed_library", Value::Integer(1)),
+    ];
+
+    /// The columns that the migrations after the first one remove: the
+    /// first schema version without the column, the table and the column.
+    const REMOVED_SINCE_V1: &[(i64, &str, &str)] = &[(3, "tracks", "has_lyrics")];
+
+    /// The integer columns whose values a migration after the first one
+    /// multiplies: the schema version that has the new values first, the
+    /// table, the column and the factor. NULL stays NULL.
+    const MULTIPLIED_SINCE_V1: &[(i64, &str, &str, i64)] = &[
+        (3, "scans", "started_at", 1000),
+        (3, "scans", "finished_at", 1000),
+    ];
+
+    /// The name that [`dump`] gives the rowid of a row.
+    const ROWID: &str = "_rowid";
+
+    /// The rows of every table: for each row in rowid order, the rowid
+    /// under the name [`ROWID`], and the name and the value of every column.
     type Dump = BTreeMap<&'static str, Vec<Vec<(String, Value)>>>;
 
     fn dump(connection: &Connection) -> Result<Dump> {
         let mut tables = Dump::new();
         for table in TABLES {
-            let mut select =
-                connection.prepare(&format!("SELECT * FROM {table} ORDER BY rowid"))?;
+            let mut select = connection.prepare(&format!(
+                "SELECT rowid AS {ROWID}, * FROM {table} ORDER BY rowid"
+            ))?;
             let names: Vec<String> = select
                 .column_names()
                 .into_iter()
@@ -1016,9 +1130,24 @@ mod tests {
     /// Brings an empty database to schema version 1 with the first
     /// migration alone, stores [`V1_ROWS`] and returns the rows.
     fn fill_at_version_1(connection: &mut Connection) -> Dump {
-        apply_migration(connection, 0, MIGRATIONS[0]).unwrap();
+        apply_migration(connection, 0, MIGRATIONS[0].sql).unwrap();
         assert_eq!(user_version(connection).unwrap(), 1);
         connection.execute_batch(V1_ROWS).unwrap();
+        let rows = dump(connection).unwrap();
+        for table in TABLES {
+            assert!(!rows[table].is_empty(), "{table} has no row");
+        }
+        rows
+    }
+
+    /// Brings an empty database to schema version 2 with the first two
+    /// migrations alone, stores [`V1_ROWS`] and [`V2_ROWS`] and returns the
+    /// rows. The database is what a build with two migrations left.
+    fn fill_at_version_2(connection: &mut Connection) -> Dump {
+        migrate_with(connection, &MIGRATIONS[..2]).unwrap();
+        assert_eq!(user_version(connection).unwrap(), 2);
+        connection.execute_batch(V1_ROWS).unwrap();
+        connection.execute_batch(V2_ROWS).unwrap();
         let rows = dump(connection).unwrap();
         for table in TABLES {
             assert!(!rows[table].is_empty(), "{table} has no row");
@@ -1044,18 +1173,57 @@ mod tests {
         (dir, path, [memory, file])
     }
 
-    /// Checks that `after` holds every row of `before` with the values it
-    /// had, with NULL in the columns of [`ADDED_SINCE_V1`], and no other
-    /// column and no other row.
-    fn assert_rows_kept(before: &Dump, after: &Dump) {
-        for table in TABLES {
-            let mut expected = before[table].clone();
-            for row in &mut expected {
-                for (_, column) in ADDED_SINCE_V1.iter().filter(|(of, _)| *of == table) {
-                    row.push(((*column).to_owned(), Value::Null));
+    /// Returns what the migrations make of the rows `before` of a database
+    /// of schema version `from` when they bring it to version `to`: every
+    /// row with its rowid and its values, except that the columns of
+    /// [`REMOVED_SINCE_V1`] are gone, the values of [`MULTIPLIED_SINCE_V1`]
+    /// are multiplied, and the columns of [`ADDED_SINCE_V1`] follow the
+    /// other columns with the value of a row from before.
+    fn migrated(before: &Dump, from: i64, to: i64) -> Dump {
+        let applies = |version: &i64| (from + 1..=to).contains(version);
+        let mut after = before.clone();
+        for (table, rows) in &mut after {
+            for row in rows {
+                for (_, _, column, factor) in MULTIPLIED_SINCE_V1
+                    .iter()
+                    .filter(|(version, of, ..)| applies(version) && of == table)
+                {
+                    let (_, value) = row
+                        .iter_mut()
+                        .find(|(name, _)| name == column)
+                        .unwrap_or_else(|| panic!("{table} has no column {column}"));
+                    match value {
+                        Value::Integer(integer) => *integer *= factor,
+                        Value::Null => {}
+                        other => panic!("{table}.{column} holds {other:?}"),
+                    }
+                }
+                for (_, _, column) in REMOVED_SINCE_V1
+                    .iter()
+                    .filter(|(version, of, _)| applies(version) && of == table)
+                {
+                    let columns = row.len();
+                    row.retain(|(name, _)| name != column);
+                    assert_eq!(row.len(), columns - 1, "{table} has no column {column}");
+                }
+                for (_, _, column, value) in ADDED_SINCE_V1
+                    .iter()
+                    .filter(|(version, of, ..)| applies(version) && of == table)
+                {
+                    row.push(((*column).to_owned(), value.clone()));
                 }
             }
-            assert_eq!(after[table], expected, "{table}");
+        }
+        after
+    }
+
+    /// Checks that `after`, the rows of a database of the latest schema
+    /// version, holds every row that the database had at schema version
+    /// `from` as [`migrated`] says, and no other column and no other row.
+    fn assert_rows_kept(before: &Dump, from: i64, after: &Dump) {
+        let expected = migrated(before, from, latest());
+        for table in TABLES {
+            assert_eq!(after[table], expected[table], "{table}");
         }
     }
 
@@ -1083,7 +1251,7 @@ mod tests {
         let before = fill_at_version_1(&mut memory);
         migrate(&mut memory).unwrap();
         assert_eq!(user_version(&memory).unwrap(), latest());
-        assert_rows_kept(&before, &dump(&memory).unwrap());
+        assert_rows_kept(&before, 1, &dump(&memory).unwrap());
         assert_consistent(&memory);
 
         // The file is what a build with the first migration alone left on
@@ -1093,7 +1261,7 @@ mod tests {
         let db = Db::open(&path).unwrap();
         db.with_reader(|c| {
             assert_eq!(user_version(c)?, latest());
-            assert_rows_kept(&before, &dump(c)?);
+            assert_rows_kept(&before, 1, &dump(c)?);
             assert_consistent(c);
             Ok(())
         })
@@ -1103,7 +1271,7 @@ mod tests {
         drop(db);
         let db = Db::open(&path).unwrap();
         db.with_reader(|c| {
-            assert_rows_kept(&before, &dump(c)?);
+            assert_rows_kept(&before, 1, &dump(c)?);
             Ok(())
         })
         .unwrap();
@@ -1137,7 +1305,373 @@ mod tests {
             // The database is at a version that the migrations apply to.
             migrate(&mut connection).unwrap();
             assert_eq!(user_version(&connection).unwrap(), latest());
-            assert_rows_kept(&before, &dump(&connection).unwrap());
+            assert_rows_kept(&before, 1, &dump(&connection).unwrap());
+        }
+    }
+
+    /// The name of the file of the third migration.
+    const THIRD: &str = "0003_scans_milliseconds_and_drop_has_lyrics.sql";
+
+    /// Returns the names of the columns of `table` in their order.
+    fn columns(connection: &Connection, table: &str) -> Vec<String> {
+        connection
+            .prepare("SELECT name FROM pragma_table_info(?1) ORDER BY cid")
+            .unwrap()
+            .query_map([table], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// Returns the type, the name and the SQL text of every object of the
+    /// schema, in name order.
+    fn schema(connection: &Connection) -> Vec<(String, String, Option<String>)> {
+        connection
+            .prepare("SELECT type, name, sql FROM sqlite_schema ORDER BY name")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap()
+    }
+
+    /// Returns `row` without the column `column`.
+    fn without(row: &[(String, Value)], column: &str) -> Vec<(String, Value)> {
+        let kept: Vec<_> = row
+            .iter()
+            .filter(|(name, _)| name != column)
+            .cloned()
+            .collect();
+        assert_eq!(kept.len(), row.len() - 1, "the row has no column {column}");
+        kept
+    }
+
+    /// Returns the value of the column `column` of `row`.
+    fn value<'a>(row: &'a [(String, Value)], column: &str) -> &'a Value {
+        let found = row.iter().find(|(name, _)| name == column);
+        &found
+            .unwrap_or_else(|| panic!("the row has no column {column}"))
+            .1
+    }
+
+    #[test]
+    fn a_database_of_schema_version_2_migrates_and_keeps_every_row() {
+        let (_dir, path, [mut memory, mut file]) = empty_connections();
+
+        let before = fill_at_version_2(&mut memory);
+        migrate(&mut memory).unwrap();
+        assert_eq!(user_version(&memory).unwrap(), latest());
+        assert_rows_kept(&before, 2, &dump(&memory).unwrap());
+        assert_consistent(&memory);
+
+        // The file is what a build with two migrations left on disk.
+        // `Db::open` of this build migrates it in place.
+        let before = fill_at_version_2(&mut file);
+        drop(file);
+        let db = Db::open(&path).unwrap();
+        db.with_reader(|c| {
+            assert_eq!(user_version(c)?, latest());
+            assert_rows_kept(&before, 2, &dump(c)?);
+            assert_consistent(c);
+            Ok(())
+        })
+        .unwrap();
+
+        // A second open finds nothing to apply and the same rows.
+        drop(db);
+        let db = Db::open(&path).unwrap();
+        db.with_reader(|c| {
+            assert_rows_kept(&before, 2, &dump(c)?);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn the_third_migration_changes_the_scan_times_and_the_two_columns_and_nothing_else() {
+        let (_dir, _path, connections) = empty_connections();
+        for mut connection in connections {
+            let before = fill_at_version_2(&mut connection);
+            // A row of an earlier build can hold 1 in the column that the
+            // migration removes.
+            let lyrics: Vec<&Value> = before["tracks"]
+                .iter()
+                .map(|row| value(row, "has_lyrics"))
+                .collect();
+            assert_eq!(
+                lyrics,
+                [
+                    &Value::Integer(1),
+                    &Value::Integer(0),
+                    &Value::Integer(0),
+                    &Value::Integer(0)
+                ]
+            );
+
+            // The third migration alone, as a build with three migrations
+            // applies it.
+            migrate_with(&mut connection, &MIGRATIONS[..3]).unwrap();
+            assert_eq!(user_version(&connection).unwrap(), 3);
+            let after = dump(&connection).unwrap();
+            assert_consistent(&connection);
+
+            // Every table but two has the rows it had: the users, the
+            // folders, the artists, the albums, the stars, the ratings and
+            // the play counts, the playlists and the play queue.
+            for table in TABLES {
+                if table != "scans" && table != "tracks" {
+                    assert_eq!(after[table], before[table], "{table}");
+                }
+            }
+
+            // A track row has its rowid, its ID and every other value, and
+            // no `has_lyrics`.
+            let expected: Vec<_> = before["tracks"]
+                .iter()
+                .map(|row| without(row, "has_lyrics"))
+                .collect();
+            assert_eq!(after["tracks"], expected);
+            assert_eq!(
+                columns(&connection, "tracks"),
+                [
+                    "id",
+                    "folder_id",
+                    "rel_path",
+                    "fingerprint",
+                    "title",
+                    "title_lc",
+                    "album_id",
+                    "artist_id",
+                    "artist_name",
+                    "album_name",
+                    "track_no",
+                    "disc_no",
+                    "year",
+                    "genre",
+                    "duration_ms",
+                    "bitrate_kbps",
+                    "sample_rate",
+                    "bit_depth",
+                    "channels",
+                    "size",
+                    "suffix",
+                    "content_type",
+                    "lossless",
+                    "has_picture",
+                    "mtime",
+                    "created_at",
+                    "updated_at",
+                    "album_artist_name",
+                ]
+            );
+            // No table, index, trigger or view names the column.
+            for (object_type, name, sql) in schema(&connection) {
+                let sql = sql.unwrap_or_default();
+                assert!(!sql.contains("has_lyrics"), "{object_type} {name}: {sql}");
+            }
+
+            // A scan row has its times in milliseconds and the flag. The
+            // scans 3 and 4 ended in one second and have one end time.
+            let scans: Vec<(i64, i64, Option<i64>, i64)> = connection
+                .prepare(
+                    "SELECT id, started_at, finished_at, changed_library FROM scans ORDER BY id",
+                )
+                .unwrap()
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                scans,
+                [
+                    (1, 40_000, Some(50_000), 1),
+                    (2, 60_000, None, 1),
+                    (3, 1_791_680_400_000, Some(1_791_680_523_000), 1),
+                    (4, 1_791_680_523_000, Some(1_791_680_523_000), 1),
+                    (5, 1_791_684_000_000, Some(1_791_684_123_000), 1),
+                ]
+            );
+            // The other columns of a scan row have the values they had.
+            let times = ["started_at", "finished_at"];
+            for (row, old) in after["scans"].iter().zip(&before["scans"]) {
+                let mut row = without(row, "changed_library");
+                let mut old = old.clone();
+                for column in times {
+                    row = without(&row, column);
+                    old = without(&old, column);
+                }
+                assert_eq!(row, old);
+            }
+            assert_eq!(
+                columns(&connection, "scans"),
+                [
+                    "id",
+                    "started_at",
+                    "finished_at",
+                    "tracks_seen",
+                    "tracks_added",
+                    "tracks_changed",
+                    "tracks_moved",
+                    "tracks_removed",
+                    "error",
+                    "changed_library",
+                ]
+            );
+        }
+    }
+
+    #[test]
+    fn the_third_migration_that_fails_at_its_last_statement_leaves_version_2_as_it_was() {
+        let (_dir, path, [_, mut file]) = empty_connections();
+        fill_at_version_2(&mut file);
+        // An index names the column that the last statement of the third
+        // migration removes, so that statement fails. The three statements
+        // before it have run by then.
+        file.execute_batch("CREATE INDEX tracks_lyrics ON tracks(has_lyrics)")
+            .unwrap();
+        let before = dump(&file).unwrap();
+        let schema_before = schema(&file);
+        drop(file);
+
+        for _ in 0..2 {
+            let error = Db::open(&path).unwrap_err();
+            assert!(
+                matches!(
+                    &error,
+                    DbError::Migration { name, version: 2, .. } if *name == THIRD
+                ),
+                "{error:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "migration {THIRD} failed and the database was left at schema version 2: \
+                     error in index tracks_lyrics after drop column: no such column: has_lyrics"
+                )
+            );
+
+            // The times are seconds, the table has no new column, the
+            // index of the migration does not exist, and every row is as it
+            // was.
+            let connection = Connection::open(&path).unwrap();
+            assert_eq!(user_version(&connection).unwrap(), 2);
+            assert_eq!(dump(&connection).unwrap(), before);
+            assert_eq!(schema(&connection), schema_before);
+            assert_consistent(&connection);
+        }
+
+        // Without the index the same file migrates.
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch("DROP INDEX tracks_lyrics")
+            .unwrap();
+        drop(connection);
+        let db = Db::open(&path).unwrap();
+        db.with_reader(|c| {
+            assert_eq!(user_version(c)?, latest());
+            assert_rows_kept(&before, 2, &dump(c)?);
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn the_error_of_a_failed_migration_names_the_migration_and_the_version_that_is_kept() {
+        // The list of a build whose third migration fails at its third
+        // statement.
+        let failing = Migration {
+            name: "0003_fails.sql",
+            sql: "ALTER TABLE scans ADD COLUMN changed_library INTEGER NOT NULL DEFAULT 1;
+                  UPDATE scans SET started_at = started_at * 1000;
+                  INSERT INTO missing VALUES (1);",
+        };
+        let migrations = [MIGRATIONS[0], MIGRATIONS[1], failing];
+        let (_dir, path, connections) = empty_connections();
+        for (mut connection, on_disk) in connections.into_iter().zip([false, true]) {
+            let before = fill_at_version_1(&mut connection);
+
+            let error = migrate_with(&mut connection, &migrations).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    DbError::Migration {
+                        name: "0003_fails.sql",
+                        version: 2,
+                        ..
+                    }
+                ),
+                "{error:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                "migration 0003_fails.sql failed and the database was left at schema version 2: \
+                 no such table: missing"
+            );
+
+            // The second migration stays applied, and nothing of the third
+            // one does: the rows are those of schema version 2.
+            let kept = migrated(&before, 1, 2);
+            assert_eq!(user_version(&connection).unwrap(), 2);
+            assert_eq!(dump(&connection).unwrap(), kept);
+            assert_consistent(&connection);
+            if on_disk {
+                let other = Connection::open(&path).unwrap();
+                assert_eq!(user_version(&other).unwrap(), 2);
+                assert_eq!(dump(&other).unwrap(), kept);
+            }
+
+            // The next run fails in the same way and leaves the same.
+            let again = migrate_with(&mut connection, &migrations).unwrap_err();
+            assert_eq!(again.to_string(), error.to_string());
+            assert_eq!(dump(&connection).unwrap(), kept);
+
+            // The migrations of this build apply to what is left.
+            migrate(&mut connection).unwrap();
+            assert_eq!(user_version(&connection).unwrap(), latest());
+            assert_rows_kept(&before, 1, &dump(&connection).unwrap());
+        }
+    }
+
+    #[test]
+    fn a_build_without_the_last_migration_refuses_the_database_and_changes_nothing() {
+        // The list of the build before this one.
+        let older = &MIGRATIONS[..MIGRATIONS.len() - 1];
+        let (_dir, path, connections) = empty_connections();
+        for (mut connection, on_disk) in connections.into_iter().zip([false, true]) {
+            fill_at_version_2(&mut connection);
+            migrate(&mut connection).unwrap();
+            let before = dump(&connection).unwrap();
+            let schema_before = schema(&connection);
+            let schema_changes = pragma_i64(&connection, "schema_version");
+
+            let error = migrate_with(&mut connection, older).unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    DbError::UnsupportedSchema { found, supported }
+                        if found == latest() && supported == latest() - 1
+                ),
+                "{error}"
+            );
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "the database has schema version {}; this build supports versions 0 to {}",
+                    latest(),
+                    latest() - 1
+                )
+            );
+            assert_eq!(user_version(&connection).unwrap(), latest());
+            assert_eq!(pragma_i64(&connection, "schema_version"), schema_changes);
+            assert_eq!(dump(&connection).unwrap(), before);
+            assert_eq!(schema(&connection), schema_before);
+            if on_disk {
+                let other = Connection::open(&path).unwrap();
+                assert_eq!(user_version(&other).unwrap(), latest());
+                assert_eq!(dump(&other).unwrap(), before);
+            }
         }
     }
 

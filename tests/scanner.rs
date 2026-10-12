@@ -10,7 +10,9 @@
 //!
 //! The first part of the file tests the track rows. The second part, from
 //! [`Album`] on, tests the album rows, the artist rows, the annotations and
-//! the covers that the scan derives from the tracks.
+//! the covers that the scan derives from the tracks. The third part, from
+//! [`Recorded`] on, tests what the `scans` row of a scan says about the
+//! changes of the scan.
 
 mod common;
 
@@ -31,7 +33,7 @@ use tokio_util::sync::CancellationToken;
 use wn_server::db::Db;
 use wn_server::db::queries::scans::{Scan, ScanCounts};
 use wn_server::db::queries::tracks::{IndexEntry, Track};
-use wn_server::db::queries::{folders, scans, tracks};
+use wn_server::db::queries::{folders, indexes, scans, tracks};
 use wn_server::ids::{self, Kind};
 use wn_server::library::scanner::{self, CANCELLED, ScanOptions, ScanSummary};
 use wn_server::library::tags;
@@ -5936,4 +5938,362 @@ fn a_scan_that_is_cancelled_before_it_walks_changes_no_album_and_no_artist() {
     assert_eq!((summary.albums, summary.artists), (4, 3));
     assert_eq!(scanned.env.albums(), albums);
     assert_eq!(scanned.env.artists(), artists);
+}
+
+/// What the `scans` table says after a scan: whether the scan changed the
+/// library, its end time in Unix milliseconds, and the time that
+/// `getIndexes` reports as `lastModified`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Recorded {
+    changed_library: bool,
+    finished_at: i64,
+    last_modified: Option<i64>,
+}
+
+fn recorded(db: &Db) -> Recorded {
+    let scan = db
+        .with_reader(scans::latest)
+        .unwrap()
+        .expect("a scan has run");
+    Recorded {
+        changed_library: scan.changed_library,
+        finished_at: scan.finished_at.expect("the scan has ended"),
+        last_modified: db.with_reader(indexes::last_modified).unwrap(),
+    }
+}
+
+/// Checks that the scan that ran last changed the library: its flag is set,
+/// and its end time is the time of the last change, which is after
+/// `before`, the time before the scan. Returns the new time.
+fn assert_changed(db: &Db, before: Option<i64>) -> Option<i64> {
+    let now = recorded(db);
+    assert!(now.changed_library, "{now:?}");
+    assert_eq!(now.last_modified, Some(now.finished_at));
+    assert!(now.last_modified > before, "{now:?} {before:?}");
+    now.last_modified
+}
+
+/// Checks that the scan that ran last did not change the library: its flag
+/// is not set, and the time of the last change is `before`, the time before
+/// the scan, although the scan ended after it.
+fn assert_unchanged(db: &Db, before: Option<i64>) {
+    let now = recorded(db);
+    assert!(!now.changed_library, "{now:?}");
+    assert_eq!(now.last_modified, before);
+    assert!(Some(now.finished_at) > before, "{now:?} {before:?}");
+}
+
+/// Returns the four counts of track changes of a scan: added, changed,
+/// moved, removed.
+fn track_changes(summary: &ScanSummary) -> (u64, u64, u64, u64) {
+    (
+        summary.added,
+        summary.changed,
+        summary.moved,
+        summary.removed,
+    )
+}
+
+/// Writes `count` audio files of one new album below `root`, each with
+/// other bytes than every file of the standard library.
+fn write_new_album(root: &Path, count: u32) {
+    let mut builder = LibraryBuilder::new();
+    for number in 1..=count {
+        let title = format!("Title {number}");
+        builder = builder.track("New Artist", "New Album", &title, number, "mp3");
+    }
+    let album = builder.build();
+    for (number, file) in (1..).zip(&album.files) {
+        let to = below(root, &format!("New Artist/New Album/{number:02}.mp3"));
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        fs::copy(file, to).unwrap();
+    }
+}
+
+#[test]
+fn a_scan_that_adds_changes_moves_or_removes_a_track_changes_the_library_and_no_other_does() {
+    let scanned = Scanned::new();
+    let db = &scanned.env.db;
+    // The first scan stored the ten tracks.
+    let mut last = assert_changed(db, None);
+
+    // Scans that find nothing changed.
+    for _ in 0..2 {
+        assert_eq!(scanned.rescan(), seen(10));
+        assert_unchanged(db, last);
+    }
+
+    // A new file.
+    write_other_track(&scanned.path("New/01 Other Title.flac"));
+    assert_eq!(track_changes(&scanned.rescan()), (1, 0, 0, 0));
+    last = assert_changed(db, last);
+    assert_eq!(track_changes(&scanned.rescan()), (0, 0, 0, 0));
+    assert_unchanged(db, last);
+
+    // A file that changed at its path.
+    shift_mtime(&scanned.path(LOW_TIDE), 5);
+    assert_eq!(track_changes(&scanned.rescan()), (0, 1, 0, 0));
+    last = assert_changed(db, last);
+
+    // A file that moved.
+    move_file(
+        &scanned.path(BREAKWATER),
+        &scanned.path("Aurora Field/Glass Harbour/Breakwater.flac"),
+    );
+    assert_eq!(track_changes(&scanned.rescan()), (0, 0, 1, 0));
+    last = assert_changed(db, last);
+
+    // A file that is gone. Its row is deleted after the batches.
+    fs::remove_file(scanned.path("New/01 Other Title.flac")).unwrap();
+    assert_eq!(track_changes(&scanned.rescan()), (0, 0, 0, 1));
+    last = assert_changed(db, last);
+
+    assert_eq!(track_changes(&scanned.rescan()), (0, 0, 0, 0));
+    assert_unchanged(db, last);
+}
+
+#[test]
+fn a_scan_that_only_finds_a_new_cover_changes_the_library() {
+    let scanned = Scanned::new();
+    let db = &scanned.env.db;
+    let last = assert_changed(db, None);
+    assert_eq!(
+        scanned.env.album("Aurora Field/Paper Maps").cover_source,
+        None
+    );
+
+    // An album without a cover gets a cover file. The scan stores no change
+    // of a track, and it writes the row of the album.
+    let cover = below(scanned.root(), "Aurora Field/Paper Maps/cover.jpg");
+    fs::copy(
+        below(scanned.root(), "Aurora Field/Glass Harbour/cover.jpg"),
+        &cover,
+    )
+    .unwrap();
+    assert_eq!(scanned.rescan(), seen(10));
+    assert_eq!(
+        scanned.env.album("Aurora Field/Paper Maps").cover_source,
+        Some(text(&cover))
+    );
+    let last = assert_changed(db, last);
+
+    // The next scan finds the cover as it is stored.
+    assert_eq!(scanned.rescan(), seen(10));
+    assert_unchanged(db, last);
+
+    // The cover file is removed: the scan writes the row of the album again.
+    fs::remove_file(&cover).unwrap();
+    assert_eq!(scanned.rescan(), seen(10));
+    assert_changed(db, last);
+}
+
+#[test]
+fn a_scan_that_only_deletes_an_annotation_does_not_change_the_library() {
+    let scanned = Scanned::new();
+    let db = &scanned.env.db;
+    let last = assert_changed(db, None);
+
+    // A star on an artist that has no row. The scan deletes the annotation
+    // and writes no row of the library.
+    let gone = "ar-ffffffffffffffffffffffffffffffff";
+    star(db, gone, "artist");
+    assert!(starred(db, gone));
+    assert_eq!(scanned.rescan(), seen(10));
+    assert!(!starred(db, gone));
+    assert_unchanged(db, last);
+}
+
+#[test]
+fn a_cancelled_scan_changes_the_library_when_it_stored_a_batch_and_not_before() {
+    let scanned = Scanned::new();
+    let db = &scanned.env.db;
+    let last = assert_changed(db, None);
+    write_new_album(scanned.root(), 3);
+
+    // The scan is cancelled before it walks. It stores none of the three
+    // new files.
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+    let summary = scanner::scan(
+        db,
+        &[scanned.root().to_path_buf()],
+        &cancel,
+        false,
+        ScanOptions::default(),
+    )
+    .unwrap();
+    assert_eq!(summary.errors, [CANCELLED]);
+    assert_eq!(track_changes(&summary), (0, 0, 0, 0));
+    assert_eq!(scanned.env.count(), 10);
+    assert_eq!(
+        scanned.env.latest_scan().error.as_deref(),
+        Some("cancelled")
+    );
+    assert_unchanged(db, last);
+
+    // The scan is cancelled after its first batch, which holds one file.
+    let summary = rescan_and_cancel_after_the_first_batch(&scanned, 1);
+    assert_eq!(summary.errors, [CANCELLED]);
+    assert_eq!(track_changes(&summary), (1, 0, 0, 0));
+    assert_eq!(scanned.env.count(), 11);
+    assert_eq!(
+        scanned.env.latest_scan().error.as_deref(),
+        Some("cancelled")
+    );
+    let last = assert_changed(db, last);
+
+    // The next scan stores the two other files, and the one after it
+    // stores nothing.
+    assert_eq!(track_changes(&scanned.rescan()), (2, 0, 0, 0));
+    let last = assert_changed(db, last);
+    assert_eq!(track_changes(&scanned.rescan()), (0, 0, 0, 0));
+    assert_unchanged(db, last);
+}
+
+#[test]
+fn a_scan_with_a_path_that_cannot_be_read_changes_the_library_only_when_it_stores_a_change() {
+    let two = TwoFolders::new();
+    let db = &two.env.db;
+    let last = assert_changed(db, None);
+
+    // The second folder cannot be read and a file of the first one is gone.
+    // The scan records two errors, keeps the row of the file and stores
+    // nothing, each time it runs.
+    fs::rename(&two.marlow, two.outside("unmounted")).unwrap();
+    fs::remove_file(two.aurora.join("Glass Harbour/03 Night Ferry.flac")).unwrap();
+    for _ in 0..2 {
+        let summary = two.rescan();
+        assert_eq!(track_changes(&summary), (0, 0, 0, 0));
+        assert_eq!(summary.errors.len(), 2, "{:?}", summary.errors);
+        assert_eq!(two.env.count(), 9);
+        assert!(two.env.latest_scan().error.is_some());
+        assert_unchanged(db, last);
+    }
+
+    // The folder still cannot be read. The scan stores a new file of the
+    // first folder.
+    write_other_track(&two.aurora.join("New/01 Other Title.flac"));
+    let summary = two.rescan();
+    assert_eq!(track_changes(&summary), (1, 0, 0, 0));
+    assert_eq!(summary.errors.len(), 2, "{:?}", summary.errors);
+    let last = assert_changed(db, last);
+
+    // The folder is back. The scan deletes the row that was kept.
+    fs::rename(two.outside("unmounted"), &two.marlow).unwrap();
+    let summary = two.rescan();
+    assert_eq!(track_changes(&summary), (0, 0, 0, 1));
+    assert_eq!(summary.errors, [""; 0]);
+    let last = assert_changed(db, last);
+    assert_eq!(track_changes(&two.rescan()), (0, 0, 0, 0));
+    assert_unchanged(db, last);
+}
+
+#[test]
+fn a_scan_after_a_scan_without_an_end_time_changes_the_library_also_when_it_stores_nothing() {
+    let scanned = Scanned::new();
+    let db = &scanned.env.db;
+    let last = assert_changed(db, None);
+    assert_eq!(scanned.rescan(), seen(10));
+    assert_unchanged(db, last);
+
+    // The process of a scan ended before the scan did. Its row has no end
+    // time, and nothing says which rows it stored.
+    let open = db.with_writer(|conn| scans::insert(conn)).unwrap();
+
+    // The next scan writes no track row, no album row and no artist row,
+    // and its end is the time of the last change.
+    forbid_track_writes(db);
+    forbid_album_and_artist_writes(db);
+    assert_eq!(scanned.rescan(), seen(10));
+    let last = assert_changed(db, last);
+    let rows = db.with_reader(scans::list).unwrap();
+    let open = rows.iter().find(|scan| scan.id == open).unwrap();
+    assert_eq!(open.finished_at, None);
+
+    // The scan after it follows a scan that has an end time.
+    assert_eq!(scanned.rescan(), seen(10));
+    assert_unchanged(db, last);
+}
+
+#[test]
+fn a_scan_that_a_database_error_ends_records_whether_it_stored_a_batch() {
+    let scanned = Scanned::new();
+    let db = &scanned.env.db;
+    let last = assert_changed(db, None);
+    write_new_album(scanned.root(), 3);
+    // The write connection, which the scanner uses, stores no twelfth
+    // track.
+    db.with_writer(|conn| {
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER eleven_tracks BEFORE INSERT ON tracks
+             WHEN (SELECT count(*) FROM tracks) >= 11
+             BEGIN SELECT RAISE(ABORT, 'the table holds eleven tracks'); END;",
+        )?;
+        Ok(())
+    })
+    .unwrap();
+    let scan_in_batches_of_one = || {
+        scanner::scan(
+            db,
+            &[scanned.root().to_path_buf()],
+            &CancellationToken::new(),
+            false,
+            ScanOptions {
+                batch_size: 1,
+                ..ScanOptions::default()
+            },
+        )
+    };
+
+    // The first batch is stored and the second one fails. The scan ends
+    // with the error and closes its row.
+    let error = scan_in_batches_of_one().unwrap_err();
+    assert!(
+        error.to_string().contains("the table holds eleven tracks"),
+        "{error}"
+    );
+    assert_eq!(scanned.env.count(), 11);
+    let scan = scanned.env.latest_scan();
+    assert_eq!(scan.error, Some(error.to_string()));
+    assert_eq!(scan.counts.added, 1);
+    let last = assert_changed(db, last);
+
+    // The next scan fails at its first batch and stores nothing.
+    let error = scan_in_batches_of_one().unwrap_err();
+    assert!(
+        error.to_string().contains("the table holds eleven tracks"),
+        "{error}"
+    );
+    assert_eq!(scanned.env.count(), 11);
+    assert_eq!(scanned.env.latest_scan().error, Some(error.to_string()));
+    assert_unchanged(db, last);
+}
+
+#[test]
+fn a_scan_that_fails_after_it_deleted_a_track_row_records_the_change() {
+    let scanned = Scanned::new();
+    let db = &scanned.env.db;
+    let last = assert_changed(db, None);
+
+    // A file is gone. The scan deletes its row after the batches, and the
+    // step after that, which writes the row of the album, fails.
+    fs::remove_file(scanned.path(LOW_TIDE)).unwrap();
+    forbid_album_and_artist_writes(db);
+    let error = scanner::scan(
+        db,
+        &[scanned.root().to_path_buf()],
+        &CancellationToken::new(),
+        false,
+        ScanOptions::default(),
+    )
+    .unwrap_err();
+    assert!(
+        error.to_string().contains("a row of albums was updated"),
+        "{error}"
+    );
+    assert_eq!(scanned.env.count(), 9);
+    let scan = scanned.env.latest_scan();
+    assert_eq!(scan.error, Some(error.to_string()));
+    assert_eq!(scan.counts.removed, 1);
+    assert_changed(db, last);
 }
