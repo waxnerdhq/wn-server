@@ -615,9 +615,8 @@ mod tests {
     use crate::config;
     use crate::db::queries::users::{self, User};
 
-    /// The rows of the table in `docs/design.md` section 4, in the order of
-    /// the table: the method names of a row and its status.
-    fn design_rows() -> Vec<(Vec<&'static str>, &'static str)> {
+    /// The text of `docs/design.md` section 4.
+    fn design_section_4() -> &'static str {
         const DESIGN: &str = include_str!("../../docs/design.md");
         let (_, rest) = DESIGN
             .split_once("\n## 4. OpenSubsonic coverage\n")
@@ -626,6 +625,12 @@ mod tests {
             .split_once("\n## 5. ")
             .expect("section 5 follows section 4");
         section
+    }
+
+    /// The rows of the table in `docs/design.md` section 4, in the order of
+    /// the table: the method names of a row and its status.
+    fn design_rows() -> Vec<(Vec<&'static str>, &'static str)> {
+        design_section_4()
             .lines()
             .filter_map(|line| line.strip_prefix("| "))
             .filter_map(|row| row.strip_suffix(" |"))
@@ -782,6 +787,26 @@ mod tests {
             assert!(
                 METHODS.iter().any(|(method, _)| method == name),
                 "{name} is not a method"
+            );
+        }
+    }
+
+    /// The method table holds no key of an answer, so this test reads the
+    /// keys from the text of section 4, which names the answer of a method
+    /// as "returns `key`". The router test
+    /// `every_element_of_the_xml_child_order_is_the_key_of_an_answer` in
+    /// `tests/search.rs` calls the methods of the table and reads the keys
+    /// of their answers.
+    #[test]
+    fn xml_child_order_names_keys_that_design_section_4_names() {
+        let section = design_section_4();
+        let mut seen = HashSet::new();
+        for (element, children) in xml::CHILD_ORDER {
+            assert!(seen.insert(*element), "{element} is listed twice");
+            assert!(!children.is_empty(), "{element} lists no child element");
+            assert!(
+                section.contains(&format!("returns `{element}`")),
+                "section 4 names no method that returns `{element}`"
             );
         }
     }

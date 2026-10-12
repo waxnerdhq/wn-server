@@ -80,6 +80,63 @@ fn xml_document(status: &str, rest: &str) -> String {
     )
 }
 
+/// The JSON body of a successful response whose response object holds `rest`
+/// after the fields of the envelope.
+fn json_document(rest: &str) -> String {
+    format!(
+        concat!(
+            r#"{{"subsonic-response":{{"status":"ok","version":"1.16.1","type":"wn-server","#,
+            r#""serverVersion":"{}","openSubsonic":true,{}}}}}"#
+        ),
+        VERSION, rest
+    )
+}
+
+/// The JSON body of `method` without a parameter of its own, as text.
+async fn json_body(server: &TestServer, method: &str) -> String {
+    let response = server.get_raw(method, &[("f", "json")]).await;
+    assert_eq!(content_type(&response), "application/json", "{method}");
+    body_string(response).await
+}
+
+/// The names of the child elements of the element `parent` of the XML
+/// document `xml`, in the order of the document. The start tag of `parent`
+/// has no attribute. Every child element must be an empty element, as an
+/// item of a list of starred items is.
+fn child_names<'a>(xml: &'a str, parent: &str) -> Vec<&'a str> {
+    let (_, rest) = xml
+        .split_once(&format!("<{parent}>"))
+        .unwrap_or_else(|| panic!("no <{parent}> in {xml}"));
+    let (content, _) = rest
+        .split_once(&format!("</{parent}>"))
+        .unwrap_or_else(|| panic!("no </{parent}> in {xml}"));
+    content
+        .split('<')
+        .skip(1)
+        .map(|element| {
+            assert!(element.ends_with("/>"), "<{element} has content: {xml}");
+            element
+                .split([' ', '/'])
+                .next()
+                .expect("a split has a first part")
+        })
+        .collect()
+}
+
+/// The names of `artists` elements `artist`, `albums` elements `album` and
+/// `songs` elements `song`, in the order of the Subsonic schema.
+fn schema_names(artists: usize, albums: usize, songs: usize) -> Vec<&'static str> {
+    [("artist", artists), ("album", albums), ("song", songs)]
+        .into_iter()
+        .flat_map(|(name, count)| std::iter::repeat_n(name, count))
+        .collect()
+}
+
+/// The position of the first element `name` in the XML document `xml`.
+fn first_element(xml: &str, name: &str) -> Option<usize> {
+    xml.find(&format!("<{name} "))
+}
+
 /// The ID of the owner account of the server.
 async fn owner_id(server: &TestServer) -> i64 {
     server
@@ -503,6 +560,32 @@ async fn star_and_rate_low_tide(server: &StandardServer) {
     }
 }
 
+/// The `song` element of the track "Low Tide" in XML after
+/// [`star_and_rate_low_tide`]. `getStarred` and `getStarred2` list the same
+/// element.
+async fn low_tide_in_xml(server: &StandardServer) -> String {
+    let row = song(server, &server.track.low_tide).await.track;
+    format!(
+        concat!(
+            r#"<song album="Glass Harbour" albumId="{album}" artist="Aurora Field""#,
+            r#" artistId="{artist}" bitDepth="16" bitRate="{bit_rate}" channelCount="1""#,
+            r#" contentType="audio/flac" coverArt="{album}" created="{created}" discNumber="1""#,
+            r#" duration="1" genre="Electronic" id="{id}" isDir="false" mediaType="song""#,
+            r#" parent="{album}" path="Aurora Field/Glass Harbour/01 Low Tide.flac""#,
+            r#" playCount="0" samplingRate="22050" size="{size}" starred="{starred}""#,
+            r#" suffix="flac" title="Low Tide" track="1" type="music" userRating="5""#,
+            r#" year="2019"/>"#
+        ),
+        album = server.album.glass_harbour,
+        artist = server.artist.aurora_field,
+        bit_rate = row.bitrate_kbps.expect("a FLAC file has a bitrate"),
+        created = model::iso8601(row.created_at),
+        id = server.track.low_tide,
+        size = row.size,
+        starred = STARRED,
+    )
+}
+
 #[tokio::test]
 async fn get_starred2_lists_the_items_in_the_forms_of_the_id3_methods() {
     let server = TestServer::standard().await;
@@ -562,31 +645,34 @@ async fn get_starred2_lists_the_items_in_the_forms_of_the_id3_methods() {
     );
     assert_eq!(element["albumId"], album_id);
 
-    // In XML the three lists are child elements of `starred2`, and a time
-    // and a rating are attributes.
-    let body = server.get_xml("getStarred2", &[]).await;
-    let (head, rest) = body
-        .split_once("<starred2>")
-        .expect("the body holds the element");
-    assert_eq!(head, xml_document("ok", ">"));
-    let (content, tail) = rest.split_once("</starred2>").expect("the element ends");
-    assert_eq!(tail, "</subsonic-response>");
-    assert_eq!(content.matches("<album ").count(), 1, "{content}");
-    assert_eq!(content.matches("<artist ").count(), 1, "{content}");
-    assert_eq!(content.matches("<song ").count(), 1, "{content}");
+    // In XML the three lists are child elements of `starred2`, in the order
+    // of the Subsonic schema: the artist, then the album, then the song. A
+    // time and a rating are attributes.
+    let created = model::iso8601(album(&server, album_id).await.created_at);
     assert_eq!(
-        content.matches(&format!(r#" starred="{STARRED}""#)).count(),
-        3,
-        "{content}"
+        server.get_xml("getStarred2", &[]).await,
+        xml_document(
+            "ok",
+            &format!(
+                concat!(
+                    r#"><starred2>"#,
+                    r#"<artist albumCount="2" id="{artist}" name="Aurora Field""#,
+                    r#" starred="{starred}"/>"#,
+                    r#"<album artist="Aurora Field" artistId="{artist}" coverArt="{album}""#,
+                    r#" created="{created}" duration="2" genre="Electronic" id="{album}""#,
+                    r#" name="Glass Harbour" playCount="0" songCount="3" starred="{starred}""#,
+                    r#" userRating="4" year="2019"/>"#,
+                    r#"{song}"#,
+                    r#"</starred2></subsonic-response>"#
+                ),
+                artist = artist_id,
+                album = album_id,
+                created = created,
+                starred = STARRED,
+                song = low_tide_in_xml(&server).await,
+            )
+        )
     );
-    assert!(
-        content.contains(&format!(
-            r#"<artist albumCount="2" id="{artist_id}" name="Aurora Field" starred="{STARRED}"/>"#
-        )),
-        "{content}"
-    );
-    assert!(content.contains(r#" userRating="4""#), "{content}");
-    assert!(content.contains(r#" userRating="5""#), "{content}");
 }
 
 #[tokio::test]
@@ -634,21 +720,156 @@ async fn get_starred_lists_the_items_in_the_forms_of_the_folder_methods() {
     // The song is the element that `getStarred2` lists.
     assert_eq!(listed["song"], starred2(&server, &[]).await["song"]);
 
-    let body = server.get_xml("getStarred", &[]).await;
-    let (head, rest) = body
-        .split_once("<starred>")
-        .expect("the body holds the element");
-    assert_eq!(head, xml_document("ok", ">"));
-    let (content, tail) = rest.split_once("</starred>").expect("the element ends");
-    assert_eq!(tail, "</subsonic-response>");
-    assert!(
-        content.contains(&format!(
-            r#"<artist id="{artist_id}" name="Aurora Field" starred="{STARRED}" userRating="3"/>"#
-        )),
-        "{content}"
+    // In XML the three lists are child elements of `starred`, in the order
+    // of the Subsonic schema: the artist, then the album as a directory,
+    // then the song.
+    assert_eq!(
+        server.get_xml("getStarred", &[]).await,
+        xml_document(
+            "ok",
+            &format!(
+                concat!(
+                    r#"><starred>"#,
+                    r#"<artist id="{artist}" name="Aurora Field" starred="{starred}""#,
+                    r#" userRating="3"/>"#,
+                    r#"<album album="Glass Harbour" artist="Aurora Field" artistId="{artist}""#,
+                    r#" coverArt="{album}" created="{created}" duration="2" genre="Electronic""#,
+                    r#" id="{album}" isDir="true" mediaType="album" parent="{artist}""#,
+                    r#" playCount="0" starred="{starred}" title="Glass Harbour" userRating="4""#,
+                    r#" year="2019"/>"#,
+                    r#"{song}"#,
+                    r#"</starred></subsonic-response>"#
+                ),
+                artist = artist_id,
+                album = album_id,
+                created = model::iso8601(album_row.created_at),
+                starred = STARRED,
+                song = low_tide_in_xml(&server).await,
+            )
+        )
     );
-    assert_eq!(content.matches(r#" isDir="true""#).count(), 1, "{content}");
-    assert_eq!(content.matches(r#" isDir="false""#).count(), 1, "{content}");
+}
+
+/// Checks the order of the child elements of the XML answer of `method`,
+/// whose element is `key`: every `artist` element, then every `album`
+/// element, then every `song` element, which is the sequence of the Subsonic
+/// schema.
+async fn xml_lists_follow_the_schema_sequence(method: &str, key: &str) {
+    let server = TestServer::standard().await;
+    let artists = [
+        ("artistId", server.artist.aurora_field.as_str()),
+        ("artistId", server.artist.marlow_quartet.as_str()),
+    ];
+    let albums = [
+        ("albumId", server.album.glass_harbour.as_str()),
+        ("albumId", server.album.slow_rivers.as_str()),
+    ];
+    let songs = [
+        ("id", server.track.low_tide.as_str()),
+        ("id", server.track.delta.as_str()),
+        ("id", server.track.open_road.as_str()),
+    ];
+    ok(&server, "star", &[&artists[..], &albums, &songs].concat()).await;
+
+    // The three lists.
+    let xml = server.get_xml(method, &[]).await;
+    let artist = first_element(&xml, "artist");
+    let album = first_element(&xml, "album");
+    let song = first_element(&xml, "song");
+    assert!(artist.is_some(), "{method}: {xml}");
+    assert!(artist < album && album < song, "{method}: {xml}");
+    assert_eq!(
+        child_names(&xml, key),
+        schema_names(2, 2, 3),
+        "{method}: {xml}"
+    );
+
+    // One list is empty: the two others keep their order.
+    for (unstarred, expected) in [
+        (&songs[..], schema_names(2, 2, 0)),
+        (&albums[..], schema_names(2, 0, 3)),
+        (&artists[..], schema_names(0, 2, 3)),
+    ] {
+        ok(&server, "unstar", unstarred).await;
+        let xml = server.get_xml(method, &[]).await;
+        assert_eq!(
+            child_names(&xml, key),
+            expected,
+            "{method} without {unstarred:?}: {xml}"
+        );
+        ok(&server, "star", unstarred).await;
+    }
+    ok(&server, "unstar", &songs).await;
+    let xml = server.get_xml(method, &[]).await;
+    let artist = first_element(&xml, "artist");
+    assert!(artist.is_some(), "{method}: {xml}");
+    assert!(artist < first_element(&xml, "album"), "{method}: {xml}");
+    assert_eq!(first_element(&xml, "song"), None, "{method}: {xml}");
+}
+
+#[tokio::test]
+async fn get_starred2_in_xml_writes_artists_then_albums_then_songs() {
+    xml_lists_follow_the_schema_sequence("getStarred2", "starred2").await;
+}
+
+#[tokio::test]
+async fn get_starred_in_xml_writes_artists_then_albums_then_songs() {
+    xml_lists_follow_the_schema_sequence("getStarred", "starred").await;
+}
+
+/// The order of the XML child elements has no effect on JSON: the keys of
+/// every object are in byte order, so the lists are `album`, `artist` and
+/// `song`.
+#[tokio::test]
+async fn json_documents_keep_the_byte_order_of_their_keys() {
+    let server = TestServer::standard().await;
+
+    // No star: the whole document as text.
+    for (method, key) in [("getStarred2", "starred2"), ("getStarred", "starred")] {
+        assert_eq!(
+            json_body(&server, method).await,
+            json_document(&format!(r#""{key}":{{"album":[],"artist":[],"song":[]}}"#)),
+            "{method}"
+        );
+    }
+
+    // One item in each list: the whole document as text. A `Value` writes
+    // its keys in byte order.
+    star_and_rate_low_tide(&server).await;
+    let annotation_of = |rating: u8| Annotation {
+        starred_at: Some(STARRED_AT),
+        rating: Some(rating),
+        ..Annotation::default()
+    };
+    let artist_row = artist(&server, &server.artist.aurora_field).await;
+    let album_row = album(&server, &server.album.glass_harbour).await;
+    let song_row = song(&server, &server.track.low_tide).await;
+    let song_element = to_json(model::child(&song_row, Some(&annotation_of(5))));
+    let starred2 = json!({
+        "artist": [model::artist(&artist_row, Some(&annotation_of(3)))],
+        "album": [model::album(&album_row, Some(&annotation_of(4)))],
+        "song": [song_element],
+    });
+    let starred = json!({
+        "artist": [model::artist_dir(&artist_row, Some(&annotation_of(3)))],
+        "album": [model::child_dir_for_album(&album_row, Some(&annotation_of(4)))],
+        "song": [song_element],
+    });
+    for (method, key, expected) in [
+        ("getStarred2", "starred2", starred2),
+        ("getStarred", "starred", starred),
+    ] {
+        let text = json_body(&server, method).await;
+        assert_eq!(
+            text,
+            json_document(&format!(r#""{key}":{expected}"#)),
+            "{method}"
+        );
+        let list = |name: &str| text.find(&format!(r#""{name}":["#));
+        let (album, artist, song) = (list("album"), list("artist"), list("song"));
+        assert!(album.is_some(), "{method}: {text}");
+        assert!(album < artist && artist < song, "{method}: {text}");
+    }
 }
 
 #[tokio::test]
