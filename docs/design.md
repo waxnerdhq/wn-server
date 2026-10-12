@@ -48,7 +48,7 @@ Owner upload, multiple users, waxnerd-cloud registration, relay, guests, billing
 - Transcode concurrency: `transcoding.max_concurrent` (default 2). A request past the limit waits up to 5 s, then returns HTTP 503 with `Retry-After: 5`.
 - The owner password is stored as plain text in the database. Token auth (`t = md5(password + s)`) requires a recoverable password. Anyone who can read the data directory can read the password, so it must not be reused anywhere else. On Unix, `init` creates the data directory with mode 0700 and the database with mode 0600; on Windows, the user-profile ACL protects the directory.
 - `init` and `user set-password` generate the password by default and print it once: four groups of five characters separated by hyphens (`xxxxx-xxxxx-xxxxx-xxxxx`), drawn from the operating system's random generator (`rand::rngs::SysRng`) from the 31-character alphabet `abcdefghjkmnpqrstuvwxyz23456789` (no `i`, `l`, `o`, `0`, `1`), which gives 99 bits of entropy and types easily on a phone. Random bytes of 248 and above are discarded, so every character is equally likely. The owner may supply a password instead through `--password-stdin` (the first line of stdin, without its line ending; an empty line is an error) or the `WN_SERVER_PASSWORD` environment variable (an empty value counts as unset); the flag wins over the variable. A supplied password is not printed. There is no interactive prompt.
-- A password is never logged and never part of an error message or of a `Debug` output. The types that hold one (`cli::PasswordSource`, `users::UserRow`) leave it out of their `Debug` output.
+- A password is never logged and never part of an error message or of a `Debug` output. The types that hold one (`cli::PasswordSource`, `users::UserRow`, `api::params::Params` and the credential types of `auth::extract`) leave it out of their `Debug` output. `Params` holds every parameter of a request, so its `Debug` output writes the name of every field and writes `[redacted]` in place of the value of `p`, `t`, `s`, `apiKey` and `password`, whatever the letter case of the name.
 - Default port 4200, bind `0.0.0.0`.
 - Search is case-insensitive substring match (SQL `LIKE` with `ESCAPE '\'`) over lower-cased name columns. An empty query returns everything, paged.
 - API errors use HTTP 200 and the Subsonic error envelope. Unknown `/rest/*` methods return error 0 with message `unknown endpoint`. Paths outside `/rest/` return 404.
@@ -160,7 +160,7 @@ All dependencies are declared in the root `Cargo.toml` from the start and `Cargo
 | clap | 4.6 (`derive`, `env`) | MIT/Apache-2.0 | CLI |
 | gethostname | 1 | Apache-2.0 | default instance name |
 | md-5 | 0.11 | MIT/Apache-2.0 | Subsonic token check |
-| sha2, hex | 0.11 / 0.4 | MIT/Apache-2.0 | fingerprints |
+| sha2, hex | 0.11 / 0.4 | MIT/Apache-2.0 | fingerprints; the digests that a credential comparison compares |
 | rand | 0.10 | MIT/Apache-2.0 | surrogate IDs, generated passwords, the instance UUID |
 | unicode-normalization | 0.1 | MIT/Apache-2.0 | natural keys |
 | image | 0.25 (`jpeg`, `png`, `webp` only) | MIT/Apache-2.0 | cover resize |
@@ -423,6 +423,8 @@ Every method needs a user, except `getOpenSubsonicExtensions`, which is public. 
 3. `apiKey` alone: error 42. `apiKey` with `u`, `p`, `t` or `s`: error 43. `p` with `t` or `s`: error 43.
 4. `u` absent: error 10 naming `u`. None of `p`, `t` and `s`: error 10 naming `p, or t and s`. `t` without `s`, or `s` without `t`: error 10 naming the absent one.
 5. The account is looked up by `u` without regard to ASCII case. `p` is compared with the stored password in constant time; an `enc:` prefix means hex-encoded, and a value with the prefix and invalid hex matches nothing (`auth::verify_password`). `t` must equal `md5(password + s)` as lower-case hex, compared in constant time; upper-case hex does not match (`auth::verify_token`). An unknown name and a wrong credential are both error 40 with the same message. The credential of an unknown name is checked against an empty password, so both cases run the same steps.
+
+Both comparisons hash the two values with SHA-256 and compare the two 32-byte digests in a loop that does not stop at the first difference. No step of the comparison depends on the length of the stored password, which is empty for an unknown name. The time depends on a length only through the number of 64-byte blocks that SHA-256 reads.
 
 Rules 1, 3 and 4 read no account, so their answers do not depend on the accounts of the server. An empty value is a value: `p=` is a password and `apiKey=` is an API key.
 

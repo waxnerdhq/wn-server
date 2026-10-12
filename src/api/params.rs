@@ -1,5 +1,6 @@
 //! The parameters of an API request.
 
+use std::fmt;
 use std::str::FromStr;
 
 use axum::extract::FromRequestParts;
@@ -7,12 +8,48 @@ use axum::http::request::Parts;
 
 use super::envelope::ApiError;
 
+/// The names of the parameters whose value is a credential: the password
+/// `p`, the token `t` with its salt `s`, the API key `apiKey`, and the
+/// `password` of the user management methods.
+const CREDENTIAL_NAMES: [&str; 5] = ["p", "t", "s", "apiKey", "password"];
+
+/// What the `Debug` output of [`Params`] holds in place of the value of a
+/// credential parameter.
+const REDACTED: &str = "[redacted]";
+
 /// The parameters of one API request: the fields of the query string,
 /// followed by the fields of the form body when the request has one. A name
 /// may occur more than once. The fields keep the order of the request.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+///
+/// The `Debug` output holds the name of every field and leaves out the value
+/// of a credential parameter (`docs/design.md` section 1.3).
+#[derive(Clone, Default, PartialEq, Eq)]
 pub struct Params {
     fields: Vec<(String, String)>,
+}
+
+/// Whether `name` is one of [`CREDENTIAL_NAMES`]. The comparison ignores
+/// ASCII case, so the value of a misspelled name such as `P` or `apikey` is
+/// left out of the `Debug` output as well.
+fn is_credential(name: &str) -> bool {
+    CREDENTIAL_NAMES
+        .iter()
+        .any(|credential| name.eq_ignore_ascii_case(credential))
+}
+
+impl fmt::Debug for Params {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let fields = self.fields.iter().map(|(name, value)| {
+            let shown = if is_credential(name) {
+                REDACTED
+            } else {
+                value.as_str()
+            };
+            (name.as_str(), shown)
+        });
+        f.write_str("Params ")?;
+        f.debug_list().entries(fields).finish()
+    }
 }
 
 impl Params {
@@ -395,5 +432,87 @@ mod tests {
     fn error_message_leaves_the_value_out() {
         let params = Params::from_query("size=secret");
         assert!(!error_0(params.opt_u32("size")).contains("secret"));
+    }
+
+    #[test]
+    fn debug_output_leaves_the_value_of_every_credential_parameter_out() {
+        // Every credential parameter is in the query string and in the form
+        // body, and every credential value starts with `zq-`.
+        let mut params = Params::from_query(concat!(
+            "u=owner&c=app&v=1.16.1&p=zq-password&t=zq-token&s=zq-salt",
+            "&apiKey=zq-key&password=zq-new-password"
+        ));
+        let form = concat!(
+            "p=enc%3Azq-form-password&t=zq-form-token&s=zq-form-salt",
+            "&apiKey=zq-form-key&password=zq-form-new-password&id=tr-1"
+        );
+        params.append_form(form.as_bytes());
+
+        for text in [format!("{params:?}"), format!("{params:#?}")] {
+            assert!(!text.contains("zq-"), "{text}");
+            assert_eq!(text.matches(REDACTED).count(), 10, "{text}");
+            // The names stay, and so do the values of the other parameters.
+            for kept in [
+                r#""u""#,
+                r#""owner""#,
+                r#""c""#,
+                r#""app""#,
+                r#""v""#,
+                r#""1.16.1""#,
+                r#""p""#,
+                r#""t""#,
+                r#""s""#,
+                r#""apiKey""#,
+                r#""password""#,
+                r#""id""#,
+                r#""tr-1""#,
+            ] {
+                assert!(text.contains(kept), "{kept}: {text}");
+            }
+        }
+
+        // The output leaves the values out. The getters return them.
+        assert_eq!(params.opt_str("p"), Some("zq-password"));
+        assert_eq!(params.all("p"), ["zq-password", "enc:zq-form-password"]);
+        assert_eq!(params.opt_str("t"), Some("zq-token"));
+        assert_eq!(params.opt_str("s"), Some("zq-salt"));
+        assert_eq!(params.opt_str("apiKey"), Some("zq-key"));
+    }
+
+    #[test]
+    fn debug_output_is_the_list_of_fields_in_order() {
+        let params = Params::from_query("u=owner&p=zq-password&id=1&id=2&empty=");
+        assert_eq!(
+            format!("{params:?}"),
+            concat!(
+                r#"Params [("u", "owner"), ("p", "[redacted]"), ("id", "1"), ("id", "2"), "#,
+                r#"("empty", "")]"#
+            )
+        );
+        assert_eq!(format!("{:?}", Params::default()), "Params []");
+        // An empty credential is left out like any other.
+        assert_eq!(
+            format!("{:?}", Params::from_query("p=&apiKey")),
+            r#"Params [("p", "[redacted]"), ("apiKey", "[redacted]")]"#
+        );
+    }
+
+    #[test]
+    fn debug_output_leaves_a_credential_out_for_any_letter_case_of_its_name() {
+        let params = Params::from_query(
+            "P=zq-1&T=zq-2&S=zq-3&APIKEY=zq-4&apikey=zq-5&Password=zq-6&PASSWORD=zq-7",
+        );
+        let text = format!("{params:?}");
+        assert!(!text.contains("zq-"), "{text}");
+        assert_eq!(text.matches(REDACTED).count(), 7, "{text}");
+    }
+
+    #[test]
+    fn debug_output_of_a_value_that_holds_params_leaves_the_credentials_out() {
+        let params = Params::from_query("u=owner&p=zq-password&t=zq-token&s=zq-salt");
+        let held: Result<Option<(Params, &str)>, ApiError> = Ok(Some((params, "handler")));
+        let text = format!("{held:?}");
+        assert!(!text.contains("zq-"), "{text}");
+        assert!(text.contains("handler"), "{text}");
     }
 }

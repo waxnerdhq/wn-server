@@ -12,6 +12,7 @@ use std::hint::black_box;
 use md5::{Digest, Md5};
 use rand::TryRng;
 use rand::rngs::SysRng;
+use sha2::Sha256;
 
 /// The characters of a generated password: the lower-case letters without
 /// `i`, `l` and `o`, and the digits without `0` and `1`.
@@ -106,19 +107,24 @@ fn alphabet_char(byte: u8) -> Option<char> {
 
 /// Returns whether `given` equals `secret`.
 ///
-/// The loop reads every byte of `given` and does not stop at the first byte
-/// that differs, so the time of a call does not depend on the position of a
-/// wrong byte or on the value of any byte. The time can depend on the two
-/// lengths: the loop runs once for each byte of `given`, and the read of
-/// `secret` takes another branch past its end. A caller learns at most the
-/// length of `secret` from the time. `black_box` asks the compiler not to
-/// replace the loop with a comparison that stops early.
+/// The two values are not compared byte by byte. Each one is hashed with
+/// SHA-256, and the two digests are compared. A digest has 32 bytes for an
+/// input of any length, so the comparison runs the same 32 steps for every
+/// pair of values, and no step depends on the length of `secret`. The loop
+/// does not stop at the first byte that differs. `black_box` asks the
+/// compiler not to replace the loop with a comparison that stops early.
+///
+/// The time of a call depends on a length only through the number of 64-byte
+/// blocks that SHA-256 reads of each value. It does not depend on the
+/// position of a wrong byte or on the value of any byte.
+///
+/// Two values that differ have equal digests only when they are a SHA-256
+/// collision, and no such pair is known.
 fn constant_time_eq(secret: &[u8], given: &[u8]) -> bool {
-    let mut difference = u8::from(secret.len() != given.len());
-    for (index, byte) in given.iter().enumerate() {
-        // A position past the end of the secret is compared with 0. The
-        // length difference has already made the result false.
-        let expected = secret.get(index).copied().unwrap_or(0);
+    let secret = Sha256::digest(secret);
+    let given = Sha256::digest(given);
+    let mut difference = 0u8;
+    for (expected, byte) in secret.iter().zip(given.iter()) {
         difference |= black_box(expected ^ byte);
     }
     black_box(difference) == 0
@@ -232,6 +238,42 @@ mod tests {
                 expected,
                 "{secret:?} {given:?}"
             );
+        }
+    }
+
+    #[test]
+    fn constant_time_eq_rejects_values_of_unequal_lengths() {
+        // One value is the start of the other, so every byte that both hold
+        // is equal and only the lengths differ. The lengths are on both
+        // sides of the 64-byte block of SHA-256, and 0 is the length of the
+        // password that an unknown user is checked against.
+        let lengths = [0, 1, 6, 23, 55, 56, 63, 64, 65, 200];
+        // A zero byte is what a comparison that pads the shorter value
+        // would read past its end.
+        for fill in [b'a', 0] {
+            let bytes = [fill; 200];
+            for secret_len in lengths {
+                for given_len in lengths {
+                    assert_eq!(
+                        constant_time_eq(&bytes[..secret_len], &bytes[..given_len]),
+                        secret_len == given_len,
+                        "fill {fill}: {secret_len} {given_len}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn an_empty_stored_password_matches_an_empty_value_only() {
+        assert!(verify_password("", ""));
+        assert!(verify_password("", "enc:"));
+        for given in ["a", "\0", " ", "enc:00", "sesame"] {
+            assert!(!verify_password("", given), "{given:?}");
+        }
+        for stored in ["a", "\0", "sesame"] {
+            assert!(!verify_password(stored, ""), "{stored:?}");
+            assert!(!verify_password(stored, "enc:"), "{stored:?}");
         }
     }
 
