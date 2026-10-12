@@ -1,4 +1,5 @@
-//! Item IDs, natural keys and file fingerprints (`docs/design.md` section 3.3).
+//! Item IDs, natural keys, the normalised form of a name and file
+//! fingerprints (`docs/design.md` section 3.3).
 
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
@@ -63,18 +64,54 @@ pub fn parse(id: &str) -> Option<(Kind, &str)> {
     is_hex.then_some((kind, hex))
 }
 
+/// Returns the normalised form of `text`: the text in Unicode form NFC, and
+/// then in lower case (`docs/design.md` section 3.3).
+///
+/// The server compares names in this form. The search brings the terms of a
+/// query into it (`db::queries::search::Terms::parse`), and the scanner
+/// stores the title of a track in it in `tracks.title_lc`
+/// (`db::queries::tracks`). Both call this function, so a term and a stored
+/// title are in one form.
+///
+/// - NFC composes a base letter and its combining marks into one character
+///   where Unicode has that character: `e` followed by U+0301 becomes
+///   U+00E9. A text in decomposed form (NFD) and the same text in composed
+///   form have one normalised form.
+/// - Lower case is the lower case of `str::to_lowercase`: the default case
+///   mapping of Unicode for every character, with no rule of a language. `I`
+///   becomes `i` in every text, and U+03A3 becomes U+03C2 at the end of a
+///   word and U+03C3 elsewhere. An ASCII letter becomes its ASCII lower-case
+///   letter.
+/// - No diacritic is removed: U+00E9 and `e` stay different letters.
+/// - The white space of the text stays. A natural key is the same form
+///   without the white space at its ends.
+///
+/// The lower case of a composed text is taken as it is and is not composed
+/// again. A capital letter with a combining mark that Unicode has as one
+/// character in lower case only, such as `J` followed by U+030C, therefore
+/// has another normalised form than that lower-case character, U+01F0.
+pub fn normalise(text: &str) -> String {
+    let composed: String = text.nfc().collect();
+    composed.to_lowercase()
+}
+
 /// Returns the natural key of an artist name: Unicode NFC, trimmed,
-/// lower-cased.
+/// lower-cased. It is the normalised form ([`normalise`]) of the trimmed
+/// name.
 pub fn artist_key(name: &str) -> String {
     natural_key(name)
 }
 
 /// Returns the natural key of an album title: Unicode NFC, trimmed,
-/// lower-cased.
+/// lower-cased. It is the normalised form ([`normalise`]) of the trimmed
+/// title.
 pub fn album_key(title: &str) -> String {
     natural_key(title)
 }
 
+// The key of a row decides its identity, so this function keeps its own
+// statements. The test `a_key_is_the_normalised_form_of_the_trimmed_name`
+// fails when its result and the result of `normalise` differ.
 fn natural_key(text: &str) -> String {
     let composed: String = text.nfc().collect();
     composed.trim().to_lowercase()
@@ -237,6 +274,90 @@ mod tests {
         assert_eq!(artist_key(nfd), "beyonc\u{e9}");
         assert_eq!(album_key(nfd), album_key(nfc));
         assert_eq!(album_key("A\u{30a}NGSTRO\u{308}M"), "\u{e5}ngstr\u{f6}m");
+    }
+
+    #[test]
+    fn normalise_composes_a_text_and_lower_cases_it() {
+        // A text without a letter outside ASCII: ASCII lower case.
+        assert_eq!(normalise("Low Tide 7\" (Remix)"), "low tide 7\" (remix)");
+        assert_eq!(normalise("already lower"), "already lower");
+        assert_eq!(normalise(""), "");
+        // The white space of the text stays.
+        assert_eq!(normalise("  A\tB \u{3000}"), "  a\tb \u{3000}");
+
+        // The decomposed form and the composed form have one normalised
+        // form, in either letter case.
+        let composed = "caf\u{e9}";
+        for spelling in ["Cafe\u{301}", "CAFE\u{301}", "Caf\u{e9}", "CAF\u{c9}"] {
+            assert_eq!(normalise(spelling), composed, "{spelling:?}");
+        }
+        // Two marks on one letter in the order that is not the canonical
+        // one: U+0323 is below the letter and U+0302 is above it.
+        assert_eq!(normalise("A\u{302}\u{323}"), "\u{1ead}");
+        assert_eq!(normalise("A\u{323}\u{302}"), "\u{1ead}");
+        // Hangul syllables are composed from their jamo.
+        assert_eq!(normalise("\u{1112}\u{1161}\u{11ab}"), "\u{d55c}");
+
+        // Lower case is the default mapping of Unicode for letters outside
+        // ASCII, without a rule of a language.
+        assert_eq!(normalise("\u{c9}DITH"), "\u{e9}dith");
+        assert_eq!(
+            normalise("\u{41a}\u{438}\u{43d}\u{43e}"),
+            "\u{43a}\u{438}\u{43d}\u{43e}"
+        );
+        assert_eq!(normalise("STRASSE"), "strasse");
+        assert_eq!(normalise("Stra\u{df}e"), "stra\u{df}e");
+        assert_eq!(normalise("I"), "i");
+        assert_eq!(normalise("\u{130}"), "i\u{307}");
+        // U+03A3 at the end of a word and inside a word.
+        assert_eq!(
+            normalise("\u{39f}\u{394}\u{39f}\u{3a3} \u{3a3}\u{391}"),
+            "\u{3bf}\u{3b4}\u{3bf}\u{3c2} \u{3c3}\u{3b1}"
+        );
+
+        // A letter with a diacritic and its base letter stay different, and
+        // so do a ligature and its letters: nothing is folded.
+        assert_ne!(normalise("\u{e9}"), normalise("e"));
+        assert_ne!(normalise("\u{fb01}"), normalise("fi"));
+        assert_ne!(normalise("\u{ff21}"), normalise("A"));
+    }
+
+    #[test]
+    fn normalise_does_not_compose_the_lower_case_of_a_text_again() {
+        // `J` and U+030C have no composed form, and `j` and U+030C have one.
+        let capital = "J\u{30c}";
+        let small: String = "j\u{30c}".nfc().collect();
+        assert_eq!(small, "\u{1f0}");
+        assert_eq!(normalise(capital), "j\u{30c}");
+        assert_eq!(normalise(&small), "\u{1f0}");
+        assert_ne!(normalise(capital), normalise(&small));
+    }
+
+    #[test]
+    fn a_key_is_the_normalised_form_of_the_trimmed_name() {
+        let names = [
+            "Aurora Field",
+            "  The Beatles ",
+            "\tAbbey Road\n",
+            "Beyonce\u{301}",
+            "BEYONC\u{c9}",
+            "A\u{30a}NGSTRO\u{308}M",
+            "\u{3000}\u{5742}\u{672c}\u{9f8d}\u{4e00}\u{a0}",
+            "\u{2000}En Quad\u{2001}",
+            "\u{39f}\u{394}\u{39f}\u{3a3} ",
+            " \u{3a3}\u{391}",
+            "\u{130}stanbul",
+            "J\u{30c}",
+            "e\u{301} ",
+            " \u{301}e",
+            "",
+            "   ",
+        ];
+        for name in names {
+            assert_eq!(artist_key(name), normalise(name.trim()), "{name:?}");
+            assert_eq!(artist_key(name), normalise(name).trim(), "{name:?}");
+            assert_eq!(album_key(name), artist_key(name), "{name:?}");
+        }
     }
 
     #[test]

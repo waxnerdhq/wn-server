@@ -1110,6 +1110,250 @@ async fn names_outside_ascii_are_found_without_regard_to_case() {
     assert!(xml.contains(r#"name="Группа крови""#), "{xml}");
 }
 
+/// The titles of the songs that `method` finds for `query`. The query must
+/// match no artist and no album.
+async fn songs(server: &TestServer, method: &str, query: &str) -> Vec<String> {
+    let (artists, albums, songs) = find(server, method, query).await;
+    assert_eq!(artists, [] as [&str; 0], "{method} {query:?}");
+    assert_eq!(albums, [] as [&str; 0], "{method} {query:?}");
+    songs
+}
+
+/// A title whose tag is in decomposed form: `e` and U+0301.
+const DECOMPOSED_TITLE: &str = "Cafe\u{301} del Mar";
+
+/// A title whose tag is in composed form: U+00E9.
+const COMPOSED_TITLE: &str = "Fianc\u{e9}e";
+
+#[tokio::test]
+async fn a_title_is_found_in_either_unicode_form_of_its_tag_and_of_the_query() {
+    let upper_case = "U\u{308}BER A\u{30a}NGSTRO\u{308}M";
+    let dotted = "\u{130}stanbul DIYARBAKIR";
+    let sigma = "\u{39f}\u{394}\u{39f}\u{3a3}";
+    let library = LibraryBuilder::new()
+        .track("Nadia Ortiz", "Formas", DECOMPOSED_TITLE, 1, "flac")
+        .track("Nadia Ortiz", "Formas", COMPOSED_TITLE, 2, "mp3")
+        .track("Nadia Ortiz", "Formas", "Cafe Society", 3, "m4a")
+        .track("Nadia Ortiz", "Formas", upper_case, 4, "ogg")
+        .track("Nadia Ortiz", "Formas", dotted, 5, "opus")
+        .track("Nadia Ortiz", "Formas", sigma, 6, "flac")
+        .build();
+    let server = TestServer::scanned(library).await;
+
+    let cases: &[(&str, &[&str])] = &[
+        // A tag in decomposed form: a composed query and a decomposed
+        // query, in lower case and in upper case.
+        ("caf\u{e9}", &[DECOMPOSED_TITLE]),
+        ("cafe\u{301}", &[DECOMPOSED_TITLE]),
+        ("CAF\u{c9}", &[DECOMPOSED_TITLE]),
+        ("CAFE\u{301}", &[DECOMPOSED_TITLE]),
+        ("Caf\u{e9} DEL", &[DECOMPOSED_TITLE]),
+        // A tag in composed form: the same four queries.
+        ("fianc\u{e9}e", &[COMPOSED_TITLE]),
+        ("fiance\u{301}e", &[COMPOSED_TITLE]),
+        ("FIANC\u{c9}E", &[COMPOSED_TITLE]),
+        ("FIANCE\u{301}E", &[COMPOSED_TITLE]),
+        // A letter with a diacritic is not its base letter, in either form
+        // of the tag: `e` does not find U+00E9, and U+00E9 does not find
+        // `e`.
+        ("cafe", &["Cafe Society"]),
+        ("fiancee", &[]),
+        ("caf\u{e9} society", &[]),
+        // The letters before the diacritic are part of both titles. The
+        // songs are in the order of the normalised titles.
+        ("caf", &["Cafe Society", DECOMPOSED_TITLE]),
+        // ASCII letters match in any letter case.
+        ("CAFE society", &["Cafe Society"]),
+        ("sOcIeTy", &["Cafe Society"]),
+        // Letters outside ASCII match in any letter case, by the default
+        // case mapping of Unicode.
+        ("\u{fc}ber", &[upper_case]),
+        ("u\u{308}ber", &[upper_case]),
+        ("\u{dc}BER", &[upper_case]),
+        ("\u{e5}ngstr\u{f6}m \u{fc}ber", &[upper_case]),
+        ("A\u{30a}NGSTRO\u{308}M", &[upper_case]),
+        // The mapping has no rule of a language: `I` is `i`, and U+0130 is
+        // `i` with U+0307, which is neither `i` nor U+0131.
+        ("diyarbakir", &[dotted]),
+        ("d\u{131}yarbak\u{131}r", &[]),
+        ("\u{130}STANBUL", &[dotted]),
+        ("i\u{307}stanbul", &[dotted]),
+        ("istanbul", &[]),
+        // U+03A3 at the end of a word is U+03C2 in lower case.
+        ("\u{3bf}\u{3b4}\u{3bf}\u{3c2}", &[sigma]),
+        ("\u{39f}\u{394}\u{39f}\u{3a3}", &[sigma]),
+        ("\u{3bf}\u{3b4}\u{3bf}\u{3c3}", &[]),
+    ];
+    for (method, _) in METHODS {
+        for (query, expected) in cases {
+            assert_eq!(
+                songs(&server, method, query).await,
+                *expected,
+                "{method} {query:?}"
+            );
+        }
+    }
+
+    // A song has the title that its tag spells, in both formats.
+    let response = server.get_json("search3", &[("query", "caf\u{e9}")]).await;
+    assert_eq!(
+        response["searchResult3"]["song"][0]["title"],
+        DECOMPOSED_TITLE
+    );
+    let xml = server.get_xml("search3", &[("query", "caf\u{e9}")]).await;
+    assert!(
+        xml.contains(&format!(r#"title="{DECOMPOSED_TITLE}""#)),
+        "{xml}"
+    );
+}
+
+#[tokio::test]
+async fn a_title_that_was_stored_without_nfc_is_found_after_the_next_scan_with_what_is_attached() {
+    let library = LibraryBuilder::new()
+        .track("Nadia Ortiz", "Formas", DECOMPOSED_TITLE, 1, "flac")
+        .track("Nadia Ortiz", "Formas", COMPOSED_TITLE, 2, "mp3")
+        .build();
+    let server = TestServer::scanned(library).await;
+    let catalogue = server.catalogue().await;
+    let id = catalogue.song(DECOMPOSED_TITLE).track.id.clone();
+    let other = catalogue.song(COMPOSED_TITLE).track.id.clone();
+
+    // The user stars, rates and plays the track and puts it into a
+    // playlist.
+    let rate = [("id", id.as_str()), ("rating", "4")];
+    let playlist = [
+        ("name", "Mix"),
+        ("songId", other.as_str()),
+        ("songId", id.as_str()),
+    ];
+    let writes: [(&str, &[(&str, &str)]); 4] = [
+        ("star", &rate[..1]),
+        ("setRating", &rate),
+        ("scrobble", &rate[..1]),
+        ("createPlaylist", &playlist),
+    ];
+    for (method, params) in writes {
+        let response = server.get_json(method, params).await;
+        assert_eq!(response["status"], "ok", "{method}: {response}");
+    }
+    let song = server.get_json("getSong", &[("id", &id)]).await["song"].clone();
+    assert_eq!(song["id"], json!(id));
+    assert_eq!(song["title"], DECOMPOSED_TITLE);
+    assert_eq!(song["userRating"], 4);
+    assert_eq!(song["playCount"], 1);
+    assert!(song["starred"].is_string(), "{song}");
+    let playlists = server.get_json("getPlaylists", &[]).await;
+    let playlist_id = playlists["playlists"]["playlist"][0]["id"]
+        .as_str()
+        .expect("the ID of the playlist")
+        .to_owned();
+    let playlist = server
+        .get_json("getPlaylist", &[("id", &playlist_id)])
+        .await["playlist"]
+        .clone();
+    assert_eq!(field(&playlist["entry"], "id"), [other.clone(), id.clone()]);
+    let album = server
+        .get_json("getAlbum", &[("id", song["albumId"].as_str().unwrap())])
+        .await["album"]
+        .clone();
+
+    // The rows as a build stored them that lower-cased a title without
+    // bringing it into Unicode form NFC.
+    let stale = server
+        .db()
+        .write(|conn| {
+            let titles: Vec<(String, String)> = conn
+                .prepare("SELECT id, title FROM tracks")?
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                .collect::<rusqlite::Result<_>>()?;
+            let mut stale = Vec::new();
+            for (id, title) in titles {
+                let lower_case = title.to_lowercase();
+                let changed = conn.execute(
+                    "UPDATE tracks SET title_lc = ?2 WHERE id = ?1 AND title_lc <> ?2",
+                    params![id, lower_case],
+                )?;
+                if changed == 1 {
+                    stale.push(id);
+                }
+            }
+            Ok(stale)
+        })
+        .await
+        .expect("store the titles without NFC");
+    assert_eq!(stale, std::slice::from_ref(&id));
+
+    // The stored text of the title is decomposed and a term is composed, so
+    // neither spelling of the query finds the title. The title whose tag is
+    // composed is found.
+    for (method, _) in METHODS {
+        for query in ["caf\u{e9}", "cafe\u{301}", "CAFE\u{301}"] {
+            assert_eq!(
+                songs(&server, method, query).await,
+                [] as [&str; 0],
+                "{method} {query:?}"
+            );
+        }
+        assert_eq!(
+            songs(&server, method, "fiance\u{301}e").await,
+            [COMPOSED_TITLE]
+        );
+    }
+
+    // The next scan sets the stored text. It reads no file, and it counts
+    // no track as added, changed, moved or removed.
+    let summary = server.rescan().await;
+    assert_eq!(summary.errors, [] as [&str; 0]);
+    assert_eq!((summary.seen, summary.tags_read), (2, 0));
+    assert_eq!(
+        (
+            summary.added,
+            summary.changed,
+            summary.moved,
+            summary.removed
+        ),
+        (0, 0, 0, 0)
+    );
+
+    // Both spellings of the query find the song, and the song is the one
+    // from before the scan: its ID, its star, its rating and its plays.
+    for (method, key) in METHODS {
+        for query in ["caf\u{e9}", "cafe\u{301}", "CAFE\u{301}", "CAF\u{c9} del"] {
+            let response = server.get_json(method, &[("query", query)]).await;
+            assert_eq!(
+                response[key]["song"],
+                json!([song]),
+                "{method} {query:?}: {response}"
+            );
+        }
+    }
+    assert_eq!(
+        server.get_json("getSong", &[("id", &id)]).await["song"],
+        song
+    );
+    // The playlist has its two entries, and the album has its ID and its
+    // songs.
+    assert_eq!(
+        server
+            .get_json("getPlaylist", &[("id", &playlist_id)])
+            .await["playlist"],
+        playlist
+    );
+    assert_eq!(
+        server
+            .get_json("getAlbum", &[("id", album["id"].as_str().unwrap())])
+            .await["album"],
+        album
+    );
+
+    // A second scan finds every row with its text and changes nothing.
+    assert_eq!(server.rescan().await, summary);
+    assert_eq!(
+        songs(&server, "search3", "caf\u{e9}").await,
+        [DECOMPOSED_TITLE]
+    );
+}
+
 #[tokio::test]
 async fn query_of_more_than_1024_characters_is_error_0() {
     let server = TestServer::standard().await;

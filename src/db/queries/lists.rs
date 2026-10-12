@@ -258,8 +258,8 @@ pub fn random_songs<R: Rng + ?Sized>(
 }
 
 /// Returns one page of the songs whose genre is `genre`, without regard to
-/// case: by title in lower case, then by the track artist, the album title
-/// and the ID.
+/// case: by the normalised title (`tracks.title_lc`), then by the track
+/// artist, the album title and the ID.
 ///
 /// With `folder_id` the list holds only the tracks that have a file in that
 /// music folder. Without it the list holds every track row of the genre, a

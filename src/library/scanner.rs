@@ -26,7 +26,9 @@
 //! After the track pass the scanner brings the album rows and the artist
 //! rows in line with the tracks: it deletes the rows that no track refers to,
 //! recomputes the counts and sets the cover of each album. An album row and
-//! an artist row keep their ID for as long as a track refers to them.
+//! an artist row keep their ID for as long as a track refers to them. In the
+//! same step it sets the normalised title of every track row that holds
+//! another value, which is the text that the search compares.
 //!
 //! [`scan`] blocks its thread on file and database work. Files are read
 //! outside the write transactions.
@@ -153,6 +155,12 @@ pub struct ScanSummary {
 /// the cover of the album changed or the album was deleted. It removes the
 /// resized covers of every track that has no row from the same directory.
 /// An album and an artist keep their ID while a track refers to them.
+///
+/// Every scan also sets `title_lc` of each track row to the normalised form
+/// of the title of the row (`tracks::normalise_titles`). It reads no file
+/// for that, and it writes only a row that holds another value. A row that
+/// a scan stores has the value, so the step writes the rows that were
+/// stored under another rule, once.
 ///
 /// The `scans` row of the scan stores whether the scan changed the library:
 /// it wrote a track row, an album row or an artist row, or it follows a scan
@@ -1800,9 +1808,10 @@ struct Aggregated {
     /// The albums whose resized covers in the cache are stale: the deleted
     /// albums and the albums whose cover changed.
     stale_covers: Vec<String>,
-    /// Whether the step deleted or wrote an album row or an artist row. The
-    /// deletion of annotations does not count: it removes what was attached
-    /// to rows that are gone, and it changes no row of the library.
+    /// Whether the step deleted or wrote an album row or an artist row, or
+    /// wrote the normalised title of a track row. The deletion of
+    /// annotations does not count: it removes what was attached to rows
+    /// that are gone, and it changes no row of the library.
     changed_library: bool,
 }
 
@@ -1815,24 +1824,29 @@ struct Aggregated {
 ///    no album and no track refers to. These are the only deletions of album
 ///    rows and artist rows. An album or an artist that a track refers to
 ///    keeps its row and its ID, also when the track has no file.
-/// 2. The song count, the duration, the year and the genre of every album
+/// 2. `title_lc` of every track is set to the normalised form of its title
+///    (`tracks::normalise_titles`, `docs/design.md` section 3.3). The value
+///    comes from the `title` of the row, so no tag is read.
+/// 3. The song count, the duration, the year and the genre of every album
 ///    and the album count of every artist are recomputed. An artist row and
 ///    an album row whose name no track carries take the spelling that the
 ///    most tracks carry, and an album row takes the name of its artist row
 ///    (`docs/design.md` section 3.3).
-/// 3. The cover of every album whose directory the walk saw is set
+/// 4. The cover of every album whose directory the walk saw is set
 ///    ([`resolve_cover`]).
-/// 4. Every annotation of an item that no longer exists is deleted.
+/// 5. Every annotation of an item that no longer exists is deleted.
 ///
-/// Without `seen`, which is the case of a cancelled scan, only step 2 runs.
-/// A cancelled scan has not stored every change it found. An album without a
-/// track may get a track from a file that the scan has not stored, and the
-/// rows may name paths that the walk saw no file at.
+/// Without `seen`, which is the case of a cancelled scan, only the steps 2
+/// and 3 run. A cancelled scan has not stored every change it found. An
+/// album without a track may get a track from a file that the scan has not
+/// stored, and the rows may name paths that the walk saw no file at. The
+/// steps 2 and 3 depend on neither: they bring the rows that are stored in
+/// line with each other.
 ///
 /// A row that already has its values is not written. The result says
-/// whether an album row or an artist row was deleted or written, which is
-/// the number of rows that SQLite counts for the statements before the
-/// deletion of annotations.
+/// whether an album row or an artist row was deleted or written or a track
+/// row was written, which is the number of rows that SQLite counts for the
+/// statements before the deletion of annotations.
 fn aggregate(conn: &mut Connection, seen: Option<&Seen<'_>>) -> Result<Aggregated> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let rows_written = tx.total_changes();
@@ -1841,6 +1855,7 @@ fn aggregate(conn: &mut Connection, seen: Option<&Seen<'_>>) -> Result<Aggregate
         stale_covers = albums::delete_orphans(&tx)?;
         artists::delete_orphans(&tx)?;
     }
+    tracks::normalise_titles(&tx)?;
     albums::recompute_aggregates(&tx)?;
     artists::recompute_aggregates(&tx)?;
     // The artists come first: an album row takes the name of its artist row.
@@ -1869,7 +1884,8 @@ fn aggregate(conn: &mut Connection, seen: Option<&Seen<'_>>) -> Result<Aggregate
             stale_covers.push(inputs.album_id);
         }
     }
-    // Every statement so far writes album rows and artist rows only.
+    // Every statement so far writes rows of the library only: album rows,
+    // artist rows and the normalised titles of track rows.
     let changed_library = tx.total_changes() != rows_written;
     if seen.is_some() {
         annotations::delete_orphans(&tx)?;

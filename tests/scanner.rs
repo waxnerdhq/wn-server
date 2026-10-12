@@ -12,21 +12,23 @@
 //! [`Album`] on, tests the album rows, the artist rows, the annotations and
 //! the covers that the scan derives from the tracks. The third part, from
 //! [`Recorded`] on, tests what the `scans` row of a scan says about the
-//! changes of the scan.
+//! changes of the scan. The fourth part, from [`Titles`] on, tests the
+//! normalised title that a track row holds for the search.
 
 mod common;
 
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::{LibraryBuilder, TestLibrary};
 use lofty::config::WriteOptions;
 use lofty::file::TaggedFileExt;
 use lofty::tag::{ItemKey, TagExt};
+use rusqlite::types::Value;
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -6296,4 +6298,430 @@ fn a_scan_that_fails_after_it_deleted_a_track_row_records_the_change() {
     assert_eq!(scan.error, Some(error.to_string()));
     assert_eq!(scan.counts.removed, 1);
     assert_changed(db, last);
+}
+
+/// The title of a track row as its tag spells it, and the normalised form of
+/// the title that the row holds in `title_lc`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Titles {
+    title: String,
+    title_lc: String,
+}
+
+/// Returns the titles of every track row by the ID of the row.
+fn titles(db: &Db) -> BTreeMap<String, Titles> {
+    db.with_reader(|conn| {
+        let rows = conn
+            .prepare("SELECT id, title, title_lc FROM tracks")?
+            .query_map([], |row| {
+                let titles = Titles {
+                    title: row.get(1)?,
+                    title_lc: row.get(2)?,
+                };
+                Ok((row.get(0)?, titles))
+            })?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(rows)
+    })
+    .unwrap()
+}
+
+/// Returns the `title_lc` of every track row by the title of the row. Every
+/// title of the library is the title of one row.
+fn normalised_titles(db: &Db) -> BTreeMap<String, String> {
+    let rows = titles(db);
+    let by_title: BTreeMap<String, String> = rows
+        .values()
+        .map(|row| (row.title.clone(), row.title_lc.clone()))
+        .collect();
+    assert_eq!(by_title.len(), rows.len(), "{rows:?}");
+    by_title
+}
+
+/// Stores in every track row the `title_lc` of a build that lower-cased the
+/// title and did not bring it into Unicode form NFC. Returns the number of
+/// rows that got another value.
+fn store_titles_without_nfc(db: &Db) -> usize {
+    let stored = titles(db);
+    db.with_writer(|conn| {
+        let mut update = conn.prepare("UPDATE tracks SET title_lc = ?2 WHERE id = ?1")?;
+        let mut changed = 0;
+        for (id, row) in &stored {
+            let lower_case = row.title.to_lowercase();
+            if lower_case != row.title_lc {
+                changed += update.execute([id, &lower_case])?;
+            }
+        }
+        Ok(changed)
+    })
+    .unwrap()
+}
+
+/// The rows of every table but `scans`, by the name of the table: for each
+/// row in rowid order, the rowid, and the name and the value of every
+/// column. `scans` gets a row with every scan.
+type Dump = BTreeMap<String, Vec<Vec<(String, Value)>>>;
+
+fn dump(db: &Db) -> Dump {
+    db.with_reader(|conn| {
+        let tables: Vec<String> = conn
+            .prepare(
+                "SELECT name FROM sqlite_schema
+                 WHERE type = 'table' AND name NOT LIKE 'sqlite_%' AND name <> 'scans'",
+            )?
+            .query_map([], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let mut dump = Dump::new();
+        for table in tables {
+            let mut select = conn.prepare(&format!(
+                "SELECT rowid AS _rowid, * FROM {table} ORDER BY rowid"
+            ))?;
+            let names: Vec<String> = select
+                .column_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            let rows = select
+                .query_map([], |row| {
+                    names
+                        .iter()
+                        .enumerate()
+                        .map(|(index, name)| Ok((name.clone(), row.get(index)?)))
+                        .collect()
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            dump.insert(table, rows);
+        }
+        Ok(dump)
+    })
+    .unwrap()
+}
+
+/// The tables whose rows a user attaches to the tracks, the albums and the
+/// artists.
+const ATTACHED: [&str; 6] = [
+    "annotations",
+    "play_queue",
+    "play_queue_tracks",
+    "playlist_tracks",
+    "playlists",
+    "users",
+];
+
+/// Returns the rows of the tables of [`ATTACHED`].
+fn attached_rows(dump: &Dump) -> Vec<&Vec<Vec<(String, Value)>>> {
+    ATTACHED.iter().map(|table| &dump[*table]).collect()
+}
+
+/// Fails every statement on the write connection, which the scanner uses,
+/// that writes a row of the library or a row that is attached to it.
+fn forbid_library_writes(db: &Db) {
+    db.with_writer(|conn| {
+        for table in ["tracks", "albums", "artists"].iter().chain(&ATTACHED) {
+            for (event, verb) in [
+                ("INSERT", "inserted"),
+                ("UPDATE", "updated"),
+                ("DELETE", "deleted"),
+            ] {
+                conn.execute_batch(&format!(
+                    "CREATE TEMP TRIGGER no_{table}_{verb} BEFORE {event} ON {table}
+                     BEGIN SELECT RAISE(ABORT, 'a row of {table} was {verb}'); END;"
+                ))?;
+            }
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// The titles of [`decomposed_library`] whose tags are in decomposed form,
+/// each with its normalised form.
+const DECOMPOSED_TITLES: [(&str, &str); 2] = [
+    ("El Salo\u{301}n", "el sal\u{f3}n"),
+    ("A\u{30a}NGSTRO\u{308}M", "\u{e5}ngstr\u{f6}m"),
+];
+
+/// A library of five tracks on three albums of three artists. The tags of
+/// the first two artists and of their albums are in decomposed form (NFD),
+/// and so are two titles. The tags of the third artist are in composed form
+/// (NFC). Two titles have no letter outside ASCII.
+fn decomposed_library() -> TestLibrary {
+    let tacvba = "Cafe\u{301} Tacvba";
+    LibraryBuilder::new()
+        .track(tacvba, "Re\u{301}", DECOMPOSED_TITLES[0].0, 1, "flac")
+        .track(tacvba, "Re\u{301}", "La Ingrata", 2, "flac")
+        .track(tacvba, "Re\u{301}", "Esa Noche", 3, "mp3")
+        .track(
+            "Zoe\u{308} A\u{30a}kesson",
+            "U\u{308}berga\u{308}nge",
+            DECOMPOSED_TITLES[1].0,
+            1,
+            "ogg",
+        )
+        .track(
+            "Sigur R\u{f3}s",
+            "\u{c1}g\u{e6}tis byrjun",
+            "Sv\u{e9}fn-g-englar",
+            1,
+            "m4a",
+        )
+        .build()
+}
+
+/// Returns the summary of a scan of [`decomposed_library`] that found
+/// nothing changed.
+fn decomposed_unchanged() -> ScanSummary {
+    ScanSummary {
+        seen: 5,
+        albums: 3,
+        artists: 3,
+        ..ScanSummary::default()
+    }
+}
+
+/// Gives every track of the library a star, a rating, a play count and a
+/// playlist entry, every album and every artist a star and a rating, and
+/// the user a play queue of the first two tracks.
+fn attach_to_every_row(scanned: &Scanned) {
+    let db = &scanned.env.db;
+    let ids: Vec<String> = scanned.env.locators().into_keys().collect();
+    for id in &ids {
+        attach(db, id);
+    }
+    for album in scanned.env.albums().values() {
+        star(db, &album.id, "album");
+    }
+    for artist in scanned.env.artists().values() {
+        star(db, &artist.id, "artist");
+    }
+    db.with_writer(|conn| {
+        conn.execute(
+            "INSERT INTO play_queue (user_id, current_id, position_ms, changed_at, changed_by)
+             VALUES (1, ?1, 1500, 40, 'a client')",
+            [&ids[0]],
+        )?;
+        conn.execute(
+            "INSERT INTO play_queue_tracks (user_id, position, track_id)
+             VALUES (1, 0, ?1), (1, 1, ?2)",
+            [&ids[0], &ids[1]],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+#[test]
+fn a_track_row_holds_the_title_of_its_tag_and_the_normalised_form_of_it() {
+    let library = decomposed_library();
+    // The fourth file has no title tag, so its title is its file stem. The
+    // stem has a decomposed letter in the form in which the file system
+    // returns the name.
+    retag(&library.files[3], &[(ItemKey::TrackTitle, None)]);
+    let scanned = Scanned::of(library);
+    let db = &scanned.env.db;
+
+    let stored = normalised_titles(db);
+    // A title is stored as the tag spells it, and `title_lc` is in Unicode
+    // form NFC and in lower case, whatever the form of the tag is.
+    let mut expected = BTreeMap::from(
+        [
+            (DECOMPOSED_TITLES[0].0, DECOMPOSED_TITLES[0].1),
+            ("La Ingrata", "la ingrata"),
+            ("Esa Noche", "esa noche"),
+            ("Sv\u{e9}fn-g-englar", "sv\u{e9}fn-g-englar"),
+        ]
+        .map(|(title, title_lc)| (title.to_owned(), title_lc.to_owned())),
+    );
+    let stem = stored
+        .keys()
+        .find(|title| title.starts_with("01 "))
+        .expect("the title of the file without a title tag")
+        .clone();
+    expected.insert(stem.clone(), "01 \u{e5}ngstr\u{f6}m".to_owned());
+    assert_eq!(stored, expected);
+    for (title, title_lc) in &stored {
+        assert_eq!(*title_lc, ids::normalise(title), "{title:?}");
+    }
+
+    // A file gets a title in decomposed form. Its row gets the normalised
+    // form of the new title.
+    retag(
+        &scanned.library.files[1],
+        &[(ItemKey::TrackTitle, Some("La Versio\u{301}n"))],
+    );
+    assert_eq!(track_changes(&scanned.rescan()), (0, 1, 0, 0));
+    expected.remove("La Ingrata");
+    expected.insert("La Versio\u{301}n".to_owned(), "la versi\u{f3}n".to_owned());
+    assert_eq!(normalised_titles(db), expected);
+}
+
+#[test]
+fn a_batch_stores_the_normalised_titles_before_the_scan_ends() {
+    let library = decomposed_library();
+    let env = TestDb::new();
+
+    // The hook runs after each batch is committed and before the step that
+    // sets the titles of the rows that lack them. It reads the titles that
+    // the database holds then.
+    let batches: Arc<Mutex<Vec<BTreeMap<String, Titles>>>> = Arc::default();
+    let hook_batches = Arc::clone(&batches);
+    let db = env.db.clone();
+    let summary = env.scan_with(
+        &[library.root.path()],
+        false,
+        ScanOptions {
+            batch_size: 2,
+            on_batch: Some(Box::new(move || {
+                hook_batches.lock().unwrap().push(titles(&db));
+            })),
+            ..ScanOptions::default()
+        },
+    );
+    assert_eq!(summary.added, 5);
+
+    let batches = batches.lock().unwrap();
+    let rows: Vec<usize> = batches.iter().map(BTreeMap::len).collect();
+    assert_eq!(rows, [2, 4, 5]);
+    for batch in batches.iter() {
+        for row in batch.values() {
+            assert_eq!(row.title_lc, ids::normalise(&row.title), "{row:?}");
+        }
+    }
+    // The rows of the last batch are the rows of the library, with the two
+    // titles whose tags are in decomposed form.
+    let last: BTreeMap<&str, &str> = batches[2]
+        .values()
+        .map(|row| (row.title.as_str(), row.title_lc.as_str()))
+        .collect();
+    for (title, title_lc) in DECOMPOSED_TITLES {
+        assert_eq!(last[title], title_lc);
+    }
+}
+
+#[test]
+fn a_scan_sets_the_normalised_titles_that_rows_lack_and_keeps_every_id_and_annotation() {
+    // The first scan after the change is a scan that is not full, or a full
+    // scan.
+    for full in [false, true] {
+        let scanned = Scanned::of(decomposed_library());
+        let db = &scanned.env.db;
+        attach_to_every_row(&scanned);
+        let stored = dump(db);
+        for table in ["tracks", "albums", "artists", "folders"]
+            .iter()
+            .chain(&ATTACHED)
+        {
+            assert!(!stored[*table].is_empty(), "{table} has no row");
+        }
+        let normalised = normalised_titles(db);
+        for (title, title_lc) in DECOMPOSED_TITLES {
+            assert_eq!(normalised[title], title_lc);
+        }
+        let ids = identities(db);
+        assert_eq!(
+            (ids.artists.len(), ids.albums.len(), ids.tracks.len()),
+            (3, 3, 5)
+        );
+        let last = recorded(db).last_modified;
+
+        // The rows as a build stored them that lower-cased a title without
+        // composing it. The two titles in decomposed form have another
+        // `title_lc`, and every other value of every row is the same.
+        assert_eq!(store_titles_without_nfc(db), 2);
+        let before = dump(db);
+        assert_ne!(before["tracks"], stored["tracks"]);
+        let stale = normalised_titles(db);
+        assert_eq!(stale[DECOMPOSED_TITLES[0].0], "el salo\u{301}n");
+        assert_eq!(stale[DECOMPOSED_TITLES[1].0], "a\u{30a}ngstro\u{308}m");
+
+        // The scan sets the two values. A scan that is not full reads no
+        // file for that and counts no track as changed.
+        let summary = scanned
+            .env
+            .scan_with(&[scanned.root()], full, ScanOptions::default());
+        if full {
+            assert_eq!(
+                (summary.seen, summary.changed, summary.tags_read),
+                (5, 5, 5)
+            );
+            assert_eq!(track_changes(&summary), (0, 5, 0, 0));
+        } else {
+            assert_eq!(summary, decomposed_unchanged());
+        }
+        assert_eq!(summary.errors, [] as [&str; 0]);
+        assert_eq!(normalised_titles(db), normalised);
+
+        // Every track, album and artist has its ID and its key, and every
+        // row that the user attached is as it was.
+        let after = dump(db);
+        assert_eq!(identities(db), ids);
+        assert_eq!(attached_rows(&after), attached_rows(&stored));
+        for table in ["albums", "artists", "folders"] {
+            assert_eq!(after[table], stored[table], "{table}");
+        }
+        if !full {
+            // No other value of a track row changed: not its rowid, not its
+            // update time.
+            assert_eq!(after, stored);
+        }
+        // The scan wrote track rows, so it changed the library.
+        assert_changed(db, last);
+        let last = recorded(db).last_modified;
+
+        // Every row has its value now. A scan that finds no file changed
+        // writes no row, and it does not count as a change of the library.
+        forbid_library_writes(db);
+        for _ in 0..2 {
+            assert_eq!(scanned.rescan(), decomposed_unchanged());
+            assert_unchanged(db, last);
+        }
+        assert_eq!(dump(db), after);
+        // The triggers are in force: a write of a track row fails.
+        let error = db
+            .with_writer(|conn| Ok(conn.execute("UPDATE tracks SET mtime = mtime", [])?))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("a row of tracks was updated"),
+            "{error}"
+        );
+    }
+}
+
+#[test]
+fn a_scan_of_a_library_that_this_build_stored_writes_no_title() {
+    // The tags are in decomposed form, and the rows were stored by the scan
+    // of this build. The next scan writes no row, so the first scan left
+    // nothing for it to set.
+    let scanned = Scanned::of(decomposed_library());
+    let db = &scanned.env.db;
+    attach_to_every_row(&scanned);
+    let stored = dump(db);
+    let last = recorded(db).last_modified;
+
+    forbid_library_writes(db);
+    for _ in 0..2 {
+        assert_eq!(scanned.rescan(), decomposed_unchanged());
+        assert_unchanged(db, last);
+    }
+    assert_eq!(dump(db), stored);
+}
+
+#[test]
+fn a_cancelled_scan_sets_the_normalised_titles_too() {
+    let scanned = Scanned::of(decomposed_library());
+    let db = &scanned.env.db;
+    let normalised = normalised_titles(db);
+    let ids = identities(db);
+    assert_eq!(store_titles_without_nfc(db), 2);
+
+    // Two files changed. The scan stores one of them and is cancelled.
+    for file in &scanned.library.files[1..3] {
+        retag(file, &[(ItemKey::Genre, Some("Rock"))]);
+    }
+    let summary = rescan_and_cancel_after_the_first_batch(&scanned, 1);
+    assert_eq!(summary.errors, [CANCELLED]);
+    assert_eq!(track_changes(&summary), (0, 1, 0, 0));
+
+    assert_eq!(normalised_titles(db), normalised);
+    assert_eq!(identities(db), ids);
 }

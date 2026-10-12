@@ -25,26 +25,31 @@
 //!
 //! # Names and letter case
 //!
-//! The names are compared in lower case. `artists.key`, `albums.key` and
-//! `tracks.title_lc` hold a name in lower case, and a term is lower-cased
-//! the same way, so the comparison ignores the case of every letter. The
-//! keys are in Unicode form NFC, and so is a term.
+//! The names are compared in their normalised form: Unicode form NFC and
+//! lower case (`ids::normalise`, `docs/design.md` section 3.3).
+//! `artists.key`, `albums.key` and `tracks.title_lc` hold a name in that
+//! form, and [`Terms::parse`] brings a term into it. The comparison
+//! therefore ignores the case of every letter, and a letter that a tag
+//! spells as a base letter and a combining mark matches the same letter as
+//! one character, and the reverse.
+//!
+//! `tracks.title_lc` and a term are results of the one function
+//! `ids::normalise`. A key is the same form of the trimmed name
+//! (`ids::artist_key`, `ids::album_key`).
 //!
 //! The track artist, `tracks.artist_name`, is stored as the tag spells it
 //! and in no other form. `LIKE` ignores the case of the letters A to Z only,
 //! so a letter outside ASCII in the name of a track artist matches a term
-//! only when the tag has it in lower case.
-//!
-//! The title and the track artist of a track are in the Unicode form of the
-//! tag. A composed letter of a term does not match the same letter in
-//! decomposed form there.
+//! only when the tag has it in lower case. The name is in the Unicode form
+//! of the tag, so a composed letter of a term does not match the same letter
+//! in decomposed form there.
 //!
 //! A letter with a diacritic and its base letter are different letters:
 //! `edith` does not match "Édith".
 //!
 //! # Order and paging
 //!
-//! Every list is in the order of the lower-cased names. Rows with the same
+//! Every list is in the order of the normalised names. Rows with the same
 //! name are in the order of their rowids, which is the order in which the
 //! scanner stored them. The rowid of a row changes only when the database is
 //! rebuilt with `VACUUM`, which the server never runs. The order is
@@ -65,11 +70,11 @@
 //! that names a music folder leaves it out.
 
 use rusqlite::Connection;
-use unicode_normalization::UnicodeNormalization;
 
 use super::browse::{self, Album, Artist, Song, json_array};
 use super::tracks::HAS_FILE_SQL;
 use crate::db::Result;
+use crate::ids;
 
 /// The most characters that a query may have.
 ///
@@ -116,8 +121,9 @@ pub enum QueryError {
 /// them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Terms {
-    /// One `LIKE` pattern for each term: the term in lower case between two
-    /// `%`, with its `%`, `_` and `\` escaped. No pattern is here twice.
+    /// One `LIKE` pattern for each term: the term in its normalised form
+    /// between two `%`, with its `%`, `_` and `\` escaped. No pattern is
+    /// here twice.
     ///
     /// `None` when a term holds the character U+0000. SQLite reads a pattern
     /// and a name up to that character, so `LIKE` cannot compare such a
@@ -130,8 +136,9 @@ impl Terms {
     ///
     /// - Every double quote is removed, so `""` is a query without a term
     ///   and `"glass harbour"` is the two terms `glass` and `harbour`.
-    /// - The text is brought into Unicode form NFC and into lower case, as a
-    ///   natural key is (`ids::artist_key`).
+    /// - The text is brought into its normalised form, Unicode form NFC and
+    ///   lower case, with `ids::normalise`. That is the function that gives
+    ///   `tracks.title_lc` its value, and a natural key is in the same form.
     /// - One `*` at the end of the text is removed, so `beat*` is the term
     ///   `beat`. A `*` at any other place is a character of its term.
     /// - The terms are the parts between white space. A term that the query
@@ -143,11 +150,11 @@ impl Terms {
         if query.chars().nth(MAX_QUERY_CHARS).is_some() {
             return Err(QueryError::TooLong);
         }
-        let text: String = query
-            .nfc()
+        let unquoted: String = query
+            .chars()
             .filter(|character| *character != QUOTE)
             .collect();
-        let text = text.to_lowercase();
+        let text = ids::normalise(&unquoted);
         let text = text.trim();
         let text = text.strip_suffix(WILDCARD).unwrap_or(text);
 
@@ -296,9 +303,9 @@ fn artists_sql() -> String {
 ///
 /// An album is left out when one pattern matches neither its key nor the key
 /// of its artist. `albums.artist_name` is the name of that artist, and the
-/// key is the same name in lower case. The rows are read in the order of the
-/// index `albums_key`, and the music folder is tested with the index
-/// `tracks_album`.
+/// key is the same name in its normalised form. The rows are read in the
+/// order of the index `albums_key`, and the music folder is tested with the
+/// index `tracks_album`.
 fn albums_sql() -> String {
     format!(
         r"SELECT id FROM albums
@@ -319,10 +326,12 @@ fn albums_sql() -> String {
 /// The statement of [`search_tracks`].
 ///
 /// A track is left out when one pattern matches none of its four names. The
-/// title and the track artist are columns of the track. The title of the
-/// album and the name of the album artist are the keys of the album row and
-/// of the artist row: `tracks.album_name` has the key of the album row, and
-/// a key is the name in lower case.
+/// title is compared through `tracks.title_lc`, which holds it in its
+/// normalised form, and the track artist through `tracks.artist_name`, which
+/// holds it as the tag spells it. The title of the album and the name of the
+/// album artist are the keys of the album row and of the artist row:
+/// `tracks.album_name` has the key of the album row, and a key is the name
+/// in its normalised form.
 ///
 /// `terms` numbers the patterns. `album_hits` and `artist_hits` hold, for
 /// each pattern, the IDs of the albums and of the artists whose key it
@@ -600,6 +609,42 @@ mod tests {
         // `e` and U+0301 compose to U+00E9.
         assert_eq!(patterns("E\u{301}dith"), ["%\u{e9}dith%"]);
         assert_eq!(patterns("\u{c9}dith"), ["%\u{e9}dith%"]);
+        // A double quote is removed before the text is composed.
+        assert_eq!(patterns("\"e\u{301}dith\""), ["%\u{e9}dith%"]);
+        assert_eq!(patterns("e\"\u{301}dith"), ["%\u{e9}dith%"]);
+    }
+
+    #[test]
+    fn term_is_the_normalised_form_that_a_stored_title_has() {
+        // Texts whose normalised form another rule would not give: lower
+        // case alone leaves the first two decomposed, NFC alone leaves the
+        // letter case, and a rule that composes the lower case again gives
+        // U+01F0 for the fourth.
+        let texts = [
+            "Cafe\u{301}",
+            "A\u{30a}NGSTRO\u{308}M",
+            "\u{c9}DITH",
+            "J\u{30c}",
+            "\u{130}stanbul",
+            "\u{39f}\u{394}\u{39f}\u{3a3}",
+            "\u{1112}\u{1161}\u{11ab}",
+            "Low-Tide",
+        ];
+        for (n, text) in (1..).zip(texts) {
+            let normalised = ids::normalise(text);
+            assert_eq!(patterns(text), [format!("%{normalised}%")], "{text:?}");
+
+            // The title of a stored track has the same form, so the term
+            // that is the whole title is a part of it.
+            let db = library(&[song(n, "Artist", "Album", text)]);
+            let title_lc: String = db
+                .with_reader(|conn| {
+                    Ok(conn.query_row("SELECT title_lc FROM tracks", [], |row| row.get(0))?)
+                })
+                .unwrap();
+            assert_eq!(title_lc, normalised, "{text:?}");
+            assert_eq!(find(&db, text).tracks, [text], "{text:?}");
+        }
     }
 
     #[test]
@@ -1100,10 +1145,10 @@ mod tests {
     }
 
     #[test]
-    fn decomposed_spelling_in_a_tag_matches_through_a_key_only() {
-        // `e` and U+0301 in the tags, where a term has U+00E9. The keys of
-        // the album and of the artist are in NFC. The title and the track
-        // artist of a track are in the form of the tag.
+    fn decomposed_spelling_in_a_tag_matches_a_composed_term_and_the_reverse() {
+        // `e` and U+0301 in the tags of the first two tracks, and U+00E9 in
+        // the tags of the third. The keys of the album and of the artist
+        // and the stored form of the title are in NFC, and so is a term.
         let db = library(&[
             song(1, "Cafe\u{301} Tacvba", "Re\u{301}", "El Baile"),
             Spec {
@@ -1111,19 +1156,49 @@ mod tests {
                 album_artist: "Various Artists",
                 ..song(2, "", "Sampler", "De\u{301}ja\u{300} Vu")
             },
+            song(3, "Sigur R\u{f3}s", "\u{c1}g\u{e6}tis", "Sv\u{e9}fn"),
         ]);
-        assert_eq!(
-            find(&db, "caf\u{e9}"),
-            names(&["Cafe\u{301} Tacvba"], &["Re\u{301}"], &["El Baile"])
-        );
+        // The artist and the album of the first track, through their keys.
+        for query in ["caf\u{e9}", "cafe\u{301}", "CAFE\u{301}"] {
+            assert_eq!(
+                find(&db, query),
+                names(&["Cafe\u{301} Tacvba"], &["Re\u{301}"], &["El Baile"]),
+                "{query:?}"
+            );
+        }
         assert_eq!(
             find(&db, "r\u{e9}"),
             names(&[], &["Re\u{301}"], &["El Baile"])
         );
-        // The title and the track artist of the second track.
-        assert_eq!(find(&db, "d\u{e9}j\u{e0}"), names(&[], &[], &[]));
+        // The title of the second track is decomposed in its tag.
+        for query in [
+            "d\u{e9}j\u{e0}",
+            "de\u{301}ja\u{300}",
+            "D\u{c9}J\u{c0}",
+            "DE\u{301}JA\u{300}",
+            "\u{e9}j",
+        ] {
+            assert_eq!(
+                find(&db, query),
+                names(&[], &[], &["De\u{301}ja\u{300} Vu"]),
+                "{query:?}"
+            );
+        }
+        // The title of the third track is composed in its tag.
+        for query in ["sv\u{e9}fn", "sve\u{301}fn", "SVE\u{301}FN", "\u{e9}fn"] {
+            assert_eq!(find(&db, query).tracks, ["Sv\u{e9}fn"], "{query:?}");
+        }
+        // The stored title is the composed text. Its base letter alone is
+        // followed by another letter there, so a term of base letters that
+        // spans the accent matches no title, in either spelling of the tag.
+        assert_eq!(find(&db, "deja").tracks, [] as [&str; 0]);
+        assert_eq!(find(&db, "svefn").tracks, [] as [&str; 0]);
+
+        // The track artist is compared as the tag spells it. The term is
+        // composed, and the tag of the second track is not.
         assert_eq!(find(&db, "beyonc\u{e9}"), names(&[], &[], &[]));
-        // The base letters are part of the decomposed text.
+        assert_eq!(find(&db, "beyonce\u{301}"), names(&[], &[], &[]));
+        // The base letters are part of the decomposed track artist.
         assert_eq!(find(&db, "beyonce").tracks, ["De\u{301}ja\u{300} Vu"]);
         assert_eq!(find(&db, "vu").tracks, ["De\u{301}ja\u{300} Vu"]);
     }
