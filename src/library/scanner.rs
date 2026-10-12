@@ -118,8 +118,9 @@ pub struct ScanSummary {
     /// One message for each problem that kept the scan from finishing its
     /// work: a folder, a path or a file that cannot be read, the number of
     /// tracks that were kept for that reason, a folder that had tracks and
-    /// has no supported file, a removed folder whose tracks were kept, and a
-    /// track that is kept without a file. A cancelled scan has
+    /// has no supported file, a removed folder whose tracks were kept, a
+    /// track that is kept without a file, and a file over the tag bound,
+    /// which kept no track from being deleted. A cancelled scan has
     /// [`CANCELLED`] as its last message.
     pub errors: Vec<String>,
 }
@@ -1450,12 +1451,33 @@ impl Scanner<'_> {
         }
     }
 
-    /// Reads the tags of `file`. Logs a warning and returns `None` when the
-    /// tags cannot be read.
+    /// Reads the tags of `file`. Returns `None` when the tags cannot be read:
+    /// with a warning for a file that the tag reader cannot parse, and with
+    /// an error of the scan for a file over the tag bound
+    /// ([`tags::MAX_TAG_BYTES`]).
+    ///
+    /// Neither file holds a deletion back. The walk read the state of the
+    /// file and the scan read its fingerprint, so the scan knows which file
+    /// it is. It is no path and no file that may hold the file of a row
+    /// ([`Unread`]).
     fn read_tags(&mut self, file: &FoundFile) -> Option<TrackMeta> {
         self.summary.tags_read += 1;
         match (self.reader.tags)(&self.path_of(file)) {
             Ok(meta) => Some(meta),
+            Err(TagError::TooLarge(_)) => {
+                // A file over the bound stays out of the library until its
+                // tags are smaller, so the owner is told in the errors of
+                // every scan that reads it.
+                let folder = self.folder_of(file).map(describe).unwrap_or_default();
+                self.problem(format!(
+                    "\"{}\" in music folder {folder} is refused: reading its tags takes more \
+                     than {} MiB of the file; it gets no track, and a track that it has stays \
+                     as it is",
+                    file.rel_path,
+                    tags::MAX_TAG_BYTES / (1024 * 1024)
+                ));
+                None
+            }
             Err(error) => {
                 tracing::warn!(%error, "the file is left for the next scan");
                 None
@@ -5207,5 +5229,45 @@ mod tests {
         assert_eq!(library.id_at("moved/a.wav"), Some(a));
         assert_eq!(library.id_at("moved/b.wav"), Some(b));
         assert_eq!(library.index().len(), 4);
+    }
+
+    /// The ten bytes of an ID3v2 header that declares a tag of 256 MiB,
+    /// which is over the tag bound.
+    const OVER_THE_TAG_BOUND: [u8; 10] = [b'I', b'D', b'3', 4, 0, 0, 0x7f, 0x7f, 0x7f, 0x7f];
+
+    #[test]
+    fn a_cancelled_scan_records_a_refused_file_only_when_it_read_the_file() {
+        // The database has no row, so the files are read in one batch, in
+        // the order of their paths. The read of the first file cancels the
+        // scan. The check before the next read stops the scan, so the file
+        // over the tag bound is not read and the scan has no error for it.
+        let library = Library::new(&[("a.wav", 100, 1)]);
+        fs::write(library.path("b.mp3"), OVER_THE_TAG_BOUND).unwrap();
+        library.cancel_at_tag_read.set(1);
+        let summary = library.scan_in_batches_of(5);
+
+        assert_eq!(summary.errors, [CANCELLED]);
+        assert_eq!(library.tag_reads.get(), 1);
+        assert_eq!(library.index(), []);
+
+        // Here the file over the bound is read first, and the read of the
+        // second file of three cancels the scan. The scan read and refused
+        // the file, so its error stays, although nothing of the batch is
+        // stored.
+        let library = Library::new(&[("b.wav", 100, 1), ("c.wav", 200, 2)]);
+        fs::write(library.path("a.mp3"), OVER_THE_TAG_BOUND).unwrap();
+        library.cancel_at_tag_read.set(2);
+        let summary = library.scan_in_batches_of(5);
+
+        assert_eq!(summary.errors.len(), 2, "{:?}", summary.errors);
+        assert!(
+            summary.errors[0].starts_with("\"a.mp3\" in music folder ")
+                && summary.errors[0].contains(" is refused: "),
+            "{:?}",
+            summary.errors
+        );
+        assert_eq!(summary.errors[1], CANCELLED);
+        assert_eq!(library.tag_reads.get(), 2);
+        assert_eq!(library.index(), []);
     }
 }
