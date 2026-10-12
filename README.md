@@ -148,9 +148,18 @@ The server answers OpenSubsonic requests at `/rest/<method>` and `/rest/<method>
 While `wn-server run` is up, it advertises the server on the local network over mDNS (DNS-SD), so that a client finds the server without its address. `discovery.mdns = false` turns the advertisement off.
 
 - Service type: `_waxnerd._tcp` in the domain `local.`
-- Instance name: `server.name`.
+- Instance name: `server.name`. The mDNS responder appends ` (2)` when another server on the network has the same name.
 - Host: the first label of the system host name, followed by `.local.`. Port: `server.port`.
-- When `server.bind` is an IPv4 address, only IPv4 addresses are advertised. When it is an IPv6 address, both families are advertised.
+
+The advertised addresses follow `server.bind`:
+
+| `server.bind` | Advertised addresses |
+|---|---|
+| `0.0.0.0` | every IPv4 address of the machine |
+| `::` | every IPv4 and IPv6 address of the machine |
+| another address | that address only, on the network it belongs to |
+
+A server on `127.0.0.1` is advertised to clients on the same machine only. On Windows a listener on `::` accepts IPv6 connections only, so the IPv4 addresses that a server on `::` advertises do not accept connections there.
 
 The TXT record holds these keys, in this order:
 
@@ -159,15 +168,17 @@ The TXT record holds these keys, in this order:
 | `txtvers` | `1`, the version of this set of keys |
 | `api` | `opensubsonic` |
 | `path` | `/rest` |
-| `id` | the UUID in `instance.id` |
+| `id` | the UUID in `instance.id`: 36 characters, lower-case hex digits in groups of 8, 4, 4, 4 and 12, separated by hyphens |
 | `name` | `server.name` |
 | `auth` | `password`, or `none` when `auth.disabled_unsafe = true` |
 | `tls` | `0` |
-| `ver` | the version of the server |
+| `ver` | the version of the server in the form `MAJOR.MINOR.PATCH`, for example `0.1.0` |
 
-Every device on the network can read the record. It holds no password and no account name.
+Every device on the network can read the record. It holds no password and no account name. Section 3.12 of [docs/design.md](docs/design.md) states what a client does with each key.
 
-The server runs without the advertisement when the advertisement cannot start, and logs one warning that names the cause: `instance.id` is missing or does not hold a UUID, `server.name` is empty or longer than 63 bytes, or nothing was announced within 10 seconds. `RUST_LOG=info,mdns_sd=debug` shows the messages of the mDNS responder.
+`id` identifies the server to clients. It stays the same across restarts and renames. `run` writes a new `instance.id` when the file is missing and `library.db` exists, and logs one warning. Clients then see a new server.
+
+The server runs without the advertisement when the advertisement cannot start, and logs one warning that names the cause: `instance.id` cannot be read or does not hold a UUID, `server.name` is empty or longer than 63 bytes, or nothing was announced within 10 seconds. `RUST_LOG=info,mdns_sd=debug` shows the messages of the mDNS responder.
 
 Ctrl-C withdraws the advertisement. On macOS, `dns-sd -B _waxnerd._tcp` lists the servers on the network.
 

@@ -17,6 +17,8 @@ use std::fs;
 use std::io;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -38,14 +40,10 @@ const LABEL_MAX_BYTES: usize = 63;
 /// The host label of a machine whose system host name is empty.
 const DEFAULT_HOST_LABEL: &str = "wn-server";
 
-/// The time the daemon probes for its names after a registration before it
-/// announces them (RFC 6762 section 8.1). Nothing is announced before this
-/// time has passed.
-const PROBE_TIME: Duration = Duration::from_millis(750);
-
-/// The time the reporting thread waits for the first announcement. A name
-/// conflict adds about a second of probing for each new name the daemon
-/// tries.
+/// The time the reporting thread waits for the first announcement. The daemon
+/// probes for its names for 750 ms to one second before it announces them
+/// (RFC 6762 section 8.1), and a name conflict adds about a second for each
+/// new name the daemon tries.
 const ANNOUNCE_WAIT: Duration = Duration::from_secs(10);
 
 /// The time [`Advertiser::stop`] waits for one reply of the daemon.
@@ -91,15 +89,16 @@ impl TxtRecord {
     /// | `txtvers` | `1`, the version of this set of keys |
     /// | `api` | `opensubsonic` |
     /// | `path` | `/rest`, the path prefix of the API |
-    /// | `id` | `instance_id`, the UUID in `instance.id` |
+    /// | `id` | `instance_id`, the UUID in `instance.id`: 36 characters |
     /// | `name` | `server.name` |
     /// | `auth` | `password`, or `none` when `auth.disabled_unsafe` is set |
     /// | `tls` | `0`; the server speaks plain HTTP |
-    /// | `ver` | `version`, the version of the server |
+    /// | `ver` | `version`, the version of the server, such as `0.1.0` |
     ///
     /// The record holds nothing else. Every device on the local network can
     /// read it, so it carries no credential, no account name and no folder
-    /// path.
+    /// path. `docs/design.md` section 3.12 states the format of each value
+    /// and what a client does with it.
     pub fn build(config: &Config, version: &str, instance_id: &str) -> Vec<(String, String)> {
         let auth = if config.auth.disabled_unsafe {
             "none"
@@ -127,7 +126,8 @@ impl TxtRecord {
 ///
 /// A server that binds an IPv4 address does not listen on IPv6, so the IPv6
 /// interfaces are disabled and no AAAA record is published. A server that
-/// binds an IPv6 address keeps both families.
+/// binds an IPv6 address keeps the interfaces of both families. [`addresses`]
+/// then decides which addresses the daemon publishes on them.
 ///
 /// Windows: a listener on `::` accepts IPv6 connections only, because Windows
 /// sets `IPV6_V6ONLY` on a new socket. Linux and macOS accept both families
@@ -137,6 +137,25 @@ pub fn interface_kinds(bind: IpAddr) -> Vec<IfKind> {
     match bind {
         IpAddr::V4(_) => vec![IfKind::IPv6],
         IpAddr::V6(_) => Vec::new(),
+    }
+}
+
+/// Returns the addresses that the registration names for a server that binds
+/// `bind`.
+///
+/// A server that binds `0.0.0.0` or `::` listens on every address of the
+/// machine. The result is empty then: the daemon publishes the addresses of
+/// the interfaces it uses and follows their changes. A server that binds one
+/// address listens on that address only, so the result is that address. The
+/// daemon announces an address on the interface whose subnet holds it and on
+/// no other. A server on `127.0.0.1` is therefore announced on the loopback
+/// interface only, and a server on one LAN address is not announced on
+/// another link.
+pub fn addresses(bind: IpAddr) -> Vec<IpAddr> {
+    if bind.is_unspecified() {
+        Vec::new()
+    } else {
+        vec![bind]
     }
 }
 
@@ -170,11 +189,12 @@ fn check_label(what: &'static str, label: &str) -> Result<(), DiscoveryError> {
 
 /// Builds the registration of the server: the service type
 /// [`SERVICE_TYPE`], the instance name `server.name`, the host name
-/// `<first label of system_host_name>.local.`, the port `server.port` and the
-/// TXT record `txt`. The function uses no network.
+/// `<first label of system_host_name>.local.`, the port `server.port`, the
+/// TXT record `txt` and the addresses that [`addresses`] returns for
+/// `server.bind`. The function uses no network.
 ///
-/// The registration names no address. The daemon publishes the addresses of
-/// the interfaces it uses and follows their changes.
+/// A registration without an address lets the daemon choose the addresses.
+/// A registration with an address keeps that address.
 fn service_info(
     config: &Config,
     system_host_name: &str,
@@ -184,15 +204,20 @@ fn service_info(
     let host = host_label(system_host_name);
     check_label("server.name", name)?;
     check_label("the host name", host)?;
+    let addresses = addresses(config.server.bind);
     let info = ServiceInfo::new(
         SERVICE_TYPE,
         name,
         &format!("{host}.local."),
-        "",
+        addresses.as_slice(),
         config.server.port,
         txt,
     )?;
-    Ok(info.enable_addr_auto())
+    if addresses.is_empty() {
+        Ok(info.enable_addr_auto())
+    } else {
+        Ok(info)
+    }
 }
 
 /// A running advertisement: the thread of the mDNS daemon and the instance
@@ -201,6 +226,9 @@ pub struct Advertiser {
     daemon: ServiceDaemon,
     /// The full name of the instance, `<server.name>._waxnerd._tcp.local.`.
     fullname: String,
+    /// Whether the daemon has announced the instance. The reporting thread
+    /// sets it.
+    announced: Arc<AtomicBool>,
     /// The moment before the registration was sent to the daemon.
     registered_at: Instant,
 }
@@ -225,6 +253,7 @@ impl Advertiser {
         let advertiser = Self {
             daemon: ServiceDaemon::new()?,
             fullname,
+            announced: Arc::new(AtomicBool::new(false)),
             registered_at: Instant::now(),
         };
         let disabled = interface_kinds(config.server.bind);
@@ -235,9 +264,10 @@ impl Advertiser {
         advertiser.daemon.register(info)?;
 
         let fullname = advertiser.fullname.clone();
+        let announced = Arc::clone(&advertiser.announced);
         thread::Builder::new()
             .name("mdns-report".to_owned())
-            .spawn(move || report(&fullname, &events))
+            .spawn(move || report(&fullname, &events, &announced))
             .map_err(DiscoveryError::Thread)?;
         Ok(advertiser)
     }
@@ -247,8 +277,8 @@ impl Advertiser {
     /// blocks for about 200 ms, and for up to one second longer for each of
     /// the two replies when the daemon does not answer.
     ///
-    /// A stop within the first 750 ms sends no goodbye packet, because the
-    /// daemon has announced nothing by then.
+    /// A stop before the first announcement sends no goodbye packet and does
+    /// not wait, because there is nothing to withdraw.
     ///
     /// Dropping the value has the same effect. This method names the step.
     pub fn stop(self) {
@@ -258,19 +288,8 @@ impl Advertiser {
 
 impl Drop for Advertiser {
     fn drop(&mut self) {
-        if self.registered_at.elapsed() < PROBE_TIME {
-            // The daemon is still probing and has announced nothing, so there
-            // is nothing to withdraw. A goodbye packet would name records
-            // that another running server with the same instance name may
-            // own, and clients would drop that server. That is the case when
-            // `run` is started twice and the second server cannot bind its
-            // port. The daemon sends a goodbye packet for every registered
-            // service when it shuts down. After this call it has no interface
-            // to send one on.
-            if let Err(error) = self.daemon.disable_interface(IfKind::All) {
-                tracing::debug!("cannot disable the mDNS interfaces: {error}");
-            }
-        } else {
+        let announced = self.announced.load(Ordering::Acquire);
+        if sends_goodbye(announced, self.registered_at.elapsed()) {
             match self.daemon.unregister(&self.fullname) {
                 Ok(reply) => {
                     if let Ok(UnregisterStatus::OK) = reply.recv_timeout(REPLY_WAIT) {
@@ -279,6 +298,11 @@ impl Drop for Advertiser {
                 }
                 Err(error) => tracing::debug!("cannot unregister {}: {error}", self.fullname),
             }
+        } else if let Err(error) = self.daemon.disable_interface(IfKind::All) {
+            // The daemon sends a goodbye packet for every registered service
+            // when it shuts down. After `disable_interface` it has no
+            // interface to send one on.
+            tracing::debug!("cannot disable the mDNS interfaces: {error}");
         }
         match self.daemon.shutdown() {
             Ok(reply) => {
@@ -287,6 +311,22 @@ impl Drop for Advertiser {
             Err(error) => tracing::debug!("cannot shut the mDNS daemon down: {error}"),
         }
     }
+}
+
+/// Whether a stop withdraws the instance with a goodbye packet. `announced`
+/// says whether the reporting thread saw an announcement, and
+/// `since_registration` is the time since the registration.
+///
+/// An instance that was not announced has nothing to withdraw. A goodbye
+/// packet would name records that another running server with the same
+/// instance name may own, and clients would drop that server. That is the
+/// case when `run` is started twice and the second server cannot bind its
+/// port.
+///
+/// The reporting thread watches for [`ANNOUNCE_WAIT`]. An announcement after
+/// that time is not seen, so a stop after it always sends the goodbye packet.
+fn sends_goodbye(announced: bool, since_registration: Duration) -> bool {
+    announced || since_registration >= ANNOUNCE_WAIT
 }
 
 /// What the daemon reported about a registration.
@@ -322,11 +362,15 @@ fn outcome(mut next: impl FnMut() -> Result<DaemonEvent, RecvTimeoutError>) -> O
 
 /// Logs the outcome of the registration of `fullname` once: the first
 /// announcement, an error of the daemon, or the absence of an announcement
-/// after [`ANNOUNCE_WAIT`]. The function returns after that log line.
-fn report(fullname: &str, events: &Receiver<DaemonEvent>) {
+/// after [`ANNOUNCE_WAIT`]. The function sets `announced` when the daemon
+/// announced the instance, and returns after the log line.
+fn report(fullname: &str, events: &Receiver<DaemonEvent>, announced: &AtomicBool) {
     let deadline = Instant::now() + ANNOUNCE_WAIT;
     match outcome(|| events.recv_deadline(deadline)) {
-        Outcome::Announced(announced) => tracing::info!("advertising {announced} over mDNS"),
+        Outcome::Announced(name) => {
+            announced.store(true, Ordering::Release);
+            tracing::info!("advertising {name} over mDNS");
+        }
         Outcome::Failed(error) => tracing::warn!("mDNS advertisement is off: {error}"),
         Outcome::Silent => tracing::warn!(
             "the mDNS daemon has not announced {fullname} after {} s, so clients may not find \
@@ -507,6 +551,32 @@ mod tests {
         }
     }
 
+    /// The address `text`.
+    fn address(text: &str) -> IpAddr {
+        text.parse().expect("an address")
+    }
+
+    #[test]
+    fn a_wildcard_bind_names_no_address() {
+        for bind in ["0.0.0.0", "::"] {
+            assert!(addresses(address(bind)).is_empty(), "{bind}");
+        }
+    }
+
+    #[test]
+    fn a_lan_bind_address_is_the_only_address() {
+        for bind in ["192.168.1.5", "10.0.0.7", "fd00::5"] {
+            assert_eq!(addresses(address(bind)), [address(bind)], "{bind}");
+        }
+    }
+
+    #[test]
+    fn a_loopback_bind_address_is_the_only_address() {
+        for bind in ["127.0.0.1", "::1"] {
+            assert_eq!(addresses(address(bind)), [address(bind)], "{bind}");
+        }
+    }
+
     #[test]
     fn host_label_is_the_first_label_of_the_system_host_name() {
         for (system_name, label) in [
@@ -552,9 +622,6 @@ mod tests {
         assert_eq!(info.get_fullname(), "studio._waxnerd._tcp.local.");
         assert_eq!(info.get_hostname(), "host.local.");
         assert_eq!(info.get_port(), 4321);
-        // The daemon fills in the addresses.
-        assert!(info.is_addr_auto());
-        assert!(info.get_addresses().is_empty());
 
         let properties: Vec<(&str, &str)> = info
             .get_properties()
@@ -562,6 +629,43 @@ mod tests {
             .map(|property| (property.key(), property.val_str()))
             .collect();
         assert_eq!(properties, pairs(&txt));
+    }
+
+    /// The registration of a server that binds `bind`.
+    fn service_info_bound_to(bind: &str) -> ServiceInfo {
+        let mut config = config_named("studio");
+        config.server.bind = address(bind);
+        let txt = TxtRecord::build(&config, "1.2.3", INSTANCE_ID);
+        service_info(&config, "studio", &txt).expect("a registration")
+    }
+
+    #[test]
+    fn service_info_leaves_the_addresses_of_a_wildcard_bind_to_the_daemon() {
+        for bind in ["0.0.0.0", "::"] {
+            let info = service_info_bound_to(bind);
+            assert!(info.is_addr_auto(), "{bind}");
+            assert!(info.get_addresses().is_empty(), "{bind}");
+        }
+    }
+
+    #[test]
+    fn service_info_names_a_lan_bind_address_and_no_other() {
+        for bind in ["192.168.1.5", "fd00::5"] {
+            let info = service_info_bound_to(bind);
+            assert!(!info.is_addr_auto(), "{bind}");
+            let named: Vec<IpAddr> = info.get_addresses().iter().copied().collect();
+            assert_eq!(named, [address(bind)], "{bind}");
+        }
+    }
+
+    #[test]
+    fn service_info_names_a_loopback_bind_address_and_no_other() {
+        for bind in ["127.0.0.1", "::1"] {
+            let info = service_info_bound_to(bind);
+            assert!(!info.is_addr_auto(), "{bind}");
+            let named: Vec<IpAddr> = info.get_addresses().iter().copied().collect();
+            assert_eq!(named, [address(bind)], "{bind}");
+        }
     }
 
     #[test]
@@ -711,6 +815,28 @@ mod tests {
         let config = config_named("studio");
         assert!(config.discovery.mdns);
         assert!(advertise(&config, &dir.path().join("instance.id")).is_none());
+    }
+
+    #[test]
+    fn a_stop_before_the_announcement_sends_no_goodbye() {
+        assert!(!sends_goodbye(false, Duration::ZERO));
+        assert!(!sends_goodbye(false, Duration::from_millis(900)));
+        assert!(!sends_goodbye(false, Duration::from_millis(9_999)));
+    }
+
+    #[test]
+    fn a_stop_after_the_announcement_sends_a_goodbye() {
+        assert!(sends_goodbye(true, Duration::ZERO));
+        assert!(sends_goodbye(true, Duration::from_millis(900)));
+        assert!(sends_goodbye(true, Duration::from_secs(3_600)));
+    }
+
+    #[test]
+    fn a_stop_after_the_watch_ended_sends_a_goodbye() {
+        // The reporting thread watches for ten seconds. It does not see an
+        // announcement that comes later.
+        assert!(sends_goodbye(false, Duration::from_secs(10)));
+        assert!(sends_goodbye(false, Duration::from_secs(3_600)));
     }
 
     /// The outcome of the events in `events`, followed by `end`.
