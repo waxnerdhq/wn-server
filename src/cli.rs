@@ -22,6 +22,8 @@ use crate::config::{self, Config, ConfigError, DataDir};
 use crate::db::queries::users::{self, User, UserRow};
 use crate::db::{Db, DbError};
 use crate::discovery;
+use crate::library::scan_controller::{ScanLock, ScanLockError};
+use crate::library::scanner::{self, ScanOptions, ScanSummary};
 use crate::server::{self, ServerError};
 
 /// The environment variable that supplies the password to `init` and
@@ -59,8 +61,8 @@ pub enum Command {
     Init(InitArgs),
     /// Runs the server in the foreground
     Run,
-    /// Runs one scan and exits
-    Scan,
+    /// Runs one scan of the music folders and exits
+    Scan(ScanArgs),
     /// Shows or changes the owner account
     User {
         #[command(subcommand)]
@@ -105,6 +107,15 @@ pub struct InitArgs {
     pub password_stdin: bool,
 }
 
+/// The options of `wn-server scan`.
+#[derive(Debug, Args)]
+pub struct ScanArgs {
+    /// Reads the tags of every file again. Without this option the scan
+    /// reads the files that are new or have changed
+    #[arg(long)]
+    pub full: bool,
+}
+
 /// The subcommands of `wn-server user`.
 #[derive(Debug, Subcommand)]
 pub enum UserCommand {
@@ -140,8 +151,6 @@ pub enum ConfigCommand {
 /// A command that did not complete. No variant holds a password.
 #[derive(Debug, Error)]
 enum CliError {
-    #[error("not implemented yet")]
-    NotImplemented,
     #[error(transparent)]
     Config(#[from] ConfigError),
     #[error("the log filter `{filter}` is not valid: {reason}")]
@@ -195,6 +204,22 @@ enum CliError {
     PasswordEnvNotUnicode,
     #[error("cannot start the runtime that closes the database: {0}")]
     Runtime(io::Error),
+    #[error(
+        "another process is scanning this library: the running server or another \
+         `wn-server scan`. Nothing was scanned; run the command again when that scan has ended"
+    )]
+    ScanRunning,
+    #[error(transparent)]
+    ScanLock(#[from] ScanLockError),
+    #[error("the scan recorded {}", count_of(*.0, "error"))]
+    ScanErrors(usize),
+}
+
+/// `count` and `noun`, with an `s` when `count` is not 1: `1 error`,
+/// `2 errors`.
+fn count_of(count: usize, noun: &str) -> String {
+    let plural = if count == 1 { "" } else { "s" };
+    format!("{count} {noun}{plural}")
 }
 
 /// Where `init` and `user set-password` take the password from.
@@ -240,17 +265,12 @@ struct NewPassword {
 }
 
 /// Runs the command and returns the exit code of the process. A command that
-/// fails prints its error to stderr and exits with 1. `scan` prints
-/// `not implemented yet` to stderr and exits with 2.
+/// fails prints its error to stderr and exits with 1.
 pub fn run(cli: &Cli) -> ExitCode {
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
     match execute(cli, &mut stdin, &mut stdout) {
         Ok(()) => ExitCode::SUCCESS,
-        Err(error @ CliError::NotImplemented) => {
-            eprintln!("{error}");
-            ExitCode::from(2)
-        }
         Err(error) => {
             eprintln!("wn-server: {error}");
             ExitCode::FAILURE
@@ -262,7 +282,13 @@ pub fn run(cli: &Cli) -> ExitCode {
 /// a command that got `--password-stdin`.
 fn execute(cli: &Cli, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<(), CliError> {
     match &cli.command {
-        Command::Scan => Err(CliError::NotImplemented),
+        Command::Scan(args) => {
+            let data_dir = DataDir::resolve(cli.data_dir.as_deref())?;
+            let config = Config::load(&data_dir.config_path())?;
+            // The scanner logs the files it leaves for the next scan.
+            init_tracing(&config.server.log_level)?;
+            scan(&data_dir, &config, args, out)
+        }
         Command::Run => {
             let data_dir = DataDir::resolve(cli.data_dir.as_deref())?;
             serve(&data_dir)
@@ -326,6 +352,72 @@ fn serve(data_dir: &DataDir) -> Result<(), CliError> {
         tokio::spawn(cancel_on_ctrl_c(cancel.clone()));
         server::run_server(config, data_dir, cancel).await
     })?;
+    Ok(())
+}
+
+/// Runs one scan of the music folders of `config` into the database of
+/// `data_dir`, in this process, and prints its summary to `out`. `--full`
+/// reads the tags of every file again.
+///
+/// The scan holds the scan lock of the data directory from its start to its
+/// end. While another process scans the library, which is the running
+/// server or another `wn-server scan`, the command scans nothing and fails.
+/// A server that runs and does not scan keeps serving during the scan:
+/// SQLite lets it read while the scan writes, and a write of the server
+/// waits for one transaction of the scan at most. The server starts no scan
+/// of its own while this one holds the lock.
+///
+/// The database must exist; only `init` creates it. The scan removes the
+/// stale files of the cover cache of the data directory. After the scan the
+/// command checkpoints the write-ahead log, as `init` does. The command
+/// fails when the scan recorded an error, after it has printed the summary.
+fn scan(
+    data_dir: &DataDir,
+    config: &Config,
+    args: &ScanArgs,
+    out: &mut dyn Write,
+) -> Result<(), CliError> {
+    let db = open_existing_db(data_dir)?;
+    let Some(lock) = ScanLock::try_acquire(&data_dir.scan_lock_path())? else {
+        return Err(CliError::ScanRunning);
+    };
+    let options = ScanOptions {
+        covers_cache_dir: Some(data_dir.covers_cache_dir()),
+        ..ScanOptions::default()
+    };
+    // The command has no way to cancel its scan. A process that is ended
+    // during the scan keeps the batches that the scan committed, and the
+    // next scan finishes the work.
+    let never = CancellationToken::new();
+    let scanned = scanner::scan(&db, &config.library.folders, &never, args.full, options);
+    drop(lock);
+    let summary = scanned?;
+    // The rows of the scan are in the database file before the summary is
+    // printed. A running server may keep the checkpoint from finishing, and
+    // it then checkpoints the log itself.
+    close_db(db)?;
+
+    print_scan_summary(out, &summary)?;
+    match summary.errors.len() {
+        0 => Ok(()),
+        errors => Err(CliError::ScanErrors(errors)),
+    }
+}
+
+/// Prints the counts of `summary`, one `name: number` line each, and then one
+/// `error: <message>` line for each error of the scan.
+fn print_scan_summary(out: &mut dyn Write, summary: &ScanSummary) -> io::Result<()> {
+    writeln!(out, "seen: {}", summary.seen)?;
+    writeln!(out, "added: {}", summary.added)?;
+    writeln!(out, "changed: {}", summary.changed)?;
+    writeln!(out, "moved: {}", summary.moved)?;
+    writeln!(out, "removed: {}", summary.removed)?;
+    writeln!(out, "albums: {}", summary.albums)?;
+    writeln!(out, "artists: {}", summary.artists)?;
+    writeln!(out, "errors: {}", summary.errors.len())?;
+    for error in &summary.errors {
+        writeln!(out, "error: {error}")?;
+    }
     Ok(())
 }
 
@@ -558,8 +650,8 @@ fn set_password(
 }
 
 /// Opens the database of a data directory that `init` has set up. `Db::open`
-/// creates a missing file, and the `user` commands must not create a
-/// database, so a missing file is an error here.
+/// creates a missing file, and the `user` commands and `scan` must not
+/// create a database, so a missing file is an error here.
 fn open_existing_db(data_dir: &DataDir) -> Result<Db, CliError> {
     let db_path = data_dir.db_path();
     if !db_path.exists() {
@@ -753,6 +845,8 @@ fn write_new_file(path: &Path, text: &str) -> Result<bool, CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::queries::scans;
+    use crate::library::scan_controller::testing::music_folder;
     use clap::CommandFactory;
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
@@ -898,13 +992,206 @@ mod tests {
     }
 
     #[test]
-    fn scan_is_not_implemented() {
-        let cli = parse(&["scan"]).expect("arguments");
+    fn scan_takes_the_full_option() {
+        for (args, full) in [(&["scan"][..], false), (&["scan", "--full"], true)] {
+            let cli = parse(args).unwrap_or_else(|error| panic!("{args:?}: {error}"));
+            let Command::Scan(scan) = cli.command else {
+                panic!("expected scan");
+            };
+            assert_eq!(scan.full, full, "{args:?}");
+        }
+        assert!(parse(&["scan", "--full=maybe"]).is_err());
+        assert!(parse(&["scan", "folder"]).is_err());
+    }
+
+    /// A data directory with an empty database, and the config of a server
+    /// with the one music folder `folder`.
+    fn scan_setup(folder: &Path) -> (tempfile::TempDir, DataDir, Config) {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let data_dir = DataDir::resolve(Some(dir.path())).expect("a data directory");
+        drop(Db::open(data_dir.db_path()).expect("create the database"));
+        let mut config = Config::default();
+        config.library.folders = vec![folder.to_path_buf()];
+        (dir, data_dir, config)
+    }
+
+    /// Runs the `scan` command and returns its result and what it printed.
+    fn run_scan(data_dir: &DataDir, config: &Config, full: bool) -> (Result<(), CliError>, String) {
         let mut out = Vec::new();
-        let error = execute(&cli, &mut io::empty(), &mut out).expect_err("not implemented");
-        assert!(matches!(error, CliError::NotImplemented), "{error}");
-        assert_eq!(error.to_string(), "not implemented yet");
-        assert!(out.is_empty());
+        let result = scan(data_dir, config, &ScanArgs { full }, &mut out);
+        (result, String::from_utf8(out).expect("UTF-8 output"))
+    }
+
+    /// The summary that `scan` prints for a scan without an error. The three
+    /// fixture files carry no tags, so they are one album of one artist.
+    fn summary_lines(added: u64, changed: u64) -> String {
+        format!(
+            "seen: 3\nadded: {added}\nchanged: {changed}\nmoved: 0\nremoved: 0\nalbums: 1\n\
+             artists: 1\nerrors: 0\n"
+        )
+    }
+
+    /// The rows of the `scans` table of `data_dir`.
+    fn scan_rows(data_dir: &DataDir) -> Vec<scans::Scan> {
+        let db = Db::open(data_dir.db_path()).expect("open the database");
+        db.with_reader(scans::list).expect("read the scans")
+    }
+
+    #[test]
+    fn scan_stores_the_tracks_prints_the_summary_and_frees_the_lock() {
+        let folder = music_folder(3);
+        let (_dir, data_dir, config) = scan_setup(folder.path());
+
+        let (result, out) = run_scan(&data_dir, &config, false);
+        result.expect("the scan succeeds");
+        assert_eq!(out, summary_lines(3, 0));
+        let rows = scan_rows(&data_dir);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].finished_at.is_some());
+        assert_eq!(rows[0].error, None);
+        assert_eq!(rows[0].counts.added, 3);
+
+        // The lock is free, so the next scan runs. It finds nothing to do.
+        let (result, out) = run_scan(&data_dir, &config, false);
+        result.expect("the scan succeeds");
+        assert_eq!(out, summary_lines(0, 0));
+
+        // A full scan reads the tags of every file again.
+        let (result, out) = run_scan(&data_dir, &config, true);
+        result.expect("the scan succeeds");
+        assert_eq!(out, summary_lines(0, 3));
+        assert_eq!(scan_rows(&data_dir).len(), 3);
+    }
+
+    #[test]
+    fn scan_fails_after_the_summary_when_the_scan_recorded_an_error() {
+        let folder = music_folder(3);
+        let (_dir, data_dir, config) = scan_setup(folder.path());
+        run_scan(&data_dir, &config, false)
+            .0
+            .expect("the scan succeeds");
+
+        // The folder had tracks and holds no supported file now.
+        for entry in fs::read_dir(folder.path()).expect("list the folder") {
+            fs::remove_file(entry.expect("an entry").path()).expect("remove the file");
+        }
+        let (result, out) = run_scan(&data_dir, &config, false);
+
+        let error = result.expect_err("the scan recorded an error");
+        assert!(matches!(error, CliError::ScanErrors(1)), "{error}");
+        assert_eq!(error.to_string(), "the scan recorded 1 error");
+        let name = folder.path().file_name().expect("a name");
+        let message = format!(
+            "music folder \"{}\" ({}) has no supported file; none of its tracks was deleted",
+            name.to_str().expect("a UTF-8 name"),
+            folder.path().display()
+        );
+        assert_eq!(
+            out,
+            format!(
+                "seen: 0\nadded: 0\nchanged: 0\nmoved: 0\nremoved: 0\nalbums: 1\nartists: 1\n\
+                 errors: 1\nerror: {message}\n"
+            )
+        );
+        let rows = scan_rows(&data_dir);
+        assert_eq!(rows[1].error.as_deref(), Some(message.as_str()));
+    }
+
+    #[test]
+    fn scan_errors_are_counted_in_the_message() {
+        assert_eq!(count_of(1, "error"), "1 error");
+        assert_eq!(count_of(2, "error"), "2 errors");
+        assert_eq!(
+            CliError::ScanErrors(12).to_string(),
+            "the scan recorded 12 errors"
+        );
+    }
+
+    #[test]
+    fn scan_scans_nothing_while_another_process_holds_the_scan_lock() {
+        let folder = music_folder(3);
+        let (_dir, data_dir, config) = scan_setup(folder.path());
+        // The lock that a scan of the running server holds.
+        let other = ScanLock::try_acquire(&data_dir.scan_lock_path())
+            .expect("lock the file")
+            .expect("the lock is free");
+
+        for full in [false, true] {
+            let (result, out) = run_scan(&data_dir, &config, full);
+            let error = result.expect_err("another process scans");
+            assert!(matches!(error, CliError::ScanRunning), "{error}");
+            assert!(error.to_string().contains("Nothing was scanned"), "{error}");
+            assert!(out.is_empty(), "{out}");
+        }
+        assert_eq!(scan_rows(&data_dir), []);
+
+        // The other scan has ended.
+        drop(other);
+        let (result, out) = run_scan(&data_dir, &config, false);
+        result.expect("the scan succeeds");
+        assert_eq!(out, summary_lines(3, 0));
+    }
+
+    #[test]
+    fn scan_without_a_database_names_init_and_creates_no_file() {
+        let folder = music_folder(1);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let data_dir = DataDir::resolve(Some(dir.path())).expect("a data directory");
+        let mut config = Config::default();
+        config.library.folders = vec![folder.path().to_path_buf()];
+
+        let (result, out) = run_scan(&data_dir, &config, false);
+        let error = result.expect_err("no database");
+        assert!(matches!(error, CliError::NoDatabase(_)), "{error}");
+        assert!(error.to_string().contains("wn-server init"), "{error}");
+        assert!(out.is_empty(), "{out}");
+        assert!(!data_dir.db_path().exists());
+        assert!(!data_dir.scan_lock_path().exists());
+    }
+
+    #[test]
+    fn scan_removes_the_stale_files_of_the_cover_cache_of_the_data_directory() {
+        let folder = music_folder(1);
+        let cover = folder.path().join("cover.jpg");
+        fs::write(&cover, "an image").expect("write the cover");
+        let (_dir, data_dir, config) = scan_setup(folder.path());
+        run_scan(&data_dir, &config, false)
+            .0
+            .expect("the scan succeeds");
+
+        let (album_id, cover_mtime): (String, i64) = Db::open(data_dir.db_path())
+            .expect("open the database")
+            .with_reader(|conn| {
+                Ok(
+                    conn.query_row("SELECT id, cover_mtime FROM albums", [], |row| {
+                        Ok((row.get(0)?, row.get(1)?))
+                    })?,
+                )
+            })
+            .expect("the album of the file");
+        let cache = data_dir.covers_cache_dir();
+        fs::create_dir_all(&cache).expect("create the cache");
+        let stale = cache.join(format!("{album_id}-64-{cover_mtime}.jpg"));
+        fs::write(&stale, "a resized cover").expect("write the cached cover");
+
+        // The cover file is replaced by a newer one.
+        fs::write(&cover, "another image").expect("replace the cover");
+        let newer = cover_mtime + 10;
+        let file = fs::File::options()
+            .write(true)
+            .open(&cover)
+            .expect("open the cover");
+        file.set_modified(
+            std::time::UNIX_EPOCH
+                + std::time::Duration::from_secs(u64::try_from(newer).expect("a time")),
+        )
+        .expect("set the time");
+        drop(file);
+
+        run_scan(&data_dir, &config, false)
+            .0
+            .expect("the scan succeeds");
+        assert!(!stale.exists(), "{}", stale.display());
     }
 
     #[test]

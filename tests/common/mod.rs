@@ -10,7 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Body;
@@ -24,11 +24,13 @@ use lofty::tag::{ItemKey, Tag, TagExt};
 use md5::{Digest, Md5};
 use serde_json::Value;
 use tempfile::TempDir;
+use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use wn_server::api::{self, AppState};
 use wn_server::config::Config;
 use wn_server::db::Db;
 use wn_server::db::queries::users;
+use wn_server::library::scan_controller::{ScanController, ScanHooks, ScanSettings, StartOutcome};
 
 /// The picture that [`LibraryBuilder::picture`] embeds: a 2×2 PNG, 8-bit RGB,
 /// with one red, one green, one blue and one white pixel.
@@ -361,6 +363,11 @@ pub const API_VERSION: &str = "1.16.1";
 /// The value of `c` in the auth defaults of a [`TestServer`].
 pub const CLIENT: &str = "wn-server-tests";
 
+/// The longest time [`TestServer::wait_for_scan`] polls. The limit ends a
+/// test whose scan does not end. It does not delay a passing run: a scan of
+/// the standard library takes some tens of milliseconds.
+const SCAN_WAIT: Duration = Duration::from_secs(1);
+
 /// The Subsonic token of `password` for `salt`: the MD5 digest of the
 /// password followed by the salt, as lower-case hex.
 pub fn token(password: &str, salt: &str) -> String {
@@ -418,21 +425,46 @@ impl AuthDefaults {
 /// `c`. A default whose name the caller passes is left out. `get_raw_noauth`,
 /// `get_json_noauth`, `get_path` and `request` add no auth default. A test
 /// that sends a password, an API key or no credential uses them.
+///
+/// The server starts no scan by itself. [`TestServer::scan_and_wait`] and
+/// the `startScan` method scan the music folders of the config.
 pub struct TestServer {
     router: Router,
     db: Db,
+    scan: ScanController,
+    scan_poll_ms: u64,
 }
 
 impl TestServer {
     /// A server with the state that `config` gives, a database that holds
     /// the owner account, and nothing else. The music folders of `config`
-    /// are not read.
+    /// are not read before a scan starts.
     pub async fn bare(config: Config) -> Self {
+        Self::with_scan(config, |_| {}).await
+    }
+
+    /// As [`TestServer::bare`], with the settings of the scans that `adjust`
+    /// changes. Without a change the scans take no scan lock, remove no
+    /// cached cover and have no test hook, because the server has no data
+    /// directory.
+    pub async fn with_scan(config: Config, adjust: impl FnOnce(&mut ScanSettings)) -> Self {
         let db = Db::open_memory().expect("open a memory database");
         db.write(|conn| users::insert_owner(conn, OWNER, OWNER_PASSWORD))
             .await
             .expect("insert the owner")
             .expect("a new database has no owner");
+
+        let mut settings = ScanSettings {
+            db: db.clone(),
+            folders: config.library.folders.clone(),
+            covers_cache_dir: None,
+            lock_path: None,
+            cancel: CancellationToken::new(),
+            hooks: ScanHooks::default(),
+        };
+        adjust(&mut settings);
+        let scan = ScanController::new(settings);
+        let scan_poll_ms = config.library.scan_poll_ms;
 
         // The fields follow the layout rule in the module comment of
         // `wn_server::api`.
@@ -446,7 +478,7 @@ impl TestServer {
 
             // transcoder
 
-            // scan
+            scan: scan.clone(),
 
             // cancel
 
@@ -455,12 +487,42 @@ impl TestServer {
         Self {
             router: api::build_router(state),
             db,
+            scan,
+            scan_poll_ms,
         }
     }
 
     /// The database of the server.
     pub fn db(&self) -> &Db {
         &self.db
+    }
+
+    /// The controller of the scans of the server.
+    pub fn scan(&self) -> &ScanController {
+        &self.scan
+    }
+
+    /// Starts a scan of the music folders of the config that is not full,
+    /// and waits until it has ended. No other scan may run.
+    pub async fn scan_and_wait(&self) {
+        let outcome = self.scan.start(false).expect("start the scan");
+        assert_eq!(outcome, StartOutcome::Started);
+        self.wait_for_scan().await;
+    }
+
+    /// Waits until no scan of the server runs. Polls the status of the
+    /// controller every `library.scan_poll_ms` of the config, which a test
+    /// sets to 10, for one second at most.
+    pub async fn wait_for_scan(&self) {
+        let poll = Duration::from_millis(self.scan_poll_ms);
+        let idle = async {
+            while self.scan.status().scanning {
+                tokio::time::sleep(poll).await;
+            }
+        };
+        tokio::time::timeout(SCAN_WAIT, idle)
+            .await
+            .expect("the scan ends within one second");
     }
 
     /// Sends `request` to the router and returns the response.

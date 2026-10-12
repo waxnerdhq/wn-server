@@ -60,7 +60,7 @@ pub mod stubs;
 
 // covers
 
-// scan
+pub mod scan;
 
 use std::future::Future;
 use std::pin::Pin;
@@ -82,6 +82,7 @@ use tracing::field::Empty;
 use crate::auth::extract::{Authed, Authenticate};
 use crate::config::Config;
 use crate::db::Db;
+use crate::library::scan_controller::ScanController;
 use envelope::{ApiError, Format, SubsonicResponse};
 use params::Params;
 
@@ -114,7 +115,8 @@ pub struct AppState {
 
     // transcoder
 
-    // scan
+    /// The scans of the server. It runs at most one at a time.
+    pub scan: ScanController,
 
     // cancel
 
@@ -367,9 +369,9 @@ pub const METHODS: &[(&str, Handler)] = &[
 
     ("savePlayQueue", not_implemented),
 
-    ("getScanStatus", not_implemented),
+    ("getScanStatus", handler!(scan::get_scan_status)),
 
-    ("startScan", not_implemented),
+    ("startScan", handler!(scan::start_scan)),
 
     ("getTranscodeDecision", not_implemented),
 
