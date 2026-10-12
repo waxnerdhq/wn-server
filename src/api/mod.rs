@@ -44,7 +44,7 @@ pub mod browse;
 
 // search
 
-// annotate
+pub mod annotate;
 
 // playlists
 
@@ -268,9 +268,9 @@ pub const METHODS: &[(&str, Handler)] = &[
 
     ("getNowPlaying", handler!(stubs::get_now_playing)),
 
-    ("getStarred", not_implemented),
+    ("getStarred", handler!(annotate::get_starred)),
 
-    ("getStarred2", not_implemented),
+    ("getStarred2", handler!(annotate::get_starred2)),
 
     ("search", not_implemented),
 
@@ -304,11 +304,11 @@ pub const METHODS: &[(&str, Handler)] = &[
 
     ("getAvatar", handler!(stubs::get_avatar)),
 
-    ("star", not_implemented),
+    ("star", handler!(annotate::star)),
 
-    ("unstar", not_implemented),
+    ("unstar", handler!(annotate::unstar)),
 
-    ("setRating", not_implemented),
+    ("setRating", handler!(annotate::set_rating)),
 
     ("scrobble", not_implemented),
 

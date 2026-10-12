@@ -846,7 +846,19 @@ Browse methods (`api/browse.rs`): the six methods of the ID3 model read the libr
 
 <!-- api/search.rs -->
 
-<!-- api/annotate.rs -->
+Annotation methods (`api/annotate.rs`): `star`, `unstar`, `setRating`, `getStarred` and `getStarred2`. A star and a rating are values of the row that the `annotations` table holds for the user of the request and the item (§3.4). `scrobble` has no handler.
+
+- `id` of `star`, `unstar` and `setRating` takes the ID of a track, an album or an artist; the prefix of the ID names the kind (§3.3). `albumId` takes the ID of an album and `artistId` the ID of an artist. The folder methods list an album and an artist under the same IDs, so an item has one star, whichever parameter set it. `star` and `unstar` take each parameter any number of times and require none: a request without an ID changes nothing and answers `ok`. `setRating` requires `id` and reads its first value.
+- A value that is not the ID of an existing item of the kind its parameter takes is error 70: a text that `ids::parse` rejects, an empty value, the ID of a playlist, an ID that no row has, and the ID of a track in `albumId`.
+- A request changes every item it names or none. `annotations::apply` checks that every item has a row and writes the items in one `IMMEDIATE` transaction. After error 70 and after a write that failed, no item of the request is changed. The check is in the transaction, so a scan in another process deletes no item between the check and the write.
+- `star` sets `starred_at` to the time of the request in Unix seconds. The time is read once the write connection is held, and the items of one request get one time. `star` for an item that has a star replaces the time with the time of the new request. The API does not define that case. Navidrome and Airsonic replace the time, and the server does the same. `unstar` sets `starred_at` to NULL. `unstar` for an item that exists and has no star answers `ok`.
+- `setRating` requires `rating`. 1 to 5 is stored, and 0 sets the rating to NULL. An absent or empty `rating` is error 10. A value that is no integer, and an integer outside 0 to 5, is error 0 and changes nothing. The rating is checked before the item.
+- Each write sets one column of the row and leaves the others. A star, a rating, a play count and the time of the last play of an item therefore do not depend on the order of the requests that set them. No method deletes a row: `unstar` and `setRating` with 0 keep the other values of the row. A row without a star, a rating and a play reads as the annotation of an item without a row.
+- `getStarred2` returns `starred2` with the lists `artist` (`ArtistID3`), `album` (`AlbumID3`) and `song` (`Child`). `getStarred` returns `starred` with `artist` (the `Artist` of the folder methods), `album` (directories) and `song`. The elements are those of the model constructors (§3.8), so `starred` and `userRating` have the form they have in every other method. `ArtistID3` has no `userRating`: the rating of an artist is part of `getStarred` and not of `getStarred2`. A list without an item is `[]` in JSON and absent in XML.
+- Each list has the item that was starred last as its first (`annotations::starred`). Items with the same time are in the order of their IDs.
+- `musicFolderId` limits the three lists to one music folder: a track whose file is in the folder, and an album or an artist that has such a track. A track without a file is in no folder (§3.4); without `musicFolderId` it is listed, and it takes a star and a rating as every other track does. An ID that no folder has gives three empty lists. A value that is no integer is error 0.
+- A star whose item has no row is not listed. Such a row exists from the deletion of a track row until a scan completes and deletes the annotation (§3.10 step 6).
+- A scan keeps the ID of a track through a rename and a move of its file, and the ID of an album and of an artist through a new spelling of the name (§1.3, §3.3). The scan does not write the `annotations` rows of these items, so their stars, their ratings and the times stay.
 
 <!-- api/playlists.rs -->
 
@@ -895,7 +907,7 @@ Scan methods (`api/scan.rs`): `startScan` and `getScanStatus` return the `scanSt
 
 <!-- tests/search.rs -->
 
-<!-- tests/annotations.rs -->
+- `tests/annotations.rs` covers `star`, `unstar`, `setRating`, `getStarred` and `getStarred2` over the router, in JSON and XML. It reads the rows of the `annotations` table after the requests: the IDs that each parameter takes, a repeated `star`, `unstar` for an item without a star, every rating from 0 to 5 and the values that are refused, a request with several IDs, a form body, and a request that names an unknown ID as its first, a middle or its last value, after which the rows are those from before the request. It compares the lists with the elements of the model constructors and checks their order, `musicFolderId`, a track without a file, a star whose item is gone, and the rows of a second user. Two tests change the files of a library of their own and rescan: after a renamed file, a moved file and a new spelling of an album and of an artist, the rows are the rows they were and the lists show the new path and the new names. The unit tests in `src/db/queries/annotations.rs` cover the write queries with rows that the tests write, among them a request whose write fails after it wrote an earlier item.
 
 <!-- tests/playlists.rs -->
 
