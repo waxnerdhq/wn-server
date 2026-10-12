@@ -112,14 +112,14 @@ pub const MAX_SIZE: u32 = 2000;
 pub const SIZE_STEPS: [u32; 6] = [80, 160, 320, 640, 1280, MAX_SIZE];
 
 /// The version of the resized covers. It is the last part of the name of a
-/// cache file ([`cache_name`]) and of the entity tag of a resized cover, so
+/// cache file (`cache_name`) and of the entity tag of a resized cover, so
 /// the service reads the cache files of this version and of no other.
 ///
 /// The number is raised by a change that makes other bytes from the same
 /// image at the same step. A cover that an older version of the server made
 /// is then neither read from the cache nor confirmed to a client that holds
 /// it. A cover of version 2 has the orientation of its JPEG applied
-/// ([`resize`]). A cache file without a version in its name has not.
+/// (`resize`). A cache file without a version in its name has not.
 pub const CACHE_VERSION: u32 = 2;
 
 /// The largest source image that the service reads, in bytes. A larger image

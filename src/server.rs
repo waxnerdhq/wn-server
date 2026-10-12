@@ -166,11 +166,11 @@ pub fn bind_addr(config: &Config) -> SocketAddr {
 /// and returns after the last one (`docs/design.md` section 3.13). Steps 1
 /// and 2 start at once and run at the same time:
 ///
-/// 1. It calls `options.withdraw` ([`withdraw_at_stop`]). The server accepts
+/// 1. It calls `options.withdraw` (`withdraw_at_stop`). The server accepts
 ///    no connection from this moment, so it is no longer advertised.
 /// 2. It closes the listener. The requests in progress have the grace to
 ///    finish. Then the connections that are still open are closed
-///    ([`serve`]).
+///    (`serve`).
 /// 3. It waits for the running scan, which `cancel` has cancelled, to end as
 ///    a cancelled scan. It waits the length of the grace at most.
 /// 4. When step 1 has ended, it checkpoints the write-ahead log and closes
@@ -178,9 +178,9 @@ pub fn bind_addr(config: &Config) -> SocketAddr {
 ///
 /// The grace is `server.shutdown_grace_ms`. It is
 /// `server.shutdown_grace_short_ms` when `options.hurry` is cancelled at the
-/// moment the step begins ([`Grace`]).
+/// moment the step begins (`Grace`).
 ///
-/// Steps 3 and 4 are [`stop`]. A caller that drops the future during the
+/// Steps 3 and 4 are `stop`. A caller that drops the future during the
 /// stop skips the steps that have not run. The database is consistent after
 /// every step and between them.
 pub async fn run_server(

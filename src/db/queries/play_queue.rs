@@ -218,7 +218,7 @@ pub fn replace<S: AsRef<str>>(
 /// request in Unix seconds. The queue then has the position 0.
 ///
 /// `play_queue.current_id` gets no value, and the entries get the positions
-/// from [`FIRST_WITHOUT_CURRENT`] upwards. Without a track ID the function
+/// from `FIRST_WITHOUT_CURRENT` upwards. Without a track ID the function
 /// stores a queue without an entry, as [`clear`] does.
 ///
 /// The request is refused, and the stored queue stays as it is, in these

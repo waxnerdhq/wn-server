@@ -54,7 +54,7 @@
 //! [`FfmpegTranscoder::probe`] runs the program twice when the server
 //! starts: `<ffmpeg> -version`, and `<ffmpeg> -hide_banner -encoders`, which
 //! lists the encoders of the build. A target is available when the list
-//! holds its encoder ([`encoder`]). A job for a target that is not available
+//! holds its encoder (`encoder`). A job for a target that is not available
 //! is [`TranscodeError::Unavailable`] and starts no process: every job when
 //! the program does not run, and the jobs of one target when the build lacks
 //! one encoder. The probe logs one warning for what is missing. No request
@@ -78,12 +78,12 @@
 //!   output within the limit, when the client disconnects, when the client
 //!   takes no chunk for the write timeout, and when the server stops.
 //! - When the output has ended, the process ends by itself. A process that
-//!   has not ended after [`EXIT_WAIT`] is killed.
+//!   has not ended after `EXIT_WAIT` is killed.
 //!
 //! A task then waits for the process, so that the system keeps no entry for
 //! it, and returns the permit. A process that ended by itself with a
 //! failure status is logged once, at `warn`, with the status and the ID of
-//! the track ([`ProcessEnd`]). A process that the server killed is not a
+//! the track (`ProcessEnd`). A process that the server killed is not a
 //! failure.
 
 use std::ffi::OsString;
@@ -231,11 +231,11 @@ pub struct FfmpegTranscoder {
 impl FfmpegTranscoder {
     /// Builds the transcoder of `config` and probes the program of
     /// `config.ffmpeg` once: `<ffmpeg> -version`, and then
-    /// `<ffmpeg> -hide_banner -encoders` ([`probed`]).
+    /// `<ffmpeg> -hide_banner -encoders` (`probed`).
     ///
     /// The result is logged: the version line of the program at `info`, and
     /// at most one warning, which says why the program is not available or
-    /// which encoder it lacks ([`Probe::warning`]). The transcoder starts no
+    /// which encoder it lacks (`Probe::warning`). The transcoder starts no
     /// process for a target that the probe did not find, and a job for such
     /// a target is [`TranscodeError::Unavailable`].
     pub async fn probe(config: &Transcoding) -> Self {
@@ -390,7 +390,7 @@ impl Transcoder for FfmpegTranscoder {
     /// a process that the system does not start.
     ///
     /// A process that ends by itself with a failure status is logged at
-    /// `warn` with the status and the ID of the track ([`log_end`]).
+    /// `warn` with the status and the ID of the track (`log_end`).
     fn spawn(&self, job: TranscodeJob) -> TranscodeFuture<'_> {
         Box::pin(async move {
             let track = job.track.clone();

@@ -8,19 +8,46 @@ use std::process::{self, Command};
 /// them on the toolchain that runs xtask.
 const CARGO: &str = env!("CARGO");
 
-/// The arguments of each check, in the order the checks run.
-const CHECKS: [&[&str]; 3] = [
-    &["fmt", "--all", "--", "--check"],
-    &[
-        "clippy",
-        "--locked",
-        "--workspace",
-        "--all-targets",
-        "--",
-        "-D",
-        "warnings",
-    ],
-    &["test", "--locked", "--workspace"],
+/// One check: a cargo command.
+struct Check {
+    /// The arguments of cargo.
+    args: &'static [&'static str],
+    /// The variables that the check sets in the environment of cargo. A
+    /// variable replaces the value that the environment of xtask holds.
+    env: &'static [(&'static str, &'static str)],
+}
+
+/// The checks, in the order in which they run.
+const CHECKS: [Check; 4] = [
+    Check {
+        args: &["fmt", "--all", "--", "--check"],
+        env: &[],
+    },
+    Check {
+        args: &[
+            "clippy",
+            "--locked",
+            "--workspace",
+            "--all-targets",
+            "--",
+            "-D",
+            "warnings",
+        ],
+        env: &[],
+    },
+    Check {
+        args: &["test", "--locked", "--workspace"],
+        env: &[],
+    },
+    // rustdoc builds the documentation of the two crates of the workspace
+    // and of no dependency. `cargo doc` has no option that turns the
+    // warnings of rustdoc into errors, so the variable passes `-D warnings`
+    // to rustdoc. A link in a doc comment that names no item is such a
+    // warning.
+    Check {
+        args: &["doc", "--locked", "--workspace", "--no-deps"],
+        env: &[("RUSTDOCFLAGS", "-D warnings")],
+    },
 ];
 
 const USAGE: &str = "usage: cargo xtask check";
@@ -39,9 +66,22 @@ fn main() {
 /// Runs every check in order. Exits with the exit code of the first check that
 /// fails.
 fn check() {
-    for cargo_args in CHECKS {
-        eprintln!("xtask: cargo {}", cargo_args.join(" "));
-        let status = match Command::new(CARGO).args(cargo_args).status() {
+    for check in CHECKS {
+        let variables: Vec<String> = check
+            .env
+            .iter()
+            .map(|(name, value)| format!("{name}=\"{value}\" "))
+            .collect();
+        eprintln!(
+            "xtask: {}cargo {}",
+            variables.concat(),
+            check.args.join(" ")
+        );
+        let status = Command::new(CARGO)
+            .args(check.args)
+            .envs(check.env.iter().copied())
+            .status();
+        let status = match status {
             Ok(status) => status,
             Err(error) => {
                 eprintln!("xtask: cannot run {CARGO}: {error}");

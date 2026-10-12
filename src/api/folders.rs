@@ -94,7 +94,7 @@ struct Indexes {
 /// - `ifModifiedSince` is a time in milliseconds. When it is at or after
 ///   `lastModified`, the artists did not change since that time, and the
 ///   answer is `indexes` with `ignoredArticles` and `lastModified` and
-///   without `index` ([`is_unchanged`]).
+///   without `index` (`is_unchanged`).
 ///
 /// An empty value of either parameter counts as absent, and a value that is
 /// no integer is error 0.
@@ -139,7 +139,7 @@ pub async fn get_indexes(
 ///   by path. `parent` of the directory is the ID of the album artist.
 ///
 /// `id` is required, and an absent one is error 10. Error 70 answers every
-/// value that names no directory ([`directory_id`]), and an artist or album
+/// value that names no directory (`directory_id`), and an artist or album
 /// ID that no row has.
 pub async fn get_music_directory(
     State(state): State<AppState>,
