@@ -18,11 +18,17 @@
 //! row is kept without a file, at a placeholder path, so that its ID does
 //! not name the other file.
 //!
+//! After the track pass the scanner brings the album rows and the artist
+//! rows in line with the tracks: it deletes the rows that no track refers to,
+//! recomputes the counts and sets the cover of each album. An album row and
+//! an artist row keep their ID for as long as a track refers to them.
+//!
 //! [`scan`] blocks its thread on file and database work. Files are read
 //! outside the write transactions.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
+use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
@@ -33,10 +39,11 @@ use rusqlite::{Connection, TransactionBehavior};
 use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
+use crate::db::queries::albums::{self, CoverInputs};
 use crate::db::queries::folders::{self, Folder};
 use crate::db::queries::scans::{self, ScanCounts};
 use crate::db::queries::tracks::{self, IndexEntry, TrackContent};
-use crate::db::queries::{albums, artists};
+use crate::db::queries::{annotations, artists};
 use crate::db::{Db, Result};
 use crate::ids::{self, Kind};
 use crate::library::tags::{self, TagError, TrackMeta};
@@ -60,16 +67,22 @@ pub struct ScanOptions {
     /// cannot be read, and a file whose changes wait for the next scan. A
     /// scan that completes adds [`ScanSummary::seen`] in total.
     pub progress: Arc<AtomicU64>,
+    /// The directory of the resized covers, `cache/covers` in the data
+    /// directory. The scan removes the files of an album there when the
+    /// cover of the album changes and when the album is deleted. With `None`
+    /// the scan removes no file.
+    pub covers_cache_dir: Option<PathBuf>,
 }
 
 impl Default for ScanOptions {
-    /// Returns a batch size of [`DEFAULT_BATCH_SIZE`], no hook and a new
-    /// counter at 0.
+    /// Returns a batch size of [`DEFAULT_BATCH_SIZE`], no hook, a new
+    /// counter at 0 and no cover cache.
     fn default() -> Self {
         Self {
             batch_size: DEFAULT_BATCH_SIZE,
             on_batch: None,
             progress: Arc::default(),
+            covers_cache_dir: None,
         }
     }
 }
@@ -89,6 +102,10 @@ pub struct ScanSummary {
     pub removed: u64,
     /// The calls of the tag reader, the failed ones included.
     pub tags_read: u64,
+    /// The album rows in the database when the scan ended.
+    pub albums: u64,
+    /// The artist rows in the database when the scan ended.
+    pub artists: u64,
     /// One message for each problem that kept the scan from finishing its
     /// work: a folder, a path or a file that cannot be read, the number of
     /// tracks that were kept for that reason, a folder that had tracks and
@@ -110,11 +127,23 @@ pub struct ScanSummary {
 /// every folder in `folders` was read in full and holds a supported file.
 /// `full` reads the fingerprint and the tags of every file.
 ///
+/// After the tracks, the scan brings the albums and the artists in line
+/// with them. It deletes every album that no track refers to, then every
+/// artist that no album and no track refers to, and the annotations of items
+/// that no longer exist. It recomputes the song count, the duration, the
+/// year and the genre of every album and the album count of every artist.
+/// It sets the cover of every album whose directory it saw, and removes the
+/// resized covers of an album from [`ScanOptions::covers_cache_dir`] when
+/// the cover of the album changed or the album was deleted. An album and an
+/// artist keep their ID while a track refers to them.
+///
 /// The function blocks. An async caller runs it with
 /// `tokio::task::spawn_blocking`. `cancel` is checked during the walk,
 /// while the fingerprints are read and between batches. A cancelled scan
 /// keeps the batches it committed, deletes nothing and returns a summary
-/// whose last error is [`CANCELLED`].
+/// whose last error is [`CANCELLED`]. It deletes no album, no artist and no
+/// annotation and sets no cover. It recomputes the counts, so that they
+/// describe the tracks it stored.
 ///
 /// # Errors
 ///
@@ -213,6 +242,8 @@ fn scan_with(
         changed = summary.changed,
         moved = summary.moved,
         removed = summary.removed,
+        albums = summary.albums,
+        artists = summary.artists,
         errors = summary.errors.len(),
         "the scan finished"
     );
@@ -298,9 +329,65 @@ struct FolderWalk {
     unread: Vec<String>,
     /// The number of supported files the walk saw.
     supported: u64,
+    /// The directories in which the walk saw a supported file, as relative
+    /// paths. The empty path stands for the folder itself.
+    audio_directories: HashSet<String>,
+    /// The cover image of each directory that holds one, by the relative
+    /// path of the directory.
+    covers: HashMap<String, CoverFile>,
+}
+
+/// A cover image file that the walk saw.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CoverFile {
+    /// The file name.
+    name: String,
+    /// The place of the name in the order of the cover names
+    /// ([`cover_rank`]).
+    rank: usize,
+    /// The modification time in Unix seconds.
+    mtime: i64,
 }
 
 impl FolderWalk {
+    /// Records that the walk saw a supported file at `rel_path`.
+    fn see_audio(&mut self, rel_path: &str) {
+        let directory = directory(rel_path);
+        if !self.audio_directories.contains(directory) {
+            self.audio_directories.insert(directory.to_owned());
+        }
+    }
+
+    /// Records that the walk saw the cover image file at `rel_path`, whose
+    /// name has the place `rank`. A directory keeps the image with the
+    /// smallest rank, and the first one the walk saw among images of the same
+    /// rank, which is the first in the order of the file names.
+    fn see_cover(&mut self, rel_path: &str, rank: usize, mtime: i64) {
+        let directory = directory(rel_path);
+        if self
+            .covers
+            .get(directory)
+            .is_some_and(|known| known.rank <= rank)
+        {
+            return;
+        }
+        self.covers.insert(
+            directory.to_owned(),
+            CoverFile {
+                name: file_name(rel_path).to_owned(),
+                rank,
+                mtime,
+            },
+        );
+    }
+
+    /// Returns whether the walk listed `directory` and saw a supported file
+    /// in it. The cover image of such a directory, or the lack of one, is
+    /// known.
+    fn saw_directory(&self, directory: &str) -> bool {
+        self.audio_directories.contains(directory) && !self.is_unread(directory)
+    }
+
     /// Returns whether the walk could not read `rel_path` or a directory
     /// above it. The scan does not know whether such a file exists.
     fn is_unread(&self, rel_path: &str) -> bool {
@@ -458,13 +545,30 @@ struct Scanner<'a> {
 }
 
 impl Scanner<'_> {
+    /// Runs the track pass and then the aggregation of albums and artists.
     fn run(&mut self, unconfigured: &[Folder], index: &[IndexEntry]) -> Result<Outcome> {
+        let mut walks: HashMap<i64, FolderWalk> = HashMap::with_capacity(self.folders.len());
+        let outcome = self.tracks(unconfigured, index, &mut walks)?;
+        self.aggregate(&outcome, &walks)?;
+        Ok(outcome)
+    }
+
+    /// Steps 3 to 5 of the scan: walks the folders, matches the rows to the
+    /// files, stores the changes and deletes the rows whose file is gone.
+    /// `walks` receives what the walk of each folder found out. It holds
+    /// every configured folder when the scan was not cancelled during the
+    /// walk.
+    fn tracks(
+        &mut self,
+        unconfigured: &[Folder],
+        index: &[IndexEntry],
+        walks: &mut HashMap<i64, FolderWalk>,
+    ) -> Result<Outcome> {
         let mut states = vec![RowState::Unseen; index.len()];
         let with_tracks: HashSet<i64> = index.iter().map(|entry| entry.folder_id).collect();
 
         // The walk reads directories and file states only.
         let mut found = Found::default();
-        let mut walks: HashMap<i64, FolderWalk> = HashMap::with_capacity(self.folders.len());
         {
             let lookup: HashMap<(i64, &str), usize> = index
                 .iter()
@@ -486,9 +590,10 @@ impl Scanner<'_> {
                 walks.insert(folder.id, walk);
             }
         }
+        let walks = &*walks;
         self.unread.paths = walks.values().any(|walk| !walk.unread.is_empty());
 
-        let any_gone = (0..index.len()).any(|row| is_gone(&index[row], states[row], &walks));
+        let any_gone = (0..index.len()).any(|row| is_gone(&index[row], states[row], walks));
         let plan = if found.changed.is_empty() && !any_gone {
             // No row can be matched, so every file at a new path is a new
             // track. Its fingerprint is read with its tags.
@@ -509,7 +614,7 @@ impl Scanner<'_> {
             };
             let mut missing: Vec<usize> = (0..index.len())
                 .filter(|&row| {
-                    states[row] == RowState::Displaced || is_gone(&index[row], states[row], &walks)
+                    states[row] == RowState::Displaced || is_gone(&index[row], states[row], walks)
                 })
                 .collect();
             missing.sort_by(|&a, &b| locator(&index[a]).cmp(&locator(&index[b])));
@@ -543,8 +648,34 @@ impl Scanner<'_> {
             return Ok(Outcome::Cancelled);
         }
 
-        self.remove(index, &walks, unconfigured, &unmatched)?;
+        self.remove(index, walks, unconfigured, &unmatched)?;
         Ok(Outcome::Completed)
+    }
+
+    /// Step 6 of the scan: brings the albums, the artists and the
+    /// annotations in line with the tracks ([`aggregate`]), stores the
+    /// numbers of albums and artists in the summary and removes the resized
+    /// covers that are stale.
+    ///
+    /// A scan that was cancelled deletes no row and sets no cover, because
+    /// it did not store every change it found. `walks` is read for a scan
+    /// that completed only.
+    fn aggregate(&mut self, outcome: &Outcome, walks: &HashMap<i64, FolderWalk>) -> Result<()> {
+        let seen = match outcome {
+            Outcome::Completed => Some(Seen {
+                folders: &self.folders,
+                walks,
+            }),
+            Outcome::Cancelled => None,
+        };
+        let aggregated = self.db.with_writer(|conn| aggregate(conn, seen.as_ref()))?;
+        self.summary.albums = aggregated.albums;
+        self.summary.artists = aggregated.artists;
+        // The transaction is committed and the write connection is free.
+        if let Some(cache_dir) = &self.options.covers_cache_dir {
+            remove_cached_covers(cache_dir, &aggregated.stale_covers);
+        }
+        Ok(())
     }
 
     /// Walks `folder`. Marks the rows whose path holds a file and sorts the
@@ -605,7 +736,23 @@ impl Scanner<'_> {
                 }
                 continue;
             };
-            if !entry.file_type().is_file() || !tags::is_supported(entry.path()) {
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            if let Some(rank) = cover_rank(file_name(&rel_path)) {
+                match file_state(&entry) {
+                    Ok((mtime, _)) => walk.see_cover(&rel_path, rank, mtime),
+                    // An image file is the file of no track, so it holds no
+                    // deletion back.
+                    Err(cause) => tracing::warn!(
+                        path = %entry.path().display(),
+                        cause,
+                        "the state of the cover image cannot be read; the image is skipped"
+                    ),
+                }
+                continue;
+            }
+            if !tags::is_supported(entry.path()) {
                 continue;
             }
             let (mtime, size) = match file_state(&entry) {
@@ -616,6 +763,7 @@ impl Scanner<'_> {
                 }
             };
             walk.supported += 1;
+            walk.see_audio(&rel_path);
             self.summary.seen += 1;
             let file = FoundFile {
                 folder_id: folder.id,
@@ -922,7 +1070,6 @@ impl Scanner<'_> {
                     folders::delete(&tx, folder.id)?;
                 }
             }
-            aggregate(&tx)?;
             tx.commit()?;
             Ok(removed)
         })?;
@@ -1242,10 +1389,239 @@ fn with_content(
     })
 }
 
-/// Step 6 of the scan, the aggregates of albums and artists. It changes
-/// nothing: album and artist rows keep the values their upserts gave them.
-fn aggregate(_conn: &Connection) -> Result<()> {
-    Ok(())
+/// What a scan that completed saw of the configured folders.
+struct Seen<'a> {
+    /// The folder rows of the configured folders.
+    folders: &'a [Folder],
+    /// What the walk of each configured folder found out.
+    walks: &'a HashMap<i64, FolderWalk>,
+}
+
+/// What [`aggregate`] did.
+struct Aggregated {
+    /// The number of album rows.
+    albums: u64,
+    /// The number of artist rows.
+    artists: u64,
+    /// The albums whose resized covers in the cache are stale: the deleted
+    /// albums, and the albums that had a cover and have another one or none
+    /// now.
+    stale_covers: Vec<String>,
+}
+
+/// Step 6 of the scan, in one transaction. It reads no file: the covers come
+/// from what the walk saw.
+///
+/// With `seen`, which a scan that completed passes:
+///
+/// 1. Every album that no track refers to is deleted, then every artist that
+///    no album and no track refers to. These are the only deletions of album
+///    rows and artist rows. An album or an artist that a track refers to
+///    keeps its row and its ID, also when the track has no file.
+/// 2. The song count, the duration, the year and the genre of every album
+///    and the album count of every artist are recomputed.
+/// 3. The cover of every album whose directory the walk saw is set
+///    ([`resolve_cover`]).
+/// 4. Every annotation of an item that no longer exists is deleted.
+///
+/// Without `seen`, which is the case of a cancelled scan, only step 2 runs.
+/// A cancelled scan has not stored every change it found. An album without a
+/// track may get a track from a file that the scan has not stored, and the
+/// rows may name paths that the walk saw no file at.
+///
+/// A row that already has its values is not written.
+fn aggregate(conn: &mut Connection, seen: Option<&Seen<'_>>) -> Result<Aggregated> {
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    let mut stale_covers = Vec::new();
+    if seen.is_some() {
+        stale_covers = albums::delete_orphans(&tx)?;
+        artists::delete_orphans(&tx)?;
+    }
+    albums::recompute_aggregates(&tx)?;
+    artists::recompute_aggregates(&tx)?;
+    if let Some(seen) = seen {
+        for inputs in albums::cover_inputs(&tx)? {
+            let Cover::Known(cover) = resolve_cover(&inputs, seen) else {
+                continue;
+            };
+            let source = cover.as_ref().map(|(source, _)| source.as_str());
+            let mtime = cover.as_ref().map(|(_, mtime)| *mtime);
+            if inputs.cover_source.as_deref() == source && inputs.cover_mtime == mtime {
+                continue;
+            }
+            albums::set_cover(&tx, &inputs.album_id, source, mtime)?;
+            // The name of a cached file holds the ID of the album and the
+            // modification time of its cover, and not the source. A new
+            // source with the old time would be served from the old files.
+            if inputs.cover_source.is_some() {
+                stale_covers.push(inputs.album_id);
+            }
+        }
+        annotations::delete_orphans(&tx)?;
+    }
+    let aggregated = Aggregated {
+        albums: albums::count(&tx)?,
+        artists: artists::count(&tx)?,
+        stale_covers,
+    };
+    tx.commit()?;
+    Ok(aggregated)
+}
+
+/// The cover that a scan found for one album.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Cover {
+    /// The walk did not see the directory of the album, so the scan does not
+    /// know which image files it holds. The stored cover stays.
+    Unknown,
+    /// The source and the modification time of the cover, or `None` for an
+    /// album without a cover.
+    Known(Option<(String, i64)>),
+}
+
+/// The start of the `cover_source` of an embedded picture. The ID of the
+/// track follows it.
+const EMBEDDED: &str = "embedded:";
+
+/// Returns the cover of an album from its tracks and from what the walk saw
+/// (`docs/design.md` section 1.3).
+///
+/// The directory of an album is the directory of its first track that has a
+/// file. The cover is, in this order:
+///
+/// 1. The cover image file of that directory ([`cover_rank`]), with the
+///    absolute path of the file as the source and its modification time.
+/// 2. The embedded picture of the first track that has a file and a picture,
+///    with `embedded:<track id>` as the source and the modification time of
+///    the track.
+/// 3. No cover.
+///
+/// A track without a file gives no directory and no picture. An album whose
+/// tracks all have no file has no cover.
+///
+/// The walk knows the image files of a directory when it listed the
+/// directory and saw a supported file in it. That is not the case for a
+/// directory in a folder that is not configured, for a directory at or below
+/// a path that the walk could not read, and for the directory of a row whose
+/// file is gone and that the scan kept. The result is then
+/// [`Cover::Unknown`].
+fn resolve_cover(inputs: &CoverInputs, seen: &Seen<'_>) -> Cover {
+    let Some((folder_id, rel_path)) = &inputs.first_track else {
+        return Cover::Known(None);
+    };
+    let directory = directory(rel_path);
+    let folder = seen.folders.iter().find(|folder| folder.id == *folder_id);
+    let (Some(folder), Some(walk)) = (folder, seen.walks.get(folder_id)) else {
+        return Cover::Unknown;
+    };
+    if !walk.saw_directory(directory) {
+        return Cover::Unknown;
+    }
+    if let Some(image) = walk.covers.get(directory) {
+        let mut path = folder.path.clone();
+        path.extend(directory.split('/').filter(|name| !name.is_empty()));
+        path.push(&image.name);
+        return match path.to_str() {
+            Some(path) => Cover::Known(Some((path.to_owned(), image.mtime))),
+            // The path of a folder row and the names of the walk are valid
+            // Unicode, so this path is too.
+            None => Cover::Unknown,
+        };
+    }
+    Cover::Known(
+        inputs
+            .first_picture
+            .as_ref()
+            .map(|(track_id, mtime)| (format!("{EMBEDDED}{track_id}"), *mtime)),
+    )
+}
+
+/// The file stems of a cover image, in the order in which they are chosen.
+const COVER_STEMS: [&str; 4] = ["cover", "folder", "front", "album"];
+
+/// The extensions of a cover image, in the order in which they are chosen.
+const COVER_EXTENSIONS: [&str; 4] = ["jpg", "jpeg", "png", "webp"];
+
+/// Returns the place of the file name `name` in the order of the cover
+/// image names, or `None` when the name is not one of them.
+///
+/// A cover image is named `cover`, `folder`, `front` or `album` with the
+/// extension `jpg`, `jpeg`, `png` or `webp`, without regard to case. The
+/// stem decides the place first, in that order, and then the extension:
+/// `cover.png` precedes `folder.jpg`, and `cover.jpg` precedes `cover.png`.
+fn cover_rank(name: &str) -> Option<usize> {
+    let (stem, extension) = name.rsplit_once('.')?;
+    let place = |known: &[&str], text: &str| {
+        known
+            .iter()
+            .position(|known| known.eq_ignore_ascii_case(text))
+    };
+    let stem = place(&COVER_STEMS, stem)?;
+    let extension = place(&COVER_EXTENSIONS, extension)?;
+    Some(stem * COVER_EXTENSIONS.len() + extension)
+}
+
+/// Removes the resized covers of the albums `album_ids` from the cover cache
+/// `cache_dir`. A file of the cache is named
+/// `<cover ID>-<size>-<cover mtime>.jpg`, and the cover ID of an album is
+/// its ID (`docs/design.md` sections 3.3 and 3.5).
+///
+/// A file that cannot be removed stays, with a warning. A cache directory
+/// that does not exist holds no file.
+fn remove_cached_covers(cache_dir: &Path, album_ids: &[String]) {
+    if album_ids.is_empty() {
+        return;
+    }
+    let stale: HashSet<&str> = album_ids.iter().map(String::as_str).collect();
+    let entries = match fs::read_dir(cache_dir) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return,
+        Err(error) => {
+            tracing::warn!(
+                path = %cache_dir.display(),
+                %error,
+                "the cover cache cannot be read; its stale files stay"
+            );
+            return;
+        }
+    };
+    for entry in entries {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) => {
+                tracing::warn!(
+                    path = %cache_dir.display(),
+                    %error,
+                    "an entry of the cover cache cannot be read"
+                );
+                continue;
+            }
+        };
+        let name = entry.file_name();
+        if !name
+            .to_str()
+            .and_then(cached_cover_id)
+            .is_some_and(|id| stale.contains(id))
+        {
+            continue;
+        }
+        if let Err(error) = fs::remove_file(entry.path()) {
+            tracing::warn!(
+                path = %entry.path().display(),
+                %error,
+                "the stale cover cannot be removed"
+            );
+        }
+    }
+}
+
+/// Returns the cover ID at the start of the name of a cached cover: the
+/// prefix, the hyphen and the hex characters of
+/// `<prefix>-<hex>-<size>-<cover mtime>.jpg`.
+fn cached_cover_id(name: &str) -> Option<&str> {
+    let (prefix, rest) = name.split_once('-')?;
+    let (hex, _) = rest.split_once('-')?;
+    name.get(..prefix.len() + 1 + hex.len())
 }
 
 /// Returns the modification time in Unix seconds and the size of the file
@@ -1340,12 +1716,20 @@ fn file_name(rel_path: &str) -> &str {
     rel_path.rsplit_once('/').map_or(rel_path, |(_, name)| name)
 }
 
+/// Returns the directory of a relative path: the path without its last
+/// component. The directory of a file in the folder itself is the empty
+/// path.
+fn directory(rel_path: &str) -> &str {
+    rel_path
+        .rsplit_once('/')
+        .map_or("", |(directory, _)| directory)
+}
+
 /// Returns the directory components of a relative path.
 fn directories(rel_path: &str) -> impl Iterator<Item = &str> {
-    let directory = rel_path
-        .rsplit_once('/')
-        .map_or("", |(directory, _)| directory);
-    directory.split('/').filter(|name| !name.is_empty())
+    directory(rel_path)
+        .split('/')
+        .filter(|name| !name.is_empty())
 }
 
 /// Returns the number of directory steps between the directories of two
@@ -1570,6 +1954,7 @@ mod tests {
         let walk = FolderWalk {
             unread: vec!["Artist/Album".to_owned()],
             supported: 1,
+            ..FolderWalk::default()
         };
         assert!(walk.is_unread("Artist/Album"));
         assert!(walk.is_unread("Artist/Album/01.flac"));
@@ -1581,12 +1966,14 @@ mod tests {
         let failed = FolderWalk {
             unread: vec![String::new()],
             supported: 0,
+            ..FolderWalk::default()
         };
         assert!(failed.is_unread("Artist/Album/01.flac"));
 
         let read = FolderWalk {
             unread: Vec::new(),
             supported: 1,
+            ..FolderWalk::default()
         };
         assert!(!read.is_unread("Artist/Album/01.flac"));
         assert!(read.holds_files());
@@ -1966,6 +2353,322 @@ mod tests {
         assert!(tracks::has_file(&walked));
     }
 
+    #[test]
+    fn a_cover_image_has_one_of_four_stems_and_one_of_four_extensions() {
+        for name in [
+            "cover.jpg",
+            "folder.jpeg",
+            "front.png",
+            "album.webp",
+            "Cover.JPG",
+            "FOLDER.Png",
+        ] {
+            assert!(cover_rank(name).is_some(), "{name}");
+        }
+        for name in [
+            "cover",
+            "cover.gif",
+            "cover.jpg.bak",
+            "back.jpg",
+            "cover art.jpg",
+            "my cover.jpg",
+            "covers.jpg",
+            ".jpg",
+            "jpg",
+            "",
+        ] {
+            assert_eq!(cover_rank(name), None, "{name:?}");
+        }
+    }
+
+    #[test]
+    fn cover_images_are_ordered_by_stem_and_then_by_extension() {
+        let ordered = [
+            "cover.jpg",
+            "cover.jpeg",
+            "cover.png",
+            "cover.webp",
+            "folder.jpg",
+            "folder.webp",
+            "front.jpg",
+            "album.jpg",
+            "album.webp",
+        ];
+        let ranks: Vec<usize> = ordered
+            .iter()
+            .map(|name| cover_rank(name).unwrap_or_else(|| panic!("{name}")))
+            .collect();
+        assert!(ranks.windows(2).all(|pair| pair[0] < pair[1]), "{ranks:?}");
+        // The case of a name does not change its place.
+        assert_eq!(cover_rank("COVER.PNG"), cover_rank("cover.png"));
+    }
+
+    /// Returns the walk of a folder in which the walk saw the supported
+    /// files `audio` and the cover images `covers`, each given with its
+    /// modification time.
+    fn walk_of(audio: &[&str], covers: &[(&str, i64)]) -> FolderWalk {
+        let mut walk = FolderWalk::default();
+        for rel_path in audio {
+            walk.supported += 1;
+            walk.see_audio(rel_path);
+        }
+        for (rel_path, mtime) in covers {
+            let rank = cover_rank(file_name(rel_path)).expect("the name of a cover image");
+            walk.see_cover(rel_path, rank, *mtime);
+        }
+        walk
+    }
+
+    #[test]
+    fn a_directory_keeps_the_cover_image_that_comes_first_in_the_order() {
+        // The walk sees the files of a directory in the order of their
+        // names.
+        let walk = walk_of(
+            &[],
+            &[
+                ("a/album.jpg", 1),
+                ("a/cover.png", 2),
+                ("a/folder.jpg", 3),
+                ("b/Cover.jpg", 4),
+                ("b/cover.jpg", 5),
+                ("front.webp", 6),
+            ],
+        );
+        let kept = |directory: &str| {
+            let cover = &walk.covers[directory];
+            (cover.name.as_str(), cover.mtime)
+        };
+        assert_eq!(kept("a"), ("cover.png", 2));
+        // Two names of one rank: the first one the walk saw stays.
+        assert_eq!(kept("b"), ("Cover.jpg", 4));
+        // The empty path is the folder itself.
+        assert_eq!(kept(""), ("front.webp", 6));
+        assert_eq!(walk.covers.len(), 3);
+    }
+
+    #[test]
+    fn the_walk_saw_a_directory_that_holds_a_supported_file_and_is_not_unread() {
+        let mut walk = walk_of(&["Artist/Album/01.flac", "loose.flac"], &[]);
+        assert!(walk.saw_directory("Artist/Album"));
+        assert!(walk.saw_directory(""));
+        // A directory without a supported file of its own.
+        assert!(!walk.saw_directory("Artist"));
+        assert!(!walk.saw_directory("Artist/Album/Scans"));
+
+        // A file of the directory that cannot be read leaves the directory
+        // listed. A directory that cannot be read is not listed in full.
+        walk.unread.push("Artist/Album/02.flac".to_owned());
+        assert!(walk.saw_directory("Artist/Album"));
+        walk.unread.push("Artist".to_owned());
+        assert!(!walk.saw_directory("Artist/Album"));
+        assert!(walk.saw_directory(""));
+        walk.unread.push(String::new());
+        assert!(!walk.saw_directory(""));
+    }
+
+    /// The path of the folder of [`seen_of`].
+    const MUSIC: &str = "music";
+
+    /// Returns the folder rows and the walks of a scan of one folder, which
+    /// has the ID 1.
+    fn seen_of(walk: FolderWalk) -> (Vec<Folder>, HashMap<i64, FolderWalk>) {
+        let folder = Folder {
+            id: 1,
+            path: PathBuf::from(MUSIC),
+            name: MUSIC.to_owned(),
+        };
+        (vec![folder], HashMap::from([(1, walk)]))
+    }
+
+    /// Returns the cover inputs of an album in the folder 1 whose first
+    /// track is at `first_track` and whose first track with a picture has
+    /// the ID and the modification time `first_picture`.
+    fn inputs_of(first_track: Option<&str>, first_picture: Option<(&str, i64)>) -> CoverInputs {
+        CoverInputs {
+            album_id: "al-1".to_owned(),
+            cover_source: None,
+            cover_mtime: None,
+            first_track: first_track.map(|rel_path| (1, rel_path.to_owned())),
+            first_picture: first_picture.map(|(id, mtime)| (id.to_owned(), mtime)),
+        }
+    }
+
+    fn resolve(inputs: &CoverInputs, walk: FolderWalk) -> Cover {
+        let (folders, walks) = seen_of(walk);
+        resolve_cover(
+            inputs,
+            &Seen {
+                folders: &folders,
+                walks: &walks,
+            },
+        )
+    }
+
+    /// Returns the cover whose source is the image file at `components`
+    /// below the folder of [`seen_of`].
+    fn image(components: &[&str], mtime: i64) -> Cover {
+        let mut path = PathBuf::from(MUSIC);
+        path.extend(components);
+        let path = path.to_str().expect("a Unicode path").to_owned();
+        Cover::Known(Some((path, mtime)))
+    }
+
+    #[test]
+    fn the_cover_image_in_the_directory_of_the_first_track_is_the_cover() {
+        let inputs = inputs_of(Some("Artist/Album/01.flac"), Some(("tr-1", 100)));
+        let walk = walk_of(
+            &["Artist/Album/01.flac"],
+            &[("Artist/Album/Folder.JPG", 500)],
+        );
+        // The image file precedes the embedded picture.
+        assert_eq!(
+            resolve(&inputs, walk),
+            image(&["Artist", "Album", "Folder.JPG"], 500)
+        );
+    }
+
+    #[test]
+    fn a_cover_image_in_the_folder_itself_is_the_cover_of_the_tracks_there() {
+        let inputs = inputs_of(Some("01.flac"), None);
+        let walk = walk_of(&["01.flac"], &[("cover.jpg", 500)]);
+        assert_eq!(resolve(&inputs, walk), image(&["cover.jpg"], 500));
+    }
+
+    #[test]
+    fn a_cover_image_in_another_directory_is_not_the_cover() {
+        let inputs = inputs_of(Some("Artist/Album/cd1/01.flac"), None);
+        let walk = walk_of(
+            &["Artist/Album/cd1/01.flac", "Artist/Album/cd2/01.flac"],
+            &[
+                ("Artist/Album/cover.jpg", 1),
+                ("Artist/Album/cd2/cover.jpg", 2),
+                ("Artist/cover.jpg", 3),
+                ("cover.jpg", 4),
+            ],
+        );
+        assert_eq!(resolve(&inputs, walk), Cover::Known(None));
+    }
+
+    #[test]
+    fn the_embedded_picture_is_the_cover_of_an_album_without_a_cover_image() {
+        let inputs = inputs_of(Some("Artist/Album/01.flac"), Some(("tr-7", 700)));
+        let walk = walk_of(&["Artist/Album/01.flac"], &[]);
+        assert_eq!(
+            resolve(&inputs, walk),
+            Cover::Known(Some(("embedded:tr-7".to_owned(), 700)))
+        );
+    }
+
+    #[test]
+    fn an_album_without_a_cover_image_and_without_a_picture_has_no_cover() {
+        let inputs = inputs_of(Some("Artist/Album/01.flac"), None);
+        let walk = walk_of(&["Artist/Album/01.flac"], &[]);
+        assert_eq!(resolve(&inputs, walk), Cover::Known(None));
+    }
+
+    #[test]
+    fn an_album_whose_tracks_have_no_file_has_no_cover() {
+        // `cover_inputs` names no track without a file, so the album has no
+        // directory. The image files of the folder are not its cover.
+        let inputs = inputs_of(None, None);
+        let walk = walk_of(&["01.flac"], &[("cover.jpg", 500)]);
+        assert_eq!(resolve(&inputs, walk), Cover::Known(None));
+    }
+
+    #[test]
+    fn the_cover_is_unknown_when_the_walk_did_not_see_the_directory_of_the_album() {
+        let inputs = inputs_of(Some("Artist/Album/01.flac"), Some(("tr-1", 100)));
+
+        // The walk saw no supported file in the directory: the row is kept
+        // although its file is gone.
+        let elsewhere = walk_of(&["Other/01.flac"], &[("Artist/Album/cover.jpg", 500)]);
+        assert_eq!(resolve(&inputs, elsewhere), Cover::Unknown);
+
+        // The directory is below a path that the walk could not read.
+        let mut unread = walk_of(&["Artist/Album/01.flac"], &[]);
+        unread.unread.push("Artist".to_owned());
+        assert_eq!(resolve(&inputs, unread), Cover::Unknown);
+
+        // The folder could not be read.
+        let mut failed = FolderWalk::default();
+        failed.unread.push(String::new());
+        assert_eq!(resolve(&inputs, failed), Cover::Unknown);
+
+        // The folder of the track is not configured, so it was not walked.
+        let (folders, walks) = seen_of(walk_of(&["Artist/Album/01.flac"], &[]));
+        let mut other_folder = inputs.clone();
+        other_folder.first_track = Some((2, "Artist/Album/01.flac".to_owned()));
+        let seen = Seen {
+            folders: &folders,
+            walks: &walks,
+        };
+        assert_eq!(resolve_cover(&other_folder, &seen), Cover::Unknown);
+    }
+
+    #[test]
+    fn the_cover_id_of_a_cached_cover_is_the_start_of_its_name() {
+        let id = "al-0123456789abcdef0123456789abcdef";
+        assert_eq!(
+            cached_cover_id(&format!("{id}-300-1700000000.jpg")),
+            Some(id)
+        );
+        assert_eq!(
+            cached_cover_id(&format!("{id}-300-1700000000.jpg.tmp")),
+            Some(id)
+        );
+        let track = "tr-0123456789abcdef0123456789abcdef";
+        assert_eq!(cached_cover_id(&format!("{track}-64--5.jpg")), Some(track));
+        assert_eq!(cached_cover_id(id), None);
+        assert_eq!(cached_cover_id("readme.txt"), None);
+        assert_eq!(cached_cover_id(""), None);
+    }
+
+    #[test]
+    fn remove_cached_covers_removes_the_files_of_the_named_albums_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let stale = "al-00000000000000000000000000000001";
+        let also_stale = "al-00000000000000000000000000000002";
+        // The ID of the third album starts with the characters of the first.
+        let kept = "al-00000000000000000000000000000011";
+        let names = [
+            format!("{stale}-300-1000.jpg"),
+            format!("{stale}-64-1000.jpg"),
+            format!("{also_stale}-300-2000.jpg"),
+            format!("{kept}-300-3000.jpg"),
+            "tr-00000000000000000000000000000001-300-1000.jpg".to_owned(),
+            "notes.txt".to_owned(),
+        ];
+        for name in &names {
+            fs::write(dir.path().join(name), b"jpeg").unwrap();
+        }
+
+        remove_cached_covers(dir.path(), &[stale.to_owned(), also_stale.to_owned()]);
+
+        let mut left: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        let mut expected = names[3..].to_vec();
+        expected.sort();
+        assert_eq!(left, expected);
+
+        // No album is named: no file is removed.
+        remove_cached_covers(dir.path(), &[]);
+        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 3);
+    }
+
+    #[test]
+    fn remove_cached_covers_accepts_a_cache_directory_that_does_not_exist() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("cache").join("covers");
+        remove_cached_covers(
+            &missing,
+            &["al-00000000000000000000000000000001".to_owned()],
+        );
+        assert!(!missing.exists());
+    }
+
     /// Returns a WAV file with `samples` samples of the value `fill`: mono,
     /// 8 kHz, 16-bit PCM. Its size is 44 bytes plus two bytes per sample.
     fn wav(samples: u32, fill: u8) -> Vec<u8> {
@@ -2132,6 +2835,42 @@ mod tests {
                 .unwrap()
                 .expect("the row exists")
         }
+
+        /// Returns the one album of the library. The files have no tags, so
+        /// every track is in the album of the tracks without an album tag.
+        fn album(&self) -> Album {
+            self.db
+                .with_reader(|conn| {
+                    let mut select = conn.prepare(
+                        "SELECT id, song_count, duration_ms, cover_source, cover_mtime
+                         FROM albums",
+                    )?;
+                    let mut albums = select
+                        .query_map([], |row| {
+                            Ok(Album {
+                                id: row.get(0)?,
+                                song_count: row.get(1)?,
+                                duration_ms: row.get(2)?,
+                                cover_source: row.get(3)?,
+                                cover_mtime: row.get(4)?,
+                            })
+                        })?
+                        .collect::<rusqlite::Result<Vec<Album>>>()?;
+                    assert_eq!(albums.len(), 1, "{albums:?}");
+                    Ok(albums.remove(0))
+                })
+                .unwrap()
+        }
+    }
+
+    /// The columns of an album row that the aggregation sets, and its ID.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct Album {
+        id: String,
+        song_count: i64,
+        duration_ms: i64,
+        cover_source: Option<String>,
+        cover_mtime: Option<i64>,
     }
 
     /// Returns the counts of a summary: added, changed, moved, removed.
@@ -2423,6 +3162,115 @@ mod tests {
         assert_eq!(library.id_at("moved/a.wav"), Some(a.clone()));
         assert_eq!(library.id_at(&tracks::placeholder_path(&a)), None);
         assert_eq!(library.id_at("a.wav"), Some(b));
+    }
+
+    #[test]
+    fn a_track_without_a_file_counts_for_its_album_and_is_not_the_source_of_its_cover() {
+        let library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2)]);
+        library.set_mtime("a.wav", 1_000);
+        library.set_mtime("b.wav", 2_000);
+        let summary = library.scan();
+        assert_eq!((summary.albums, summary.artists), (1, 1));
+        let a = library.id_at("a.wav").unwrap();
+        let duration =
+            library.track_at("a.wav").duration_ms + library.track_at("b.wav").duration_ms;
+        let duration = i64::try_from(duration).unwrap();
+        assert!(duration > 0);
+
+        // The first track has an embedded picture. A WAV file of the test
+        // holds none, so the row is given the mark. It keeps the mark until
+        // a scan reads the tags of the file again.
+        let mark = || {
+            library
+                .db
+                .with_writer(|conn| {
+                    conn.execute("UPDATE tracks SET has_picture = 1 WHERE id = ?1", [&a])?;
+                    Ok(())
+                })
+                .unwrap();
+        };
+        mark();
+        library.scan();
+        let before = library.album();
+        assert_eq!(
+            before,
+            Album {
+                id: before.id.clone(),
+                song_count: 2,
+                duration_ms: duration,
+                cover_source: Some(format!("embedded:{a}")),
+                cover_mtime: Some(1_000),
+            }
+        );
+
+        // The first file moves to a place where it cannot be read. The
+        // second file moves to the old path of the first, so the first
+        // track is kept without a file.
+        library.rename("a.wav", "moved/a.wav");
+        library.rename("b.wav", "a.wav");
+        library
+            .unreadable
+            .borrow_mut()
+            .insert(library.path("moved/a.wav"));
+        let summary = library.scan();
+        let placeholder = tracks::placeholder_path(&a);
+        assert!(!library.track_at(&placeholder).has_file());
+
+        // The album keeps its row and counts both tracks. The track without
+        // a file is not the source of the cover, and the other track has no
+        // picture.
+        assert_eq!((summary.albums, summary.artists), (1, 1));
+        assert_eq!(
+            library.album(),
+            Album {
+                cover_source: None,
+                cover_mtime: None,
+                ..before.clone()
+            }
+        );
+
+        // The file can be read, and the track has a file again. The scan
+        // read its tags again, so the row is given the mark again. The
+        // track is then the source of the cover.
+        library.unreadable.borrow_mut().clear();
+        library.scan();
+        assert_eq!(library.id_at("moved/a.wav"), Some(a.clone()));
+        mark();
+        library.scan();
+        assert_eq!(library.album(), before);
+    }
+
+    #[test]
+    fn an_album_whose_only_track_has_no_file_keeps_its_row_and_its_id() {
+        let library = Library::new(&[("a.wav", 100, 1)]);
+        library.set_mtime("a.wav", 1_000);
+        library.scan();
+        let a = library.id_at("a.wav").unwrap();
+        let before = library.album();
+        assert_eq!(before.song_count, 1);
+
+        // The file moves to a place where it cannot be read, and a file
+        // with tags that cannot be read takes its path. The scan stores no
+        // row for that file, so the track without a file is the only track
+        // of its album.
+        library.rename("a.wav", "moved/a.wav");
+        library.write("a.wav", 300, 3);
+        library.set_mtime("a.wav", 3_000);
+        library
+            .unreadable
+            .borrow_mut()
+            .insert(library.path("moved/a.wav"));
+        library
+            .untaggable
+            .borrow_mut()
+            .insert(library.path("a.wav"));
+        let summary = library.scan();
+
+        let index = library.index();
+        assert_eq!(index.len(), 1, "{index:?}");
+        assert_eq!(index[0].id, a);
+        assert_eq!((summary.albums, summary.artists), (1, 1));
+        assert_eq!(library.album(), before);
     }
 
     #[test]
