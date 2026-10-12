@@ -226,6 +226,21 @@ async fn starred(server: &TestServer, params: &[(&str, &str)]) -> Value {
     response["starred"].take()
 }
 
+/// The `song` object of `getSong` for the track `id`.
+async fn get_song(server: &TestServer, id: &str) -> Value {
+    let mut response = server.get_json("getSong", &[("id", id)]).await;
+    assert_eq!(response["status"], "ok", "{response}");
+    response["song"].take()
+}
+
+/// The `album` object of `getAlbum` for the album `id`, with its `song`
+/// list.
+async fn get_album(server: &TestServer, id: &str) -> Value {
+    let mut response = server.get_json("getAlbum", &[("id", id)]).await;
+    assert_eq!(response["status"], "ok", "{response}");
+    response["album"].take()
+}
+
 /// The value of `id` of each element of the list `list`.
 fn ids(list: &Value) -> Vec<&str> {
     list.as_array()
@@ -345,9 +360,38 @@ async fn star_with_id_and_album_id_stars_the_song_and_the_album_and_unstar_clear
         );
     }
 
-    // The elements are those of the model constructors, which `getSong` and
-    // `getAlbum` build their answers from: the song and the album show the
-    // star there.
+    // `getSong` and `getAlbum` show the star, with the time that the lists
+    // show.
+    let of_get_song = get_song(&server, low_tide).await;
+    assert!(
+        is_time_between(&of_get_song["starred"], before, after),
+        "{of_get_song}"
+    );
+    assert_eq!(of_get_song, listed["song"][0]);
+    let mut of_get_album = get_album(&server, glass_harbour).await;
+    assert!(
+        is_time_between(&of_get_album["starred"], before, after),
+        "{of_get_album}"
+    );
+    // The song of the album that has the star shows it, and the other two
+    // songs show none.
+    let songs = of_get_album["song"].take();
+    assert_eq!(songs.as_array().map(Vec::len), Some(3), "{songs}");
+    for element in songs.as_array().expect("the album has songs") {
+        if element["id"] == low_tide {
+            assert_eq!(*element, of_get_song);
+        } else {
+            assert!(element.get("starred").is_none(), "{element}");
+        }
+    }
+    // Without its songs the album is the element of the list.
+    of_get_album
+        .as_object_mut()
+        .expect("the album is an object")
+        .remove("song");
+    assert_eq!(of_get_album, listed["album"][0]);
+
+    // The elements are those of the model constructors.
     let of_song = annotation(&server, low_tide).await;
     let of_album = annotation(&server, glass_harbour).await;
     assert!((before..=after).contains(&of_song.starred_at.expect("the song has a star")));
@@ -383,6 +427,21 @@ async fn star_with_id_and_album_id_stars_the_song_and_the_album_and_unstar_clear
     assert_eq!(annotation(&server, glass_harbour).await.starred_at, None);
     let child = model::child(&song(&server, low_tide).await, None);
     assert_eq!(child.starred, None);
+    // `getSong` and `getAlbum` show no star, and no song of the album shows
+    // one.
+    let of_get_song = get_song(&server, low_tide).await;
+    assert_eq!(of_get_song["id"], low_tide);
+    assert!(of_get_song.get("starred").is_none(), "{of_get_song}");
+    let of_get_album = get_album(&server, glass_harbour).await;
+    assert_eq!(of_get_album["id"], glass_harbour);
+    assert!(of_get_album.get("starred").is_none(), "{of_get_album}");
+    let songs = of_get_album["song"]
+        .as_array()
+        .expect("the album has songs");
+    assert_eq!(songs.len(), 3);
+    for element in songs {
+        assert!(element.get("starred").is_none(), "{element}");
+    }
 }
 
 #[tokio::test]
@@ -751,8 +810,19 @@ async fn set_rating_sets_replaces_and_removes_the_rating() {
     let listed = starred2(&server, &[]).await;
     assert_eq!(listed["album"][0]["userRating"], 4);
     assert!(listed["song"][0].get("userRating").is_none());
-    // The album shows the rating in both of its forms, as `getAlbum` and
-    // `getMusicDirectory` build them.
+    // `getAlbum` shows the rating of the album. Its songs have none, and
+    // neither has `getSong`.
+    let of_get_album = get_album(&server, album_id).await;
+    assert_eq!(of_get_album["userRating"], json!(4), "{of_get_album}");
+    for element in of_get_album["song"]
+        .as_array()
+        .expect("the album has songs")
+    {
+        assert!(element.get("userRating").is_none(), "{element}");
+    }
+    let of_get_song = get_song(&server, track).await;
+    assert!(of_get_song.get("userRating").is_none(), "{of_get_song}");
+    // The constructors show the rating in both forms of the album.
     let stored = annotation(&server, album_id).await;
     let album_row = album(&server, album_id).await;
     assert_eq!(model::album(&album_row, Some(&stored)).user_rating, Some(4));
@@ -769,6 +839,21 @@ async fn set_rating_sets_replaces_and_removes_the_rating() {
             assert_eq!(starred(&server, &[]).await[list][0]["userRating"], rating);
         }
     }
+    // Each has the last value, 5, in `getSong` and `getAlbum` as well.
+    assert_eq!(get_song(&server, track).await["userRating"], json!(5));
+    let of_get_album = get_album(&server, album_id).await;
+    assert_eq!(of_get_album["userRating"], json!(5), "{of_get_album}");
+    let rated: Vec<&Value> = of_get_album["song"]
+        .as_array()
+        .expect("the album has songs")
+        .iter()
+        .filter(|element| element.get("userRating").is_some())
+        .collect();
+    assert_eq!(rated.len(), 1, "{rated:?}");
+    assert_eq!(
+        (&rated[0]["id"], &rated[0]["userRating"]),
+        (&json!(track), &json!(5))
+    );
 
     // 0 removes the rating and keeps the star.
     for (id, list) in [(track, "song"), (album_id, "album"), (artist_id, "artist")] {
@@ -787,6 +872,20 @@ async fn set_rating_sets_replaces_and_removes_the_rating() {
             .get("userRating")
             .is_none()
     );
+    // `getAlbum` and `getSong` show no rating, and both show the star that
+    // the removal kept.
+    let of_get_album = get_album(&server, album_id).await;
+    assert!(of_get_album.get("userRating").is_none(), "{of_get_album}");
+    assert!(of_get_album.get("starred").is_some(), "{of_get_album}");
+    for element in of_get_album["song"]
+        .as_array()
+        .expect("the album has songs")
+    {
+        assert!(element.get("userRating").is_none(), "{element}");
+    }
+    let of_get_song = get_song(&server, track).await;
+    assert!(of_get_song.get("userRating").is_none(), "{of_get_song}");
+    assert!(of_get_song.get("starred").is_some(), "{of_get_song}");
 
     // A removal for an item without a row writes none.
     let other = server.track.breakwater.as_str();
