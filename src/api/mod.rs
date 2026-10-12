@@ -399,12 +399,16 @@ pub const EXTENSIONS: &[(&str, &[u32])] = &[
 /// Builds the router of the server: one route for `/rest/{method}` that
 /// answers GET and POST. A path outside `/rest/` gets HTTP 404.
 ///
-/// [`cors::add_headers`] wraps the route and nothing else. It answers an
-/// `OPTIONS` request, which therefore is not authenticated, and it adds its
-/// headers to every response of the route.
+/// The route answers `OPTIONS` with [`cors::preflight`], which is not an API
+/// method, so that request is not authenticated. [`cors::add_headers`] wraps
+/// the route and nothing else, and adds its headers to every response of the
+/// route.
 pub fn build_router(state: AppState) -> Router {
     Router::new()
-        .route("/rest/{method}", get(dispatch).post(dispatch))
+        .route(
+            "/rest/{method}",
+            get(dispatch).post(dispatch).options(cors::preflight),
+        )
         .route_layer(axum::middleware::from_fn(cors::add_headers))
         .layer(
             TraceLayer::new_for_http()

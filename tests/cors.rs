@@ -216,6 +216,7 @@ async fn preflight_request_is_answered_with_http_204_and_the_allow_headers() {
             header_of(&response, header::ACCESS_CONTROL_EXPOSE_HEADERS),
             None
         );
+        assert_eq!(header_of(&response, header::ALLOW), None);
         assert_eq!(content_type(&response), "");
         assert!(body_string(response).await.is_empty());
     }
@@ -297,6 +298,10 @@ async fn no_response_carries_allow_credentials() {
 #[tokio::test]
 async fn response_exposes_the_headers_a_player_reads() {
     let server = server().await;
+    // `stream` and `getCoverArt` answer an error envelope to these requests.
+    // The test covers the envelope of a media method and not a media body.
+    // The unit test in `src/api/cors.rs` covers a response with a body of
+    // its own.
     for name in ["ping", "stream", "getCoverArt", "getOpenSubsonicExtensions"] {
         let response = server.get_raw(name, &[]).await;
         assert_eq!(allow_origin(&response), Some("*"), "{name}");
@@ -328,6 +333,11 @@ async fn other_http_method_is_http_405_that_allows_every_origin() {
             "{method}"
         );
         assert_eq!(allow_origin(&response), Some("*"), "{method}");
+        assert_eq!(
+            header_of(&response, header::ALLOW),
+            Some("GET,HEAD,POST,OPTIONS"),
+            "{method}"
+        );
     }
 }
 

@@ -32,32 +32,37 @@ const MAX_AGE: &str = "86400";
 /// reads them from a media response.
 const EXPOSE_HEADERS: &str = "Content-Range, Accept-Ranges, Content-Length";
 
-/// The middleware of the API route. It answers an `OPTIONS` request itself
-/// with HTTP 204 and the allowed methods and headers, so a preflight request
-/// needs no user. It passes every other request on and adds
-/// `Access-Control-Expose-Headers` to the response. Every response carries
-/// `Access-Control-Allow-Origin: *`, whatever the route answers: an
-/// envelope, an authentication error, a body of a handler or HTTP 405.
+/// The handler of an `OPTIONS` request to the API route. It answers a
+/// preflight request with HTTP 204 and the allowed methods and headers. It
+/// reads nothing of the request, so a preflight request needs no user.
+pub async fn preflight() -> Response {
+    let headers = [
+        (header::ACCESS_CONTROL_ALLOW_METHODS, ALLOW_METHODS),
+        (header::ACCESS_CONTROL_ALLOW_HEADERS, ALLOW_HEADERS),
+        (header::ACCESS_CONTROL_MAX_AGE, MAX_AGE),
+    ];
+    (StatusCode::NO_CONTENT, headers).into_response()
+}
+
+/// The middleware of the API route. It adds `Access-Control-Allow-Origin: *`
+/// to every response of the route, whatever the route answers: an envelope,
+/// an authentication error, a body of a handler, the answer of [`preflight`]
+/// or HTTP 405. It adds `Access-Control-Expose-Headers` to every response
+/// that does not answer an `OPTIONS` request.
 pub async fn add_headers(request: Request, next: Next) -> Response {
-    let mut response = if request.method() == Method::OPTIONS {
-        let preflight = [
-            (header::ACCESS_CONTROL_ALLOW_METHODS, ALLOW_METHODS),
-            (header::ACCESS_CONTROL_ALLOW_HEADERS, ALLOW_HEADERS),
-            (header::ACCESS_CONTROL_MAX_AGE, MAX_AGE),
-        ];
-        (StatusCode::NO_CONTENT, preflight).into_response()
-    } else {
-        let mut response = next.run(request).await;
-        response.headers_mut().insert(
-            header::ACCESS_CONTROL_EXPOSE_HEADERS,
-            HeaderValue::from_static(EXPOSE_HEADERS),
-        );
-        response
-    };
-    response.headers_mut().insert(
+    let is_preflight = request.method() == Method::OPTIONS;
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
         header::ACCESS_CONTROL_ALLOW_ORIGIN,
         HeaderValue::from_static(ALLOW_ORIGIN),
     );
+    if !is_preflight {
+        headers.insert(
+            header::ACCESS_CONTROL_EXPOSE_HEADERS,
+            HeaderValue::from_static(EXPOSE_HEADERS),
+        );
+    }
     response
 }
 
