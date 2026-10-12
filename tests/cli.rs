@@ -1,9 +1,10 @@
 //! Runs the `wn-server` binary for the commands that work without a socket:
 //! `init`, `scan`, `user show`, `user set-password`, `config path`,
-//! `config show`, and `run` up to the point where it loads the config.
+//! `config show`, and `run` up to the point where it opens the database.
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::Path;
@@ -17,7 +18,7 @@ use wn_server::config::{Config, DATA_DIR_ENV};
 use wn_server::db::Db;
 use wn_server::db::queries::folders::{self, Folder};
 use wn_server::db::queries::scans::{self, Scan};
-use wn_server::db::queries::tracks;
+use wn_server::db::queries::tracks::{self, IndexEntry};
 use wn_server::db::queries::users::{self, UserRow};
 use wn_server::library::scan_controller::ScanLock;
 
@@ -27,12 +28,13 @@ use common::{LibraryBuilder, TestLibrary};
 const NOTICE: &str =
     "The password is stored in plain text in the data directory. Do not reuse it elsewhere.";
 
-/// The binary, without the data directory variable and the password variable
-/// of the developer's shell.
+/// The binary, without the data directory variable, the password variable
+/// and the log filter variable of the developer's shell.
 fn binary() -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_wn-server"));
     command.env_remove(DATA_DIR_ENV);
     command.env_remove(PASSWORD_ENV);
+    command.env_remove("RUST_LOG");
     command
 }
 
@@ -343,6 +345,25 @@ fn init_names_a_missing_folder_and_writes_nothing() {
     assert!(
         message.contains(&missing.display().to_string()),
         "{message}"
+    );
+    assert!(!data_dir.exists());
+
+    // A folder that exists next to the missing one does not change that.
+    // `run` and `scan` start with a folder that does not exist; `init` does
+    // not write one.
+    let music = temp_dir();
+    let output = run(init_command(&data_dir)
+        .arg("--folder")
+        .arg(music.path())
+        .arg("--folder")
+        .arg(&missing));
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "wn-server: music folder {} does not exist\n",
+            missing.display()
+        )
     );
     assert!(!data_dir.exists());
 }
@@ -1291,7 +1312,7 @@ fn config_show_names_an_unknown_key() {
 }
 
 #[test]
-fn config_show_names_a_missing_folder() {
+fn config_show_prints_a_config_whose_folder_does_not_exist() {
     let dir = temp_dir();
     let missing = dir.path().join("absent");
     fs::write(
@@ -1300,15 +1321,63 @@ fn config_show_names_a_missing_folder() {
     )
     .expect("write config");
 
+    // A folder that does not exist is unavailable now. It is no error of
+    // the config.
     let output = run(binary()
         .args(["config", "show", "--data-dir"])
         .arg(dir.path()));
-    assert_eq!(output.status.code(), Some(1));
-    let message = stderr(&output);
+    assert!(output.status.success(), "{}", stderr(&output));
+    let text = stdout(&output);
     assert!(
-        message.contains(&missing.display().to_string()),
-        "{message}"
+        text.contains(&format!("folders = ['{}']", missing.display())),
+        "{text}"
     );
+}
+
+#[test]
+fn a_malformed_folder_value_fails_the_commands_that_load_the_config_and_names_the_key() {
+    let music = temp_dir();
+    let file = music.path().join("song.flac");
+    fs::write(&file, b"").expect("write a file");
+    for (folders, reason) in [
+        (
+            "[]".to_owned(),
+            "at least one music folder is required".to_owned(),
+        ),
+        (
+            "['music']".to_owned(),
+            "the music folder music is not an absolute path".to_owned(),
+        ),
+        (
+            format!("['{}', 'more/music']", music.path().display()),
+            "the music folder more/music is not an absolute path".to_owned(),
+        ),
+        (
+            format!("['{}']", file.display()),
+            format!("the music folder {} is not a directory", file.display()),
+        ),
+    ] {
+        let dir = temp_dir();
+        fs::write(
+            dir.path().join("config.toml"),
+            format!("[library]\nfolders = {folders}\n"),
+        )
+        .expect("write config");
+
+        // Each command fails when it loads the config. `run` and `scan` open
+        // no database and no socket.
+        for command in [&["config", "show"][..], &["run"], &["scan"]] {
+            let output = run(binary().args(command).arg("--data-dir").arg(dir.path()));
+            assert_eq!(output.status.code(), Some(1), "{command:?} {folders}");
+            assert!(stdout(&output).is_empty(), "{command:?} {folders}");
+            assert_eq!(
+                stderr(&output),
+                format!("wn-server: library.folders: {reason}\n"),
+                "{command:?} {folders}"
+            );
+        }
+        assert!(!dir.path().join("library.db").exists());
+    }
 }
 
 #[test]
@@ -1554,26 +1623,143 @@ fn scan_of_the_standard_library_prints_10_seen_and_exits_0() {
     assert_eq!(track_count(dir.path()), 10);
 }
 
+/// The index entry of every track in the database of `data_dir`, by folder
+/// ID and relative path.
+fn track_index(data_dir: &Path) -> BTreeMap<(i64, String), IndexEntry> {
+    let db = Db::open(data_dir.join("library.db")).expect("open the database");
+    db.with_reader(tracks::load_index)
+        .expect("read the tracks")
+        .into_iter()
+        .map(|entry| ((entry.folder_id, entry.rel_path.clone()), entry))
+        .collect()
+}
+
+/// The lines of the log in `stderr` that say that the music folder `folder`
+/// is unavailable.
+fn unavailable_lines(stderr: &str, folder: &Path) -> Vec<String> {
+    let start = format!("music folder {} is unavailable: ", folder.display());
+    stderr
+        .lines()
+        .filter(|line| line.contains(&start))
+        .map(str::to_owned)
+        .collect()
+}
+
 #[test]
-fn scan_names_a_missing_folder_and_exits_1() {
+fn scan_with_a_missing_folder_scans_the_other_folder_and_deletes_no_track() {
+    let home = LibraryBuilder::new()
+        .track("Aurora Field", "Glass Harbour", "Low Tide", 1, "flac")
+        .track("Aurora Field", "Glass Harbour", "Breakwater", 2, "flac")
+        .build();
+    let volume = LibraryBuilder::new()
+        .track("Marlow Quartet", "Slow Rivers", "Upstream", 1, "m4a")
+        .track("Marlow Quartet", "Slow Rivers", "Delta", 2, "m4a")
+        .track("Tessa Lund", "Field Notes", "Marsh", 1, "ogg")
+        .build();
+    let (home_path, volume_path) = (home.root.path(), volume.root.path());
+    let dir = temp_dir();
+    let output = run(init_command(dir.path())
+        .arg("--folder")
+        .arg(home_path)
+        .arg("--folder")
+        .arg(volume_path));
+    assert!(output.status.success(), "{}", stderr(&output));
+
+    let summary = |seen: u64, added: u64| {
+        format!(
+            "seen: {seen}\nadded: {added}\nchanged: 0\nmoved: 0\nremoved: 0\nalbums: 3\n\
+             artists: 3\n"
+        )
+    };
+    let output = scan(dir.path(), &[]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output), format!("{}errors: 0\n", summary(5, 5)));
+    assert_eq!(unavailable_lines(&stderr(&output), volume_path), [""; 0]);
+    let before = track_index(dir.path());
+    let folders = folder_rows(dir.path());
+    assert_eq!((before.len(), folders.len()), (5, 2));
+
+    // The volume of the second folder is unplugged: its path does not exist.
+    let parking = temp_dir();
+    let unplugged = parking.path().join("unplugged");
+    fs::rename(volume_path, &unplugged).expect("move the folder away");
+    let output = scan(dir.path(), &[]);
+
+    // The command scans the folder that is there, prints the summary with
+    // the error of the scan, and exits with 1 for that error.
+    assert_eq!(output.status.code(), Some(1));
+    let printed = stdout(&output);
+    let name = volume_path.file_name().expect("a name");
+    let name = name.to_str().expect("a UTF-8 name");
+    let start = format!(
+        "{}errors: 1\nerror: music folder \"{name}\" ({}) cannot be read: ",
+        summary(2, 0),
+        volume_path.display()
+    );
+    assert!(printed.starts_with(&start), "{printed}");
+    assert!(printed.ends_with("; no track was deleted\n"), "{printed}");
+    assert_eq!(printed.lines().count(), 9, "{printed}");
+    // The log names the folder once when the command starts, as a warning.
+    let log = stderr(&output);
+    let lines = unavailable_lines(&log, volume_path);
+    assert_eq!(lines.len(), 1, "{log}");
+    assert!(lines[0].contains(" WARN "), "{log}");
+    assert!(
+        log.ends_with("wn-server: the scan recorded 1 error\n"),
+        "{log}"
+    );
+    // No track row and no folder row is gone, and the scan is recorded.
+    assert_eq!(track_index(dir.path()), before);
+    assert_eq!(folder_rows(dir.path()), folders);
+    let scans = scan_rows(dir.path());
+    assert_eq!(scans.len(), 2);
+    assert_eq!(scans[1].counts.removed, 0);
+    let error = scans[1].error.as_deref().expect("the scan has an error");
+    assert!(
+        error.contains(&volume_path.display().to_string()),
+        "{error}"
+    );
+
+    // The volume is back. The scan finds the tracks at the paths of their
+    // rows, so each one keeps its ID.
+    fs::rename(&unplugged, volume_path).expect("move the folder back");
+    let output = scan(dir.path(), &[]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output), format!("{}errors: 0\n", summary(5, 0)));
+    assert_eq!(unavailable_lines(&stderr(&output), volume_path), [""; 0]);
+    assert_eq!(track_index(dir.path()), before);
+    assert_eq!(folder_rows(dir.path()), folders);
+}
+
+#[test]
+fn scan_whose_only_folder_is_missing_records_the_error_and_exits_1() {
     let (library, dir) = initialised_library();
+    let output = scan(dir.path(), &[]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
     let folder = library.root.path().to_path_buf();
     drop(library);
     assert!(!folder.exists());
 
+    // The config loads, and the scan starts. It reads no file and deletes
+    // no track.
     let output = scan(dir.path(), &[]);
     assert_eq!(output.status.code(), Some(1));
-    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
-    assert_eq!(
-        stderr(&output),
-        format!(
-            "wn-server: music folder {} does not exist\n",
-            folder.display()
-        )
+    let printed = stdout(&output);
+    assert!(
+        printed.starts_with(
+            "seen: 0\nadded: 0\nchanged: 0\nmoved: 0\nremoved: 0\nalbums: 4\nartists: 3\n\
+             errors: 1\nerror: music folder "
+        ),
+        "{printed}"
     );
-    // The command stopped when it loaded the config. No scan ran.
-    assert_eq!(scan_rows(dir.path()), []);
-    assert!(!dir.path().join("scan.lock").exists());
+    let log = stderr(&output);
+    assert_eq!(unavailable_lines(&log, &folder).len(), 1, "{log}");
+    assert!(
+        log.ends_with("wn-server: the scan recorded 1 error\n"),
+        "{log}"
+    );
+    assert_eq!(track_count(dir.path()), 10);
+    assert_eq!(scan_rows(dir.path()).len(), 2);
 }
 
 #[test]
@@ -1719,6 +1905,46 @@ fn run_without_a_config_names_the_config_path_and_exits_1() {
         "{message}"
     );
     assert!(message.contains("wn-server init"), "{message}");
+}
+
+#[test]
+fn run_with_a_missing_folder_loads_the_config_and_logs_the_folder_once() {
+    let dir = temp_dir();
+    let music = temp_dir();
+    let missing = music.path().join("unplugged");
+    // The data directory has no database, so `run` ends before it opens a
+    // socket. With `mdns = false` it starts no mDNS daemon either.
+    fs::write(
+        dir.path().join("config.toml"),
+        format!(
+            "[library]\nfolders = ['{}', '{}']\n\n[discovery]\nmdns = false\n",
+            music.path().display(),
+            missing.display()
+        ),
+    )
+    .expect("write config");
+
+    let output = run(binary().arg("run").arg("--data-dir").arg(dir.path()));
+
+    // The command got past the config: it logs the folder that is
+    // unavailable as a warning, and its error is the missing database.
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).is_empty());
+    let log = stderr(&output);
+    let lines = unavailable_lines(&log, &missing);
+    assert_eq!(lines.len(), 1, "{log}");
+    assert!(lines[0].contains(" WARN "), "{log}");
+    assert_eq!(unavailable_lines(&log, music.path()), [""; 0], "{log}");
+    let error = log.lines().last().expect("an error line");
+    assert_eq!(
+        error,
+        format!(
+            "wn-server: the database {} does not exist; `wn-server init` creates it and the \
+             owner account and keeps config.toml",
+            dir.path().join("library.db").display()
+        )
+    );
+    assert!(!dir.path().join("library.db").exists());
 }
 
 #[test]

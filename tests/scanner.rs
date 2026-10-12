@@ -1859,6 +1859,85 @@ fn a_directory_with_an_ordinary_name_that_cannot_be_listed_holds_deletions_back(
     );
 }
 
+// File modes exist on Unix only.
+#[cfg(unix)]
+#[test]
+fn a_folder_that_cannot_be_listed_deletes_nothing_and_is_named_in_the_error() {
+    let two = TwoFolders::new();
+    let before = two.env.index();
+    let (aurora_id, marlow_id) = (
+        two.env.folder_id(&two.aurora),
+        two.env.folder_id(&two.marlow),
+    );
+    for entry in before.values() {
+        attach(&two.env.db, &entry.id);
+    }
+
+    // A file of the first folder is deleted. The second folder exists and
+    // has no permission, which is the state of a network share that refuses
+    // the user of the server.
+    let deleted = "Glass Harbour/02 Breakwater.flac";
+    fs::remove_file(two.aurora.join(deleted)).unwrap();
+    set_mode(&two.marlow, 0o000);
+    let listed = fs::read_dir(&two.marlow).is_ok();
+    let summary = two.rescan();
+    // The folder gets its mode back before the assertions, so that the
+    // directory of the test can be deleted when one fails.
+    set_mode(&two.marlow, 0o755);
+    if listed {
+        eprintln!("not checked: the process lists a directory that has no permission");
+        return;
+    }
+
+    assert_eq!(summary.seen, 6);
+    assert_eq!((summary.added, summary.moved, summary.removed), (0, 0, 0));
+    assert_eq!(summary.errors.len(), 2, "{:?}", summary.errors);
+    let error = &summary.errors[0];
+    assert!(error.contains("\"Marlow Quartet\""), "{error}");
+    assert!(error.contains(&two.marlow.display().to_string()), "{error}");
+    assert!(error.contains("cannot be read"), "{error}");
+    assert!(error.contains("no track was deleted"), "{error}");
+    assert_eq!(
+        summary.errors[1],
+        "1 track whose file is gone was kept, because a path or a file could not be read"
+    );
+    assert_eq!(two.env.latest_scan().error, Some(summary.errors.join("; ")));
+    assert_eq!(two.env.latest_scan().counts.removed, 0);
+
+    // Every row is as it was, in both folders, with what was attached to
+    // it. The row of the deleted file stays, because its file may be in the
+    // folder that the scan could not read.
+    assert_eq!(two.env.index(), before);
+    for (locator, entry) in &before {
+        assert_eq!(attached(&two.env.db, &entry.id).as_ref(), Some(locator));
+    }
+
+    // The folder can be listed again. Its tracks are found under their IDs,
+    // and the row of the deleted file goes.
+    let summary = two.rescan();
+    assert_eq!(
+        summary,
+        ScanSummary {
+            seen: 8,
+            removed: 1,
+            ..standard()
+        }
+    );
+    let mut after = before.clone();
+    after.remove(&(aurora_id, deleted.to_owned()));
+    assert_eq!(two.env.index(), after);
+    assert_eq!(
+        after
+            .keys()
+            .filter(|(folder_id, _)| *folder_id == marlow_id)
+            .count(),
+        2
+    );
+    for (locator, entry) in &after {
+        assert_eq!(attached(&two.env.db, &entry.id).as_ref(), Some(locator));
+    }
+}
+
 #[test]
 fn cancelling_after_the_first_batch_keeps_the_rows_of_that_batch_only() {
     let library = LibraryBuilder::standard().build();

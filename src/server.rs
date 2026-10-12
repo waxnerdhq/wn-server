@@ -105,6 +105,14 @@ pub fn bind_addr(config: &Config) -> SocketAddr {
 /// missing. When `auth.disabled_unsafe` is `true`, the function logs a
 /// warning first.
 ///
+/// A music folder of `config` that does not exist or cannot be read does not
+/// keep the server from starting. The function logs one warning for each
+/// such folder when it starts, with the path of the folder. No request logs
+/// that line, so the log has it once for a run of the server. The server
+/// serves the tracks of the other folders. The tracks of the folder stay in
+/// the database, and a scan reads the folder when it is back
+/// (`docs/design.md` section 3.10).
+///
 /// Before it serves the first request, the function stores the music folders
 /// of `config` in the database and starts the scans that `config` asks for
 /// (`start_scans`). It does not wait for a scan.
@@ -135,6 +143,7 @@ pub async fn run_server(
     if config.auth.disabled_unsafe {
         tracing::warn!("{AUTH_DISABLED_WARNING}");
     }
+    config.library.warn_unavailable_folders();
     let db = open_database(data_dir).await?;
     let covers = crate::library::covers::Covers::new(data_dir.covers_cache_dir(), db.clone());
 
@@ -427,6 +436,11 @@ impl AsyncWrite for ClosableStream {
 /// request finds them, with or without a scan. A folder that left the config
 /// keeps its row and its tracks here. The scanner deletes them under its
 /// rules for a removed folder (`docs/design.md` section 3.10).
+///
+/// A folder of the config that does not exist or cannot be read is stored
+/// like every other folder: it gets a row when it has none, and it keeps the
+/// row and the tracks it has. The function reads no folder. The scan treats
+/// such a folder as an unread root and deletes no track.
 ///
 /// A scan runs on a blocking thread, and the function does not wait for it.
 /// Every scan of the controller holds the scan lock of `data_dir` and
@@ -777,6 +791,135 @@ mod tests {
         );
         assert_eq!(track_count(&db).await, 3);
         assert_eq!(folder_rows(&db).await.len(), 2);
+    }
+
+    /// The index entries of the tracks, in the order of their folders and
+    /// their paths.
+    async fn index_by_folder(db: &Db) -> Vec<tracks::IndexEntry> {
+        let mut entries = db.read(tracks::load_index).await.expect("read the index");
+        entries.sort_by(|a, b| (a.folder_id, &a.rel_path).cmp(&(b.folder_id, &b.rel_path)));
+        entries
+    }
+
+    #[tokio::test]
+    async fn start_scans_stores_the_row_of_a_folder_that_does_not_exist() {
+        let present = music_folder(2);
+        let volumes = TempDir::new().expect("a temporary directory");
+        let missing = volumes.path().join("unplugged");
+        let (_dir, data_dir, db) = library();
+        let mut config = config(&[present.path(), &missing]);
+
+        // The folder that does not exist gets its row, so the folder list of
+        // the server names it before a scan and without one.
+        let scan = start(&config, &data_dir, &db, ScanHooks::default()).await;
+        let rows = folder_rows(&db).await;
+        let stored: Vec<_> = rows
+            .iter()
+            .map(|folder| (folder.id, folder.path.as_path(), folder.name.as_str()))
+            .collect();
+        let name = present.path().file_name().expect("a name");
+        let name = name.to_str().expect("a UTF-8 name");
+        assert_eq!(
+            stored,
+            [
+                (1, present.path(), name),
+                (2, missing.as_path(), "unplugged")
+            ]
+        );
+        assert_eq!(scan_rows(&db).await, []);
+        scan.stop().await;
+
+        // The scan at startup reads the folder that exists and records the
+        // other one as an error.
+        config.library.scan_on_start = true;
+        let scan = start(&config, &data_dir, &db, ScanHooks::default()).await;
+        ended(&scan).await;
+        scan.stop().await;
+        let scans = scan_rows(&db).await;
+        assert_eq!(scans.len(), 1);
+        assert_eq!((scans[0].counts.seen, scans[0].counts.added), (2, 2));
+        let error = scans[0].error.as_deref().expect("the scan has an error");
+        assert!(
+            error.contains(&format!("\"unplugged\" ({})", missing.display())),
+            "{error}"
+        );
+        assert!(error.contains("cannot be read"), "{error}");
+        assert_eq!(track_count(&db).await, 2);
+        assert_eq!(folder_rows(&db).await, rows);
+    }
+
+    #[tokio::test]
+    async fn start_scans_keeps_the_row_and_the_tracks_of_a_folder_that_became_unavailable() {
+        let (present, away) = (music_folder(2), music_folder(3));
+        let (_dir, data_dir, db) = library();
+        let mut config = config(&[present.path(), away.path()]);
+        config.library.scan_on_start = true;
+        let scan = start(&config, &data_dir, &db, ScanHooks::default()).await;
+        ended(&scan).await;
+        scan.stop().await;
+        let rows = folder_rows(&db).await;
+        let tracks = index_by_folder(&db).await;
+        assert_eq!((rows.len(), tracks.len()), (2, 5));
+        assert!(config.library.unavailable_folders().is_empty());
+
+        // The volume of the second folder is unplugged: its path does not
+        // exist when the server starts again.
+        let volumes = TempDir::new().expect("a temporary directory");
+        let unplugged = volumes.path().join("unplugged");
+        fs::rename(away.path(), &unplugged).expect("move the folder away");
+        let unavailable = config.library.unavailable_folders();
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0].path, away.path());
+
+        // A server without a scan at startup stores the folders only. The
+        // row of the folder stays, and so does every track.
+        config.library.scan_on_start = false;
+        let scan = start(&config, &data_dir, &db, ScanHooks::default()).await;
+        scan.stop().await;
+        assert_eq!(folder_rows(&db).await, rows);
+        assert_eq!(index_by_folder(&db).await, tracks);
+        assert_eq!(scan_rows(&db).await.len(), 1);
+
+        // The scan at startup reads the other folder, deletes nothing and
+        // records an error that names the folder.
+        config.library.scan_on_start = true;
+        let scan = start(&config, &data_dir, &db, ScanHooks::default()).await;
+        ended(&scan).await;
+        scan.stop().await;
+        let scans = scan_rows(&db).await;
+        assert_eq!(scans.len(), 2);
+        assert_eq!(scans[1].counts.seen, 2);
+        assert_eq!(scans[1].counts.removed, 0);
+        let error = scans[1].error.as_deref().expect("the scan has an error");
+        assert!(
+            error.contains(&away.path().display().to_string()),
+            "{error}"
+        );
+        assert!(error.contains("cannot be read"), "{error}");
+        assert!(error.contains("no track was deleted"), "{error}");
+        assert_eq!(folder_rows(&db).await, rows);
+        assert_eq!(index_by_folder(&db).await, tracks);
+
+        // The volume is back. The scan at the next startup finds every file
+        // at the path of its row, so every track keeps its ID.
+        fs::rename(&unplugged, away.path()).expect("move the folder back");
+        let scan = start(&config, &data_dir, &db, ScanHooks::default()).await;
+        ended(&scan).await;
+        scan.stop().await;
+        let scans = scan_rows(&db).await;
+        assert_eq!(scans.len(), 3);
+        assert_eq!(scans[2].error, None);
+        assert_eq!(scans[2].counts.seen, 5);
+        assert_eq!(
+            (
+                scans[2].counts.added,
+                scans[2].counts.moved,
+                scans[2].counts.removed
+            ),
+            (0, 0, 0)
+        );
+        assert_eq!(folder_rows(&db).await, rows);
+        assert_eq!(index_by_folder(&db).await, tracks);
     }
 
     #[tokio::test]
