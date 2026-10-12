@@ -69,6 +69,12 @@ pub fn list(conn: &Connection) -> Result<Vec<Folder>> {
     Ok(folders)
 }
 
+/// Deletes the folder row `id`. The tracks of the folder go with it.
+pub fn delete(conn: &Connection, id: i64) -> Result<()> {
+    conn.execute("DELETE FROM folders WHERE id = ?1", [id])?;
+    Ok(())
+}
+
 /// Returns the last component of `path`, or `text`, the whole path, when the
 /// path has no last component (a root such as `/` or `C:\`).
 fn display_name<'a>(path: &'a Path, text: &'a str) -> &'a str {
@@ -256,6 +262,20 @@ mod tests {
                     (3, os_text("/music/c")),
                 ]
             );
+        }
+    }
+
+    #[test]
+    fn delete_removes_the_named_row_only() {
+        let (_dir, dbs) = both_dbs();
+        for db in dbs {
+            let folders = sync(&db, &["/music/rock", "/music/jazz"]);
+            db.with_writer(|conn| delete(conn, folders[0].id)).unwrap();
+            assert_eq!(db.with_reader(list).unwrap(), [folders[1].clone()]);
+
+            // A row that does not exist is not an error.
+            db.with_writer(|conn| delete(conn, folders[0].id)).unwrap();
+            assert_eq!(db.with_reader(list).unwrap(), [folders[1].clone()]);
         }
     }
 
