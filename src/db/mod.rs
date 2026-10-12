@@ -1737,9 +1737,11 @@ mod tests {
         assert!(timers.remove(id));
     }
 
-    /// `Db::open` runs the migrations on the write connection before the
-    /// handle exists. This test runs a migration on the write connection of
-    /// a handle, so a limit that reached that connection would stop it.
+    /// `Db::open` runs `migrate` on the write connection before the handle
+    /// exists, and `migrate` applies each migration with `apply_migration`.
+    /// This test applies one more migration with `apply_migration` on the
+    /// write connection of a handle, after the migrations of the build. A
+    /// limit that reached that connection would stop it.
     #[test]
     fn a_migration_that_runs_longer_than_the_read_limit_completes() {
         const LIMIT: Duration = Duration::from_millis(5);
