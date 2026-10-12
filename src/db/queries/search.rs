@@ -10,12 +10,16 @@
 //! meaning. A query without a term matches every row, which is how a client
 //! reads the whole library.
 //!
+//! A query has [`MAX_QUERY_CHARS`] characters and [`MAX_TERMS`] different
+//! terms at most. The work of a search grows with both, so a longer query is
+//! an error and reaches no statement.
+//!
 //! # The query is a parameter
 //!
 //! The text of a query never becomes part of a statement. The terms are one
 //! parameter: a JSON array of `LIKE` patterns that the statement reads with
 //! `json_each`, as the statements of `browse` read a list of IDs. A query
-//! with any number of terms is therefore the same statement. In a pattern
+//! with any number of terms is therefore the same statement text. In a pattern
 //! the characters `%`, `_` and `\` of a term are escaped with `\`, so they
 //! match themselves.
 //!
@@ -69,24 +73,44 @@ use crate::db::Result;
 
 /// The most characters that a query may have.
 ///
-/// The limit bounds the work of one search: the number of terms, which is at
-/// most half of it, and the length of a `LIKE` pattern. SQLite fails a
-/// `LIKE` whose pattern has more than 50 000 bytes. The pattern of a term of
-/// this length has fewer than 13 000 bytes, whatever its characters are.
+/// The limit bounds the length of a `LIKE` pattern. SQLite fails a `LIKE`
+/// whose pattern has more than 50 000 bytes. The pattern of a term of this
+/// length has fewer than 13 000 bytes, whatever its characters are.
 pub const MAX_QUERY_CHARS: usize = 1024;
+
+/// The most different terms that a query may have. A term that the query
+/// holds twice counts once.
+///
+/// The limit bounds the work of one search, which grows with the number of
+/// terms. The statement of the tracks tests the key of every album and of
+/// every artist against every term, and then every track against the terms
+/// until one does not match. A query that a person types has fewer terms.
+pub const MAX_TERMS: usize = 32;
 
 /// The character that a query may hold and a term does not: the double
 /// quote. Some clients send `""` for a query without a term.
 const QUOTE: char = '"';
 
+/// The character that a query may end with and that is no part of its last
+/// term. The search of the Subsonic API 1.x took it as a wildcard, and some
+/// clients still append it to a query.
+const WILDCARD: char = '*';
+
 /// The character that escapes `%`, `_` and itself in a pattern. Every `LIKE`
 /// of this module names it in its `ESCAPE` clause.
 const ESCAPE: char = '\\';
 
-/// The error of a query that has more than [`MAX_QUERY_CHARS`] characters.
+/// The error of a query that is larger than the statements of this module
+/// take.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
-#[error("the query has more than {MAX_QUERY_CHARS} characters")]
-pub struct QueryTooLong;
+pub enum QueryError {
+    /// The query has more than [`MAX_QUERY_CHARS`] characters.
+    #[error("the query has more than {MAX_QUERY_CHARS} characters")]
+    TooLong,
+    /// The query has more than [`MAX_TERMS`] different terms.
+    #[error("the query has more than {MAX_TERMS} terms")]
+    TooManyTerms,
+}
 
 /// The terms of one search query, as the statements of this module take
 /// them.
@@ -108,32 +132,40 @@ impl Terms {
     ///   and `"glass harbour"` is the two terms `glass` and `harbour`.
     /// - The text is brought into Unicode form NFC and into lower case, as a
     ///   natural key is (`ids::artist_key`).
+    /// - One `*` at the end of the text is removed, so `beat*` is the term
+    ///   `beat`. A `*` at any other place is a character of its term.
     /// - The terms are the parts between white space. A term that the query
     ///   holds twice counts once.
     ///
-    /// A query of more than [`MAX_QUERY_CHARS`] characters is an error.
-    pub fn parse(query: &str) -> std::result::Result<Self, QueryTooLong> {
+    /// A query of more than [`MAX_QUERY_CHARS`] characters is an error, and
+    /// so is a query of more than [`MAX_TERMS`] different terms.
+    pub fn parse(query: &str) -> std::result::Result<Self, QueryError> {
         if query.chars().nth(MAX_QUERY_CHARS).is_some() {
-            return Err(QueryTooLong);
+            return Err(QueryError::TooLong);
         }
         let text: String = query
             .nfc()
             .filter(|character| *character != QUOTE)
             .collect();
         let text = text.to_lowercase();
+        let text = text.trim();
+        let text = text.strip_suffix(WILDCARD).unwrap_or(text);
 
         let mut patterns: Vec<String> = Vec::new();
+        let mut comparable = true;
         for term in text.split_whitespace() {
-            if term.contains('\0') {
-                return Ok(Self { patterns: None });
-            }
             let pattern = pattern(term);
-            if !patterns.contains(&pattern) {
-                patterns.push(pattern);
+            if patterns.contains(&pattern) {
+                continue;
             }
+            if patterns.len() == MAX_TERMS {
+                return Err(QueryError::TooManyTerms);
+            }
+            comparable &= !term.contains('\0');
+            patterns.push(pattern);
         }
         Ok(Self {
-            patterns: Some(patterns),
+            patterns: comparable.then_some(patterns),
         })
     }
 }
@@ -595,28 +627,134 @@ mod tests {
         assert_eq!(patterns(&longest), [format!("%{longest}%")]);
         assert_eq!(
             Terms::parse(&"a".repeat(MAX_QUERY_CHARS + 1)),
-            Err(QueryTooLong)
+            Err(QueryError::TooLong)
         );
         assert_eq!(
             Terms::parse(&" ".repeat(MAX_QUERY_CHARS + 1)),
-            Err(QueryTooLong)
+            Err(QueryError::TooLong)
         );
-        assert_eq!(Terms::parse(&"é".repeat(1_000_000)), Err(QueryTooLong));
+        assert_eq!(
+            Terms::parse(&"é".repeat(1_000_000)),
+            Err(QueryError::TooLong)
+        );
+        // The length is tested before the terms are counted.
+        assert_eq!(
+            Terms::parse(&"a b ".repeat(MAX_QUERY_CHARS)),
+            Err(QueryError::TooLong)
+        );
 
         // The limit counts characters and not bytes.
         let wide = "é".repeat(MAX_QUERY_CHARS);
         assert_eq!(patterns(&wide), [format!("%{wide}%")]);
     }
 
+    /// A query of `count` different terms: the ideographs from U+4E00 on.
+    fn different_terms(count: u32) -> String {
+        (0..count)
+            .map(|n| char::from_u32(0x4e00 + n).unwrap().to_string())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    #[test]
+    fn query_of_more_than_the_maximum_number_of_terms_is_an_error() {
+        assert_eq!(MAX_TERMS, 32);
+        assert_eq!(patterns(&different_terms(32)).len(), 32);
+        assert_eq!(
+            Terms::parse(&different_terms(33)),
+            Err(QueryError::TooManyTerms)
+        );
+        assert_eq!(
+            Terms::parse(&different_terms(500)),
+            Err(QueryError::TooManyTerms)
+        );
+
+        // A term that the query holds twice counts once, in any letter case
+        // and with or without quotes.
+        let repeated = format!("{} \u{4e00} A a \"a\"", different_terms(31));
+        assert_eq!(patterns(&repeated).len(), 32);
+        assert_eq!(patterns(&"a ".repeat(512)), ["%a%"]);
+        assert_eq!(
+            Terms::parse(&format!("{repeated} b")),
+            Err(QueryError::TooManyTerms)
+        );
+
+        // A term with a NUL character is a term: 33 terms are an error, and
+        // 32 terms match nothing.
+        assert_eq!(
+            Terms::parse(&format!("a\0b {}", different_terms(32))),
+            Err(QueryError::TooManyTerms)
+        );
+        assert_eq!(
+            Terms::parse(&format!("{} a\0b", different_terms(32))),
+            Err(QueryError::TooManyTerms)
+        );
+        assert_eq!(
+            terms(&format!("a\0b {}", different_terms(31))).patterns,
+            None
+        );
+
+        // The statements take the most terms.
+        let db = catalogue();
+        assert_eq!(find(&db, &different_terms(32)), names(&[], &[], &[]));
+        // 32 parts of the names of "Come Together" on "Abbey Road" by The
+        // Beatles.
+        let parts = "a b c d e g h l m o r s t y ab bb be ey ro oa ad th he ea at tl le es co \
+                     om me to";
+        assert_eq!(patterns(parts).len(), 32);
+        assert_eq!(find(&db, parts), names(&[], &[], &["Come Together"]));
+    }
+
+    #[test]
+    fn one_wildcard_at_the_end_of_a_query_is_removed() {
+        assert_eq!(patterns("beat*"), ["%beat%"]);
+        assert_eq!(patterns("BEAT* "), ["%beat%"]);
+        assert_eq!(patterns("\"beat*\""), ["%beat%"]);
+        assert_eq!(patterns("the beat*"), ["%the%", "%beat%"]);
+        assert_eq!(patterns("beat *"), ["%beat%"]);
+        assert_eq!(patterns("*"), [] as [&str; 0]);
+        assert_eq!(patterns(" \"*\" "), [] as [&str; 0]);
+        // One is removed, and only at the end of the query.
+        assert_eq!(patterns("beat**"), ["%beat*%"]);
+        assert_eq!(patterns("**"), ["%*%"]);
+        assert_eq!(patterns("the* beat"), ["%the*%", "%beat%"]);
+        assert_eq!(patterns("m*a*s*h"), ["%m*a*s*h%"]);
+        assert_eq!(patterns("* beat"), ["%*%", "%beat%"]);
+
+        let db = library(&[
+            song(1, "The Beatles", "Help!", "Yesterday"),
+            song(2, "Various", "M*A*S*H", "Suicide Is Painless"),
+        ]);
+        assert_eq!(find(&db, "beat*"), find(&db, "beat"));
+        assert_eq!(find(&db, "beat*").artists, ["The Beatles"]);
+        assert_eq!(find(&db, "*"), find(&db, ""));
+        // A `*` inside a query matches itself.
+        assert_eq!(
+            find(&db, "m*a*"),
+            names(&[], &["M*A*S*H"], &["Suicide Is Painless"])
+        );
+        assert_eq!(
+            find(&db, "**"),
+            names(&[], &["M*A*S*H"], &["Suicide Is Painless"])
+        );
+        assert_eq!(find(&db, "b*t"), names(&[], &[], &[]));
+    }
+
     #[test]
     fn longest_queries_run() {
         let db = catalogue();
-        // 1024 characters that grow in lower case, that grow in NFC, that
-        // are escaped, and 512 terms.
-        let many_terms: String = (0..512u32)
-            .map(|n| char::from_u32(0x4e00 + n).unwrap().to_string())
+        // 1024 characters that grow in lower case, that grow in NFC and that
+        // are escaped, and the most terms, each as long as the limit allows.
+        let many_terms: String = (0..32u32)
+            .map(|n| {
+                char::from_u32(0x4e00 + n)
+                    .unwrap()
+                    .to_string()
+                    .repeat(MAX_QUERY_CHARS / 32 - 1)
+            })
             .collect::<Vec<_>>()
             .join(" ");
+        assert_eq!(many_terms.chars().count(), MAX_QUERY_CHARS - 1);
         for query in [
             "a".repeat(MAX_QUERY_CHARS),
             "\u{130}".repeat(MAX_QUERY_CHARS),
@@ -1376,20 +1514,24 @@ mod tests {
                 time("two terms that match one artist", "artist x42x", 0, None)?,
                 (1, 4, 48)
             );
-            let broad: String = "abcdefghijklmnopqrstuvwxyz0123456789"
+            let broad: String = "abcdefghijklmnopqrstuvwxyz012345"
                 .chars()
                 .map(|letter| format!("{letter} "))
                 .collect();
-            time("36 terms of one character", &broad, 0, None)?;
-            // Parts of `song`, `artist` and `album`: each matches every
-            // track. The last term matches none, so every term is tested
-            // for every track.
-            let every = "s o n g so on ng son ong song z a r t i ar rt ti is st art rti tis \
-                         ist arti rtis tist artis rtist artist x l b u m al lb bu um alb lbu bum \
-                         albu lbum album y qqq";
+            time("32 terms of one character", &broad, 0, None)?;
+            // The most terms. 31 are parts of `song`, `artist` and `album`,
+            // and each matches every track: 15 of them through the album
+            // only. The last term matches none, so every term is tested for
+            // every track.
+            let every = "s o n g so on ng son ong song z a r t i x l b u m al lb bu um alb lbu \
+                         bum albu lbum album y qqq";
+            assert_eq!(
+                terms(every).patterns.map(|patterns| patterns.len()),
+                Some(32)
+            );
             assert_eq!(
                 time(
-                    "46 terms that match every track and one that matches none",
+                    "31 terms that match every track and one that matches none",
                     every,
                     0,
                     None

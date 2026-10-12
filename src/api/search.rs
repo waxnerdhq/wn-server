@@ -10,7 +10,8 @@
 //!
 //! - `query` is required. It may be empty, and then every artist, album and
 //!   song is a match. A client reads the whole library that way, one page
-//!   after the other.
+//!   after the other. A query of more than 1024 characters or of more than
+//!   32 different terms is error 0.
 //! - `artistCount`, `albumCount` and `songCount` are the most items of a
 //!   list. The default is [`DEFAULT_COUNT`], and a larger value than
 //!   [`MAX_COUNT`] counts as [`MAX_COUNT`].
@@ -36,7 +37,7 @@ use crate::auth::extract::Authed;
 use crate::db::Db;
 use crate::db::queries::annotations::{self, Annotation};
 use crate::db::queries::browse::{Album, Artist, Song};
-use crate::db::queries::search::{self, MAX_QUERY_CHARS, Terms};
+use crate::db::queries::search::{self, MAX_QUERY_CHARS, MAX_TERMS, QueryError, Terms};
 
 /// The number of items of a list when the request names none.
 const DEFAULT_COUNT: u32 = 20;
@@ -87,13 +88,19 @@ struct SearchRequest {
 
 impl SearchRequest {
     /// Reads the parameters of a search. An absent `query` is error 10. A
-    /// `query` of more than [`MAX_QUERY_CHARS`] characters and a number that
-    /// is not one are error 0.
+    /// `query` of more than [`MAX_QUERY_CHARS`] characters or of more than
+    /// [`MAX_TERMS`] different terms and a number that is not one are
+    /// error 0.
     fn from_params(params: &Params) -> Result<Self, ApiError> {
-        let terms = Terms::parse(params.req_str("query")?).map_err(|_| {
-            ApiError::Other(format!(
-                "parameter query must be at most {MAX_QUERY_CHARS} characters"
-            ))
+        let terms = Terms::parse(params.req_str("query")?).map_err(|error| {
+            ApiError::Other(match error {
+                QueryError::TooLong => {
+                    format!("parameter query must be at most {MAX_QUERY_CHARS} characters")
+                }
+                QueryError::TooManyTerms => {
+                    format!("parameter query must have at most {MAX_TERMS} terms")
+                }
+            })
         })?;
         Ok(Self {
             terms,
@@ -362,6 +369,15 @@ mod tests {
             "parameter query must be at most 1024 characters"
         );
         assert!(request(&format!("query={}", "a".repeat(MAX_QUERY_CHARS))).is_ok());
+
+        // 32 different terms are a query, and 33 are none.
+        let terms: Vec<String> = (0..33).map(|n| format!("t{n}")).collect();
+        assert!(request(&format!("query={}", terms[..32].join("+"))).is_ok());
+        assert_eq!(
+            error_0(&format!("query={}", terms.join("+"))),
+            "parameter query must have at most 32 terms"
+        );
+        assert!(request(&format!("query={}+T0+t1", terms[..32].join("+"))).is_ok());
         // The absent query is reported before a number that is none.
         let error = request("songCount=-1").expect_err("the query is absent");
         assert_eq!(error.code(), 10);

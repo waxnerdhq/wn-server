@@ -56,6 +56,9 @@ const SONGS: [&str; 10] = [
 /// The message of the error for a query that is too long.
 const QUERY_TOO_LONG: &str = "parameter query must be at most 1024 characters";
 
+/// The message of the error for a query of too many terms.
+const TOO_MANY_TERMS: &str = "parameter query must have at most 32 terms";
+
 /// The `error` object with `code` and `message`.
 fn error(code: u32, message: &str) -> Value {
     json!({ "code": code, "message": message })
@@ -737,9 +740,23 @@ async fn term_matches_a_part_of_a_name_and_two_terms_require_both() {
             &["Abbey Road", "Help!"],
             &["Beat It", "Come Together", "Yesterday"],
         );
-        for query in ["beat", "BEAT", "Beat", "\"beat\"", " beat "] {
+        // One `*` at the end of a query is no part of the term.
+        for query in [
+            "beat",
+            "BEAT",
+            "Beat",
+            "\"beat\"",
+            " beat ",
+            "beat*",
+            "\"beat*\"",
+        ] {
             assert_eq!(find(&server, method, query).await, beat, "{method} {query}");
         }
+        assert_eq!(
+            find(&server, method, "beat**").await,
+            found(&[], &[], &[]),
+            "{method}"
+        );
 
         // Two terms: both are part of a name of the item. No artist name
         // holds `road`.
@@ -1069,6 +1086,52 @@ async fn query_of_more_than_1024_characters_is_error_0() {
             assert_eq!(content_type(&response), "application/json", "{method}");
             let response = subsonic_response(&body_string(response).await);
             assert_eq!(response["error"], error(0, QUERY_TOO_LONG), "{method}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn query_of_more_than_32_terms_is_error_0() {
+    let server = TestServer::standard().await;
+    let numbered: Vec<String> = (0..33).map(|n| format!("t{n}")).collect();
+    let at_the_bound = numbered[..32].join(" ");
+    let above_the_bound = numbered.join(" ");
+    // 33 terms of which two are one term in another letter case.
+    let repeated = format!("{at_the_bound} T0 \"t1\"");
+    // 32 parts of the names of "Low Tide" and "Breakwater" on "Glass
+    // Harbour" by Aurora Field. Both titles hold a `w`, and the third track
+    // of the album, "Night Ferry", holds none.
+    let parts = "a u r o f i e l d g s h b w t au ur ro or ra fi ie el ld gl la as ss ha ar rb bo";
+    assert_eq!(parts.split(' ').count(), 32);
+
+    for (method, key) in METHODS {
+        for query in [at_the_bound.as_str(), repeated.as_str()] {
+            let response = server.get_json(method, &[("query", query)]).await;
+            assert_eq!(response["status"], "ok", "{method} {query}");
+            assert_eq!(names(method, &response[key]), found(&[], &[], &[]));
+        }
+        assert_eq!(
+            find(&server, method, parts).await,
+            found(&[], &[], &["Breakwater", "Low Tide"]),
+            "{method}"
+        );
+
+        for query in [
+            above_the_bound.clone(),
+            format!("{parts} n"),
+            format!("{above_the_bound} \0"),
+            // 250 terms in 890 characters.
+            (0..250).map(|n| format!("{n} ")).collect(),
+        ] {
+            let response = server.get_json(method, &[("query", &query)]).await;
+            assert_eq!(response["status"], "failed", "{method} {query:?}");
+            assert_eq!(response["error"], error(0, TOO_MANY_TERMS), "{method}");
+            assert!(response.get(key).is_none(), "{method}");
+            assert_eq!(
+                server.get_xml(method, &[("query", &query)]).await,
+                xml_error(0, TOO_MANY_TERMS),
+                "{method}"
+            );
         }
     }
 }
