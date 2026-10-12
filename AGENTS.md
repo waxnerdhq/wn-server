@@ -54,11 +54,11 @@ wn-server is a headless music server. It scans a local music collection into SQL
 - The reviewer runs in the implementer's worktree so that it can run the checks on the PR's code.
 - A lane brief that omits the reviewer pass or the Linear state moves is defective and is corrected before the lane starts.
 - The merge sequence is three scripts in `scripts/orchestrator/`. The orchestrator runs them in this order after the implementer reports its fixes. `<worktree-id>` names the lane's worktree, `.claude/worktrees/agent-<worktree-id>`.
-  1. `prep-lane.sh <worktree-id>` rebases the lane's branch on `origin/main`, formats the code, reruns `cargo xtask check`, pushes, and prints the head commit. `main` moves after every merge, and parallel PRs touch shared tables such as `METHODS`. When the branch already contains `origin/main`, the script only prints the head commit.
+  1. `prep-lane.sh <worktree-id>` rebases the lane's branch on `origin/main`, formats the code, reruns `cargo xtask check`, pushes, and prints the head commit. `main` moves after every merge, and parallel PRs touch shared tables such as `METHODS`. When the branch already contains `origin/main`, the script checks that the head commit is pushed and prints it. The format commit ends with the attribution line in `PREP_LANE_ATTRIBUTION`.
   2. `ci-wait.sh <pr> <sha>` waits for the Woodpecker status on that commit.
-  3. `merge-lane.sh <pr> <WAX-id> <sha> <worktree-id>` checks that the PR's head commit is `<sha>`, that GitHub reports the merge state as clean, and that the CI status is green. It then squash-merges, removes the worktree and the lane's branches, updates `main`, and moves the Linear issue to Done.
+  3. `merge-lane.sh <pr> <WAX-id> <sha> <worktree-id>` checks that the PR's head commit is `<sha>`, that GitHub reports the merge state as clean, and that the CI status is green. It then squash-merges, removes the worktree and the lane's branches, updates `main`, and closes the Linear issue (see Process).
 - The three scripts are POSIX `sh` and run on the owner's Mac only. They are orchestrator tooling, not contributor tooling, so the rule that contributor scripts are Rust holds.
-- `.gitattributes` sets `merge=union` on the module-list files, so a rebase keeps the `pub mod` lines of both sides and the format step orders them. A rebase conflict in any other file stops `prep-lane.sh` and goes back to the lane's implementer.
+- `.gitattributes` sets `merge=union` on `src/lib.rs` only, so a rebase keeps the `pub mod` lines of both sides in that file and the format step orders them. A rebase conflict in any other file stops `prep-lane.sh` and goes back to the lane's implementer.
 - Work state lives in Linear and git. Anything the orchestrator knows that those do not show goes into a handoff note for the next orchestrator session.
 
 ## Documentation

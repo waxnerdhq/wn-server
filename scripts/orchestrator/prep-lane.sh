@@ -9,14 +9,27 @@
 # branch on origin/main, runs `cargo fmt --all` and commits the result when the
 # rebase left the code unformatted, runs `cargo xtask check`, and force-pushes
 # with a lease. When the branch already contains origin/main, the script
-# changes nothing. In both cases it prints HEAD=<sha>, the commit that
-# ci-wait.sh and merge-lane.sh take.
+# changes nothing and checks that the head commit is the pushed one. It prints
+# HEAD=<sha>, the commit that ci-wait.sh and merge-lane.sh take.
 #
-# The check output goes to ${TMPDIR:-/tmp}/prep-lane-<worktree-id>.log.
+# The format commit ends with the attribution line in PREP_LANE_ATTRIBUTION.
+# When the variable is unset, the line is the default below.
 #
-# Exit status: 0 when the branch is ready, 1 when the worktree has uncommitted
-# changes, 2 on a rebase conflict (the script lists the files and aborts the
-# rebase), 3 when the check fails, 64 on wrong arguments.
+# The output of the rebase, the format step and the check goes to
+# ${TMPDIR:-/tmp}/prep-lane-<worktree-id>.log.
+#
+# Exit status:
+#   0   the branch is ready and pushed
+#   1   the worktree has uncommitted changes or is not on a branch
+#   2   the rebase failed; the script aborted it, and it listed the conflicting
+#       files when there were any
+#   3   the format step or the check failed after the rebase; the worktree
+#       holds the rebased branch, unpushed, and after a failed format step it
+#       can hold uncommitted changes
+#   4   the branch contains origin/main and its head is not the pushed head
+#   64  wrong arguments
+# Any other status comes from a failed git or cargo command. The worktree may
+# then hold the rebased branch, unpushed.
 set -eu
 
 usage() {
@@ -25,6 +38,8 @@ usage() {
     exit 64
 }
 [ $# -eq 1 ] || usage
+
+ATTRIBUTION="${PREP_LANE_ATTRIBUTION:-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>}"
 
 # The main checkout, also when this script runs from a linked worktree.
 COMMON=$(git -C "$(dirname "$0")" rev-parse --path-format=absolute --git-common-dir)
@@ -38,21 +53,42 @@ if [ -n "$(git status --porcelain)" ]; then
     git status --short | head
     exit 1
 fi
+BRANCH=$(git symbolic-ref -q --short HEAD) || {
+    echo "worktree is not on a branch"
+    exit 1
+}
 git fetch -q origin
 if git merge-base --is-ancestor origin/main HEAD; then
+    # The PR's head is origin/<branch>. A commit that exists only in the
+    # worktree is not the merge candidate.
+    PUSHED=$(git rev-parse -q --verify "refs/remotes/origin/$BRANCH") || PUSHED=none
+    if [ "$(git rev-parse HEAD)" != "$PUSHED" ]; then
+        echo "NOT PUSHED: HEAD is $(git rev-parse HEAD), origin/$BRANCH is $PUSHED"
+        exit 4
+    fi
     echo "up to date with main"
 else
-    if ! git rebase -q origin/main >/dev/null 2>&1; then
-        echo "REBASE CONFLICT:"
-        git diff --name-only --diff-filter=U
-        git rebase --abort
+    if ! git rebase -q origin/main >"$LOG" 2>&1; then
+        CONFLICTS=$(git diff --name-only --diff-filter=U) || true
+        git rebase --abort >/dev/null 2>&1 || true
+        if [ -n "$CONFLICTS" ]; then
+            echo "REBASE CONFLICT:"
+            echo "$CONFLICTS"
+        else
+            echo "REBASE FAILED:"
+            tail -25 "$LOG"
+        fi
         exit 2
     fi
     if ! cargo fmt --all -- --check >/dev/null 2>&1; then
-        cargo fmt --all
+        if ! cargo fmt --all >"$LOG" 2>&1; then
+            echo "FORMAT FAILED after rebase:"
+            tail -25 "$LOG"
+            exit 3
+        fi
         git commit -q -am "Format module declarations after rebase on main
 
-Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>"
+$ATTRIBUTION"
         echo "formatted after rebase: $(git show --stat --format= HEAD | tail -1)"
     fi
     if ! cargo xtask check >"$LOG" 2>&1; then
