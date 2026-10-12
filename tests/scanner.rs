@@ -3456,6 +3456,47 @@ fn a_cover_file_that_is_removed_or_added_changes_the_cover_and_removes_the_resiz
 }
 
 #[test]
+fn an_album_that_gets_a_cover_loses_the_resized_covers_that_an_earlier_scan_left() {
+    let scanned = Scanned::new();
+    let cache = tempfile::tempdir().unwrap();
+    let albums = scanned.env.albums();
+    let album = albums["Aurora Field/Glass Harbour"].clone();
+    let other = &albums["Marlow Quartet/Slow Rivers"];
+    let old_mtime = album.cover_mtime.expect("the album has a cover");
+    let stale = cache_cover(cache.path(), &album.id, 300, old_mtime);
+    let fresh = cache_cover(cache.path(), &other.id, 300, other.cover_mtime.unwrap());
+
+    // The cover file is gone, and a scan without a cache directory stores
+    // that the album has no cover. The resized cover stays in the cache.
+    let cover = below(scanned.root(), "Aurora Field/Glass Harbour/cover.jpg");
+    fs::remove_file(&cover).unwrap();
+    assert_eq!(scanned.rescan(), seen(10));
+    assert_eq!(
+        scanned.env.album("Aurora Field/Glass Harbour"),
+        Album {
+            cover_source: None,
+            cover_mtime: None,
+            ..album.clone()
+        }
+    );
+    assert!(stale.exists());
+
+    // Another image with the modification time of the old one is the cover
+    // file. Its resized cover has the name of the file in the cache.
+    fs::write(&cover, b"another image").unwrap();
+    set_mtime(
+        &cover,
+        UNIX_EPOCH + Duration::from_secs(u64::try_from(old_mtime).unwrap()),
+    );
+    let summary = rescan_with_cache(&scanned, cache.path());
+
+    assert_eq!(summary, seen(10));
+    assert_eq!(scanned.env.album("Aurora Field/Glass Harbour"), album);
+    assert!(!stale.exists());
+    assert!(fresh.exists());
+}
+
+#[test]
 fn a_deleted_album_loses_its_resized_covers() {
     let scanned = Scanned::new();
     let cache = tempfile::tempdir().unwrap();

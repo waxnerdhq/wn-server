@@ -68,9 +68,12 @@ pub struct ScanOptions {
     /// scan that completes adds [`ScanSummary::seen`] in total.
     pub progress: Arc<AtomicU64>,
     /// The directory of the resized covers, `cache/covers` in the data
-    /// directory. The scan removes the files of an album there when the
-    /// cover of the album changes and when the album is deleted. With `None`
-    /// the scan removes no file.
+    /// directory (`DataDir::covers_cache_dir`). The scan removes the files of
+    /// an album there when the cover of the album changes and when the album
+    /// is deleted. With `None` the scan removes no file, and a resized cover
+    /// of an old image can be served for a new image with the same
+    /// modification time. Every caller that scans the library of a data
+    /// directory sets it.
     pub covers_cache_dir: Option<PathBuf>,
 }
 
@@ -1404,8 +1407,7 @@ struct Aggregated {
     /// The number of artist rows.
     artists: u64,
     /// The albums whose resized covers in the cache are stale: the deleted
-    /// albums, and the albums that had a cover and have another one or none
-    /// now.
+    /// albums and the albums whose cover changed.
     stale_covers: Vec<String>,
 }
 
@@ -1453,9 +1455,11 @@ fn aggregate(conn: &mut Connection, seen: Option<&Seen<'_>>) -> Result<Aggregate
             // The name of a cached file holds the ID of the album and the
             // modification time of its cover, and not the source. A new
             // source with the old time would be served from the old files.
-            if inputs.cover_source.is_some() {
-                stale_covers.push(inputs.album_id);
-            }
+            // That holds for an album without a stored cover too: the cache
+            // holds files of the album when a scan without a cache directory
+            // cleared its cover, and when a process ended between the commit
+            // and the removal.
+            stale_covers.push(inputs.album_id);
         }
         annotations::delete_orphans(&tx)?;
     }
@@ -1764,6 +1768,7 @@ fn same_extension(a: &str, b: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use std::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
     use std::fs;
     use std::rc::Rc;
     use std::time::Duration;
@@ -2702,6 +2707,10 @@ mod tests {
         unreadable: Rc<RefCell<HashSet<PathBuf>>>,
         /// The paths whose tags cannot be read.
         untaggable: Rc<RefCell<HashSet<PathBuf>>>,
+        /// The artist and the album that the reader reports for a path, in
+        /// place of the tags of the file. The WAV files of a test have no
+        /// tags.
+        tagged: Rc<RefCell<HashMap<PathBuf, (&'static str, &'static str)>>>,
         /// The number of fingerprint reads so far.
         fingerprint_reads: Rc<Cell<usize>>,
         /// The fingerprint read, counted from 1, that cancels the scan. No
@@ -2719,6 +2728,7 @@ mod tests {
                 cancel: CancellationToken::new(),
                 unreadable: Rc::default(),
                 untaggable: Rc::default(),
+                tagged: Rc::default(),
                 fingerprint_reads: Rc::default(),
                 cancel_at_read: Rc::default(),
             };
@@ -2753,11 +2763,23 @@ mod tests {
                 .expect("set the modification time");
         }
 
+        /// Makes the reader report `artist` as the artist and the album
+        /// artist and `album` as the album of the file at `rel_path`. The
+        /// tags belong to the path, so a file that moves needs them at its
+        /// new path when the scan reads its tags there.
+        fn tag(&self, rel_path: &str, artist: &'static str, album: &'static str) {
+            self.tagged
+                .borrow_mut()
+                .insert(self.path(rel_path), (artist, album));
+        }
+
         /// Returns a reader of the files on disk that fails for the paths
-        /// in `unreadable` and `untaggable`.
+        /// in `unreadable` and `untaggable` and reports the tags in
+        /// `tagged`.
         fn reader(&self) -> FileReader {
             let unreadable = Rc::clone(&self.unreadable);
             let untaggable = Rc::clone(&self.untaggable);
+            let tagged = Rc::clone(&self.tagged);
             let reads = Rc::clone(&self.fingerprint_reads);
             let cancel_at_read = Rc::clone(&self.cancel_at_read);
             let cancel = self.cancel.clone();
@@ -2779,7 +2801,13 @@ mod tests {
                     if untaggable.borrow().contains(path) {
                         return Err(TagError::UnsupportedExtension(path.to_owned()));
                     }
-                    tags::read(path)
+                    let mut meta = tags::read(path)?;
+                    if let Some((artist, album)) = tagged.borrow().get(path) {
+                        meta.artist = (*artist).to_owned();
+                        meta.album_artist = (*artist).to_owned();
+                        meta.album = (*album).to_owned();
+                    }
+                    Ok(meta)
                 }),
             }
         }
@@ -2836,28 +2864,48 @@ mod tests {
                 .expect("the row exists")
         }
 
-        /// Returns the one album of the library. The files have no tags, so
-        /// every track is in the album of the tracks without an album tag.
+        /// Returns the one album of the library. Files without tags are in
+        /// the album of the tracks without an album tag.
         fn album(&self) -> Album {
+            let mut albums: Vec<Album> = self.albums().into_values().collect();
+            assert_eq!(albums.len(), 1, "{albums:?}");
+            albums.remove(0)
+        }
+
+        /// Returns every album by name.
+        fn albums(&self) -> BTreeMap<String, Album> {
             self.db
                 .with_reader(|conn| {
                     let mut select = conn.prepare(
-                        "SELECT id, song_count, duration_ms, cover_source, cover_mtime
+                        "SELECT name, id, song_count, duration_ms, cover_source, cover_mtime
                          FROM albums",
                     )?;
-                    let mut albums = select
+                    let albums = select
                         .query_map([], |row| {
-                            Ok(Album {
-                                id: row.get(0)?,
-                                song_count: row.get(1)?,
-                                duration_ms: row.get(2)?,
-                                cover_source: row.get(3)?,
-                                cover_mtime: row.get(4)?,
-                            })
+                            let album = Album {
+                                id: row.get(1)?,
+                                song_count: row.get(2)?,
+                                duration_ms: row.get(3)?,
+                                cover_source: row.get(4)?,
+                                cover_mtime: row.get(5)?,
+                            };
+                            Ok((row.get(0)?, album))
                         })?
-                        .collect::<rusqlite::Result<Vec<Album>>>()?;
-                    assert_eq!(albums.len(), 1, "{albums:?}");
-                    Ok(albums.remove(0))
+                        .collect::<rusqlite::Result<_>>()?;
+                    Ok(albums)
+                })
+                .unwrap()
+        }
+
+        /// Returns the ID and the album count of every artist by name.
+        fn artists(&self) -> BTreeMap<String, (String, i64)> {
+            self.db
+                .with_reader(|conn| {
+                    let mut select = conn.prepare("SELECT name, id, album_count FROM artists")?;
+                    let artists = select
+                        .query_map([], |row| Ok((row.get(0)?, (row.get(1)?, row.get(2)?))))?
+                        .collect::<rusqlite::Result<_>>()?;
+                    Ok(artists)
                 })
                 .unwrap()
         }
@@ -3242,35 +3290,64 @@ mod tests {
 
     #[test]
     fn an_album_whose_only_track_has_no_file_keeps_its_row_and_its_id() {
-        let library = Library::new(&[("a.wav", 100, 1)]);
+        let library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2)]);
         library.set_mtime("a.wav", 1_000);
-        library.scan();
+        library.set_mtime("b.wav", 2_000);
+        // Each file is the one track of an album of its own artist.
+        library.tag("a.wav", "First Artist", "First Album");
+        library.tag("moved/a.wav", "First Artist", "First Album");
+        library.tag("b.wav", "Second Artist", "Second Album");
+        let summary = library.scan();
+        assert_eq!((summary.albums, summary.artists), (2, 2));
         let a = library.id_at("a.wav").unwrap();
-        let before = library.album();
-        assert_eq!(before.song_count, 1);
+        let b = library.id_at("b.wav").unwrap();
+        let albums = library.albums();
+        let artists = library.artists();
+        let first = albums["First Album"].clone();
+        assert_eq!(first.song_count, 1);
+        assert_eq!(library.track_at("a.wav").album_id, first.id);
+        assert_eq!(artists["First Artist"].1, 1);
 
-        // The file moves to a place where it cannot be read, and a file
-        // with tags that cannot be read takes its path. The scan stores no
-        // row for that file, so the track without a file is the only track
-        // of its album.
+        // The first file moves to a place where it cannot be read. The
+        // second file, which is a track of the other album, moves to the old
+        // path of the first. The first track is kept without a file.
         library.rename("a.wav", "moved/a.wav");
-        library.write("a.wav", 300, 3);
-        library.set_mtime("a.wav", 3_000);
+        library.rename("b.wav", "a.wav");
         library
             .unreadable
             .borrow_mut()
             .insert(library.path("moved/a.wav"));
-        library
-            .untaggable
-            .borrow_mut()
-            .insert(library.path("a.wav"));
         let summary = library.scan();
 
-        let index = library.index();
-        assert_eq!(index.len(), 1, "{index:?}");
-        assert_eq!(index[0].id, a);
-        assert_eq!((summary.albums, summary.artists), (1, 1));
-        assert_eq!(library.album(), before);
+        // The scan read no tags, so the second track is in its album.
+        assert_eq!(summary.tags_read, 0);
+        assert_eq!(library.id_at("a.wav"), Some(b));
+        assert_eq!(
+            library.track_at("a.wav").album_id,
+            albums["Second Album"].id
+        );
+        // The only track of the first album has a placeholder path.
+        let placeholder = tracks::placeholder_path(&a);
+        let kept = library.track_at(&placeholder);
+        assert_eq!(kept.id, a);
+        assert!(!tracks::has_file(&kept.rel_path));
+        assert_eq!(kept.album_id, first.id);
+        assert_eq!(kept.artist_id, artists["First Artist"].0);
+        // The album and its artist keep their rows, their IDs and their
+        // counts.
+        assert_eq!((summary.albums, summary.artists), (2, 2));
+        assert_eq!(library.albums(), albums);
+        assert_eq!(library.artists(), artists);
+
+        // The file can be read. The track has a file again, in the album
+        // row that it kept.
+        library.unreadable.borrow_mut().clear();
+        let summary = library.scan();
+        assert_eq!(summary.errors, [""; 0]);
+        assert_eq!(library.id_at("moved/a.wav"), Some(a));
+        assert_eq!(library.track_at("moved/a.wav").album_id, first.id);
+        assert_eq!(library.albums(), albums);
+        assert_eq!(library.artists(), artists);
     }
 
     #[test]
