@@ -1,13 +1,22 @@
-//! The HTTP server: the state, the listener and the router.
+//! The HTTP server: the state, the listener, the router and the stop
+//! (`docs/design.md` section 3.13).
 
+use std::future::{Future, IntoFuture};
 use std::io;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use tokio::net::TcpListener;
-use tokio_util::sync::CancellationToken;
+use axum::Router;
+use axum::serve::Listener;
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::net::{TcpListener, TcpStream};
+use tokio::sync::oneshot;
+use tokio::task::JoinHandle;
+use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use crate::api::{self, AppState};
 use crate::config::{Config, DataDir, Library};
@@ -52,6 +61,33 @@ pub enum ServerError {
     /// The server stopped with an I/O error.
     #[error("the server stopped: {0}")]
     Serve(#[source] io::Error),
+    /// The stop cannot move the write-ahead log into the database file. The
+    /// log stays next to the file and holds every change that was stored.
+    #[error("cannot checkpoint the database: {0}")]
+    Checkpoint(#[source] DbError),
+}
+
+/// A step of the stop that the caller of [`run_server`] supplies. It may
+/// block its thread.
+pub type StopStep = Box<dyn FnOnce() + Send>;
+
+/// What the caller of [`run_server`] adds to the server. The default adds
+/// nothing.
+#[derive(Default)]
+pub struct ServerOptions {
+    /// Withdraws what advertises the server on the network. The `run`
+    /// command passes the stop of the mDNS advertiser. `run_server` calls it
+    /// on a blocking thread as soon as the server is asked to stop, and it
+    /// closes the database only when the call has returned.
+    pub withdraw: Option<StopStep>,
+    /// Receives the address of the listener when the listener is bound. A
+    /// test that binds port 0 reads the port here.
+    pub listening: Option<oneshot::Sender<SocketAddr>>,
+    /// Routes next to the API route. The server has none. A test adds a
+    /// route that holds a request in progress.
+    pub routes: Router<AppState>,
+    /// The test hooks of the scans.
+    pub scan: ScanHooks,
 }
 
 /// The address the listener binds: `server.bind` and `server.port`.
@@ -59,9 +95,10 @@ pub fn bind_addr(config: &Config) -> SocketAddr {
     SocketAddr::new(config.server.bind, config.server.port)
 }
 
-/// Opens the database of `data_dir`, binds the address of `config`, logs it
-/// and serves the API until `cancel` is cancelled. Requests that are in
-/// progress at that moment are answered before the function returns.
+/// Opens the database of `data_dir`, binds the address of `config`, logs one
+/// line with the version, the data directory, the address, the number of
+/// music folders and the authentication state, and serves the API until
+/// `cancel` is cancelled.
 ///
 /// The database and its owner account must exist. The function does not
 /// create them, and it fails before it binds the address when one is
@@ -70,13 +107,30 @@ pub fn bind_addr(config: &Config) -> SocketAddr {
 ///
 /// Before it serves the first request, the function stores the music folders
 /// of `config` in the database and starts the scans that `config` asks for
-/// (`start_scans`). It does not wait for a scan. When the server has
-/// stopped, the function cancels the scan that runs and waits until that
-/// scan has ended.
+/// (`start_scans`). It does not wait for a scan.
+///
+/// When `cancel` is cancelled, the function stops the server in four steps
+/// and returns after the last one (`docs/design.md` section 3.13). Steps 1
+/// and 2 start at once and run at the same time:
+///
+/// 1. It calls `options.withdraw` ([`withdraw_at_stop`]). The server accepts
+///    no connection from this moment, so it is no longer advertised.
+/// 2. It closes the listener. The requests in progress have
+///    `server.shutdown_grace_ms` to finish. Then the connections that are
+///    still open are closed ([`serve`]).
+/// 3. It waits for the running scan, which `cancel` has cancelled, to end as
+///    a cancelled scan. It waits `server.shutdown_grace_ms` at most.
+/// 4. When step 1 has ended, it checkpoints the write-ahead log and closes
+///    the database.
+///
+/// Steps 3 and 4 are [`stop`]. A caller that drops the future during the
+/// stop skips the steps that have not run. The database is consistent after
+/// every step and between them.
 pub async fn run_server(
     config: Config,
     data_dir: &DataDir,
     cancel: CancellationToken,
+    options: ServerOptions,
 ) -> Result<(), ServerError> {
     if config.auth.disabled_unsafe {
         tracing::warn!("{AUTH_DISABLED_WARNING}");
@@ -92,20 +146,34 @@ pub async fn run_server(
     let local_addr = listener.local_addr().map_err(bind_error)?;
 
     // The address is bound first: a second server on the same data directory
-    // fails above, stores no folder and starts no scan. The token of the
-    // scans is a child of `cancel`, so the scans end when the server is asked
-    // to stop, and `stop` below ends them when the server stops for another
-    // reason.
+    // fails above, stores no folder and starts no scan.
+    //
+    // `stopping` starts the parts of the stop that do not wait for the
+    // requests: it cancels the scans, and it starts the step that withdraws
+    // the advertisement. It is a child of `cancel`, so both happen when the
+    // server is asked to stop. A server that stops for another reason
+    // cancels it below.
+    let stopping = cancel.child_token();
     let scan = start_scans(
         &config,
         data_dir,
         &db,
-        cancel.child_token(),
+        stopping.clone(),
         MINUTE,
-        ScanHooks::default(),
+        options.scan,
     )
     .await?;
-    tracing::info!("listening on {local_addr}");
+    tracing::info!(
+        version = crate::VERSION,
+        data_dir = %data_dir.path().display(),
+        folders = config.library.folders.len(),
+        auth = if config.auth.disabled_unsafe { "none" } else { "password" },
+        "listening on {local_addr}"
+    );
+    let grace = Duration::from_millis(config.server.shutdown_grace_ms);
+    // This handle stays out of the state, so that the stop can close the
+    // database when the router and its state are gone.
+    let closing = db.clone();
 
     // The fields follow the layout rule in the module comment of `api`.
     #[rustfmt::skip]
@@ -120,17 +188,233 @@ pub async fn run_server(
 
         scan: scan.clone(),
 
-        // cancel
+        cancel: cancel.clone(),
 
         started_at: Instant::now(),
     };
 
-    let served = axum::serve(listener, api::build_router(state))
-        .with_graceful_shutdown(cancel.cancelled_owned())
-        .await
-        .map_err(ServerError::Serve);
-    scan.stop().await;
-    served
+    let router = api::build_router_with(state, options.routes);
+    if let Some(listening) = options.listening {
+        // A receiver that is gone needs no address.
+        let _ = listening.send(local_addr);
+    }
+    let withdrawn = tokio::spawn(withdraw_at_stop(stopping.clone(), options.withdraw));
+    let served = serve(listener, router, &cancel, grace).await;
+    stopping.cancel();
+    let stopped = stop(scan, withdrawn, closing, grace).await;
+    tracing::info!("the server has stopped");
+    served.map_err(ServerError::Serve)?;
+    stopped
+}
+
+/// Step 1 of the stop. Waits until `stopping` is cancelled and then calls
+/// `withdraw` on a blocking thread. The future ends when the call has
+/// returned.
+///
+/// The step starts when the stop starts and does not wait for the requests
+/// or the scan. The listener is closed at the same moment, so from then on
+/// the advertisement would name a server that refuses every connection. A
+/// process that is ended from outside during a later step has sent its
+/// goodbye packet.
+async fn withdraw_at_stop(stopping: CancellationToken, withdraw: Option<StopStep>) {
+    stopping.cancelled().await;
+    if let Some(withdraw) = withdraw
+        && let Err(error) = tokio::task::spawn_blocking(withdraw).await
+    {
+        tracing::error!("the step that withdraws the advertisement failed: {error}");
+    }
+}
+
+/// Step 2 of the stop. Serves `router` on `listener` until `cancel` is
+/// cancelled. Then the listener is closed, so no connection is accepted. A
+/// connection without a request in progress is closed at once. A request in
+/// progress is answered, and its connection is closed after the response.
+///
+/// The function returns when every connection is closed. Connections that
+/// are still open `grace` after the cancellation are closed then, with one
+/// warning: the request of such a connection is dropped, and its client
+/// reads the end of the connection in place of the rest of the response.
+async fn serve(
+    listener: TcpListener,
+    router: Router,
+    cancel: &CancellationToken,
+    grace: Duration,
+) -> io::Result<()> {
+    let close = CancellationToken::new();
+    let listener = ClosableListener {
+        listener,
+        close: close.clone(),
+    };
+    let mut served = axum::serve(listener, router)
+        .with_graceful_shutdown(cancel.clone().cancelled_owned())
+        .into_future();
+    let grace_over = async {
+        cancel.cancelled().await;
+        tokio::time::sleep(grace).await;
+    };
+    tokio::select! {
+        result = &mut served => return result,
+        () = grace_over => {}
+    }
+    tracing::warn!(
+        "requests were still in progress {grace:?} after the stop began; \
+         their connections are closed"
+    );
+    close.cancel();
+    served.await
+}
+
+/// Steps 3 and 4 of the stop. `withdrawn` is the task of step 1.
+///
+/// 3. Waits for the periodic scans and for the running scan to end, for
+///    `scan_limit` at most. The token of the scans is cancelled, so the
+///    scanner stops at its next check and closes its `scans` row as
+///    `cancelled`. A scan that has not ended after `scan_limit` is left
+///    behind with one warning: it reads a file that does not answer, or a
+///    batch that takes longer. Its thread ends with the process, its `scans`
+///    row keeps no end time, and the next scan finishes the work, as after a
+///    process that was killed during a scan.
+/// 4. Waits for step 1, so that the process does not exit before the goodbye
+///    packet is sent. Then moves the write-ahead log into the database file
+///    and closes the database. `db` is the last handle of the database when
+///    no request is in progress and no scan was left behind, so its
+///    connections close here. A checkpoint that another process blocks is
+///    logged and is no error: that process holds the log.
+async fn stop(
+    scan: ScanController,
+    withdrawn: JoinHandle<()>,
+    db: Db,
+    scan_limit: Duration,
+) -> Result<(), ServerError> {
+    if scan.status().scanning {
+        tracing::info!("waiting for the running scan to stop");
+    }
+    if tokio::time::timeout(scan_limit, scan.stop()).await.is_err() {
+        tracing::warn!(
+            "the scan has not stopped after {scan_limit:?}; the server stops without it, \
+             and the next scan finishes its work"
+        );
+    }
+    // The controller holds a handle of the database.
+    drop(scan);
+
+    if let Err(error) = withdrawn.await {
+        tracing::error!("the task that withdraws the advertisement failed: {error}");
+    }
+
+    checkpointed(db.close().await)
+}
+
+/// The result of the stop for the result of its checkpoint.
+fn checkpointed(closed: Result<(), DbError>) -> Result<(), ServerError> {
+    match closed {
+        Ok(()) => Ok(()),
+        Err(DbError::CheckpointBusy) => {
+            tracing::info!(
+                "another process uses the database, so the write-ahead log was not moved \
+                 into the database file; the log holds every change"
+            );
+            Ok(())
+        }
+        Err(error) => Err(ServerError::Checkpoint(error)),
+    }
+}
+
+/// The listener of the server. A connection that it accepted ends when
+/// `close` is cancelled.
+///
+/// `axum::serve` runs each connection in a task of its own and gives the
+/// caller no handle of that task. The stop of the server ends a connection
+/// through its stream instead: every read and write of a
+/// [`ClosableStream`] fails after the cancellation, and the task of the
+/// connection ends with that error.
+struct ClosableListener {
+    listener: TcpListener,
+    close: CancellationToken,
+}
+
+impl Listener for ClosableListener {
+    type Io = ClosableStream;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        // The implementation of axum for `TcpListener` logs an error of the
+        // system and tries again.
+        let (stream, addr) = Listener::accept(&mut self.listener).await;
+        let closed = Box::pin(self.close.clone().cancelled_owned());
+        (ClosableStream { stream, closed }, addr)
+    }
+
+    fn local_addr(&self) -> io::Result<Self::Addr> {
+        self.listener.local_addr()
+    }
+}
+
+/// A connection of a [`ClosableListener`].
+struct ClosableStream {
+    stream: TcpStream,
+    /// Completes when the token of the listener is cancelled.
+    closed: Pin<Box<WaitForCancellationFutureOwned>>,
+}
+
+impl ClosableStream {
+    /// Fails when the token of the listener is cancelled. Otherwise the task
+    /// that polls the connection is woken when the token is cancelled, so
+    /// that it polls again and gets the error.
+    fn poll_open(&mut self, cx: &mut Context<'_>) -> io::Result<()> {
+        match self.closed.as_mut().poll(cx) {
+            Poll::Ready(()) => Err(io::Error::new(
+                io::ErrorKind::ConnectionAborted,
+                "the server stopped",
+            )),
+            Poll::Pending => Ok(()),
+        }
+    }
+}
+
+impl AsyncRead for ClosableStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        self.poll_open(cx)?;
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for ClosableStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_open(cx)?;
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_open(cx)?;
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        self.poll_open(cx)?;
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+
+    fn poll_write_vectored(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        bufs: &[io::IoSlice<'_>],
+    ) -> Poll<io::Result<usize>> {
+        self.poll_open(cx)?;
+        Pin::new(&mut self.stream).poll_write_vectored(cx, bufs)
+    }
+
+    fn is_write_vectored(&self) -> bool {
+        self.stream.is_write_vectored()
+    }
 }
 
 /// Stores the music folders of `config` in the `folders` table, builds the
@@ -223,6 +507,8 @@ mod tests {
     use crate::db::queries::tracks;
     use crate::library::scan_controller::testing::{Gate, WAIT, ended, music_folder};
     use crate::library::scan_controller::{ScanLock, ScanStatus};
+    use crate::library::scanner::{self, CANCELLED, ScanOptions};
+    use tokio::sync::mpsc::unbounded_channel;
 
     /// A data directory in a new temporary directory. The guard keeps the
     /// directory for the life of the test.
@@ -237,9 +523,14 @@ mod tests {
     async fn start_error(data_dir: &DataDir) -> ServerError {
         let cancel = CancellationToken::new();
         cancel.cancel();
-        run_server(Config::default(), data_dir, cancel)
-            .await
-            .expect_err("the server does not start")
+        run_server(
+            Config::default(),
+            data_dir,
+            cancel,
+            ServerOptions::default(),
+        )
+        .await
+        .expect_err("the server does not start")
     }
 
     #[tokio::test]
@@ -596,6 +887,352 @@ mod tests {
         );
         assert_eq!(folder_rows(&db).await, []);
         assert_eq!(scan_rows(&db).await, []);
+    }
+
+    /// The size of the write-ahead log of the database of `data_dir`, and 0
+    /// when the file does not exist.
+    fn wal_len(data_dir: &DataDir) -> u64 {
+        let mut name = data_dir.db_path().into_os_string();
+        name.push("-wal");
+        fs::metadata(name).map_or(0, |file| file.len())
+    }
+
+    /// The longest time a test of the stop waits for an event, and the time
+    /// that such a test gives a stop for a scan that ends. Each of these
+    /// waits ends with its event, after milliseconds, so the limit does not
+    /// delay a passing run. It is 10 s, far above what a loaded machine
+    /// needs for a checkpoint of a small file, so that it only ends a test
+    /// whose stop hangs.
+    const LIMIT: Duration = Duration::from_secs(10);
+
+    /// The task of step 1 of a stop that has nothing to withdraw.
+    fn nothing_to_withdraw(stopping: &CancellationToken) -> JoinHandle<()> {
+        tokio::spawn(withdraw_at_stop(stopping.clone(), None))
+    }
+
+    /// Waits until no scan of `scan` runs. The scan of a test ends
+    /// milliseconds after the test lets it go on.
+    async fn idle(scan: &ScanController) {
+        let idle = async {
+            while scan.status().scanning {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        };
+        tokio::time::timeout(LIMIT, idle)
+            .await
+            .expect("the scan ends");
+    }
+
+    /// The index entries of the tracks, in the order of their paths.
+    async fn index(db: &Db) -> Vec<tracks::IndexEntry> {
+        let mut entries = db.read(tracks::load_index).await.expect("read the index");
+        entries.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+        entries
+    }
+
+    /// Checks the database file with SQLite: `PRAGMA integrity_check`
+    /// answers `ok`, and `PRAGMA foreign_key_check` finds no row whose
+    /// folder, album or artist is missing.
+    async fn assert_sound(db: &Db) {
+        let (integrity, orphans) = db
+            .read(|conn| {
+                let integrity: String =
+                    conn.query_row("PRAGMA integrity_check", [], |row| row.get(0))?;
+                let mut check = conn.prepare("PRAGMA foreign_key_check")?;
+                let orphans = check.query_map([], |_| Ok(()))?.count();
+                Ok((integrity, orphans))
+            })
+            .await
+            .expect("check the database");
+        assert_eq!(integrity, "ok");
+        assert_eq!(orphans, 0);
+    }
+
+    #[tokio::test]
+    async fn cancelling_the_shared_token_stops_the_running_scan_as_cancelled() {
+        let folder = music_folder(3);
+        let (_dir, data_dir, db) = library();
+        let mut config = config(&[folder.path()]);
+        config.library.scan_on_start = true;
+        // The token of the server. The token of the scans is its child, as
+        // in `run_server`. The hook cancels the token of the server when the
+        // first batch of two files is committed.
+        let shared = CancellationToken::new();
+        let stopping = shared.child_token();
+        let hooks = ScanHooks {
+            batch_size: Some(2),
+            on_batch: Some(Arc::new({
+                let shared = shared.clone();
+                move || shared.cancel()
+            })),
+        };
+        let minute = Duration::from_millis(20);
+        let scan = start_scans(&config, &data_dir, &db, stopping.clone(), minute, hooks)
+            .await
+            .expect("the scans start");
+
+        // The server stops when its token is cancelled, which the hook
+        // does. The stop waits for the scan, which ends before its second
+        // batch.
+        tokio::time::timeout(LIMIT, shared.cancelled())
+            .await
+            .expect("the hook cancels the token");
+        let withdrawn = nothing_to_withdraw(&stopping);
+        tokio::time::timeout(LIMIT, stop(scan, withdrawn, db.clone(), LIMIT))
+            .await
+            .expect("the stop ends")
+            .expect("the stop succeeds");
+
+        let rows = scan_rows(&db).await;
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].finished_at.is_some());
+        assert_eq!(rows[0].error.as_deref(), Some(CANCELLED));
+        assert_eq!(rows[0].counts.added, 2);
+        assert_eq!(track_count(&db).await, 2);
+        // The scan lock is free for the next start.
+        let lock_path = data_dir.scan_lock_path();
+        assert!(ScanLock::try_acquire(&lock_path).expect("open").is_some());
+    }
+
+    #[tokio::test]
+    async fn stop_withdraws_at_once_and_checkpoints_after_the_scan_and_the_withdrawal() {
+        let folder = music_folder(3);
+        let (_dir, data_dir, db) = library();
+        let mut config = config(&[folder.path()]);
+        config.library.scan_on_start = true;
+        let (hooks, mut gate) = Gate::hooks();
+        let stopping = CancellationToken::new();
+        let minute = Duration::from_millis(20);
+        let scan = start_scans(&config, &data_dir, &db, stopping.clone(), minute, hooks)
+            .await
+            .expect("the scans start");
+        gate.reached().await;
+
+        // The step that withdraws the advertisement tells the test that it
+        // runs, and it returns when the test drops `release`.
+        let (entered, mut step_entered) = unbounded_channel();
+        let (release, released) = std::sync::mpsc::channel::<()>();
+        let withdraw: StopStep = Box::new(move || {
+            entered.send(()).expect("the test listens");
+            let _ = released.recv();
+        });
+        let withdrawn = tokio::spawn(withdraw_at_stop(stopping.clone(), Some(withdraw)));
+
+        // Nothing is withdrawn while the server runs.
+        settle().await;
+        assert!(step_entered.try_recv().is_err());
+
+        // Step 1 starts when the stop starts. It does not wait for the scan,
+        // which the hook of its first batch still holds.
+        stopping.cancel();
+        tokio::time::timeout(LIMIT, step_entered.recv())
+            .await
+            .expect("the step starts with the stop")
+            .expect("the step is alive");
+        assert!(scan.status().scanning);
+
+        // Step 3 waits for the scan.
+        let stopped = tokio::spawn(stop(scan.clone(), withdrawn, db.clone(), LIMIT));
+        settle().await;
+        assert!(!stopped.is_finished());
+
+        // The scan ends. Step 1 has not ended, so the stop has not
+        // checkpointed the log and does not end: the process would exit
+        // during the goodbye packet.
+        gate.open();
+        idle(&scan).await;
+        settle().await;
+        assert!(!stopped.is_finished());
+        assert!(wal_len(&data_dir) > 0);
+
+        // Step 1 ends, and step 4 moves the log into the database file.
+        drop(release);
+        tokio::time::timeout(LIMIT, stopped)
+            .await
+            .expect("the stop ends")
+            .expect("the stop does not panic")
+            .expect("the stop succeeds");
+        assert_eq!(wal_len(&data_dir), 0);
+        let rows = scan_rows(&db).await;
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].finished_at.is_some());
+        assert_eq!(rows[0].error.as_deref(), Some(CANCELLED));
+        assert_eq!(track_count(&db).await, 1);
+    }
+
+    #[tokio::test]
+    async fn stop_leaves_a_scan_behind_that_does_not_end_within_the_limit() {
+        let folder = music_folder(3);
+        let (_dir, data_dir, db) = library();
+        let mut config = config(&[folder.path()]);
+        config.library.scan_on_start = true;
+        let (hooks, mut gate) = Gate::hooks();
+        let stopping = CancellationToken::new();
+        let minute = Duration::from_millis(20);
+        let scan = start_scans(&config, &data_dir, &db, stopping.clone(), minute, hooks)
+            .await
+            .expect("the scans start");
+        gate.reached().await;
+        // The scan has stored its first batch of one file. The hook of the
+        // batch holds it from here on, as a file read that does not return
+        // holds a scan.
+        let committed = index(&db).await;
+        assert_eq!(committed.len(), 1);
+
+        stopping.cancel();
+        let limit = Duration::from_millis(50);
+        let began = Instant::now();
+        let withdrawn = nothing_to_withdraw(&stopping);
+        tokio::time::timeout(LIMIT, stop(scan.clone(), withdrawn, db.clone(), limit))
+            .await
+            .expect("the stop ends without the scan")
+            .expect("the stop succeeds");
+        // The stop gave the scan its limit. A wait does not end early, so a
+        // slow machine cannot fail this.
+        assert!(began.elapsed() >= limit, "{:?}", began.elapsed());
+
+        // The scan is left as a process that is killed leaves it: it has
+        // not ended, and its row has no end time and no error.
+        assert!(scan.status().scanning);
+        let rows = scan_rows(&db).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].finished_at, None);
+        assert_eq!(rows[0].error, None);
+        // Step 4 ran: the log is in the database file. The file is sound,
+        // and its tracks are those of the batch that the scan committed.
+        assert_eq!(wal_len(&data_dir), 0);
+        assert_sound(&db).await;
+        assert_eq!(index(&db).await, committed);
+
+        // The next scan finishes the work, as the scan at the next start
+        // does: it adds the two other files and keeps the row of the first.
+        let next = tokio::task::spawn_blocking({
+            let (db, folders) = (db.clone(), config.library.folders.clone());
+            let never = CancellationToken::new();
+            move || scanner::scan(&db, &folders, &never, false, ScanOptions::default())
+        })
+        .await
+        .expect("the scan does not panic")
+        .expect("the scan succeeds");
+        assert_eq!((next.seen, next.added, next.changed), (3, 2, 0));
+        assert_eq!((next.moved, next.removed), (0, 0));
+        assert_eq!(next.errors, [""; 0]);
+        let complete = index(&db).await;
+        assert_eq!(complete.len(), 3);
+        assert!(complete.contains(&committed[0]), "{complete:?}");
+        let rows = scan_rows(&db).await;
+        assert_eq!(rows.len(), 2);
+        assert!(rows[1].finished_at.is_some());
+        assert_eq!(rows[1].error, None);
+        // The album rows count the tracks that refer to them.
+        let (counted, tracks): (i64, i64) = db
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT (SELECT sum(song_count) FROM albums), (SELECT count(*) FROM tracks)",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?)
+            })
+            .await
+            .expect("count the songs");
+        assert_eq!((counted, tracks), (3, 3));
+        assert_sound(&db).await;
+
+        // A process ends the thread of the scan by exiting. The test lets
+        // it end, so that it does not outlive the database file.
+        gate.open();
+        idle(&scan).await;
+    }
+
+    #[tokio::test]
+    async fn stop_of_an_idle_server_checkpoints_the_database() {
+        let folder = music_folder(1);
+        let (_dir, data_dir, db) = library();
+        let stopping = CancellationToken::new();
+        let minute = Duration::from_millis(20);
+        let config = config(&[folder.path()]);
+        let hooks = ScanHooks::default();
+        let scan = start_scans(&config, &data_dir, &db, stopping.clone(), minute, hooks)
+            .await
+            .expect("the scans start");
+        assert!(wal_len(&data_dir) > 0);
+
+        stopping.cancel();
+        let withdrawn = nothing_to_withdraw(&stopping);
+        tokio::time::timeout(LIMIT, stop(scan, withdrawn, db.clone(), LIMIT))
+            .await
+            .expect("the stop ends")
+            .expect("the stop succeeds");
+
+        assert_eq!(wal_len(&data_dir), 0);
+        assert_eq!(scan_rows(&db).await, []);
+        assert_eq!(folder_rows(&db).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn stop_succeeds_when_another_connection_blocks_the_checkpoint() {
+        let folder = music_folder(1);
+        let (_dir, data_dir, db) = library();
+        let stopping = CancellationToken::new();
+        let minute = Duration::from_millis(20);
+        let config = config(&[folder.path()]);
+        let hooks = ScanHooks::default();
+        let scan = start_scans(&config, &data_dir, &db, stopping.clone(), minute, hooks)
+            .await
+            .expect("the scans start");
+        // The checkpoint waits 20 ms for the other connection, not the 5 s
+        // of the server.
+        db.write(|conn| Ok(conn.busy_timeout(Duration::from_millis(20))?))
+            .await
+            .expect("set the timeout");
+
+        // A read transaction of a connection outside the handle pins the
+        // log, as a `wn-server scan` that runs does.
+        let outside = rusqlite::Connection::open(data_dir.db_path()).expect("open the database");
+        outside.execute_batch("BEGIN").expect("begin");
+        let folders: i64 = outside
+            .query_row("SELECT count(*) FROM folders", [], |row| row.get(0))
+            .expect("count the folders");
+        assert_eq!(folders, 1);
+
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let withdraw: StopStep = Box::new({
+            let ran = Arc::clone(&ran);
+            move || ran.store(true, std::sync::atomic::Ordering::SeqCst)
+        });
+        stopping.cancel();
+        let withdrawn = tokio::spawn(withdraw_at_stop(stopping.clone(), Some(withdraw)));
+        tokio::time::timeout(LIMIT, stop(scan, withdrawn, db.clone(), LIMIT))
+            .await
+            .expect("the stop ends")
+            .expect("a blocked checkpoint is no error");
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+        // The log holds the rows, and the database reads them.
+        assert!(wal_len(&data_dir) > 0);
+        assert_eq!(folder_rows(&db).await.len(), 1);
+    }
+
+    #[test]
+    fn checkpoint_error_other_than_a_blocked_one_is_the_error_of_the_stop() {
+        assert!(checkpointed(Ok(())).is_ok());
+        assert!(checkpointed(Err(DbError::CheckpointBusy)).is_ok());
+
+        let error = checkpointed(Err(DbError::Cancelled)).expect_err("the checkpoint failed");
+        assert!(matches!(error, ServerError::Checkpoint(_)), "{error:?}");
+        assert_eq!(
+            error.to_string(),
+            "cannot checkpoint the database: the runtime shut down before the database task ran"
+        );
+    }
+
+    #[test]
+    fn server_options_add_nothing_by_default() {
+        let options = ServerOptions::default();
+        assert!(options.withdraw.is_none());
+        assert!(options.listening.is_none());
+        assert!(!options.routes.has_routes());
+        assert!(options.scan.batch_size.is_none());
+        assert!(options.scan.on_batch.is_none());
     }
 
     #[test]

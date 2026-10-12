@@ -9,8 +9,12 @@ use serde_json::{Value, json};
 use wn_server::VERSION;
 use wn_server::api::{EXTENSIONS, METHODS};
 use wn_server::config::Config;
+use wn_server::db::queries::users;
 
-use common::{TestServer, body_string, captured_log, content_type, subsonic_response, urlencode};
+use common::{
+    OWNER, TestServer, body_string, captured_log, content_type, form_request, subsonic_response,
+    token, urlencode,
+};
 
 /// The methods that return `not supported` in local mode for good
 /// (`docs/design.md` section 4, status "deferred: `not supported`").
@@ -367,16 +371,35 @@ async fn other_http_methods_are_http_405() {
     }
 }
 
-/// The line of the captured log that reports the end of the request of the
+/// The lines of the captured log that carry the span of a request of the
 /// client `client`. Every test of this file logs to the same buffer, so a
 /// test finds its request by a client name that only it sends.
+fn request_lines(client: &str) -> Vec<String> {
+    captured_log().lines_with(&format!(r#"c="{client}""#))
+}
+
+/// The one line of the captured log that reports the request of the client
+/// `client`.
 fn finished_line(client: &str) -> String {
-    let field = format!(r#"c="{client}""#);
-    let lines = captured_log().lines_with(&field);
-    lines
+    let lines: Vec<String> = request_lines(client)
         .into_iter()
-        .find(|line| line.contains("finished processing request"))
-        .unwrap_or_else(|| panic!("no line for {field}: {}", captured_log().text()))
+        .filter(|line| line.contains("finished processing request"))
+        .collect();
+    assert_eq!(lines.len(), 1, "{client}: {}", captured_log().text());
+    lines.into_iter().next().expect("one line")
+}
+
+/// Request parameters: pairs of a name and a value.
+type Pairs<'a> = &'a [(&'a str, &'a str)];
+
+/// The names of the fields of a log line, in the order of the line: the
+/// fields of the span and then the fields of the event. The tests send no
+/// value that holds `=`, a space or a brace.
+fn field_names(line: &str) -> Vec<&str> {
+    line.split([' ', '{', '}'])
+        .filter_map(|piece| piece.split_once('='))
+        .map(|(name, _)| name)
+        .collect()
 }
 
 #[tokio::test]
@@ -399,7 +422,13 @@ async fn request_log_names_method_client_user_and_status_without_the_query_strin
     assert_eq!(response.status(), StatusCode::OK);
 
     let line = finished_line("log-get-client");
-    for field in [r#"method="ping""#, r#"u="log-get-user""#, "status=200"] {
+    for field in [
+        " INFO ",
+        r#"method="ping""#,
+        r#"u="log-get-user""#,
+        "status=200",
+        "duration_ms=",
+    ] {
         assert!(line.contains(field), "{field}: {line}");
     }
     let text = log.text();
@@ -429,14 +458,157 @@ async fn request_log_names_client_and_user_of_a_form_body_without_the_body() {
 
     let line = finished_line("log-form-client");
     for field in [
+        " INFO ",
         r#"method="getLicense""#,
         r#"u="log-form-user""#,
         "status=200",
+        "duration_ms=",
     ] {
         assert!(line.contains(field), "{field}: {line}");
     }
     let text = log.text();
     assert!(!text.contains("form-secret-"), "{text}");
+}
+
+#[tokio::test]
+async fn request_log_is_one_line_at_info_with_method_client_user_status_and_duration() {
+    captured_log();
+    let response = server()
+        .await
+        .get_raw("ping.view", &[("c", "log-one-line-client"), ("f", "json")])
+        .await;
+    assert_eq!(response.status(), StatusCode::OK);
+
+    // A request that is answered logs this line and no other. The lines
+    // that the trace layer writes by default at the start of a request and
+    // at the end of a body are off for every request.
+    let lines = request_lines("log-one-line-client");
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    let log = captured_log();
+    for message in ["started processing request", "end of stream"] {
+        assert_eq!(log.lines_with(message), Vec::<String>::new());
+    }
+    let line = &lines[0];
+    assert!(line.contains(" INFO "), "{line}");
+    assert!(line.contains("finished processing request"), "{line}");
+    assert_eq!(
+        field_names(line),
+        ["method", "c", "u", "status", "duration_ms"],
+        "{line}"
+    );
+    for field in [r#"method="ping""#, r#"u="owner""#, "status=200"] {
+        assert!(line.contains(field), "{field}: {line}");
+    }
+    // The duration is the last field: a whole number of milliseconds.
+    let (_, duration) = line.rsplit_once("duration_ms=").expect("the duration");
+    assert!(duration.parse::<u64>().is_ok(), "{line}");
+}
+
+#[tokio::test]
+async fn request_log_of_stream_and_get_cover_art_is_at_debug() {
+    captured_log();
+    let server = server().await;
+    let id = ("id", "tr-00000000000000000000000000000001");
+    for (path_name, method, client) in [
+        ("stream", "stream", "log-debug-stream"),
+        ("stream.view", "stream", "log-debug-stream-view"),
+        ("getCoverArt", "getCoverArt", "log-debug-cover"),
+        ("getCoverArt.view", "getCoverArt", "log-debug-cover-view"),
+    ] {
+        server
+            .get_raw(path_name, &[("c", client), id, ("f", "json")])
+            .await;
+
+        let lines = request_lines(client);
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let line = &lines[0];
+        assert!(line.contains(" DEBUG "), "{line}");
+        assert!(line.contains("finished processing request"), "{line}");
+        let field = format!(r#"method="{method}""#);
+        assert!(line.contains(&field), "{field}: {line}");
+    }
+
+    // The level follows the method name. `download` names a track as
+    // `stream` does and is logged at `info`.
+    server
+        .get_raw("download", &[("c", "log-info-download"), id, ("f", "json")])
+        .await;
+    let line = finished_line("log-info-download");
+    assert!(line.contains(" INFO "), "{line}");
+}
+
+#[tokio::test]
+async fn request_log_of_each_credential_form_has_the_request_and_not_the_credential() {
+    let log = captured_log();
+    let server = server().await;
+    // The owner gets a password that no other test sends, so a line of the
+    // log that holds it is a line of this test.
+    const PASSWORD: &str = "log-cred-secret-password";
+    server
+        .db()
+        .write(|conn| {
+            let owner = users::get_owner(conn)?.expect("the owner");
+            users::set_password(conn, owner.user.id, PASSWORD)
+        })
+        .await
+        .expect("set the password");
+    let hex_password = hex::encode(PASSWORD);
+    let encoded = format!("enc:{hex_password}");
+    let salt = "log-cred-secret-salt";
+    let token = token(PASSWORD, salt);
+    let api_key = "log-cred-secret-key";
+
+    // Each form of a credential: its name, its parameters and whether the
+    // server accepts it.
+    let plain = [("u", OWNER), ("p", PASSWORD)];
+    let encoded = [("u", OWNER), ("p", encoded.as_str())];
+    let with_token = [("u", OWNER), ("t", token.as_str()), ("s", salt)];
+    let key = [("apiKey", api_key)];
+    let forms: [(&str, Pairs, &str); 4] = [
+        ("plain", &plain, "ok"),
+        ("encoded", &encoded, "ok"),
+        ("token", &with_token, "ok"),
+        ("key", &key, "failed"),
+    ];
+    for (form, credential, status) in forms {
+        for body in [false, true] {
+            // The credential is in the query string, or in a form body.
+            let client = format!("log-cred-{form}-{}", if body { "post" } else { "get" });
+            let mut params = credential.to_vec();
+            params.extend([("v", "1.16.1"), ("c", client.as_str()), ("f", "json")]);
+            let response = if body {
+                server.request(form_request("/rest/ping", &params)).await
+            } else {
+                server.get_raw_noauth("ping", &params).await
+            };
+            assert_eq!(response.status(), StatusCode::OK, "{client}");
+            let answer = subsonic_response(&body_string(response).await);
+            assert_eq!(answer["status"], status, "{client}");
+
+            // The request has its line, with the fields of the design and
+            // no field of a credential.
+            let line = finished_line(&client);
+            assert!(line.contains(" INFO "), "{line}");
+            let mut expected = vec!["method", "c", "u", "status", "duration_ms"];
+            if !credential.iter().any(|(name, _)| *name == "u") {
+                expected.retain(|name| *name != "u");
+            }
+            assert_eq!(field_names(&line), expected, "{line}");
+        }
+    }
+
+    // No line of the log holds a credential: not these lines, and not the
+    // line of the attempt that failed.
+    let text = log.text();
+    for secret in [
+        PASSWORD,
+        hex_password.as_str(),
+        token.as_str(),
+        salt,
+        api_key,
+    ] {
+        assert!(!text.contains(secret), "{secret}: {text}");
+    }
 }
 
 #[tokio::test]

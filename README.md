@@ -7,7 +7,7 @@ wn-server is a headless music server for OpenSubsonic clients. The design is des
 | Command | Effect |
 |---|---|
 | `wn-server init [--folder PATH]... [--port N] [--username NAME] [--password-stdin]` | Creates the data directory, `config.toml`, `instance.id`, the database and the owner account. With a `config.toml` and no owner account, keeps `config.toml` and creates what is missing. |
-| `wn-server run` | Runs the server in the foreground until Ctrl-C. |
+| `wn-server run` | Runs the server in the foreground until a stop signal, such as Ctrl-C. |
 | `wn-server scan [--full]` | Runs one scan of the music folders and prints its summary. `--full` reads the tags of every file again. See [Scanning](#scanning). |
 | `wn-server user show` | Prints the name, the role and the creation date of the owner account. |
 | `wn-server user set-password [--username NAME] [--password-stdin]` | Stores a new password for the owner account, or for the account `--username` names. |
@@ -111,13 +111,24 @@ A relative folder path resolves against the working directory of the command.
 wn-server run
 ```
 
-`run` loads `config.toml`, listens on `server.bind` and `server.port` (`0.0.0.0:4200` by default) and logs the address. Ctrl-C stops the server. Requests that are in progress are answered first.
+`run` loads `config.toml`, listens on `server.bind` and `server.port` (`0.0.0.0:4200` by default) and logs one line with the address, the version, the data directory, the number of music folders and whether authentication is on.
 
 `run` opens `library.db` and needs the owner account in it. `run` creates neither and fails at startup when one is missing. `wn-server init` then creates what is missing and keeps `config.toml` (see [Owner account](#owner-account)).
 
 `run` stores the music folders of `config.toml` in the database before it answers the first request, and then scans them in the background (see [Scanning](#scanning)). The server answers requests while it scans.
 
-Logs go to stderr. `server.log_level` is the log filter, for example `info` or `warn,wn_server=debug`. The `RUST_LOG` environment variable replaces it when it is set and not empty. The log names the method, the client (`c`) and the user (`u`) of a request, each cut to 64 characters. It never holds the query string or the form body.
+Ctrl-C stops the server. So does SIGTERM on Linux and macOS, which `kill`, systemd, launchd and `docker stop` send. On Windows Ctrl-Break, closing the console window and shutting the system down stop it as well. The server stops in this order:
+
+1. It withdraws the mDNS advertisement, so clients see the server leave at once (see [Discovery](#discovery)). At the same time it closes its port.
+2. The requests that are in progress are answered. A request that is still in progress after 10 seconds is dropped, with one warning in the log.
+3. It waits for a running scan to stop, for 10 seconds at most. The scan keeps what it has stored, and the next scan does the rest. A scan that has not stopped by then is left behind with one warning.
+4. It moves the write-ahead log into `library.db` and closes the database.
+
+`run` then exits with status 0. A second signal during the stop ends the server at once: it skips the steps that have not run and exits with status 1. The advertisement is withdrawn in that case as well. The database is consistent after that, and also after the system has ended the process. A scan that was cut short is finished by the next scan.
+
+Windows ends a console program 5 seconds after its window is closed or the system shuts down. The advertisement is withdrawn within that time. A stop whose requests or whose scan take longer does not reach its last step.
+
+Logs go to stderr. `server.log_level` is the log filter, for example `info` or `warn,wn_server=debug`. The `RUST_LOG` environment variable replaces it when it is set and not empty. The log has one line for each request, at the level `info`: the method, the client (`c`) and the user (`u`), each cut to 64 characters, the HTTP status, and the milliseconds until the response headers. The lines of `stream` and `getCoverArt` have the level `debug`. The log never holds the query string, the form body or a password, a token, a salt or an API key.
 
 ## Scanning
 
@@ -266,6 +277,6 @@ Every device on the network can read the record. It holds no password and no acc
 
 The server runs without the advertisement when the advertisement cannot start, and logs one warning that names the cause: `instance.id` cannot be read or does not hold a UUID, or nothing was announced within 10 seconds. `RUST_LOG=info,mdns_sd=debug` shows the messages of the mDNS responder.
 
-Ctrl-C withdraws the advertisement. On macOS, `dns-sd -B _waxnerd._tcp` lists the servers on the network.
+Stopping the server withdraws the advertisement (see [Running](#running)). On macOS, `dns-sd -B _waxnerd._tcp` lists the servers on the network.
 
 On Windows, Windows Firewall prompts on the first start. The server needs TCP port 4200 (`server.port`) for the API and UDP port 5353 for mDNS.

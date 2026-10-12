@@ -16,7 +16,7 @@ use tokio_util::sync::CancellationToken;
 use wn_server::VERSION;
 use wn_server::api::{METHODS, PUBLIC_METHODS};
 use wn_server::config::{Config, DataDir};
-use wn_server::server::{ServerError, run_server};
+use wn_server::server::{ServerError, ServerOptions, run_server};
 
 use common::{
     OWNER, OWNER_PASSWORD, TestServer, body_string, captured_log, content_type, form_request,
@@ -924,7 +924,8 @@ async fn run_warns_at_startup_that_disabled_auth_is_unsafe() {
     // The data directory has no database, so the server stops before it
     // binds an address. No other test of this file starts the server, so
     // every line with the warning is a line of this test.
-    let error = run_server(Config::default(), &data_dir, CancellationToken::new())
+    let (cancel, options) = (CancellationToken::new(), ServerOptions::default());
+    let error = run_server(Config::default(), &data_dir, cancel, options)
         .await
         .expect_err("the server does not start without a database");
     assert!(matches!(error, ServerError::NoDatabase(_)), "{error:?}");
@@ -932,7 +933,8 @@ async fn run_warns_at_startup_that_disabled_auth_is_unsafe() {
 
     let mut config = Config::default();
     config.auth.disabled_unsafe = true;
-    let error = run_server(config, &data_dir, CancellationToken::new())
+    let (cancel, options) = (CancellationToken::new(), ServerOptions::default());
+    let error = run_server(config, &data_dir, cancel, options)
         .await
         .expect_err("the server does not start without a database");
     assert!(matches!(error, ServerError::NoDatabase(_)), "{error:?}");

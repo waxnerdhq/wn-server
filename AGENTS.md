@@ -27,7 +27,7 @@ wn-server is a headless music server. It scans a local music collection into SQL
 - CI is Woodpecker (`.woodpecker/check.yaml`), one Linux container, no cache. It runs `cargo xtask check` natively and `cargo clippy --locked --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings` as a Windows cross build. macOS is verified by the local `cargo xtask check` run on the developer's Mac before every push. Windows tests run natively by hand until a Windows agent exists.
 - The project is licensed Apache-2.0. A new dependency needs a licence compatible with that (MIT, Apache-2.0, BSD, ISC, Zlib, MPL-2.0 as a dependency). GPL, LGPL and AGPL crates are not added. All dependencies are declared in the root `Cargo.toml`; a feature PR does not add one without saying so in the PR.
 - ffmpeg is an external program found on PATH. The project does not link or bundle it.
-- Tests run without network, audio hardware or ffmpeg. The default suite finishes in under 30 seconds after compiling in a debug build. A test that needs more is `#[ignore]`. No test sleeps or polls for more than one second.
+- Tests run without network beyond loopback, audio hardware or ffmpeg. The default suite finishes in under 30 seconds after compiling in a debug build. A test that needs more is `#[ignore]`. No test sleeps or polls for more than one second.
 - Linear: team `WAX`, workspace `waxnerd` (`.linear.toml`). The `linear` CLI default workspace is correct for this repo.
 
 ## Process

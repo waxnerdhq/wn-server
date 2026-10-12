@@ -75,6 +75,7 @@ use axum::http::{self, Method, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::Serialize;
+use tokio_util::sync::CancellationToken;
 use tower_http::trace::TraceLayer;
 use tracing::Span;
 use tracing::field::Empty;
@@ -100,6 +101,11 @@ const FORM_CONTENT_TYPE: &str = "application/x-www-form-urlencoded";
 /// line of the request repeats them.
 const LOG_FIELD_CHARS: usize = 64;
 
+/// The methods whose request log line has the level `debug`. Every other
+/// request is logged at `info`. A client that plays music or draws a list of
+/// albums sends many requests for these two.
+const DEBUG_LOG_METHODS: &[&str] = &["stream", "getCoverArt"];
+
 /// The state that the handlers share. `docs/design.md` section 3.8 names the
 /// fields, and they are in that order here.
 #[derive(Clone)]
@@ -119,7 +125,9 @@ pub struct AppState {
     /// The scans of the server. It runs at most one at a time.
     pub scan: ScanController,
 
-    // cancel
+    /// The token of the stop. It is cancelled when the server is asked to
+    /// stop.
+    pub cancel: CancellationToken,
 
     /// The moment the server started.
     pub started_at: Instant,
@@ -406,17 +414,33 @@ pub const EXTENSIONS: &[(&str, &[u32])] = &[
 /// method, so that request is not authenticated. [`cors::add_headers`] wraps
 /// the route and nothing else, and adds its headers to every response of the
 /// route.
+///
+/// Every request is logged with one line (`docs/design.md` section 3.8).
 pub fn build_router(state: AppState) -> Router {
+    build_router_with(state, Router::new())
+}
+
+/// Builds the router of [`build_router`] with the routes of `extra` next to
+/// the API route. The requests of these routes are logged as every other
+/// request is. The server has no such route. A test adds one to hold a
+/// request in progress.
+pub fn build_router_with(state: AppState, extra: Router<AppState>) -> Router {
     Router::new()
         .route(
             "/rest/{method}",
             get(dispatch).post(dispatch).options(cors::preflight),
         )
         .route_layer(axum::middleware::from_fn(cors::add_headers))
+        .merge(extra)
+        // The layer logs one line for a request, in `record_response`. The
+        // lines that it logs by default at the start of a request and at the
+        // end of a body are turned off.
         .layer(
             TraceLayer::new_for_http()
                 .make_span_with(request_span)
-                .on_response(record_response),
+                .on_request(())
+                .on_response(record_response)
+                .on_eos(()),
         )
         .with_state(state)
 }
@@ -436,13 +460,37 @@ fn request_span<B>(_request: &http::Request<B>) -> Span {
     )
 }
 
-/// Records the HTTP status of the response in the span of the request.
+/// Marks the response of a method of [`DEBUG_LOG_METHODS`], so that
+/// [`record_response`] logs its line at `debug`.
+#[derive(Clone, Copy)]
+struct LoggedAtDebug;
+
+/// Records the HTTP status of the response in the span of the request and
+/// logs the one line of the request. The span gives the line the method
+/// name, `c`, `u` and the status. `duration_ms` is the time from the arrival
+/// of the request to the response headers, in milliseconds.
+///
+/// A body that is streamed after the headers adds no time to the line and no
+/// line of its own. When the client closes the connection during the body,
+/// the server drops the body and logs nothing. The trace layer logs a body
+/// that fails on the server once, at `error`.
+///
+/// The level is `info`, and `debug` for a response with the
+/// [`LoggedAtDebug`] mark.
 fn record_response<B>(response: &http::Response<B>, latency: Duration, span: &Span) {
     span.record("status", response.status().as_u16());
-    tracing::debug!(
-        latency_ms = latency.as_millis(),
-        "finished processing request"
-    );
+    let duration_ms = latency.as_millis();
+    if response.extensions().get::<LoggedAtDebug>().is_some() {
+        tracing::debug!(duration_ms, "finished processing request");
+    } else {
+        tracing::info!(duration_ms, "finished processing request");
+    }
+}
+
+/// The method name of the last path segment `name`: a `.view` suffix is not
+/// part of it.
+fn method_name(name: &str) -> &str {
+    name.strip_suffix(".view").unwrap_or(name)
 }
 
 /// The handler of the one route. `name` is the last path segment. A segment
@@ -454,7 +502,11 @@ async fn dispatch(
     request: Request,
 ) -> Response {
     let name = name.map(|Path(name)| name).unwrap_or_default();
-    respond(METHODS, PUBLIC_METHODS, state, &name, request).await
+    let mut response = respond(METHODS, PUBLIC_METHODS, state, &name, request).await;
+    if DEBUG_LOG_METHODS.contains(&method_name(&name)) {
+        response.extensions_mut().insert(LoggedAtDebug);
+    }
+    response
 }
 
 /// Answers one API request with the handler that `methods` holds for `name`.
@@ -477,7 +529,7 @@ async fn respond<S: Authenticate>(
     name: &str,
     request: Request,
 ) -> Response {
-    let name = name.strip_suffix(".view").unwrap_or(name);
+    let name = method_name(name);
     let (mut parts, body) = request.into_parts();
 
     let mut params = Params::from_query(parts.uri.query().unwrap_or_default());
@@ -1073,6 +1125,28 @@ mod tests {
             response.extensions().get::<SubsonicResponse>(),
             Some(&SubsonicResponse::error(70, "not found"))
         );
+    }
+
+    #[test]
+    fn stream_and_get_cover_art_are_the_methods_logged_at_debug() {
+        assert_eq!(DEBUG_LOG_METHODS, ["stream", "getCoverArt"]);
+        for name in DEBUG_LOG_METHODS {
+            assert!(
+                METHODS.iter().any(|(method, _)| method == name),
+                "{name} is not a method"
+            );
+        }
+    }
+
+    #[test]
+    fn method_name_is_the_path_segment_without_the_view_suffix() {
+        assert_eq!(method_name("stream"), "stream");
+        assert_eq!(method_name("stream.view"), "stream");
+        assert_eq!(method_name("getCoverArt.view"), "getCoverArt");
+        assert_eq!(method_name(""), "");
+        // Only one suffix is removed, and only at the end.
+        assert_eq!(method_name("ping.view.view"), "ping.view");
+        assert_eq!(method_name(".viewping"), ".viewping");
     }
 
     #[test]
