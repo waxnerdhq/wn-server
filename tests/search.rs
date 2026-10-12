@@ -1436,8 +1436,8 @@ async fn elements_carry_the_annotations_of_the_user() {
                 "album",
                 1_700_000_100,
                 5,
-                7,
-                1_700_000_200
+                0,
+                None::<i64>
             ])?;
             insert.execute(params![
                 user,
@@ -1464,11 +1464,13 @@ async fn elements_carry_the_annotations_of_the_user() {
             "starred": "2023-11-14T22:13:20Z",
         }])
     );
+    // The album has the star and the rating of its row and the plays of
+    // its track "Delta".
     let album = &result["album"][0];
     assert_eq!(album["starred"], "2023-11-14T22:15:00Z");
     assert_eq!(album["userRating"], 5);
-    assert_eq!(album["playCount"], 7);
-    assert_eq!(album["played"], "2023-11-14T22:16:40Z");
+    assert_eq!(album["playCount"], 9);
+    assert_eq!(album["played"], "2023-11-14T22:20:00Z");
     // The songs are "Delta" and "Upstream". Only "Delta" has an annotation.
     let delta = &result["song"][0];
     assert_eq!(delta["id"], json!(server.track.delta));
@@ -1498,7 +1500,7 @@ async fn elements_carry_the_annotations_of_the_user() {
     assert_eq!(album["isDir"], true);
     assert_eq!(album["starred"], "2023-11-14T22:15:00Z");
     assert_eq!(album["userRating"], 5);
-    assert_eq!(album["playCount"], 7);
+    assert_eq!(album["playCount"], 9);
     assert_eq!(result["song"][0]["userRating"], 3);
 }
 

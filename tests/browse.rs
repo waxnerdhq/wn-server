@@ -1434,7 +1434,13 @@ async fn browse_methods_report_what_the_user_attached_to_an_item() {
                 None::<i64>
             ])?;
             insert.execute(params![
-                user_id, album, "album", STARRED_AT, 4, 7, PLAYED_AT
+                user_id,
+                album,
+                "album",
+                STARRED_AT,
+                4,
+                0,
+                None::<i64>
             ])?;
             insert.execute(params![
                 user_id, track, "track", STARRED_AT, 5, 3, PLAYED_AT
@@ -1457,10 +1463,11 @@ async fn browse_methods_report_what_the_user_attached_to_an_item() {
     assert_eq!(*other, standard.artist_json(marlow_quartet));
 
     // The album, as an entry of its artist and as the answer of `getAlbum`.
+    // Its plays are those of its tracks, of which one was played.
     let mut album = standard.album_json(&GLASS_HARBOUR);
     album["starred"] = json!(starred);
     album["userRating"] = json!(4);
-    album["playCount"] = json!(7);
+    album["playCount"] = json!(3);
     album["played"] = json!(played);
     artist["album"] = json!([album, standard.album_json(&PAPER_MAPS)]);
     assert_eq!(

@@ -825,14 +825,7 @@ async fn get_many_is_empty_on_a_new_database_and_returns_an_inserted_annotation(
             2,
             Some(1_700_000_500_i64),
         ),
-        (
-            glass_harbour.to_owned(),
-            "album",
-            None,
-            Some(3),
-            4,
-            Some(1_700_000_500),
-        ),
+        (glass_harbour.to_owned(), "album", None, Some(3), 0, None),
         (
             aurora_field.to_owned(),
             "artist",
@@ -884,16 +877,17 @@ async fn get_many_is_empty_on_a_new_database_and_returns_an_inserted_annotation(
     assert_eq!(child.user_rating, Some(5));
     assert_eq!(child.play_count, 2);
     assert_eq!(child.played.as_deref(), Some("2023-11-14T22:21:40Z"));
+    // The album has the rating of its row and the plays of its track.
     let album_row = album(&server, glass_harbour).await;
     let album = model::album(&album_row, found.get(glass_harbour));
     assert_eq!(
         (album.starred, album.user_rating, album.play_count),
-        (None, Some(3), 4)
+        (None, Some(3), 2)
     );
     assert_eq!(album.played.as_deref(), Some("2023-11-14T22:21:40Z"));
     // The album as a directory reports the same plays.
     let directory = model::child_dir_for_album(&album_row, found.get(glass_harbour));
-    assert_eq!(directory.play_count, 4);
+    assert_eq!(directory.play_count, 2);
     assert_eq!(directory.played, album.played);
     let artist = model::artist(
         &artist(&server, aurora_field).await,

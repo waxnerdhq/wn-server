@@ -1,5 +1,6 @@
 //! Queries on the `annotations` table. A row holds what one user attached to
-//! one track, album or artist: a star, a rating and a play count.
+//! one track, album or artist: a star and a rating, and for a track its
+//! plays.
 //!
 //! `item_id` has no foreign key, because it names a row of one of three
 //! tables. The scanner removes the rows of items that no longer exist with
@@ -9,16 +10,29 @@
 //! handler passes the IDs of the items of its response and gives each model
 //! constructor the annotation of its item (`docs/design.md` section 3.8).
 //!
+//! # Plays
+//!
+//! A play is the play of a track. [`record_play`] counts it in the row of
+//! the track and writes no other row. The play count of an album is the sum
+//! of the play counts of its tracks, and the last play of an album is the
+//! latest play of one of its tracks. Neither is stored: [`get_many`]
+//! computes both from the rows of the tracks, and the album lists of `lists`
+//! order the albums by the same two values of the same rows. The row of an
+//! album and the row of an artist hold no play. No function writes
+//! `play_count` or `last_played_at` of such a row, and [`get_many`] does not
+//! read them.
+//!
 //! # Writes
 //!
-//! [`star`], [`unstar`] and [`set_rating`] write one value of one row. Each
-//! leaves the other values of the row as they are, so a star, a rating and a
-//! play count of one item do not depend on the order of the requests that
-//! set them. No function deletes a row of an item that exists.
+//! [`star`], [`unstar`], [`set_rating`] and [`record_play`] write the values
+//! of one kind of one row. Each leaves the other values of the row as they
+//! are, so a star, a rating and the plays of one item do not depend on the
+//! order of the requests that set them. No function deletes a row of an item
+//! that exists.
 //!
-//! [`apply`] is what the API calls: it checks that every item of a request
-//! exists and writes them in one transaction, so a request changes every
-//! item it names or none.
+//! [`apply`] and [`record_plays`] are what the API calls. Each checks that
+//! every item of a request exists and writes them in one transaction, so a
+//! request changes every item it names or none.
 
 use std::collections::HashMap;
 
@@ -30,11 +44,12 @@ use super::tracks::HAS_FILE_SQL;
 use crate::db::Result;
 use crate::ids::{self, Kind};
 
-/// What one user attached to one item: the values of one row of the
-/// `annotations` table.
+/// What one user attached to one item: the star and the rating of the row
+/// that the `annotations` table holds for the item, and the plays of the
+/// item.
 ///
-/// The default value is the annotation of an item that has no row: no star,
-/// no rating, a play count of 0 and no play.
+/// The default value is the annotation of an item that has no row and no
+/// play: no star, no rating, a play count of 0 and no play.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Annotation {
     /// The time the user starred the item, in Unix seconds. `None` for an
@@ -42,23 +57,65 @@ pub struct Annotation {
     pub starred_at: Option<i64>,
     /// The rating of the user, 1 to 5. `None` for an item without a rating.
     pub rating: Option<u8>,
-    /// The number of plays that the row counts.
+    /// The number of plays. For a track it is the count of its row. For an
+    /// album it is the sum of the counts of its tracks. For an artist it is
+    /// 0, because no response reports the plays of an artist.
     pub play_count: u64,
-    /// The time of the last play, in Unix seconds. `None` for an item that
-    /// was not played.
+    /// The time of the last play, in Unix seconds. For an album it is the
+    /// latest play of one of its tracks. `None` for an item that was not
+    /// played, and for an artist.
     pub last_played_at: Option<i64>,
 }
+
+/// The statement of [`get_many`] that reads the rows of the items. `?1` is
+/// the ID of the user and `?2` the IDs of the items as a JSON array.
+///
+/// Only the row of a track holds plays (see the module documentation). The
+/// plays of every other row read as none, whatever the row holds.
+const OWN_ROWS: &str = "SELECT item_id, starred_at, rating,
+       CASE item_type WHEN 'track' THEN play_count ELSE 0 END,
+       CASE item_type WHEN 'track' THEN last_played_at END
+     FROM annotations
+     WHERE user_id = ?1 AND item_id IN (SELECT value FROM json_each(?2))";
+
+/// The statement of [`get_many`] that reads the plays of the albums: for
+/// each ID of `?2` that is the ID of an album with a played track, the sum
+/// of the play counts of its tracks and their latest play. `?1` is the ID of
+/// the user and `?2` the IDs of the albums as a JSON array.
+///
+/// An ID that the list holds twice counts once. The statement starts from
+/// the IDs: it finds the tracks of each through the index `tracks_album` and
+/// the row of each track through the primary key of `annotations`, so it
+/// reads neither table as a whole. `CROSS JOIN` keeps that order of the
+/// tables.
+const ALBUM_PLAYS: &str = "SELECT wanted.value, sum(played.play_count), max(played.last_played_at)
+     FROM (SELECT DISTINCT value FROM json_each(?2)) AS wanted
+     CROSS JOIN tracks ON tracks.album_id = wanted.value
+     CROSS JOIN annotations AS played
+       ON played.user_id = ?1 AND played.item_id = tracks.id
+     WHERE played.play_count > 0 OR played.last_played_at IS NOT NULL
+     GROUP BY wanted.value";
 
 /// Returns the annotations of the user `user_id` for the items `item_ids`,
 /// keyed by item ID.
 ///
-/// The map holds an entry for each ID that has a row. An item that the user
-/// never starred, rated or played has no row and no entry, and its
-/// annotation is `Annotation::default()`. The IDs can be of tracks, albums
-/// and artists at once, and an ID that `item_ids` holds twice is one entry.
+/// The map holds an entry for each ID that has a row, and for each ID of an
+/// album of which the user played a track. An item that the user never
+/// starred, rated or played has no entry, and its annotation is
+/// `Annotation::default()`. The IDs can be of tracks, albums and artists at
+/// once, and an ID that `item_ids` holds twice is one entry.
 ///
-/// The IDs are one parameter of the statement, so a list of any length is
-/// one statement.
+/// The star and the rating of an entry are those of the row of the item.
+/// The plays of a track are those of its row. The plays of an album are the
+/// sum of the play counts of its tracks and the latest of their plays, read
+/// from the rows of the tracks (see the module documentation). A track row
+/// without a file counts as every other track row.
+///
+/// The IDs are one parameter of a statement, so a list of any length is one
+/// statement for the rows of the items. A second statement reads the plays
+/// of the albums, and it runs only when the list holds the ID of an album. A
+/// caller that needs the star, the rating and the plays of one state of the
+/// database calls the function in a transaction.
 pub fn get_many<S: AsRef<str>>(
     conn: &Connection,
     user_id: i64,
@@ -67,13 +124,26 @@ pub fn get_many<S: AsRef<str>>(
     if item_ids.is_empty() {
         return Ok(HashMap::new());
     }
-    let mut select = conn.prepare_cached(
-        "SELECT item_id, starred_at, rating, play_count, last_played_at FROM annotations
-         WHERE user_id = ?1 AND item_id IN (SELECT value FROM json_each(?2))",
-    )?;
-    let annotations = select
+    let mut annotations: HashMap<String, Annotation> = conn
+        .prepare_cached(OWN_ROWS)?
         .query_map((user_id, json_array(item_ids)), annotation_from_row)?
         .collect::<rusqlite::Result<_>>()?;
+
+    let album_ids: Vec<&str> = item_ids
+        .iter()
+        .map(AsRef::as_ref)
+        .filter(|id| matches!(ids::parse(id), Some((Kind::Album, _))))
+        .collect();
+    if album_ids.is_empty() {
+        return Ok(annotations);
+    }
+    let mut select = conn.prepare_cached(ALBUM_PLAYS)?;
+    let mut albums = select.query((user_id, json_array(&album_ids)))?;
+    while let Some(row) = albums.next()? {
+        let annotation = annotations.entry(row.get(0)?).or_default();
+        annotation.play_count = int::get_u64(row, 1)?;
+        annotation.last_played_at = row.get(2)?;
+    }
     Ok(annotations)
 }
 
@@ -230,10 +300,8 @@ pub fn apply(conn: &mut Connection, user_id: i64, items: &[Item], change: Change
         return Ok(true);
     }
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-    for item in items {
-        if !exists(&tx, item)? {
-            return Ok(false);
-        }
+    if !all_exist(&tx, items)? {
+        return Ok(false);
     }
     for item in items {
         match change {
@@ -246,6 +314,73 @@ pub fn apply(conn: &mut Connection, user_id: i64, items: &[Item], change: Change
     Ok(true)
 }
 
+/// One play of a track, as a `scrobble` request reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Play {
+    track: Item,
+    at: Option<i64>,
+}
+
+impl Play {
+    /// Returns the play of the track `track`. `at` is the time of the play
+    /// in Unix seconds. A play without a time is counted at the time that
+    /// [`record_plays`] is given.
+    ///
+    /// Returns `None` when `track` is an album or an artist: a play is the
+    /// play of a track.
+    pub fn new(track: Item, at: Option<i64>) -> Option<Self> {
+        (track.kind == ItemKind::Track).then_some(Self { track, at })
+    }
+
+    /// The track that was played.
+    pub fn track(&self) -> &Item {
+        &self.track
+    }
+}
+
+/// Records every play of `plays` for the user `user_id`, in one
+/// transaction. `now` is the time of each play that has none, in Unix
+/// seconds.
+///
+/// Returns `false` and writes nothing when the track of one play has no
+/// row. The check and the writes are in the same transaction, so a scan in
+/// another process does not delete a track between the two. When a write
+/// fails, the transaction is rolled back and the error is returned. The
+/// request therefore counts every play or none.
+///
+/// Each play is counted with [`record_play`]. A track that `plays` holds
+/// several times gets one play for each, also when two of them have one
+/// time. The result does not depend on the order of `plays`. An empty list
+/// writes nothing and returns `true`.
+pub fn record_plays(conn: &mut Connection, user_id: i64, plays: &[Play], now: i64) -> Result<bool> {
+    if plays.is_empty() {
+        return Ok(true);
+    }
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+    if !all_exist(&tx, plays.iter().map(Play::track))? {
+        return Ok(false);
+    }
+    for play in plays {
+        record_play(&tx, user_id, &play.track.id, play.at.unwrap_or(now))?;
+    }
+    tx.commit()?;
+    Ok(true)
+}
+
+/// Returns whether every item of `items` has a row in the table of its
+/// kind. A list without an item has no missing item.
+///
+/// A caller that writes afterwards calls the function in the transaction of
+/// its writes ([`apply`], [`record_plays`]).
+pub fn all_exist<'a>(conn: &Connection, items: impl IntoIterator<Item = &'a Item>) -> Result<bool> {
+    for item in items {
+        if !exists(conn, item)? {
+            return Ok(false);
+        }
+    }
+    Ok(true)
+}
+
 /// Returns whether `item` has a row in the table of its kind.
 fn exists(conn: &Connection, item: &Item) -> Result<bool> {
     let found = conn
@@ -255,6 +390,40 @@ fn exists(conn: &Connection, item: &Item) -> Result<bool> {
         ))?
         .query_row([&item.id], |row| row.get(0))?;
     Ok(found)
+}
+
+/// Counts one play of the track `track_id` by the user `user_id` at the
+/// time `at`, in Unix seconds.
+///
+/// The play count of the row grows by 1 with every call. Two calls with one
+/// track and one time are two plays: the API has no value that tells a
+/// repeated report from a second play, and Navidrome and Airsonic count
+/// every report as well.
+///
+/// The time of the last play becomes `at` when the track has no play, and
+/// the later of the stored time and `at` otherwise. A client can report a
+/// play long after it happened, and several plays in any order, so a play
+/// that is reported late does not move the last play back. Navidrome stores
+/// the later time as well. `at` is stored as it is given, also when it is
+/// far from the time of the call.
+///
+/// The star and the rating of the row stay as they are. A track without a
+/// row gets one. The row is that of the track: the function writes no row
+/// of the album or of the artist (see the module documentation).
+///
+/// The function does not check that the track exists; [`record_plays`]
+/// does.
+pub fn record_play(conn: &Connection, user_id: i64, track_id: &str, at: i64) -> Result<()> {
+    conn.prepare_cached(
+        "INSERT INTO annotations (user_id, item_id, item_type, play_count, last_played_at)
+         VALUES (?1, ?2, ?3, 1, ?4)
+         ON CONFLICT (user_id, item_id) DO UPDATE SET
+           play_count = play_count + 1,
+           last_played_at = max(coalesce(last_played_at, excluded.last_played_at),
+             excluded.last_played_at)",
+    )?
+    .execute((user_id, track_id, ItemKind::Track.item_type(), at))?;
+    Ok(())
 }
 
 /// Stars the item `item_id` of the kind `kind` for the user `user_id`, with
@@ -474,6 +643,7 @@ mod tests {
     const ALBUM: &str = "al-00000000000000000000000000000002";
     const ARTIST: &str = "ar-00000000000000000000000000000003";
     const OTHER: &str = "tr-00000000000000000000000000000004";
+    const PLAYED: &str = "tr-00000000000000000000000000000005";
 
     /// A database with the owner and a second user. Returns it with the IDs
     /// of the two.
@@ -569,7 +739,8 @@ mod tests {
         let (db, owner, _) = two_users();
         annotate(&db, owner, TRACK, "track", (Some(100), None, 0, None));
         annotate(&db, owner, ALBUM, "album", (None, Some(5), 0, None));
-        annotate(&db, owner, ARTIST, "artist", (None, None, 3, Some(300)));
+        annotate(&db, owner, ARTIST, "artist", (Some(200), Some(2), 0, None));
+        annotate(&db, owner, PLAYED, "track", (None, None, 3, Some(300)));
         // A row that the lookup does not ask for.
         annotate(
             &db,
@@ -586,6 +757,7 @@ mod tests {
                 ARTIST,
                 "al-ffffffffffffffffffffffffffffffff",
                 TRACK,
+                PLAYED,
                 ALBUM,
                 TRACK,
             ],
@@ -598,6 +770,11 @@ mod tests {
             rating: Some(5),
             ..Annotation::default()
         };
+        let both = Annotation {
+            starred_at: Some(200),
+            rating: Some(2),
+            ..Annotation::default()
+        };
         let plays = Annotation {
             play_count: 3,
             last_played_at: Some(300),
@@ -608,7 +785,8 @@ mod tests {
             HashMap::from([
                 (TRACK.to_owned(), star),
                 (ALBUM.to_owned(), rating),
-                (ARTIST.to_owned(), plays),
+                (ARTIST.to_owned(), both),
+                (PLAYED.to_owned(), plays),
             ])
         );
     }
@@ -1477,6 +1655,536 @@ mod tests {
         assert_eq!(
             library.starred(ItemKind::Track, None),
             sorted([&library.first_track, &library.second_track])
+        );
+    }
+
+    /// An annotation of `play_count` plays, the last at `last_played_at`.
+    fn played(play_count: u64, last_played_at: i64) -> Annotation {
+        Annotation {
+            play_count,
+            last_played_at: Some(last_played_at),
+            ..Annotation::default()
+        }
+    }
+
+    /// Counts one play of `track_id` by `user_id` at each time of `times`,
+    /// in that order.
+    fn play_at(db: &Db, user_id: i64, track_id: &str, times: &[i64]) {
+        db.with_writer(|conn| {
+            for at in times {
+                record_play(conn, user_id, track_id, *at)?;
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn record_play_gives_a_track_without_a_row_a_row_with_one_play() {
+        let (db, owner, _) = two_users();
+        play_at(&db, owner, TRACK, &[1_500_000_000]);
+        assert_eq!(
+            stored(&db),
+            [(
+                owner,
+                TRACK.to_owned(),
+                "track".to_owned(),
+                None,
+                None,
+                1,
+                Some(1_500_000_000)
+            )]
+        );
+        assert_eq!(
+            lookup(&db, owner, &[TRACK])[TRACK],
+            played(1, 1_500_000_000)
+        );
+    }
+
+    #[test]
+    fn record_play_counts_every_call_and_keeps_the_star_and_the_rating() {
+        let (db, owner, _) = two_users();
+        annotate(&db, owner, TRACK, "track", (Some(100), Some(4), 0, None));
+        let with_plays = |play_count: u64, last_played_at: i64| Annotation {
+            starred_at: Some(100),
+            rating: Some(4),
+            ..played(play_count, last_played_at)
+        };
+        let play = |at: i64| {
+            play_at(&db, owner, TRACK, &[at]);
+            lookup(&db, owner, &[TRACK])[TRACK]
+        };
+
+        assert_eq!(play(500), with_plays(1, 500));
+        assert_eq!(play(700), with_plays(2, 700));
+        // A call with the track and the time of the call before it is one
+        // more play.
+        assert_eq!(play(700), with_plays(3, 700));
+        assert_eq!(stored(&db).len(), 1);
+    }
+
+    #[test]
+    fn the_last_play_is_the_latest_time_whatever_the_order_of_the_calls() {
+        let (db, owner, _) = two_users();
+        let play = |at: i64| {
+            play_at(&db, owner, TRACK, &[at]);
+            lookup(&db, owner, &[TRACK])[TRACK]
+        };
+        // A time long before the others is stored as it is given.
+        assert_eq!(play(86_400), played(1, 86_400));
+        assert_eq!(play(900), played(2, 86_400));
+        assert_eq!(play(1_700_000_000), played(3, 1_700_000_000));
+        // A play that is reported late counts and keeps the last play.
+        assert_eq!(play(1_600_000_000), played(4, 1_700_000_000));
+        assert_eq!(play(0), played(5, 1_700_000_000));
+
+        // Every order of three times gives the same row.
+        let orders: [[i64; 3]; 6] = [
+            [100, 200, 300],
+            [100, 300, 200],
+            [200, 100, 300],
+            [200, 300, 100],
+            [300, 100, 200],
+            [300, 200, 100],
+        ];
+        for order in orders {
+            let (db, owner, _) = two_users();
+            play_at(&db, owner, TRACK, &order);
+            assert_eq!(
+                lookup(&db, owner, &[TRACK])[TRACK],
+                played(3, 300),
+                "{order:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_play_a_star_and_a_rating_do_not_depend_on_the_order_of_the_calls() {
+        let star_it = |conn: &Connection, user: i64| star(conn, user, TRACK, ItemKind::Track, 100);
+        let rate_it = |conn: &Connection, user: i64| {
+            set_rating(conn, user, TRACK, ItemKind::Track, rating(4))
+        };
+        let play_it = |conn: &Connection, user: i64| record_play(conn, user, TRACK, 500);
+        let unstar_it = |conn: &Connection, user: i64| unstar(conn, user, TRACK);
+        let unrate_it = |conn: &Connection, user: i64| {
+            set_rating(conn, user, TRACK, ItemKind::Track, rating(0))
+        };
+        type Call<'a> = &'a dyn Fn(&Connection, i64) -> Result<()>;
+
+        let after = |calls: &[Call<'_>]| {
+            let (db, owner, _) = two_users();
+            db.with_writer(|conn| {
+                for call in calls {
+                    call(conn, owner)?;
+                }
+                Ok(())
+            })
+            .unwrap();
+            lookup(&db, owner, &[TRACK])
+                .get(TRACK)
+                .copied()
+                .unwrap_or_default()
+        };
+        let all = Annotation {
+            starred_at: Some(100),
+            rating: Some(4),
+            ..played(1, 500)
+        };
+        assert_eq!(after(&[&star_it, &rate_it, &play_it]), all);
+        assert_eq!(after(&[&play_it, &star_it, &rate_it]), all);
+        assert_eq!(after(&[&rate_it, &play_it, &star_it]), all);
+
+        // The removal of the star and of the rating keeps the plays, and a
+        // play keeps the removal.
+        assert_eq!(
+            after(&[&star_it, &rate_it, &play_it, &unstar_it, &unrate_it]),
+            played(1, 500)
+        );
+        assert_eq!(
+            after(&[&star_it, &unstar_it, &play_it, &play_it]),
+            played(2, 500)
+        );
+    }
+
+    #[test]
+    fn record_play_changes_the_row_of_the_user_and_of_no_other() {
+        let (db, owner, second) = two_users();
+        annotate(&db, second, TRACK, "track", (None, Some(5), 9, Some(900)));
+        play_at(&db, owner, TRACK, &[100, 200]);
+
+        assert_eq!(lookup(&db, owner, &[TRACK])[TRACK], played(2, 200));
+        assert_eq!(
+            lookup(&db, second, &[TRACK])[TRACK],
+            Annotation {
+                rating: Some(5),
+                ..played(9, 900)
+            }
+        );
+
+        // A user that does not exist has no plays.
+        let nobody = owner + second + 1;
+        let error = db
+            .with_writer(|conn| record_play(conn, nobody, TRACK, 100))
+            .unwrap_err();
+        assert!(error.to_string().contains("FOREIGN KEY"), "{error}");
+        assert_eq!(stored(&db).len(), 2);
+    }
+
+    fn play(id: &str, at: Option<i64>) -> Play {
+        Play::new(item(id), at).expect("the ID of a track")
+    }
+
+    impl Library {
+        fn record(&self, plays: &[Play], now: i64) -> Result<bool> {
+            self.db
+                .with_writer(|conn| record_plays(conn, self.owner, plays, now))
+        }
+
+        /// The annotation of the owner for the item `id`. The default
+        /// annotation when the lookup has no entry for it.
+        fn annotation(&self, id: &str) -> Annotation {
+            lookup(&self.db, self.owner, &[id])
+                .get(id)
+                .copied()
+                .unwrap_or_default()
+        }
+    }
+
+    #[test]
+    fn a_play_is_the_play_of_a_track() {
+        assert_eq!(play(TRACK, Some(100)).track(), &item(TRACK));
+        for id in [ALBUM, ARTIST] {
+            assert_eq!(Play::new(item(id), Some(100)), None, "{id}");
+            assert_eq!(Play::new(item(id), None), None, "{id}");
+        }
+    }
+
+    #[test]
+    fn all_exist_is_false_when_one_item_has_no_row() {
+        let library = library();
+        let all_exist = |items: &[Item]| {
+            library
+                .db
+                .with_reader(|conn| all_exist(conn, items))
+                .unwrap()
+        };
+        let present = library.items();
+        assert!(all_exist(&present));
+        assert!(all_exist(&[]));
+        for missing in [TRACK, ALBUM, ARTIST] {
+            for place in [0, 3, present.len()] {
+                let mut items = present.clone();
+                items.insert(place, item(missing));
+                assert!(!all_exist(&items), "{missing} {place}");
+            }
+        }
+    }
+
+    #[test]
+    fn record_plays_counts_every_play_of_a_request_in_the_rows_of_the_tracks() {
+        let library = library();
+        let plays = [
+            play(&library.first_track, Some(300)),
+            play(&library.other_track, None),
+            play(&library.first_track, Some(200)),
+            // The track and the time of the first play: one more play.
+            play(&library.first_track, Some(300)),
+        ];
+        assert!(library.record(&plays, 1_000).unwrap());
+
+        assert_eq!(library.annotation(&library.first_track), played(3, 300));
+        // A play without a time has the time that the call is given.
+        assert_eq!(library.annotation(&library.other_track), played(1, 1_000));
+        assert_eq!(
+            library.annotation(&library.second_track),
+            Annotation::default()
+        );
+
+        // The rows are those of the two tracks. No album and no artist has
+        // a row.
+        let rows = stored(&library.db);
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().all(|row| row.2 == "track"), "{rows:?}");
+
+        // The same request again counts every play again.
+        assert!(library.record(&plays, 2_000).unwrap());
+        assert_eq!(library.annotation(&library.first_track), played(6, 300));
+        assert_eq!(library.annotation(&library.other_track), played(2, 2_000));
+        assert_eq!(stored(&library.db).len(), 2);
+    }
+
+    #[test]
+    fn record_plays_writes_nothing_when_one_track_has_no_row() {
+        let library = library();
+        let present = [
+            play(&library.first_track, Some(100)),
+            play(&library.second_track, None),
+            play(&library.other_track, Some(300)),
+        ];
+        assert!(library.record(&present[..1], 50).unwrap());
+        let before = stored(&library.db);
+        assert_eq!(before.len(), 1);
+
+        // The missing track is the first, in the middle and the last. An ID
+        // of the hex part of an album is the ID of no track.
+        let as_track = library.split_album.replacen("al-", "tr-", 1);
+        for missing in [TRACK, as_track.as_str()] {
+            for place in [0, 1, present.len()] {
+                let mut plays = present.to_vec();
+                plays.insert(place, play(missing, Some(200)));
+                assert!(!library.record(&plays, 400).unwrap(), "{missing} {place}");
+                assert_eq!(stored(&library.db), before, "{missing} {place}");
+            }
+            assert!(!library.record(&[play(missing, None)], 400).unwrap());
+        }
+        assert_eq!(stored(&library.db), before);
+
+        // The same plays without that track are counted.
+        assert!(library.record(&present, 400).unwrap());
+        assert_eq!(library.annotation(&library.first_track), played(2, 100));
+        assert_eq!(library.annotation(&library.second_track), played(1, 400));
+        assert_eq!(library.annotation(&library.other_track), played(1, 300));
+    }
+
+    #[test]
+    fn record_plays_rolls_back_the_plays_it_counted_when_a_later_write_fails() {
+        let library = library();
+        let plays = [
+            play(&library.first_track, Some(100)),
+            play(&library.second_track, Some(200)),
+            play(&library.other_track, Some(300)),
+        ];
+        assert!(library.record(&plays[..1], 50).unwrap());
+        let before = stored(&library.db);
+
+        // The write of the third play fails, after an update of the row of
+        // the first track and an insert for the second.
+        library
+            .db
+            .with_writer(|conn| {
+                conn.execute_batch(&format!(
+                    "CREATE TRIGGER refuse BEFORE INSERT ON annotations
+                     WHEN NEW.item_id = '{}'
+                     BEGIN SELECT RAISE(ABORT, 'refused'); END;",
+                    library.other_track
+                ))?;
+                Ok(())
+            })
+            .unwrap();
+        let error = library.record(&plays, 400).unwrap_err();
+        assert!(error.to_string().contains("refused"), "{error}");
+        assert_eq!(stored(&library.db), before);
+
+        // The connection is usable, and a request without that track is
+        // counted.
+        assert!(library.record(&plays[..2], 400).unwrap());
+        assert_eq!(library.annotation(&library.first_track), played(2, 100));
+        assert_eq!(library.annotation(&library.second_track), played(1, 200));
+        assert_eq!(stored(&library.db).len(), 2);
+    }
+
+    #[test]
+    fn record_plays_with_an_empty_list_writes_nothing() {
+        let library = library();
+        assert!(library.record(&[], 100).unwrap());
+        assert_eq!(stored(&library.db), []);
+    }
+
+    #[test]
+    fn get_many_gives_an_album_the_plays_of_its_tracks() {
+        let library = library();
+        let (first, second, other) = (
+            library.first_track.as_str(),
+            library.second_track.as_str(),
+            library.other_track.as_str(),
+        );
+        let (split, single) = (library.split_album.as_str(), library.second_album.as_str());
+
+        // No track is played: no album has an entry.
+        assert_eq!(
+            lookup(&library.db, library.owner, &[split, single]),
+            HashMap::new()
+        );
+
+        // Two tracks of one album: the sum of the counts and the latest
+        // play. The other album has no played track.
+        play_at(&library.db, library.owner, first, &[500, 700]);
+        play_at(&library.db, library.owner, second, &[900, 100, 300]);
+        let found = lookup(
+            &library.db,
+            library.owner,
+            &[split, single, first, second, other, &library.artist],
+        );
+        assert_eq!(
+            found,
+            HashMap::from([
+                (split.to_owned(), played(5, 900)),
+                (first.to_owned(), played(2, 700)),
+                (second.to_owned(), played(3, 900)),
+            ])
+        );
+
+        // An ID that the list holds several times counts once.
+        let found = lookup(&library.db, library.owner, &[split, split, first, split]);
+        assert_eq!(found[split], played(5, 900));
+        assert_eq!(found.len(), 2);
+
+        // The album keeps the star and the rating of its own row.
+        let album = [item(split)];
+        library.apply(&album, Change::Star { at: 50 }).unwrap();
+        library.apply(&album, Change::Rate(rating(4))).unwrap();
+        assert_eq!(
+            library.annotation(split),
+            Annotation {
+                starred_at: Some(50),
+                rating: Some(4),
+                ..played(5, 900)
+            }
+        );
+
+        // The album of one track has the plays of that track.
+        play_at(&library.db, library.owner, other, &[400]);
+        assert_eq!(library.annotation(single), played(1, 400));
+        assert_eq!(library.annotation(split).play_count, 5);
+    }
+
+    #[test]
+    fn get_many_reads_no_plays_from_the_row_of_an_album_or_of_an_artist() {
+        let library = library();
+        let (album, artist) = (library.split_album.as_str(), library.artist.as_str());
+        // Rows that no function of the module writes.
+        annotate(
+            &library.db,
+            library.owner,
+            album,
+            "album",
+            (Some(100), None, 7, Some(700)),
+        );
+        annotate(
+            &library.db,
+            library.owner,
+            artist,
+            "artist",
+            (None, Some(3), 8, Some(800)),
+        );
+
+        let star = Annotation {
+            starred_at: Some(100),
+            ..Annotation::default()
+        };
+        let rated = Annotation {
+            rating: Some(3),
+            ..Annotation::default()
+        };
+        assert_eq!(library.annotation(album), star);
+        assert_eq!(library.annotation(artist), rated);
+
+        // The plays of the album are those of its track, and the artist has
+        // none.
+        play_at(&library.db, library.owner, &library.first_track, &[200]);
+        assert_eq!(
+            library.annotation(album),
+            Annotation {
+                starred_at: Some(100),
+                ..played(1, 200)
+            }
+        );
+        assert_eq!(library.annotation(artist), rated);
+    }
+
+    #[test]
+    fn the_plays_of_an_album_are_those_of_the_user() {
+        let library = library();
+        let second = library
+            .db
+            .with_writer(|conn| {
+                conn.execute(
+                    "INSERT INTO users (name, role, password, created_at, updated_at)
+                     VALUES ('second', 'guest', 'x', 1, 1)",
+                    [],
+                )?;
+                Ok(conn.last_insert_rowid())
+            })
+            .unwrap();
+        play_at(&library.db, second, &library.first_track, &[100, 200, 300]);
+        play_at(&library.db, library.owner, &library.second_track, &[50]);
+
+        let album = library.split_album.as_str();
+        assert_eq!(library.annotation(album), played(1, 50));
+        assert_eq!(lookup(&library.db, second, &[album])[album], played(3, 300));
+    }
+
+    #[test]
+    fn a_track_without_a_file_takes_a_play_and_counts_for_its_album() {
+        let library = library();
+        let track = library.first_track.as_str();
+        play_at(&library.db, library.owner, track, &[100]);
+        library
+            .db
+            .with_writer(|conn| {
+                let placeholder = tracks::placeholder_path(track);
+                tracks::relink_track(conn, track, library.folders[0], &placeholder, 1000, 100)
+            })
+            .unwrap();
+
+        // The play from before stays, and a play of the row is counted.
+        assert_eq!(library.annotation(track), played(1, 100));
+        assert!(library.record(&[play(track, Some(200))], 300).unwrap());
+        assert_eq!(library.annotation(track), played(2, 200));
+        assert_eq!(library.annotation(&library.split_album), played(2, 200));
+    }
+
+    #[test]
+    fn the_plays_of_a_track_whose_row_is_gone_leave_its_album() {
+        let library = library();
+        play_at(
+            &library.db,
+            library.owner,
+            &library.first_track,
+            &[100, 200],
+        );
+        play_at(&library.db, library.owner, &library.second_track, &[50]);
+        let album = library.split_album.as_str();
+        assert_eq!(library.annotation(album), played(3, 200));
+
+        library
+            .db
+            .with_writer(|conn| tracks::delete_tracks(conn, &[&library.first_track]))
+            .unwrap();
+        // The row of the annotation is there until a scan deletes it. The
+        // album has the plays of the track that is left.
+        assert_eq!(stored(&library.db).len(), 2);
+        assert_eq!(library.annotation(album), played(1, 50));
+        library.db.with_writer(|conn| delete_orphans(conn)).unwrap();
+        assert_eq!(stored(&library.db).len(), 1);
+        assert_eq!(library.annotation(album), played(1, 50));
+    }
+
+    #[test]
+    fn the_statement_of_the_album_plays_reads_no_table_as_a_whole() {
+        let db = Db::open_memory().unwrap();
+        let plan: Vec<String> = db
+            .with_reader(|conn| {
+                let mut explain = conn.prepare(&format!("EXPLAIN QUERY PLAN {ALBUM_PLAYS}"))?;
+                let steps = explain
+                    .query_map((1, "[]"), |row| row.get(3))?
+                    .collect::<rusqlite::Result<_>>()?;
+                Ok(steps)
+            })
+            .unwrap();
+        // A step that reads every row of a table starts with `SCAN` and the
+        // name of the table in the statement.
+        for step in &plan {
+            assert!(
+                !step.starts_with("SCAN tracks") && !step.starts_with("SCAN played"),
+                "{plan:?}"
+            );
+        }
+        let reads = |start: &str| plan.iter().any(|step| step.starts_with(start));
+        assert!(reads("SEARCH tracks USING INDEX tracks_album"), "{plan:?}");
+        assert!(
+            reads("SEARCH played USING INDEX sqlite_autoindex_annotations_1"),
+            "{plan:?}"
         );
     }
 }

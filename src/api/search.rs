@@ -464,11 +464,14 @@ mod tests {
                 .map(|song| song.track.title.as_str())
                 .collect();
             assert_eq!(songs, ["Breakwater", "Low Tide"]);
-            // The one annotation of the user is for "Low Tide".
-            assert_eq!(found.annotations.len(), 1);
+            // The one annotation row of the user is for "Low Tide". Its
+            // album has the plays of the track and no rating.
+            assert_eq!(found.annotations.len(), 2);
             let annotation = found.annotations[&low_tide];
             assert_eq!(annotation.rating, Some(5));
             assert_eq!(annotation.play_count, 3);
+            let of_album = found.annotations[&found.albums[0].id];
+            assert_eq!((of_album.rating, of_album.play_count), (None, 3));
         }
 
         // Another user has no annotation for the same rows.
