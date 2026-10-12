@@ -39,7 +39,7 @@ pub mod annotations;
 
 pub mod browse;
 
-// lists
+pub mod lists;
 
 // search
 

@@ -191,7 +191,10 @@ The server answers OpenSubsonic requests at `/rest/<method>` and `/rest/<method>
 
 <!-- api/folders.rs -->
 
-<!-- api/lists.rs -->
+- `getAlbumList2` returns a page of albums as `albumList2`, and `getAlbumList` returns the same albums as directories in `albumList`. `type` is required and is one of `random`, `newest`, `highest`, `frequent`, `recent`, `alphabeticalByName`, `alphabeticalByArtist`, `starred`, `byYear` and `byGenre`; another value returns error 0. `size` is 10 by default, and a value above 500 is lowered to 500. `offset` selects a later page, and `musicFolderId` restricts the list to one music folder. `byYear` needs `fromYear` and `toYear`, and lists the latest year first when `fromYear` is the greater one. An album without a year counts as year 0. `byGenre` needs `genre`. `highest`, `frequent`, `recent` and `starred` list only the albums that the user rated, played or starred, so they are empty until the user has done that. Every list but `random` has a fixed order, so its pages neither repeat nor skip an album. `random` draws its albums anew for every request, and with an `offset` it returns at most the number of albums less the offset.
+- `getRandomSongs` returns up to `size` different songs as `randomSongs`: 10 by default and 500 at most. `genre`, `fromYear`, `toYear` and `musicFolderId` restrict the songs. A song without a year counts as year 0.
+- `getSongsByGenre` needs `genre` and returns the songs of that genre in the order of their titles as `songsByGenre`. `count` is 10 by default and 500 at most, `offset` selects a later page, and `musicFolderId` restricts the songs to one music folder.
+- A `genre` of these methods matches as a whole text and without regard to case. `getGenres` lists spellings that differ by case as separate genres, and a list for one of them holds the albums or songs of all of them.
 
 <!-- api/search.rs -->
 
