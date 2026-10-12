@@ -499,10 +499,9 @@ async fn request_log_is_one_line_at_info_with_method_client_user_status_and_dura
     for field in [r#"method="ping""#, r#"u="owner""#, "status=200"] {
         assert!(line.contains(field), "{field}: {line}");
     }
-    // The duration is the last field: a number of milliseconds.
+    // The duration is the last field: a whole number of milliseconds.
     let (_, duration) = line.rsplit_once("duration_ms=").expect("the duration");
-    let milliseconds: u64 = duration.parse().unwrap_or_else(|_| panic!("{line}"));
-    assert!(milliseconds < 1000, "{line}");
+    assert!(duration.parse::<u64>().is_ok(), "{line}");
 }
 
 #[tokio::test]

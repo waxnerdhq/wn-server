@@ -374,18 +374,15 @@ fn serve(data_dir: &DataDir) -> Result<(), CliError> {
     let outcome = runtime.block_on(async {
         let cancel = CancellationToken::new();
         let (signals, received) = mpsc::channel(1);
-        tokio::spawn(async move {
-            if let Err(error) = forward_stop_signals(signals).await {
-                tracing::warn!("cannot wait for a stop signal: {error}");
-            }
-        });
+        tokio::spawn(forward_stop_signals(signals));
         let server = server::run_server(config, data_dir, cancel.clone(), options);
         run_until_stopped(server, &cancel, received).await
     });
-    // The stop of the server withdraws the advertisement. A server that did
-    // not start and a server that a second signal ended have not done so.
-    // The step runs here for them, so the process never exits before the
-    // goodbye packet is sent.
+    // The stop of the server withdraws the advertisement as its first step.
+    // A server that did not start has not done so, and after a second signal
+    // the step may still run. The call runs the step, or waits for the call
+    // that runs it, so the process never exits before the goodbye packet is
+    // sent, and the step runs once.
     withdraw.run();
     // Nothing that still runs on the runtime is waited for. After a stop in
     // order nothing runs. After a second signal a scan may run: it ends with
@@ -453,27 +450,52 @@ async fn run_until_stopped(
 /// `signals`, until the receiver is gone. Ctrl-C is a stop signal on every
 /// OS. [`OtherStopSignals`] holds the ones that differ.
 ///
-/// # Errors
-///
-/// Returns the error of a signal that the process cannot listen for.
-async fn forward_stop_signals(signals: mpsc::Sender<&'static str>) -> io::Result<()> {
-    let mut others = OtherStopSignals::new()?;
+/// The two listeners do not depend on each other. When the process cannot
+/// listen for Ctrl-C, or cannot listen for the other signals, the function
+/// logs one warning and listens for the rest. A signal without a listener
+/// keeps the action of the system, which ends the process without the stop.
+/// The function returns when it can listen for no signal.
+async fn forward_stop_signals(signals: mpsc::Sender<&'static str>) {
     // One future listens for Ctrl-C while the other signals arrive, so a
     // Ctrl-C that comes together with another signal is not lost. A new
     // future takes its place after each Ctrl-C.
     let mut ctrl_c = pin!(tokio::signal::ctrl_c());
-    loop {
+    let mut ctrl_c_listens = true;
+    let mut others = match OtherStopSignals::new() {
+        Ok(others) => Some(others),
+        Err(error) => {
+            tracing::warn!("cannot listen for a stop signal other than Ctrl-C: {error}");
+            None
+        }
+    };
+    while ctrl_c_listens || others.is_some() {
         let signal = tokio::select! {
-            result = &mut ctrl_c => {
-                result?;
-                ctrl_c.set(tokio::signal::ctrl_c());
-                "Ctrl-C"
-            }
-            signal = others.recv() => signal,
+            result = &mut ctrl_c, if ctrl_c_listens => match result {
+                Ok(()) => {
+                    ctrl_c.set(tokio::signal::ctrl_c());
+                    "Ctrl-C"
+                }
+                Err(error) => {
+                    tracing::warn!("cannot listen for Ctrl-C: {error}");
+                    ctrl_c_listens = false;
+                    continue;
+                }
+            },
+            Some(signal) = next_signal(&mut others) => signal,
         };
         if signals.send(signal).await.is_err() {
-            return Ok(());
+            return;
         }
+    }
+    tracing::warn!("the server cannot listen for a stop signal");
+}
+
+/// Waits for the next signal of `others` and returns its name. `None`
+/// without a listener.
+async fn next_signal(others: &mut Option<OtherStopSignals>) -> Option<&'static str> {
+    match others {
+        Some(others) => Some(others.recv().await),
+        None => None,
     }
 }
 
@@ -1561,11 +1583,14 @@ mod tests {
         assert!(!data_dir.instance_id_path().exists());
     }
 
-    /// The longest time a test of the stop waits for an event. The limit
-    /// ends a test that does not get there. It does not delay a passing run.
-    const WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+    /// The longest time a test of the stop waits for an event. Each of these
+    /// waits ends with its event, which needs no file and no socket, so the
+    /// limit does not delay a passing run. It is 10 s, so that it only ends
+    /// a test that hangs, also on a loaded machine.
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 
-    /// A time in which a call that must wait does not return.
+    /// A time in which a call that must wait does not return. A call that
+    /// returns in it fails the test, so a slow machine cannot fail the test.
     const SHORT: std::time::Duration = std::time::Duration::from_millis(50);
 
     /// A server that runs until `cancel` is cancelled and then returns

@@ -119,14 +119,14 @@ wn-server run
 
 Ctrl-C stops the server. So does SIGTERM on Linux and macOS, which `kill`, systemd, launchd and `docker stop` send. On Windows Ctrl-Break, closing the console window and shutting the system down stop it as well. The server stops in this order:
 
-1. It closes its port. The requests that are in progress are answered. A request that is still in progress after 10 seconds is dropped, with one warning in the log.
-2. It waits for a running scan to stop. The scan keeps what it has stored, and the next scan does the rest.
-3. It withdraws the mDNS advertisement, so clients see the server leave (see [Discovery](#discovery)).
+1. It withdraws the mDNS advertisement, so clients see the server leave at once (see [Discovery](#discovery)). At the same time it closes its port.
+2. The requests that are in progress are answered. A request that is still in progress after 10 seconds is dropped, with one warning in the log.
+3. It waits for a running scan to stop, for 10 seconds at most. The scan keeps what it has stored, and the next scan does the rest. A scan that has not stopped by then is left behind with one warning.
 4. It moves the write-ahead log into `library.db` and closes the database.
 
-`run` then exits with status 0. A second signal during the stop ends the server at once: it withdraws the advertisement, skips the steps that have not run and exits with status 1. The database is consistent after that, and also after the system has ended the process. A scan that was cut short is finished by the next scan.
+`run` then exits with status 0. A second signal during the stop ends the server at once: it skips the steps that have not run and exits with status 1. The advertisement is withdrawn in that case as well. The database is consistent after that, and also after the system has ended the process. A scan that was cut short is finished by the next scan.
 
-Windows ends a console program 5 seconds after its window is closed or the system shuts down. A stop that takes longer does not reach its last steps.
+Windows ends a console program 5 seconds after its window is closed or the system shuts down. The advertisement is withdrawn within that time. A stop whose requests or whose scan take longer does not reach its last step.
 
 Logs go to stderr. `server.log_level` is the log filter, for example `info` or `warn,wn_server=debug`. The `RUST_LOG` environment variable replaces it when it is set and not empty. The log has one line for each request, at the level `info`: the method, the client (`c`) and the user (`u`), each cut to 64 characters, the HTTP status, and the milliseconds until the response headers. The lines of `stream` and `getCoverArt` have the level `debug`. The log never holds the query string, the form body or a password, a token, a salt or an API key.
 
