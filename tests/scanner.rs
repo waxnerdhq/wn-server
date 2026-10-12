@@ -769,8 +769,38 @@ fn a_file_placed_at_the_old_path_of_a_moved_track_gets_a_new_id() {
     assert_eq!(scanned.env.count(), 11);
 }
 
+/// Scans the one folder of `scanned` in batches of `batch_size` and returns
+/// the summary and the number of batches that were committed.
+fn rescan_in_batches_of(scanned: &Scanned, batch_size: usize) -> (ScanSummary, usize) {
+    let batches = Arc::new(AtomicUsize::new(0));
+    let counted = Arc::clone(&batches);
+    let summary = scanned.env.scan_with(
+        &[scanned.root()],
+        false,
+        ScanOptions {
+            batch_size,
+            on_batch: Some(Box::new(move || {
+                counted.fetch_add(1, Ordering::Relaxed);
+            })),
+            ..ScanOptions::default()
+        },
+    );
+    (summary, batches.load(Ordering::Relaxed))
+}
+
 #[test]
 fn two_files_that_exchange_paths_keep_their_ids() {
+    exchange_two_paths(scanner::DEFAULT_BATCH_SIZE);
+}
+
+#[test]
+fn two_files_exchange_paths_in_one_transaction_when_a_batch_holds_one_file() {
+    // Stored one at a time, the first row would take a path that the
+    // second row still has.
+    exchange_two_paths(1);
+}
+
+fn exchange_two_paths(batch_size: usize) {
     let library = LibraryBuilder::standard().build();
     // The two files get times that differ, so that the exchange shows in
     // the file state of both paths.
@@ -786,7 +816,7 @@ fn two_files_that_exchange_paths_keep_their_ids() {
     fs::rename(scanned.path(LOW_TIDE), &spare).unwrap();
     fs::rename(scanned.path(BREAKWATER), scanned.path(LOW_TIDE)).unwrap();
     fs::rename(&spare, scanned.path(BREAKWATER)).unwrap();
-    let summary = scanned.rescan();
+    let (summary, batches) = rescan_in_batches_of(&scanned, batch_size);
 
     assert_eq!(
         summary,
@@ -796,6 +826,7 @@ fn two_files_that_exchange_paths_keep_their_ids() {
             ..ScanSummary::default()
         }
     );
+    assert_eq!(batches, 1);
     let at_first_path = scanned.track_at(LOW_TIDE);
     let at_second_path = scanned.track_at(BREAKWATER);
     assert_eq!(at_first_path.id, second.id);
@@ -817,6 +848,15 @@ fn two_files_that_exchange_paths_keep_their_ids() {
 
 #[test]
 fn a_file_moved_over_another_track_keeps_its_id_and_the_other_row_is_deleted() {
+    move_over_another_track(scanner::DEFAULT_BATCH_SIZE);
+}
+
+#[test]
+fn a_file_moves_over_another_track_in_one_transaction_when_a_batch_holds_one_file() {
+    move_over_another_track(1);
+}
+
+fn move_over_another_track(batch_size: usize) {
     let library = LibraryBuilder::standard().build();
     shift_mtime(&library.files[0], 100);
     shift_mtime(&library.files[1], 200);
@@ -825,7 +865,7 @@ fn a_file_moved_over_another_track_keeps_its_id_and_the_other_row_is_deleted() {
     let moved = scanned.id_at(BREAKWATER);
 
     fs::rename(scanned.path(BREAKWATER), scanned.path(LOW_TIDE)).unwrap();
-    let summary = scanned.rescan();
+    let (summary, batches) = rescan_in_batches_of(&scanned, batch_size);
 
     assert_eq!(
         summary,
@@ -836,6 +876,7 @@ fn a_file_moved_over_another_track_keeps_its_id_and_the_other_row_is_deleted() {
             ..ScanSummary::default()
         }
     );
+    assert_eq!(batches, 1);
     assert_eq!(scanned.id_at(LOW_TIDE), moved);
     assert_eq!(scanned.find(BREAKWATER), None);
     assert!(!scanned.env.locators().contains_key(&overwritten));
@@ -1236,6 +1277,20 @@ fn the_tracks_and_the_row_of_a_folder_removed_from_the_config_are_deleted() {
 }
 
 #[test]
+fn a_scan_without_a_configured_folder_deletes_nothing() {
+    let scanned = Scanned::new();
+    let before = scanned.env.index();
+
+    let summary = scanned.env.scan(&[]);
+
+    assert_eq!(summary.removed, 0);
+    assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+    assert!(summary.errors[0].contains("no music folder is configured"));
+    assert_eq!(scanned.env.index(), before);
+    assert_eq!(scanned.env.folders().len(), 1);
+}
+
+#[test]
 fn tracks_of_a_removed_folder_are_kept_while_a_configured_folder_has_no_supported_file() {
     let library = LibraryBuilder::standard().build();
     let old = library.root.path().join("Aurora Field");
@@ -1328,13 +1383,197 @@ fn tracks_below_a_link_whose_target_is_gone_are_kept() {
     assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
     let error = &summary.errors[0];
     assert!(error.contains("\"Marlow Quartet\""), "{error}");
-    assert!(error.contains("were kept"), "{error}");
+    assert!(error.contains("cannot be read"), "{error}");
+    assert!(error.contains("no track was deleted"), "{error}");
     assert_eq!(scanned.env.index(), before);
 
     // The volume is back.
     fs::rename(&unmounted, &target).unwrap();
     assert_eq!(scanned.rescan(), seen(10));
     assert_eq!(scanned.env.index(), before);
+}
+
+#[test]
+fn a_missing_file_keeps_its_row_while_a_folder_cannot_be_read() {
+    let two = TwoFolders::new();
+    let before = two.env.index();
+    let (aurora_id, marlow_id) = (
+        two.env.folder_id(&two.aurora),
+        two.env.folder_id(&two.marlow),
+    );
+    let moved_from = "Glass Harbour/01 Low Tide.flac";
+    let moved_to = "Imports/01 Low Tide.flac";
+    let deleted = "Glass Harbour/02 Breakwater.flac";
+    let moved = two.env.id_at(aurora_id, moved_from).unwrap();
+    attach(&two.env.db, &moved);
+
+    // One file of the first folder moves to the second folder and another
+    // one is deleted. Then the second folder cannot be read. The scan does
+    // not know which of the two files is in it.
+    move_file(&two.aurora.join(moved_from), &two.marlow.join(moved_to));
+    fs::remove_file(two.aurora.join(deleted)).unwrap();
+    fs::rename(&two.marlow, two.outside("unmounted")).unwrap();
+    let summary = two.rescan();
+
+    assert_eq!(summary.seen, 5);
+    assert_eq!((summary.moved, summary.removed), (0, 0));
+    assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+    assert!(summary.errors[0].contains("\"Marlow Quartet\""));
+    assert!(summary.errors[0].contains("no track was deleted"));
+    assert_eq!(two.env.index(), before);
+    assert_eq!(
+        attached(&two.env.db, &moved),
+        Some((aurora_id, moved_from.to_owned()))
+    );
+
+    // The second folder is back. The moved file keeps its ID and the row
+    // of the deleted file goes.
+    fs::rename(two.outside("unmounted"), &two.marlow).unwrap();
+    let summary = two.rescan();
+    assert_eq!(
+        summary,
+        ScanSummary {
+            seen: 8,
+            moved: 1,
+            removed: 1,
+            ..ScanSummary::default()
+        }
+    );
+    assert_eq!(two.env.id_at(marlow_id, moved_to), Some(moved.clone()));
+    assert_eq!(two.env.id_at(aurora_id, deleted), None);
+    assert_eq!(
+        attached(&two.env.db, &moved),
+        Some((marlow_id, moved_to.to_owned()))
+    );
+}
+
+// A symbolic link is created with a Unix call. On Windows the call needs a
+// privilege that a test run does not have.
+#[cfg(unix)]
+#[test]
+fn a_file_moved_below_a_link_whose_target_is_gone_keeps_its_id() {
+    let scanned = Scanned::new();
+    let id = scanned.id_at(LOW_TIDE);
+    attach(&scanned.env.db, &id);
+    let before = scanned.env.index();
+
+    // The file moves to a directory on another volume, which the library
+    // reaches through a link. The volume is not mounted.
+    let volume = tempfile::tempdir().unwrap();
+    let mounted = volume.path().join("archive");
+    let unmounted = volume.path().join("unmounted");
+    fs::create_dir(&unmounted).unwrap();
+    fs::rename(scanned.path(LOW_TIDE), unmounted.join("01 Low Tide.flac")).unwrap();
+    std::os::unix::fs::symlink(&mounted, scanned.path("Archive")).unwrap();
+    let summary = scanned.rescan();
+
+    assert_eq!(summary.seen, 9);
+    assert_eq!((summary.moved, summary.removed), (0, 0));
+    assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+    assert!(summary.errors[0].contains("\"Archive\""));
+    assert_eq!(scanned.env.index(), before);
+    assert_eq!(
+        attached(&scanned.env.db, &id),
+        Some((scanned.folder_id, LOW_TIDE.to_owned()))
+    );
+
+    // The volume is mounted and the scan reads the file.
+    fs::rename(&unmounted, &mounted).unwrap();
+    assert_moved(&scanned, &id, LOW_TIDE, "Archive/01 Low Tide.flac");
+}
+
+/// Sets the permission bits of a file.
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .unwrap_or_else(|error| panic!("set the mode of {}: {error}", path.display()));
+}
+
+/// Takes the read permission from a file. Returns whether the process can
+/// still open it, which is the case for a process that runs as root. A test
+/// of an unreadable file then has nothing to check.
+#[cfg(unix)]
+fn deny_read(path: &Path) -> bool {
+    set_mode(path, 0o000);
+    let readable = fs::File::open(path).is_ok();
+    if readable {
+        eprintln!("not checked: the process reads a file that has no read permission");
+    }
+    !readable
+}
+
+// File modes exist on Unix only.
+#[cfg(unix)]
+#[test]
+fn a_moved_file_that_cannot_be_read_keeps_its_row_and_its_id() {
+    let scanned = Scanned::new();
+    let to = "Aurora Field/Glass Harbour/01 Ebb.flac";
+    let before = scanned.track_at(LOW_TIDE);
+    attach(&scanned.env.db, &before.id);
+
+    move_file(&scanned.path(LOW_TIDE), &scanned.path(to));
+    if !deny_read(&scanned.path(to)) {
+        return;
+    }
+    let summary = scanned.rescan();
+
+    assert_eq!(summary.seen, 10);
+    assert_eq!((summary.added, summary.moved, summary.removed), (0, 0, 0));
+    assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+    let error = &summary.errors[0];
+    assert!(error.contains(&format!("\"{to}\"")), "{error}");
+    assert!(error.contains("cannot be read"), "{error}");
+    assert_eq!(scanned.env.latest_scan().error.as_ref(), Some(error));
+    // The row is where it was, with what the user attached to it.
+    assert_eq!(scanned.track_at(LOW_TIDE), before);
+    assert_eq!(scanned.find(to), None);
+    assert_eq!(scanned.env.count(), 10);
+    assert_eq!(
+        attached(&scanned.env.db, &before.id),
+        Some((scanned.folder_id, LOW_TIDE.to_owned()))
+    );
+
+    // The file can be read again and the row follows it.
+    set_mode(&scanned.path(to), 0o644);
+    assert_moved(&scanned, &before.id, LOW_TIDE, to);
+}
+
+// File modes exist on Unix only.
+#[cfg(unix)]
+#[test]
+fn a_changed_file_that_cannot_be_read_keeps_its_row_and_deletes_nothing() {
+    let scanned = Scanned::new();
+    let before = scanned.env.index();
+    let row = scanned.track_at(LOW_TIDE);
+
+    shift_mtime(&scanned.path(LOW_TIDE), 5);
+    if !deny_read(&scanned.path(LOW_TIDE)) {
+        return;
+    }
+    let summary = scanned.rescan();
+
+    assert_eq!(summary.seen, 10);
+    assert_eq!((summary.changed, summary.removed), (0, 0));
+    assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+    assert!(summary.errors[0].contains(&format!("\"{LOW_TIDE}\"")));
+    assert_eq!(scanned.env.index(), before);
+    assert_eq!(scanned.track_at(LOW_TIDE), row);
+
+    // The file can be read again. Its row takes the new file state.
+    set_mode(&scanned.path(LOW_TIDE), 0o644);
+    let summary = scanned.rescan();
+    assert_eq!(
+        summary,
+        ScanSummary {
+            seen: 10,
+            changed: 1,
+            tags_read: 1,
+            ..ScanSummary::default()
+        }
+    );
+    assert_eq!(scanned.track_at(LOW_TIDE).id, row.id);
 }
 
 #[test]

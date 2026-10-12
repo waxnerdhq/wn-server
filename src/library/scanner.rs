@@ -3,16 +3,21 @@
 //!
 //! A track keeps its ID while the scanner can tell where its file is. A
 //! file that is unchanged at its path, a file that changed at its path, and a
-//! file that moved, alone or with its folder, all keep the row. A row is
-//! deleted only when the scanner knows that its file is gone: it read the
-//! directory of the file and the file is not there, or the folder was
-//! removed from the configuration.
+//! file that moved, alone or with its folder, all keep the row.
+//!
+//! A row is deleted only when the scanner knows that its file is gone. That
+//! needs two things. The scanner read the directory of the file and the file
+//! is not there, or the folder was removed from the configuration. And the
+//! scanner read every file that could be the file of the row: a path that
+//! could not be read may hold any file, and a file whose content could not
+//! be read may be any file of its size.
 //!
 //! [`scan`] blocks its thread on file and database work. Files are read
 //! outside the write transactions.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
+use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -28,7 +33,7 @@ use crate::db::queries::tracks::{self, IndexEntry, TrackContent};
 use crate::db::queries::{albums, artists};
 use crate::db::{Db, Result};
 use crate::ids::{self, Kind};
-use crate::library::tags::{self, TrackMeta};
+use crate::library::tags::{self, TagError, TrackMeta};
 
 /// The number of files in a batch when [`ScanOptions`] has its defaults.
 pub const DEFAULT_BATCH_SIZE: usize = 500;
@@ -45,9 +50,9 @@ pub struct ScanOptions {
     /// Runs after each batch is committed.
     pub on_batch: Option<Box<dyn Fn() + Send>>,
     /// The scan adds 1 for each supported file it has finished with: a file
-    /// that is unchanged, a file whose changes are committed, and a file
-    /// that cannot be read. A scan that completes adds [`ScanSummary::seen`]
-    /// in total.
+    /// that is unchanged, a file whose changes are committed, a file that
+    /// cannot be read, and a file whose changes wait for the next scan. A
+    /// scan that completes adds [`ScanSummary::seen`] in total.
     pub progress: Arc<AtomicU64>,
 }
 
@@ -78,10 +83,11 @@ pub struct ScanSummary {
     pub removed: u64,
     /// The calls of the tag reader, the failed ones included.
     pub tags_read: u64,
-    /// One message for each folder problem: a folder or a path in it that
-    /// cannot be read, a folder that had tracks and has no supported file,
-    /// and a removed folder whose tracks were kept. A cancelled scan has
-    /// [`CANCELLED`] as its last message.
+    /// One message for each problem that kept the scan from deleting
+    /// tracks: a folder, a path or a file that cannot be read, a folder
+    /// that had tracks and has no supported file, and a removed folder
+    /// whose tracks were kept. A cancelled scan has [`CANCELLED`] as its
+    /// last message.
     pub errors: Vec<String>,
 }
 
@@ -91,11 +97,11 @@ pub struct ScanSummary {
 /// is unchanged is not read. A track whose file changed at its path keeps
 /// its row and has its tags read again. A track whose file is gone is
 /// matched by fingerprint to a file the database does not know and follows
-/// it. A track without a match is deleted, unless the path of its file could
-/// not be read or its folder holds no supported file any more. The tracks of
-/// a folder that is no longer in `folders` are deleted when every folder in
-/// `folders` was read in full and holds a supported file. `full` reads the
-/// fingerprint and the tags of every file.
+/// it. A track without a match is deleted, unless a file that the scan could
+/// not read may be its file, or its folder holds no supported file any more.
+/// The tracks of a folder that is no longer in `folders` are deleted when
+/// every folder in `folders` was read in full and holds a supported file.
+/// `full` reads the fingerprint and the tags of every file.
 ///
 /// The function blocks. An async caller runs it with
 /// `tokio::task::spawn_blocking`. `cancel` is checked during the walk,
@@ -106,8 +112,8 @@ pub struct ScanSummary {
 /// # Errors
 ///
 /// Returns a database error, and the error of a folder path that is not
-/// valid Unicode. A file or a folder that cannot be read is not an error of
-/// the scan.
+/// valid Unicode. A file or a folder that cannot be read does not end the
+/// scan. It is a message in [`ScanSummary::errors`].
 ///
 /// # Panics
 ///
@@ -119,16 +125,59 @@ pub fn scan(
     full: bool,
     options: ScanOptions,
 ) -> Result<ScanSummary> {
-    let start = db.with_writer(|conn| begin(conn, folders))?;
-    let scan_id = start.scan_id;
+    scan_with(db, folders, cancel, full, options, &FileReader::default())
+}
+
+/// The two reads of the content of a file. [`scan`] reads the files on disk.
+/// The tests of this module replace the reads to make them fail.
+struct FileReader {
+    fingerprint: Box<ReadFingerprint>,
+    tags: Box<ReadTags>,
+}
+
+/// Reads the fingerprint of the file at a path.
+type ReadFingerprint = dyn Fn(&Path) -> io::Result<String>;
+
+/// Reads the tags of the file at a path.
+type ReadTags = dyn Fn(&Path) -> std::result::Result<TrackMeta, TagError>;
+
+impl Default for FileReader {
+    /// Returns the reader of the files on disk: `ids::fingerprint` and
+    /// `tags::read`.
+    fn default() -> Self {
+        Self {
+            fingerprint: Box::new(ids::fingerprint),
+            tags: Box::new(tags::read),
+        }
+    }
+}
+
+/// Runs [`scan`] with `reader` as the reader of file content.
+fn scan_with(
+    db: &Db,
+    folders: &[PathBuf],
+    cancel: &CancellationToken,
+    full: bool,
+    options: ScanOptions,
+    reader: &FileReader,
+) -> Result<ScanSummary> {
+    let Start {
+        scan_id,
+        configured,
+        unconfigured,
+        index,
+    } = db.with_writer(|conn| begin(conn, folders))?;
     let mut scanner = Scanner {
         db,
         cancel,
         full,
         options,
+        reader,
+        folders: configured,
+        unread: Unread::default(),
         summary: ScanSummary::default(),
     };
-    let outcome = scanner.run(start);
+    let outcome = scanner.run(&unconfigured, &index);
     let mut summary = scanner.summary;
 
     let error = match &outcome {
@@ -199,6 +248,16 @@ enum Outcome {
     Cancelled,
 }
 
+/// The two kinds of batch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Batch {
+    /// The changes that vacate or take the path of a displaced row. They
+    /// are one transaction whatever their number.
+    Exchange,
+    /// At most `batch_size` changes that depend on no other change.
+    Ordinary,
+}
+
 /// What the walk and the fingerprints say about one row of the index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowState {
@@ -211,14 +270,13 @@ enum RowState {
     Displaced,
 }
 
-/// A supported file that the walk saw.
+/// A supported file that the walk saw. The path that opens the file is the
+/// path of its folder joined with the components of `rel_path`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct FoundFile {
     folder_id: i64,
     /// The path below the folder, components joined with `/`.
     rel_path: String,
-    /// The path that opens the file.
-    path: PathBuf,
     /// The modification time in Unix seconds.
     mtime: i64,
     size: u64,
@@ -264,6 +322,29 @@ impl FolderWalk {
     }
 }
 
+/// What the scan could not read. A row whose file is gone is deleted only
+/// when nothing here may be its file.
+#[derive(Debug, Default)]
+struct Unread {
+    /// Whether the walk could not read a path in a configured folder. A file
+    /// of any size may be at or below such a path.
+    paths: bool,
+    /// The sizes of the files whose fingerprint could not be read.
+    sizes: HashSet<u64>,
+}
+
+impl Unread {
+    /// Returns whether a file that the scan could not read may be the file
+    /// of `entry`. A fingerprint starts with the size of its file, so a file
+    /// of another size cannot have the fingerprint of the row.
+    fn may_be(&self, entry: &IndexEntry) -> bool {
+        self.paths
+            || (!self.sizes.is_empty()
+                && fingerprint_size(&entry.fingerprint)
+                    .is_none_or(|size| self.sizes.contains(&size)))
+    }
+}
+
 /// A file that may be the new place of a missing track.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Candidate {
@@ -304,12 +385,14 @@ enum Op {
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Plan {
     /// The changes that vacate or take the path of a displaced row. They
-    /// are stored in one transaction.
+    /// are stored in one transaction, or not at all.
     exchange: Vec<Op>,
     /// The other changes. They are stored after `exchange`, in batches.
     rest: Vec<Op>,
     /// The rows whose file is gone and that no candidate matches.
     unmatched: Vec<usize>,
+    /// The number of files whose changes wait for the next scan.
+    postponed: u64,
 }
 
 /// A change with everything that was read for it from the file.
@@ -323,10 +406,9 @@ enum Write<'a> {
         /// its new path.
         via_temporary: bool,
         file: FoundFile,
-        /// The modification time to store.
-        mtime: i64,
         /// The fingerprint of the row, which is the one of the file.
         fingerprint: &'a str,
+        /// The tags, when they were read again.
         meta: Option<TrackMeta>,
     },
     Update {
@@ -348,31 +430,29 @@ struct Scanner<'a> {
     cancel: &'a CancellationToken,
     full: bool,
     options: ScanOptions,
+    reader: &'a FileReader,
+    /// The folder rows of the configured folders.
+    folders: Vec<Folder>,
+    unread: Unread,
     summary: ScanSummary,
 }
 
 impl Scanner<'_> {
-    fn run(&mut self, start: Start) -> Result<Outcome> {
-        let Start {
-            configured,
-            unconfigured,
-            index,
-            ..
-        } = start;
+    fn run(&mut self, unconfigured: &[Folder], index: &[IndexEntry]) -> Result<Outcome> {
         let mut states = vec![RowState::Unseen; index.len()];
         let with_tracks: HashSet<i64> = index.iter().map(|entry| entry.folder_id).collect();
 
         // The walk reads directories and file states only.
         let mut found = Found::default();
-        let mut walks: HashMap<i64, FolderWalk> = HashMap::with_capacity(configured.len());
+        let mut walks: HashMap<i64, FolderWalk> = HashMap::with_capacity(self.folders.len());
         {
             let lookup: HashMap<(i64, &str), usize> = index
                 .iter()
                 .enumerate()
                 .map(|(row, entry)| (locator(entry), row))
                 .collect();
-            for folder in &configured {
-                let walk = self.walk(folder, &lookup, &index, &mut states, &mut found);
+            for folder in self.folders.clone() {
+                let walk = self.walk(&folder, &lookup, index, &mut states, &mut found);
                 if self.cancel.is_cancelled() {
                     return Ok(Outcome::Cancelled);
                 }
@@ -380,12 +460,13 @@ impl Scanner<'_> {
                 {
                     self.problem(format!(
                         "music folder {} has no supported file; none of its tracks was deleted",
-                        describe(folder)
+                        describe(&folder)
                     ));
                 }
                 walks.insert(folder.id, walk);
             }
         }
+        self.unread.paths = walks.values().any(|walk| !walk.unread.is_empty());
 
         let any_gone = (0..index.len()).any(|row| is_gone(&index[row], states[row], &walks));
         let plan = if found.changed.is_empty() && !any_gone {
@@ -403,7 +484,7 @@ impl Scanner<'_> {
                 ..Plan::default()
             }
         } else {
-            let Some((updates, candidates)) = self.fingerprints(found, &index, &mut states) else {
+            let Some((updates, candidates)) = self.fingerprints(found, index, &mut states) else {
                 return Ok(Outcome::Cancelled);
             };
             let mut missing: Vec<usize> = (0..index.len())
@@ -412,34 +493,39 @@ impl Scanner<'_> {
                 })
                 .collect();
             missing.sort_by(|&a, &b| locator(&index[a]).cmp(&locator(&index[b])));
-            plan(&index, &states, &missing, candidates, updates)
+            plan(index, &states, &missing, candidates, updates, &self.unread)
         };
 
         let Plan {
             exchange,
             rest,
             unmatched,
+            postponed,
         } = plan;
+        self.advance(postponed);
+        if !exchange.is_empty() {
+            if self.cancel.is_cancelled() {
+                return Ok(Outcome::Cancelled);
+            }
+            self.apply(index, &states, exchange, Batch::Exchange)?;
+        }
         let batch_size = self.options.batch_size.max(1);
         let mut rest = rest.into_iter();
-        let mut batch = exchange;
         loop {
-            if batch.is_empty() {
-                batch = rest.by_ref().take(batch_size).collect();
-            }
+            let batch: Vec<Op> = rest.by_ref().take(batch_size).collect();
             if batch.is_empty() {
                 break;
             }
             if self.cancel.is_cancelled() {
                 return Ok(Outcome::Cancelled);
             }
-            self.apply(&index, &states, std::mem::take(&mut batch))?;
+            self.apply(index, &states, batch, Batch::Ordinary)?;
         }
         if self.cancel.is_cancelled() {
             return Ok(Outcome::Cancelled);
         }
 
-        self.remove(&index, &walks, &configured, &unconfigured, &unmatched)?;
+        self.remove(index, &walks, unconfigured, &unmatched)?;
         Ok(Outcome::Completed)
     }
 
@@ -474,8 +560,8 @@ impl Scanner<'_> {
                 if !is_dir {
                     walk.unread.push(String::new());
                     self.problem(format!(
-                        "music folder {} cannot be read: it is not a directory; none of its \
-                         tracks was deleted",
+                        "music folder {} cannot be read: it is not a directory; no track was \
+                         deleted",
                         describe(folder)
                     ));
                 }
@@ -504,7 +590,7 @@ impl Scanner<'_> {
             let (mtime, size) = match file_state(&entry) {
                 Ok(state) => state,
                 Err(cause) => {
-                    self.unread(folder, &mut walk, rel_path, &cause);
+                    self.unread_path(folder, &mut walk, rel_path, &cause);
                     continue;
                 }
             };
@@ -513,7 +599,6 @@ impl Scanner<'_> {
             let file = FoundFile {
                 folder_id: folder.id,
                 rel_path,
-                path: entry.into_path(),
                 mtime,
                 size,
             };
@@ -541,7 +626,7 @@ impl Scanner<'_> {
         if error.depth() == 0 {
             walk.unread.push(String::new());
             self.problem(format!(
-                "music folder {} cannot be read: {cause}; none of its tracks was deleted",
+                "music folder {} cannot be read: {cause}; no track was deleted",
                 describe(folder)
             ));
             return;
@@ -553,7 +638,7 @@ impl Scanner<'_> {
             // The error does not say which directory it is about.
             walk.unread.push(String::new());
             self.problem(format!(
-                "music folder {} cannot be read in full: {cause}; none of its tracks was deleted",
+                "music folder {} cannot be read in full: {cause}; no track was deleted",
                 describe(folder)
             ));
             return;
@@ -562,7 +647,7 @@ impl Scanner<'_> {
             return;
         }
         match rel_path(relative) {
-            Some(rel_path) => self.unread(folder, walk, rel_path, &cause),
+            Some(rel_path) => self.unread_path(folder, walk, rel_path, &cause),
             // No track is stored below a name that is not valid Unicode.
             None => tracing::warn!(
                 path = %relative.display(),
@@ -572,11 +657,16 @@ impl Scanner<'_> {
         }
     }
 
-    /// Records that `rel_path` in `folder` could not be read.
-    fn unread(&mut self, folder: &Folder, walk: &mut FolderWalk, rel_path: String, cause: &str) {
+    /// Records that the walk could not read `rel_path` in `folder`.
+    fn unread_path(
+        &mut self,
+        folder: &Folder,
+        walk: &mut FolderWalk,
+        rel_path: String,
+        cause: &str,
+    ) {
         self.problem(format!(
-            "\"{rel_path}\" in music folder {} cannot be read: {cause}; the tracks at and below \
-             it were kept",
+            "\"{rel_path}\" in music folder {} cannot be read: {cause}; no track was deleted",
             describe(folder)
         ));
         walk.unread.push(rel_path);
@@ -604,8 +694,8 @@ impl Scanner<'_> {
             if position % batch_size == 0 && self.cancel.is_cancelled() {
                 return None;
             }
-            let Some(fingerprint) = read_fingerprint(&file) else {
-                // The row of an unreadable file stays as it is.
+            let Some(fingerprint) = self.read_fingerprint(&file) else {
+                // The row of a file that cannot be read stays as it is.
                 self.advance(1);
                 continue;
             };
@@ -635,9 +725,22 @@ impl Scanner<'_> {
 
     /// Reads what the changes of one batch need from the files, stores the
     /// changes in one transaction and runs the batch hook.
-    fn apply(&mut self, index: &[IndexEntry], states: &[RowState], batch: Vec<Op>) -> Result<()> {
+    ///
+    /// A change whose file cannot be read is left out, and the next scan
+    /// finds it again: a new file gets no row, a changed file leaves its row
+    /// as it is, and a moved file leaves its row at the old path. The changes
+    /// of [`Batch::Exchange`] depend on each other, so a moved file that
+    /// cannot be read leaves out the whole batch.
+    fn apply(
+        &mut self,
+        index: &[IndexEntry],
+        states: &[RowState],
+        batch: Vec<Op>,
+        kind: Batch,
+    ) -> Result<()> {
         let mut writes = Vec::with_capacity(batch.len());
         let mut files = 0;
+        let mut complete = true;
         for op in batch {
             match op {
                 Op::Delete { row } => writes.push(Write::Delete { id: &index[row].id }),
@@ -647,8 +750,6 @@ impl Scanner<'_> {
                     fingerprint,
                 } => {
                     files += 1;
-                    // The row of a file whose tags cannot be read stays as
-                    // it is, so the next scan reads the file again.
                     if let Some(meta) = self.read_tags(&file) {
                         writes.push(Write::Update {
                             id: &index[row].id,
@@ -662,25 +763,22 @@ impl Scanner<'_> {
                     files += 1;
                     let known = &index[row];
                     let meta = if reread { self.read_tags(&file) } else { None };
-                    // When the tags cannot be read, the row keeps its
-                    // modification time, so the next scan reads them.
-                    let mtime = if reread && meta.is_none() {
-                        known.mtime
-                    } else {
-                        file.mtime
-                    };
+                    if reread && meta.is_none() {
+                        complete = false;
+                        continue;
+                    }
                     writes.push(Write::Relink {
                         id: &known.id,
                         via_temporary: states[row] == RowState::Displaced,
                         file,
-                        mtime,
                         fingerprint: &known.fingerprint,
                         meta,
                     });
                 }
                 Op::Insert { file, fingerprint } => {
                     files += 1;
-                    let Some(fingerprint) = fingerprint.or_else(|| read_fingerprint(&file)) else {
+                    let Some(fingerprint) = fingerprint.or_else(|| self.read_fingerprint(&file))
+                    else {
                         continue;
                     };
                     if let Some(meta) = self.read_tags(&file) {
@@ -692,6 +790,14 @@ impl Scanner<'_> {
                     }
                 }
             }
+        }
+        if kind == Batch::Exchange && !complete {
+            tracing::warn!(
+                "the tags of a moved file cannot be read; the files that exchange paths with it \
+                 wait for the next scan"
+            );
+            self.advance(files);
+            return Ok(());
         }
 
         let counts = self.db.with_writer(|conn| store(conn, &writes))?;
@@ -709,6 +815,7 @@ impl Scanner<'_> {
     /// Deletes the rows whose file is gone, and the folder rows that are no
     /// longer configured.
     ///
+    /// A row stays when a file that the scan could not read may be its file.
     /// A configured folder that had tracks and holds no supported file keeps
     /// its rows. A folder that is no longer configured keeps its rows unless
     /// at least one folder is configured and every configured folder was
@@ -718,32 +825,37 @@ impl Scanner<'_> {
         &mut self,
         index: &[IndexEntry],
         walks: &HashMap<i64, FolderWalk>,
-        configured: &[Folder],
         unconfigured: &[Folder],
         unmatched: &[usize],
     ) -> Result<()> {
-        let all_hold_files = !configured.is_empty() && walks.values().all(FolderWalk::holds_files);
+        let all_hold_files =
+            !self.folders.is_empty() && walks.values().all(FolderWalk::holds_files);
         let mut deleted_ids: Vec<&str> = Vec::new();
         let mut kept: HashSet<i64> = HashSet::new();
         for &row in unmatched {
             let entry = &index[row];
-            let delete = match walks.get(&entry.folder_id) {
-                Some(walk) => walk.supported > 0,
-                None => all_hold_files,
-            };
+            let delete = !self.unread.may_be(entry)
+                && match walks.get(&entry.folder_id) {
+                    Some(walk) => walk.supported > 0,
+                    None => all_hold_files,
+                };
             if delete {
                 deleted_ids.push(&entry.id);
             } else {
                 kept.insert(entry.folder_id);
             }
         }
+        let reason = if self.folders.is_empty() {
+            "no music folder is configured"
+        } else {
+            "a configured music folder could not be read in full or has no supported file"
+        };
         for folder in unconfigured
             .iter()
             .filter(|folder| kept.contains(&folder.id))
         {
             self.problem(format!(
-                "the tracks of the removed music folder {} were kept, because a configured \
-                 music folder could not be read in full or has no supported file",
+                "the tracks of the removed music folder {} were kept, because {reason}",
                 describe(folder)
             ));
         }
@@ -764,17 +876,55 @@ impl Scanner<'_> {
         Ok(())
     }
 
-    /// Reads the tags of `file`. Logs a warning and returns `None` when the
-    /// file cannot be read.
-    fn read_tags(&mut self, file: &FoundFile) -> Option<TrackMeta> {
-        self.summary.tags_read += 1;
-        match tags::read(&file.path) {
-            Ok(meta) => Some(meta),
+    /// Reads the fingerprint of `file`. When the file cannot be read, records
+    /// an error and the size of the file, and returns `None`. No missing row
+    /// of that size is deleted in this scan, because the file may be the
+    /// file of the row.
+    fn read_fingerprint(&mut self, file: &FoundFile) -> Option<String> {
+        match (self.reader.fingerprint)(&self.path_of(file)) {
+            Ok(fingerprint) => Some(fingerprint),
             Err(error) => {
-                tracing::warn!(%error, "the file is skipped");
+                self.unread.sizes.insert(file.size);
+                let folder = self.folder_of(file).map(describe).unwrap_or_default();
+                self.problem(format!(
+                    "\"{}\" in music folder {folder} cannot be read: {error}; no track of {} \
+                     bytes was deleted",
+                    file.rel_path, file.size
+                ));
                 None
             }
         }
+    }
+
+    /// Reads the tags of `file`. Logs a warning and returns `None` when the
+    /// tags cannot be read.
+    fn read_tags(&mut self, file: &FoundFile) -> Option<TrackMeta> {
+        self.summary.tags_read += 1;
+        match (self.reader.tags)(&self.path_of(file)) {
+            Ok(meta) => Some(meta),
+            Err(error) => {
+                tracing::warn!(%error, "the file is left for the next scan");
+                None
+            }
+        }
+    }
+
+    /// Returns the folder row of `file`.
+    fn folder_of(&self, file: &FoundFile) -> Option<&Folder> {
+        self.folders
+            .iter()
+            .find(|folder| folder.id == file.folder_id)
+    }
+
+    /// Returns the path that opens `file`: the path of its folder joined
+    /// with the components of its relative path.
+    fn path_of(&self, file: &FoundFile) -> PathBuf {
+        let mut path = self
+            .folder_of(file)
+            .map(|folder| folder.path.clone())
+            .unwrap_or_default();
+        path.extend(file.rel_path.split('/'));
+        path
     }
 
     /// Logs `message` as a warning and adds it to the errors of the scan.
@@ -809,13 +959,17 @@ fn is_gone(entry: &IndexEntry, state: RowState, walks: &HashMap<i64, FolderWalk>
 ///
 /// A displaced row without a match stays at its path and takes the content
 /// of the file there, unless another row chose that file. That is the case
-/// of a file that was retagged in place.
+/// of a file that was retagged in place. When another row chose the file,
+/// the displaced row is deleted, unless a file in `unread` may be its file.
+/// In that case every change of the exchange waits for the next scan,
+/// because the changes of the exchange depend on each other.
 fn plan(
     index: &[IndexEntry],
     states: &[RowState],
     missing: &[usize],
     candidates: Vec<Candidate>,
     updates: Vec<Op>,
+    unread: &Unread,
 ) -> Plan {
     let mut by_fingerprint: HashMap<&str, Vec<usize>> = HashMap::new();
     for (position, candidate) in candidates.iter().enumerate() {
@@ -882,11 +1036,33 @@ fn plan(
                 file,
                 fingerprint,
             }),
-            (None, None) => plan.rest.push(Op::Insert {
-                file,
-                fingerprint: Some(fingerprint),
-            }),
+            (None, None) => {
+                let op = Op::Insert {
+                    file,
+                    fingerprint: Some(fingerprint),
+                };
+                // The row at the path of the file leaves it in the exchange.
+                if displaces.is_some() {
+                    plan.exchange.push(op);
+                } else {
+                    plan.rest.push(op);
+                }
+            }
         }
+    }
+
+    let keeps_a_row = plan
+        .exchange
+        .iter()
+        .any(|op| matches!(op, Op::Delete { row } if unread.may_be(&index[*row])));
+    if keeps_a_row {
+        let files = plan
+            .exchange
+            .iter()
+            .filter(|op| !matches!(op, Op::Delete { .. }))
+            .count();
+        plan.postponed = files as u64;
+        plan.exchange.clear();
     }
     plan
 }
@@ -928,13 +1104,12 @@ fn store(conn: &mut Connection, writes: &[Write<'_>]) -> Result<ScanCounts> {
             id,
             via_temporary: true,
             file,
-            mtime,
             ..
         } = write
         {
             // A relative path never starts with `/`.
             let temporary = format!("/{id}");
-            tracks::relink_track(&tx, id, file.folder_id, &temporary, *mtime, file.size)?;
+            tracks::relink_track(&tx, id, file.folder_id, &temporary, file.mtime, file.size)?;
         }
     }
 
@@ -944,12 +1119,12 @@ fn store(conn: &mut Connection, writes: &[Write<'_>]) -> Result<ScanCounts> {
             Write::Relink {
                 id,
                 file,
-                mtime,
                 fingerprint,
                 meta,
                 ..
             } => {
-                tracks::relink_track(&tx, id, file.folder_id, &file.rel_path, *mtime, file.size)?;
+                let (folder_id, mtime) = (file.folder_id, file.mtime);
+                tracks::relink_track(&tx, id, folder_id, &file.rel_path, mtime, file.size)?;
                 if let Some(meta) = meta {
                     with_content(&tx, file, fingerprint, meta, |content| {
                         tracks::update_track_meta(&tx, id, content)
@@ -1016,22 +1191,6 @@ fn with_content(
 /// nothing: album and artist rows keep the values their upserts gave them.
 fn aggregate(_conn: &Connection) -> Result<()> {
     Ok(())
-}
-
-/// Reads the fingerprint of `file`. Logs a warning and returns `None` when
-/// the file cannot be read.
-fn read_fingerprint(file: &FoundFile) -> Option<String> {
-    match ids::fingerprint(&file.path) {
-        Ok(fingerprint) => Some(fingerprint),
-        Err(error) => {
-            tracing::warn!(
-                path = %file.path.display(),
-                %error,
-                "cannot read the file; it is skipped"
-            );
-            None
-        }
-    }
 }
 
 /// Returns the modification time in Unix seconds and the size of the file
@@ -1123,6 +1282,12 @@ fn path_distance(from: &str, to: &str) -> usize {
     directories(from).count() + directories(to).count() - 2 * common
 }
 
+/// Returns the size at the start of a fingerprint, which has the form
+/// `size:hash`.
+fn fingerprint_size(fingerprint: &str) -> Option<u64> {
+    fingerprint.split_once(':')?.0.parse().ok()
+}
+
 /// Returns whether two relative paths have the same extension without
 /// regard to case. The extension decides the suffix and the content type of
 /// a track.
@@ -1137,9 +1302,15 @@ fn same_extension(a: &str, b: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::{Cell, RefCell};
+    use std::fs;
+    use std::rc::Rc;
     use std::time::Duration;
 
+    use tempfile::TempDir;
+
     use super::*;
+    use crate::db::queries::tracks::Track;
 
     fn entry(id: &str, folder_id: i64, rel_path: &str, fingerprint: &str) -> IndexEntry {
         IndexEntry {
@@ -1156,7 +1327,6 @@ mod tests {
         FoundFile {
             folder_id,
             rel_path: rel_path.to_owned(),
-            path: PathBuf::from(rel_path),
             mtime: 100,
             size: 10,
         }
@@ -1185,13 +1355,33 @@ mod tests {
         }
     }
 
-    /// Plans with every row in `missing`, in the order of the rows.
+    /// Plans with every row in `missing`, in the order of the rows, for a
+    /// scan that read every file.
     fn plan_of(index: &[IndexEntry], states: &[RowState], candidates: Vec<Candidate>) -> Plan {
+        plan_with(index, states, candidates, &Unread::default())
+    }
+
+    /// Plans with every row in `missing`, in the order of the rows.
+    fn plan_with(
+        index: &[IndexEntry],
+        states: &[RowState],
+        candidates: Vec<Candidate>,
+        unread: &Unread,
+    ) -> Plan {
         let mut missing: Vec<usize> = (0..index.len())
             .filter(|&row| states[row] != RowState::Present)
             .collect();
         missing.sort_by(|&a, &b| locator(&index[a]).cmp(&locator(&index[b])));
-        plan(index, states, &missing, candidates, Vec::new())
+        plan(index, states, &missing, candidates, Vec::new(), unread)
+    }
+
+    /// Returns what the scan could not read when it failed to read the
+    /// fingerprint of files of these sizes.
+    fn unread_sizes(sizes: &[u64]) -> Unread {
+        Unread {
+            paths: false,
+            sizes: sizes.iter().copied().collect(),
+        }
     }
 
     #[test]
@@ -1343,6 +1533,7 @@ mod tests {
                 exchange: Vec::new(),
                 rest: vec![insert("new/b.flac", "10:bb"), relink(0, "new/a.flac")],
                 unmatched: Vec::new(),
+                postponed: 0,
             }
         );
     }
@@ -1368,6 +1559,7 @@ mod tests {
             &[],
             vec![candidate("copy/a.flac", "10:aa", None)],
             Vec::new(),
+            &Unread::default(),
         );
         assert_eq!(plan.rest, [insert("copy/a.flac", "10:aa")]);
         assert_eq!(plan.unmatched, [0usize; 0]);
@@ -1507,6 +1699,7 @@ mod tests {
                     fingerprint: "12:a2".to_owned(),
                 }],
                 unmatched: Vec::new(),
+                postponed: 0,
             }
         );
     }
@@ -1527,9 +1720,10 @@ mod tests {
         assert_eq!(
             plan,
             Plan {
-                exchange: vec![relink(0, "q.flac")],
-                rest: vec![insert("p.flac", "10:cc")],
+                exchange: vec![insert("p.flac", "10:cc"), relink(0, "q.flac")],
+                rest: Vec::new(),
                 unmatched: Vec::new(),
+                postponed: 0,
             }
         );
     }
@@ -1554,6 +1748,7 @@ mod tests {
                 exchange: vec![relink(1, "p.flac"), relink(0, "q.flac")],
                 rest: Vec::new(),
                 unmatched: Vec::new(),
+                postponed: 0,
             }
         );
     }
@@ -1577,6 +1772,7 @@ mod tests {
                 exchange: vec![Op::Delete { row: 0 }, relink(1, "p.flac")],
                 rest: Vec::new(),
                 unmatched: Vec::new(),
+                postponed: 0,
             }
         );
     }
@@ -1595,7 +1791,493 @@ mod tests {
             &[],
             Vec::new(),
             vec![update.clone()],
+            &Unread::default(),
         );
         assert_eq!(plan.rest, [update]);
+    }
+
+    #[test]
+    fn fingerprint_size_is_the_number_before_the_colon() {
+        assert_eq!(fingerprint_size("244:0123abcd"), Some(244));
+        assert_eq!(fingerprint_size("0:e3b0"), Some(0));
+        assert_eq!(fingerprint_size("0123abcd"), None);
+        assert_eq!(fingerprint_size("x:0123abcd"), None);
+    }
+
+    #[test]
+    fn an_unread_file_may_be_a_row_of_its_size_and_an_unread_path_any_row() {
+        let row = entry("tr-a", 1, "a.flac", "10:aa");
+        assert!(!Unread::default().may_be(&row));
+        assert!(unread_sizes(&[10]).may_be(&row));
+        assert!(unread_sizes(&[9, 10]).may_be(&row));
+        assert!(!unread_sizes(&[9, 11]).may_be(&row));
+        let paths = Unread {
+            paths: true,
+            sizes: HashSet::new(),
+        };
+        assert!(paths.may_be(&row));
+
+        // A fingerprint without a size may belong to a file of any size.
+        let odd = entry("tr-b", 1, "b.flac", "aa");
+        assert!(unread_sizes(&[9]).may_be(&odd));
+        assert!(!Unread::default().may_be(&odd));
+    }
+
+    #[test]
+    fn an_exchange_that_deletes_a_row_waits_while_an_unread_file_may_be_that_row() {
+        // The file of B was moved over the file of A. A file of the size of
+        // A could not be read, so the bytes of A may be in it.
+        let index = [
+            entry("tr-a", 1, "p.flac", "10:aa"),
+            entry("tr-b", 1, "q.flac", "10:bb"),
+        ];
+        let states = [RowState::Displaced, RowState::Unseen];
+        let candidates = || vec![candidate("p.flac", "10:bb", Some(0))];
+        let waits = Plan {
+            postponed: 1,
+            ..Plan::default()
+        };
+
+        assert_eq!(
+            plan_with(&index, &states, candidates(), &unread_sizes(&[10])),
+            waits
+        );
+        let paths = Unread {
+            paths: true,
+            sizes: HashSet::new(),
+        };
+        assert_eq!(plan_with(&index, &states, candidates(), &paths), waits);
+
+        // An unread file of another size cannot be the file of A.
+        let plan = plan_with(&index, &states, candidates(), &unread_sizes(&[11]));
+        assert_eq!(plan.exchange, [Op::Delete { row: 0 }, relink(1, "p.flac")]);
+        assert_eq!(plan.postponed, 0);
+    }
+
+    #[test]
+    fn an_exchange_without_a_deletion_does_not_wait_for_unread_files() {
+        let index = [
+            entry("tr-a", 1, "p.flac", "10:aa"),
+            entry("tr-b", 1, "q.flac", "10:bb"),
+        ];
+        let plan = plan_with(
+            &index,
+            &[RowState::Displaced; 2],
+            vec![
+                candidate("p.flac", "10:bb", Some(0)),
+                candidate("q.flac", "10:aa", Some(1)),
+            ],
+            &unread_sizes(&[10]),
+        );
+        assert_eq!(plan.exchange, [relink(1, "p.flac"), relink(0, "q.flac")]);
+        assert_eq!(plan.postponed, 0);
+    }
+
+    /// Returns a WAV file with `samples` samples of the value `fill`: mono,
+    /// 8 kHz, 16-bit PCM. Its size is 44 bytes plus two bytes per sample.
+    fn wav(samples: u32, fill: u8) -> Vec<u8> {
+        let data_len = samples * 2;
+        let mut bytes = Vec::new();
+        bytes.extend(b"RIFF");
+        bytes.extend((36 + data_len).to_le_bytes());
+        bytes.extend(b"WAVEfmt ");
+        bytes.extend(16u32.to_le_bytes());
+        bytes.extend(1u16.to_le_bytes()); // PCM
+        bytes.extend(1u16.to_le_bytes()); // channels
+        bytes.extend(8000u32.to_le_bytes()); // sample rate
+        bytes.extend(16000u32.to_le_bytes()); // bytes per second
+        bytes.extend(2u16.to_le_bytes()); // bytes per frame
+        bytes.extend(16u16.to_le_bytes()); // bits per sample
+        bytes.extend(b"data");
+        bytes.extend(data_len.to_le_bytes());
+        bytes.resize(bytes.len() + data_len as usize, fill);
+        bytes
+    }
+
+    /// One music folder of WAV files in a temp directory, a database in
+    /// memory, and a reader whose reads a test makes fail. A file system
+    /// refuses a read for reasons a test cannot produce on every OS and as
+    /// every user, so the tests of unreadable files go through this reader.
+    struct Library {
+        dir: TempDir,
+        db: Db,
+        cancel: CancellationToken,
+        /// The paths whose fingerprint cannot be read.
+        unreadable: Rc<RefCell<HashSet<PathBuf>>>,
+        /// The paths whose tags cannot be read.
+        untaggable: Rc<RefCell<HashSet<PathBuf>>>,
+        /// The number of fingerprint reads so far.
+        fingerprint_reads: Rc<Cell<usize>>,
+        /// The fingerprint read, counted from 1, that cancels the scan. No
+        /// read cancels it while the value is 0.
+        cancel_at_read: Rc<Cell<usize>>,
+    }
+
+    impl Library {
+        /// Writes the files, each given as its relative path, its number of
+        /// samples and the value of its samples.
+        fn new(files: &[(&str, u32, u8)]) -> Self {
+            let library = Self {
+                dir: tempfile::tempdir().expect("create the library directory"),
+                db: Db::open_memory().expect("open the database"),
+                cancel: CancellationToken::new(),
+                unreadable: Rc::default(),
+                untaggable: Rc::default(),
+                fingerprint_reads: Rc::default(),
+                cancel_at_read: Rc::default(),
+            };
+            for (rel_path, samples, fill) in files {
+                library.write(rel_path, *samples, *fill);
+            }
+            library
+        }
+
+        fn path(&self, rel_path: &str) -> PathBuf {
+            self.dir.path().join(rel_path)
+        }
+
+        fn write(&self, rel_path: &str, samples: u32, fill: u8) {
+            fs::write(self.path(rel_path), wav(samples, fill)).expect("write the file");
+        }
+
+        /// Moves a file and creates the directory it moves to. The file
+        /// keeps its modification time.
+        fn rename(&self, from: &str, to: &str) {
+            let to = self.path(to);
+            fs::create_dir_all(to.parent().expect("the path has a parent")).unwrap();
+            fs::rename(self.path(from), to).expect("move the file");
+        }
+
+        fn set_mtime(&self, rel_path: &str, unix_seconds: u64) {
+            let file = fs::File::options()
+                .write(true)
+                .open(self.path(rel_path))
+                .expect("open the file");
+            file.set_modified(UNIX_EPOCH + Duration::from_secs(unix_seconds))
+                .expect("set the modification time");
+        }
+
+        /// Returns a reader of the files on disk that fails for the paths
+        /// in `unreadable` and `untaggable`.
+        fn reader(&self) -> FileReader {
+            let unreadable = Rc::clone(&self.unreadable);
+            let untaggable = Rc::clone(&self.untaggable);
+            let reads = Rc::clone(&self.fingerprint_reads);
+            let cancel_at_read = Rc::clone(&self.cancel_at_read);
+            let cancel = self.cancel.clone();
+            FileReader {
+                fingerprint: Box::new(move |path| {
+                    reads.set(reads.get() + 1);
+                    if reads.get() == cancel_at_read.get() {
+                        cancel.cancel();
+                    }
+                    if unreadable.borrow().contains(path) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::PermissionDenied,
+                            "the test denies the read",
+                        ));
+                    }
+                    ids::fingerprint(path)
+                }),
+                tags: Box::new(move |path| {
+                    if untaggable.borrow().contains(path) {
+                        return Err(TagError::UnsupportedExtension(path.to_owned()));
+                    }
+                    tags::read(path)
+                }),
+            }
+        }
+
+        fn scan(&self) -> ScanSummary {
+            self.scan_in_batches_of(DEFAULT_BATCH_SIZE)
+        }
+
+        fn scan_in_batches_of(&self, batch_size: usize) -> ScanSummary {
+            let options = ScanOptions {
+                batch_size,
+                ..ScanOptions::default()
+            };
+            let folders = [self.dir.path().to_path_buf()];
+            scan_with(
+                &self.db,
+                &folders,
+                &self.cancel,
+                false,
+                options,
+                &self.reader(),
+            )
+            .expect("the scan returns a summary")
+        }
+
+        /// Returns the index in the order of the relative paths.
+        fn index(&self) -> Vec<IndexEntry> {
+            let mut index = self.db.with_reader(tracks::load_index).unwrap();
+            index.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
+            index
+        }
+
+        fn id_at(&self, rel_path: &str) -> Option<String> {
+            self.index()
+                .into_iter()
+                .find(|entry| entry.rel_path == rel_path)
+                .map(|entry| entry.id)
+        }
+
+        fn latest_scan(&self) -> scans::Scan {
+            self.db
+                .with_reader(scans::latest)
+                .unwrap()
+                .expect("a scan has run")
+        }
+
+        fn track_at(&self, rel_path: &str) -> Track {
+            let id = self
+                .id_at(rel_path)
+                .unwrap_or_else(|| panic!("no track is at {rel_path}"));
+            self.db
+                .with_reader(|conn| tracks::get_track(conn, &id))
+                .unwrap()
+                .expect("the row exists")
+        }
+    }
+
+    /// Returns the counts of a summary: added, changed, moved, removed.
+    fn counts(summary: &ScanSummary) -> (u64, u64, u64, u64) {
+        (
+            summary.added,
+            summary.changed,
+            summary.moved,
+            summary.removed,
+        )
+    }
+
+    #[test]
+    fn a_moved_file_whose_fingerprint_cannot_be_read_keeps_its_row_until_it_is_read() {
+        let library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2)]);
+        assert_eq!(counts(&library.scan()), (2, 0, 0, 0));
+        let before = library.index();
+        let id = library.id_at("a.wav").unwrap();
+
+        library.rename("a.wav", "moved/a.wav");
+        library
+            .unreadable
+            .borrow_mut()
+            .insert(library.path("moved/a.wav"));
+        let summary = library.scan();
+
+        // The row is not deleted: the file that cannot be read has its size.
+        assert_eq!(counts(&summary), (0, 0, 0, 0));
+        assert_eq!(library.index(), before);
+        assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+        let error = &summary.errors[0];
+        assert!(error.contains("\"moved/a.wav\""), "{error}");
+        assert!(
+            error.contains("cannot be read: the test denies the read"),
+            "{error}"
+        );
+        assert!(
+            error.contains("no track of 244 bytes was deleted"),
+            "{error}"
+        );
+        let scan = library.latest_scan();
+        assert_eq!(scan.error.as_ref(), Some(error));
+
+        // The file can be read again and the row follows it.
+        library.unreadable.borrow_mut().clear();
+        let summary = library.scan();
+        assert_eq!(counts(&summary), (0, 0, 1, 0));
+        assert_eq!(summary.errors, [""; 0]);
+        assert_eq!(library.id_at("moved/a.wav"), Some(id));
+        assert_eq!(library.id_at("a.wav"), None);
+    }
+
+    #[test]
+    fn a_file_that_cannot_be_read_keeps_the_missing_rows_of_its_size_only() {
+        let library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2)]);
+        library.scan();
+        let a = library.id_at("a.wav").unwrap();
+
+        // Both files are gone. A new file has the size of the first one and
+        // cannot be read.
+        fs::remove_file(library.path("a.wav")).unwrap();
+        fs::remove_file(library.path("b.wav")).unwrap();
+        library.write("c.wav", 100, 3);
+        library
+            .unreadable
+            .borrow_mut()
+            .insert(library.path("c.wav"));
+        let summary = library.scan();
+
+        assert_eq!(counts(&summary), (0, 0, 0, 1));
+        assert_eq!(library.id_at("a.wav"), Some(a.clone()));
+        assert_eq!(library.id_at("b.wav"), None);
+        assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+        assert!(summary.errors[0].contains("\"c.wav\""));
+
+        // The new file is read. It is not the first file, whose row goes.
+        library.unreadable.borrow_mut().clear();
+        let summary = library.scan();
+        assert_eq!(counts(&summary), (1, 0, 0, 1));
+        assert_eq!(library.id_at("a.wav"), None);
+        assert_ne!(library.id_at("c.wav"), Some(a));
+    }
+
+    #[test]
+    fn a_changed_file_whose_fingerprint_cannot_be_read_keeps_its_row_as_it_is() {
+        let library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2)]);
+        library.set_mtime("a.wav", 1_000);
+        library.scan();
+        let before = library.track_at("a.wav");
+        let index = library.index();
+
+        library.set_mtime("a.wav", 2_000);
+        library
+            .unreadable
+            .borrow_mut()
+            .insert(library.path("a.wav"));
+        let summary = library.scan();
+
+        assert_eq!(counts(&summary), (0, 0, 0, 0));
+        assert_eq!(summary.tags_read, 0);
+        assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+        assert!(summary.errors[0].contains("\"a.wav\""));
+        assert_eq!(library.track_at("a.wav"), before);
+        assert_eq!(library.index(), index);
+
+        // The file can be read again. Its row takes the new file state.
+        library.unreadable.borrow_mut().clear();
+        let summary = library.scan();
+        assert_eq!(counts(&summary), (0, 1, 0, 0));
+        let after = library.track_at("a.wav");
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.mtime, 2_000);
+    }
+
+    #[test]
+    fn a_moved_file_whose_tags_cannot_be_read_stays_at_its_old_path_until_they_are_read() {
+        let library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2)]);
+        library.scan();
+        let before = library.track_at("a.wav");
+        assert_eq!(before.suffix, "wav");
+
+        // Only the extension changes, so the modification time and the size
+        // of the file are those of the row. The tags are read again because
+        // the suffix and the content type come from the extension.
+        library.rename("a.wav", "a.aiff");
+        library
+            .untaggable
+            .borrow_mut()
+            .insert(library.path("a.aiff"));
+        let summary = library.scan();
+
+        assert_eq!(counts(&summary), (0, 0, 0, 0));
+        assert_eq!(summary.tags_read, 1);
+        assert_eq!(summary.errors, [""; 0]);
+        assert_eq!(library.track_at("a.wav"), before);
+        assert_eq!(library.id_at("a.aiff"), None);
+
+        // The tags can be read again. The row follows the file and takes
+        // the suffix of its new name.
+        library.untaggable.borrow_mut().clear();
+        let summary = library.scan();
+        assert_eq!(counts(&summary), (0, 0, 1, 0));
+        assert_eq!(summary.tags_read, 1);
+        let after = library.track_at("a.aiff");
+        assert_eq!(after.id, before.id);
+        assert_eq!(after.suffix, "aiff");
+        assert_eq!(after.content_type, "audio/aiff");
+        assert_eq!(library.id_at("a.wav"), None);
+    }
+
+    #[test]
+    fn an_exchange_waits_for_the_next_scan_when_the_tags_of_one_file_cannot_be_read() {
+        let library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2)]);
+        library.set_mtime("a.wav", 1_000);
+        library.set_mtime("b.wav", 2_000);
+        library.scan();
+        let before = library.index();
+        let (a, b) = (before[0].id.clone(), before[1].id.clone());
+
+        // The two files exchange their paths and get new modification
+        // times, so the tags of both are read again.
+        library.rename("a.wav", "spare.tmp");
+        library.rename("b.wav", "a.wav");
+        library.rename("spare.tmp", "b.wav");
+        library.set_mtime("a.wav", 3_000);
+        library.set_mtime("b.wav", 4_000);
+        library
+            .untaggable
+            .borrow_mut()
+            .insert(library.path("b.wav"));
+        let summary = library.scan();
+
+        // Neither row moves. One row alone cannot take the path of the
+        // other.
+        assert_eq!(counts(&summary), (0, 0, 0, 0));
+        assert_eq!(library.index(), before);
+
+        library.untaggable.borrow_mut().clear();
+        let summary = library.scan();
+        assert_eq!(counts(&summary), (0, 0, 2, 0));
+        assert_eq!(library.id_at("a.wav"), Some(b));
+        assert_eq!(library.id_at("b.wav"), Some(a));
+    }
+
+    #[test]
+    fn a_file_at_the_old_path_of_a_moved_track_waits_with_the_exchange() {
+        let library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2)]);
+        library.set_mtime("a.wav", 1_000);
+        library.scan();
+        let before = library.index();
+        let a = library.id_at("a.wav").unwrap();
+
+        // The track moves and gets a new modification time, so its tags are
+        // read again. Another file takes its old path.
+        library.rename("a.wav", "moved/a.wav");
+        library.set_mtime("moved/a.wav", 2_000);
+        library.write("a.wav", 300, 3);
+        library.set_mtime("a.wav", 3_000);
+        library
+            .untaggable
+            .borrow_mut()
+            .insert(library.path("moved/a.wav"));
+        let summary = library.scan();
+
+        // The row stays at its old path, so the file there gets no row in
+        // this scan.
+        assert_eq!(counts(&summary), (0, 0, 0, 0));
+        assert_eq!(library.index(), before);
+
+        library.untaggable.borrow_mut().clear();
+        let summary = library.scan();
+        assert_eq!(counts(&summary), (1, 0, 1, 0));
+        assert_eq!(library.id_at("moved/a.wav"), Some(a.clone()));
+        let placed = library.id_at("a.wav").expect("the new file has a row");
+        assert_ne!(placed, a);
+    }
+
+    #[test]
+    fn cancelling_while_the_fingerprints_are_read_stops_the_scan() {
+        let library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2)]);
+        library.scan();
+        let before = library.index();
+
+        // A file is gone, so the scan reads the fingerprint of every new
+        // file before it writes. The second read cancels the scan.
+        fs::remove_file(library.path("a.wav")).unwrap();
+        library.write("c.wav", 300, 3);
+        library.write("d.wav", 400, 4);
+        library.write("e.wav", 500, 5);
+        library.fingerprint_reads.set(0);
+        library.cancel_at_read.set(2);
+        let summary = library.scan_in_batches_of(1);
+
+        assert_eq!(summary.errors, [CANCELLED]);
+        assert_eq!(counts(&summary), (0, 0, 0, 0));
+        // The check before the third read stopped the scan.
+        assert_eq!(library.fingerprint_reads.get(), 2);
+        assert_eq!(library.index(), before);
+        let scan = library.latest_scan();
+        assert_eq!(scan.error.as_deref(), Some(CANCELLED));
     }
 }
