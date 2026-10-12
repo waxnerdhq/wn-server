@@ -267,7 +267,7 @@ impl ScanController {
 
     /// Cancels the token of the settings and waits for the periodic scans
     /// and for the running scan to end. The scanner stops during its walk,
-    /// during its fingerprint pass or between two batches, and stores
+    /// before its next file read or between two batches, and stores
     /// `cancelled` as the error of the scan.
     pub async fn stop(&self) {
         self.inner.settings.cancel.cancel();

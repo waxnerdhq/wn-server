@@ -153,11 +153,13 @@ pub struct ScanSummary {
 ///
 /// The function blocks. An async caller runs it with
 /// `tokio::task::spawn_blocking`. `cancel` is checked during the walk,
-/// while the fingerprints are read and between batches. A cancelled scan
-/// keeps the batches it committed, deletes nothing and returns a summary
-/// whose last error is [`CANCELLED`]. It deletes no album, no artist and no
-/// annotation and sets no cover. It recomputes the counts, so that they
-/// describe the tracks it stored.
+/// before each read of a fingerprint or of the tags of a file, and between
+/// batches. After the cancellation the scan finishes at most the file read
+/// that is in progress. A cancelled scan keeps the batches it committed,
+/// stores nothing of the batch it was reading, deletes nothing and returns a
+/// summary whose last error is [`CANCELLED`]. It deletes no album, no artist
+/// and no annotation and sets no cover. It recomputes the counts, so that
+/// they describe the tracks it stored.
 ///
 /// # Errors
 ///
@@ -298,6 +300,16 @@ fn begin(conn: &mut Connection, paths: &[PathBuf]) -> Result<Start> {
 /// How a scan ended when no database error stopped it.
 enum Outcome {
     Completed,
+    Cancelled,
+}
+
+/// What [`Scanner::apply`] did with a batch.
+#[must_use]
+enum Applied {
+    /// The batch is committed.
+    Stored,
+    /// The scan was cancelled while the files of the batch were read.
+    /// Nothing of the batch is stored.
     Cancelled,
 }
 
@@ -755,7 +767,9 @@ impl Scanner<'_> {
             if self.cancel.is_cancelled() {
                 return Ok(Outcome::Cancelled);
             }
-            self.apply(index, &states, exchange)?;
+            if let Applied::Cancelled = self.apply(index, &states, exchange)? {
+                return Ok(Outcome::Cancelled);
+            }
         }
         let batch_size = self.options.batch_size.max(1);
         let mut rest = rest.into_iter();
@@ -767,7 +781,9 @@ impl Scanner<'_> {
             if self.cancel.is_cancelled() {
                 return Ok(Outcome::Cancelled);
             }
-            self.apply(index, &states, batch)?;
+            if let Applied::Cancelled = self.apply(index, &states, batch)? {
+                return Ok(Outcome::Cancelled);
+            }
         }
         if self.cancel.is_cancelled() {
             return Ok(Outcome::Cancelled);
@@ -1116,14 +1132,14 @@ impl Scanner<'_> {
     /// Reads the fingerprint of every changed and every new file. Returns
     /// the updates of the rows whose file kept its fingerprint, and the
     /// candidates. Marks the rows whose file has another fingerprint as
-    /// displaced. Returns `None` when the scan is cancelled.
+    /// displaced. The token is checked before each read. Returns `None`
+    /// when the scan is cancelled.
     fn fingerprints(
         &mut self,
         found: Found,
         index: &[IndexEntry],
         states: &mut [RowState],
     ) -> Option<(Vec<Op>, Vec<Candidate>)> {
-        let batch_size = self.options.batch_size.max(1);
         let mut updates = Vec::new();
         let mut candidates = Vec::new();
         let changed = found
@@ -1131,8 +1147,8 @@ impl Scanner<'_> {
             .into_iter()
             .map(|(row, file)| (Some(row), file));
         let new = found.new.into_iter().map(|file| (None, file));
-        for (position, (row, file)) in changed.chain(new).enumerate() {
-            if position % batch_size == 0 && self.cancel.is_cancelled() {
+        for (row, file) in changed.chain(new) {
+            if self.cancel.is_cancelled() {
                 return None;
             }
             let Some(fingerprint) = self.read_fingerprint(&file) else {
@@ -1167,13 +1183,25 @@ impl Scanner<'_> {
     /// Reads what the changes of one batch need from the files, stores the
     /// changes in one transaction and runs the batch hook.
     ///
+    /// The token is checked before each read of a fingerprint and before
+    /// each read of tags. When it is cancelled, the function returns
+    /// [`Applied::Cancelled`]: it reads no further file, stores no change
+    /// of the batch and does not run the hook. A batch is therefore stored
+    /// whole or not at all, which the exchange batch needs, and the next
+    /// scan finds the changes of the batch again.
+    ///
     /// A change whose tags cannot be read is left out, and the next scan
     /// finds it again: a new file gets no row, a changed file leaves its row
     /// as it is, and a moved file does not get its row. The row of the moved
     /// file stays at its old path when no file is there. When another file
     /// is there, which is the case for a displaced row, the row gets its
     /// placeholder path and the scan records an error.
-    fn apply(&mut self, index: &[IndexEntry], states: &[RowState], batch: Vec<Op>) -> Result<()> {
+    fn apply(
+        &mut self,
+        index: &[IndexEntry],
+        states: &[RowState],
+        batch: Vec<Op>,
+    ) -> Result<Applied> {
         let mut writes = Vec::with_capacity(batch.len());
         let mut files = 0;
         // The messages about the rows that get their placeholder path.
@@ -1196,6 +1224,9 @@ impl Scanner<'_> {
                     file,
                     fingerprint,
                 } => {
+                    if self.cancel.is_cancelled() {
+                        return Ok(Applied::Cancelled);
+                    }
                     files += 1;
                     if let Some(meta) = self.read_tags(&file) {
                         writes.push(Write::Update {
@@ -1207,6 +1238,9 @@ impl Scanner<'_> {
                     }
                 }
                 Op::Relink { row, file, reread } => {
+                    if reread && self.cancel.is_cancelled() {
+                        return Ok(Applied::Cancelled);
+                    }
                     files += 1;
                     let known = &index[row];
                     let meta = if reread { self.read_tags(&file) } else { None };
@@ -1233,10 +1267,23 @@ impl Scanner<'_> {
                     });
                 }
                 Op::Insert { file, fingerprint } => {
+                    if self.cancel.is_cancelled() {
+                        return Ok(Applied::Cancelled);
+                    }
                     files += 1;
-                    let Some(fingerprint) = fingerprint.or_else(|| self.read_fingerprint(&file))
-                    else {
-                        continue;
+                    let fingerprint = match fingerprint {
+                        Some(fingerprint) => fingerprint,
+                        None => {
+                            let Some(fingerprint) = self.read_fingerprint(&file) else {
+                                continue;
+                            };
+                            // The fingerprint read is a file read of its
+                            // own, so the tag read has a check of its own.
+                            if self.cancel.is_cancelled() {
+                                return Ok(Applied::Cancelled);
+                            }
+                            fingerprint
+                        }
                     };
                     if let Some(meta) = self.read_tags(&file) {
                         writes.push(Write::Insert {
@@ -1261,7 +1308,7 @@ impl Scanner<'_> {
         if let Some(on_batch) = &self.options.on_batch {
             on_batch();
         }
-        Ok(())
+        Ok(Applied::Stored)
     }
 
     /// Deletes the rows whose file is gone, and the folder rows that are no
@@ -3750,6 +3797,13 @@ mod tests {
         /// The fingerprint read, counted from 1, that cancels the scan. No
         /// read cancels it while the value is 0.
         cancel_at_read: Rc<Cell<usize>>,
+        /// The number of tag reads so far.
+        tag_reads: Rc<Cell<usize>>,
+        /// The tag read, counted from 1, that cancels the scan. No read
+        /// cancels it while the value is 0.
+        cancel_at_tag_read: Rc<Cell<usize>>,
+        /// The number of batches whose hook ran, in every scan so far.
+        batches: Arc<AtomicU64>,
     }
 
     impl Library {
@@ -3765,6 +3819,9 @@ mod tests {
                 tagged: Rc::default(),
                 fingerprint_reads: Rc::default(),
                 cancel_at_read: Rc::default(),
+                tag_reads: Rc::default(),
+                cancel_at_tag_read: Rc::default(),
+                batches: Arc::default(),
             };
             for (rel_path, samples, fill) in files {
                 library.write(rel_path, *samples, *fill);
@@ -3809,7 +3866,9 @@ mod tests {
 
         /// Returns a reader of the files on disk that fails for the paths
         /// in `unreadable` and `untaggable` and reports the tags in
-        /// `tagged`.
+        /// `tagged`. It counts its reads, and it cancels the scan during
+        /// the read that `cancel_at_read` or `cancel_at_tag_read` names.
+        /// That read returns what it read.
         fn reader(&self) -> FileReader {
             let unreadable = Rc::clone(&self.unreadable);
             let untaggable = Rc::clone(&self.untaggable);
@@ -3817,6 +3876,9 @@ mod tests {
             let reads = Rc::clone(&self.fingerprint_reads);
             let cancel_at_read = Rc::clone(&self.cancel_at_read);
             let cancel = self.cancel.clone();
+            let tag_reads = Rc::clone(&self.tag_reads);
+            let cancel_at_tag_read = Rc::clone(&self.cancel_at_tag_read);
+            let cancel_tags = self.cancel.clone();
             FileReader {
                 fingerprint: Box::new(move |path| {
                     reads.set(reads.get() + 1);
@@ -3832,6 +3894,10 @@ mod tests {
                     ids::fingerprint(path)
                 }),
                 tags: Box::new(move |path| {
+                    tag_reads.set(tag_reads.get() + 1);
+                    if tag_reads.get() == cancel_at_tag_read.get() {
+                        cancel_tags.cancel();
+                    }
                     if untaggable.borrow().contains(path) {
                         return Err(TagError::UnsupportedExtension(path.to_owned()));
                     }
@@ -3851,8 +3917,12 @@ mod tests {
         }
 
         fn scan_in_batches_of(&self, batch_size: usize) -> ScanSummary {
+            let batches = Arc::clone(&self.batches);
             let options = ScanOptions {
                 batch_size,
+                on_batch: Some(Box::new(move || {
+                    batches.fetch_add(1, Ordering::SeqCst);
+                })),
                 ..ScanOptions::default()
             };
             let folders = [self.dir.path().to_path_buf()];
@@ -4439,5 +4509,300 @@ mod tests {
         assert_eq!(library.index(), before);
         let scan = library.latest_scan();
         assert_eq!(scan.error.as_deref(), Some(CANCELLED));
+    }
+
+    #[test]
+    fn cancelling_during_the_fingerprint_pass_stops_before_the_next_read_within_a_batch() {
+        let library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2)]);
+        library.scan();
+        let before = library.index();
+
+        // A file is gone, so the scan reads the fingerprint of every new
+        // file before it writes. The four new files are fewer than one
+        // batch of five, so no position after the first is a multiple of
+        // the batch size. The second read cancels the scan.
+        fs::remove_file(library.path("a.wav")).unwrap();
+        library.write("c.wav", 300, 3);
+        library.write("d.wav", 400, 4);
+        library.write("e.wav", 500, 5);
+        library.write("f.wav", 600, 6);
+        library.fingerprint_reads.set(0);
+        library.tag_reads.set(0);
+        library.cancel_at_read.set(2);
+        let summary = library.scan_in_batches_of(5);
+
+        assert_eq!(summary.errors, [CANCELLED]);
+        // The check before the third read stopped the scan.
+        assert_eq!(library.fingerprint_reads.get(), 2);
+        assert_eq!(library.tag_reads.get(), 0);
+        assert_eq!(summary.tags_read, 0);
+        assert_eq!(counts(&summary), (0, 0, 0, 0));
+        assert_eq!(library.index(), before);
+        assert_eq!(library.latest_scan().error.as_deref(), Some(CANCELLED));
+    }
+
+    /// The relative paths of the rows of `index`.
+    fn paths(index: &[IndexEntry]) -> Vec<&str> {
+        index.iter().map(|entry| entry.rel_path.as_str()).collect()
+    }
+
+    #[test]
+    fn cancelling_within_a_batch_stores_no_row_of_it_and_the_next_scan_stores_them() {
+        // Twelve new files of twelve sizes. The database has no row, so the
+        // scan skips the fingerprint pass and reads the fingerprint and
+        // then the tags of each file when it comes to the batch of the file.
+        const FILES: [(&str, u32, u8); 12] = [
+            ("01.wav", 100, 1),
+            ("02.wav", 200, 2),
+            ("03.wav", 300, 3),
+            ("04.wav", 400, 4),
+            ("05.wav", 500, 5),
+            ("06.wav", 600, 6),
+            ("07.wav", 700, 7),
+            ("08.wav", 800, 8),
+            ("09.wav", 900, 9),
+            ("10.wav", 1000, 10),
+            ("11.wav", 1100, 11),
+            ("12.wav", 1200, 12),
+        ];
+        let names: Vec<&str> = FILES.iter().map(|file| file.0).collect();
+        let mut library = Library::new(&FILES);
+
+        // The batches hold five files. The seventh tag read is the second
+        // one of the second batch, and it cancels the scan.
+        library.cancel_at_tag_read.set(7);
+        let summary = library.scan_in_batches_of(5);
+
+        assert_eq!(summary.errors, [CANCELLED]);
+        // The five reads of the first batch and two reads of the second.
+        assert_eq!(summary.tags_read, 7);
+        // The check before the third file of the batch stopped the scan:
+        // neither the fingerprint nor the tags of that file were read.
+        assert_eq!(library.tag_reads.get(), 7);
+        assert_eq!(library.fingerprint_reads.get(), 7);
+        // The first batch is stored. No row of the second batch is, and
+        // the hook did not run for it.
+        assert_eq!(counts(&summary), (5, 0, 0, 0));
+        let stored = library.index();
+        assert_eq!(paths(&stored), names[..5]);
+        assert_eq!(library.batches.load(Ordering::SeqCst), 1);
+        let scan = library.latest_scan();
+        assert_eq!(scan.error.as_deref(), Some(CANCELLED));
+        assert_eq!((scan.counts.added, scan.counts.removed), (5, 0));
+
+        // The next scan stores the two files that the cancelled scan had
+        // read and the five that it had not, and it keeps the five rows.
+        library.cancel = CancellationToken::new();
+        library.cancel_at_tag_read.set(0);
+        let summary = library.scan_in_batches_of(5);
+        assert_eq!(summary.errors, [""; 0]);
+        assert_eq!(counts(&summary), (7, 0, 0, 0));
+        assert_eq!(summary.tags_read, 7);
+        let complete = library.index();
+        assert_eq!(paths(&complete), names);
+        assert_eq!(complete[..5], stored[..]);
+        // The batches of five and of two files.
+        assert_eq!(library.batches.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn cancelling_during_the_fingerprint_read_of_a_batch_stops_before_the_tags_of_the_file() {
+        // The database has no row, so the fingerprint of each file is read
+        // in its batch, before its tags. The second fingerprint read
+        // cancels the scan.
+        let library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2), ("c.wav", 300, 3)]);
+        library.cancel_at_read.set(2);
+        let summary = library.scan_in_batches_of(5);
+
+        assert_eq!(summary.errors, [CANCELLED]);
+        assert_eq!(library.fingerprint_reads.get(), 2);
+        // The tags of the first file were read. The check after the second
+        // fingerprint read stopped the scan before the tags of that file.
+        assert_eq!(library.tag_reads.get(), 1);
+        assert_eq!(summary.tags_read, 1);
+        assert_eq!(counts(&summary), (0, 0, 0, 0));
+        assert_eq!(library.index(), []);
+        assert_eq!(library.batches.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn cancelling_within_a_batch_of_changed_files_leaves_every_row_as_it_is() {
+        let mut library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2), ("c.wav", 300, 3)]);
+        for name in ["a.wav", "b.wav", "c.wav"] {
+            library.set_mtime(name, 1_000);
+        }
+        library.scan();
+        let before = library.index();
+
+        // Each file has a new modification time and its old content, so
+        // each row is updated in place from the tags of its file. The
+        // second tag read cancels the scan.
+        for name in ["a.wav", "b.wav", "c.wav"] {
+            library.set_mtime(name, 2_000);
+        }
+        library.tag_reads.set(0);
+        library.cancel_at_tag_read.set(2);
+        let summary = library.scan_in_batches_of(5);
+
+        assert_eq!(summary.errors, [CANCELLED]);
+        assert_eq!(library.tag_reads.get(), 2);
+        assert_eq!(counts(&summary), (0, 0, 0, 0));
+        assert_eq!(library.index(), before);
+
+        library.cancel = CancellationToken::new();
+        library.cancel_at_tag_read.set(0);
+        let summary = library.scan_in_batches_of(5);
+        assert_eq!(summary.errors, [""; 0]);
+        assert_eq!(counts(&summary), (0, 3, 0, 0));
+    }
+
+    #[test]
+    fn cancelling_within_a_batch_of_moved_files_moves_no_row() {
+        let mut library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2), ("c.wav", 300, 3)]);
+        library.scan();
+        let before = library.index();
+
+        // Each file moves and gets a new modification time, so each row
+        // follows its file and the tags of the file are read again. The
+        // second tag read cancels the scan.
+        for name in ["a.wav", "b.wav", "c.wav"] {
+            let moved = format!("moved/{name}");
+            library.rename(name, &moved);
+            library.set_mtime(&moved, 2_000);
+        }
+        library.tag_reads.set(0);
+        library.cancel_at_tag_read.set(2);
+        let summary = library.scan_in_batches_of(5);
+
+        assert_eq!(summary.errors, [CANCELLED]);
+        assert_eq!(library.tag_reads.get(), 2);
+        // No row moved, and none was deleted, although no file is at the
+        // path of a row.
+        assert_eq!(counts(&summary), (0, 0, 0, 0));
+        assert_eq!(library.index(), before);
+
+        library.cancel = CancellationToken::new();
+        library.cancel_at_tag_read.set(0);
+        let summary = library.scan_in_batches_of(5);
+        assert_eq!(summary.errors, [""; 0]);
+        assert_eq!(counts(&summary), (0, 0, 3, 0));
+        let ids = |index: &[IndexEntry]| -> Vec<String> {
+            index.iter().map(|entry| entry.id.clone()).collect()
+        };
+        assert_eq!(ids(&library.index()), ids(&before));
+    }
+
+    #[test]
+    fn a_scan_that_is_cancelled_within_a_batch_deletes_no_row() {
+        let mut library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2)]);
+        library.scan();
+        let before = library.index();
+        let b = library.id_at("b.wav").unwrap();
+
+        // The file of a row is gone, and three files of other sizes are
+        // new. A scan that completes inserts the three and deletes the row.
+        // This one is cancelled by the second tag read of its one batch.
+        fs::remove_file(library.path("a.wav")).unwrap();
+        library.write("c.wav", 300, 3);
+        library.write("d.wav", 400, 4);
+        library.write("e.wav", 500, 5);
+        library.tag_reads.set(0);
+        library.cancel_at_tag_read.set(2);
+        let summary = library.scan_in_batches_of(5);
+
+        assert_eq!(summary.errors, [CANCELLED]);
+        assert_eq!(library.tag_reads.get(), 2);
+        assert_eq!(summary.tags_read, 2);
+        // The scan did not read every file, so it does not know that the
+        // file of the row is gone. It stored nothing and deleted nothing.
+        assert_eq!(counts(&summary), (0, 0, 0, 0));
+        assert_eq!(library.index(), before);
+
+        // The next scan reads every file and does both.
+        library.cancel = CancellationToken::new();
+        library.cancel_at_tag_read.set(0);
+        let summary = library.scan_in_batches_of(5);
+        assert_eq!(summary.errors, [""; 0]);
+        assert_eq!(counts(&summary), (3, 0, 0, 1));
+        assert_eq!(
+            paths(&library.index()),
+            ["b.wav", "c.wav", "d.wav", "e.wav"]
+        );
+        assert_eq!(library.id_at("b.wav"), Some(b));
+    }
+
+    #[test]
+    fn a_scan_that_is_cancelled_by_its_last_file_read_stores_the_batch_and_deletes_no_row() {
+        let mut library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2)]);
+        library.scan();
+        let a = library.id_at("a.wav").unwrap();
+
+        // The file of a row is gone, and three files of other sizes are
+        // new. The third tag read is the last file read of the scan, and
+        // it cancels the scan.
+        fs::remove_file(library.path("a.wav")).unwrap();
+        library.write("c.wav", 300, 3);
+        library.write("d.wav", 400, 4);
+        library.write("e.wav", 500, 5);
+        library.tag_reads.set(0);
+        library.cancel_at_tag_read.set(3);
+        let summary = library.scan_in_batches_of(5);
+
+        // The batch was read in full, so it is stored. The scan is a
+        // cancelled scan all the same, and a cancelled scan deletes no row.
+        assert_eq!(summary.errors, [CANCELLED]);
+        assert_eq!(library.tag_reads.get(), 3);
+        assert_eq!(counts(&summary), (3, 0, 0, 0));
+        assert_eq!(library.id_at("a.wav"), Some(a));
+        assert_eq!(library.index().len(), 5);
+
+        // The next scan deletes the row.
+        library.cancel = CancellationToken::new();
+        library.cancel_at_tag_read.set(0);
+        let summary = library.scan_in_batches_of(5);
+        assert_eq!(summary.errors, [""; 0]);
+        assert_eq!(counts(&summary), (0, 0, 0, 1));
+        assert_eq!(library.id_at("a.wav"), None);
+    }
+
+    #[test]
+    fn cancelling_within_the_exchange_batch_stores_none_of_its_changes() {
+        let mut library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2)]);
+        library.set_mtime("a.wav", 1_000);
+        library.set_mtime("b.wav", 2_000);
+        library.scan();
+        let before = library.index();
+        let a = library.id_at("a.wav").unwrap();
+        let b = library.id_at("b.wav").unwrap();
+
+        // Each file moves, and a new file takes its path. Both rows are
+        // displaced, so the exchange batch holds four changes: the new row
+        // of each new file, and the move of each row to its file.
+        library.rename("a.wav", "moved/a.wav");
+        library.rename("b.wav", "moved/b.wav");
+        library.write("a.wav", 300, 3);
+        library.write("b.wav", 400, 4);
+        // The tags of the two new files are read. The first read cancels
+        // the scan.
+        library.tag_reads.set(0);
+        library.cancel_at_tag_read.set(1);
+        let summary = library.scan();
+
+        assert_eq!(summary.errors, [CANCELLED]);
+        assert_eq!(library.tag_reads.get(), 1);
+        // No change of the batch is stored: each row is at its old path
+        // with its old fingerprint, and no row is new.
+        assert_eq!(counts(&summary), (0, 0, 0, 0));
+        assert_eq!(library.index(), before);
+
+        // The next scan stores the whole batch. Each row follows its file.
+        library.cancel = CancellationToken::new();
+        library.cancel_at_tag_read.set(0);
+        let summary = library.scan();
+        assert_eq!(summary.errors, [""; 0]);
+        assert_eq!(counts(&summary), (2, 0, 2, 0));
+        assert_eq!(library.id_at("moved/a.wav"), Some(a));
+        assert_eq!(library.id_at("moved/b.wav"), Some(b));
+        assert_eq!(library.index().len(), 4);
     }
 }
