@@ -20,6 +20,20 @@ pub const FAKE_TRANSCODE: &[u8] = b"the bytes of a transcode";
 /// The size of the chunks in which a [`FakeTranscoder`] yields its bytes.
 pub const FAKE_CHUNK: usize = 4096;
 
+/// A value of `transcoding.ffmpeg` that names no program: a path in the
+/// directory of the audio fixtures, which holds no such file.
+///
+/// A test that runs `run_server` sets it. The server then probes this path
+/// and starts no program, so the test does not depend on whether the
+/// machine has ffmpeg, and the default suite starts no ffmpeg.
+pub fn no_ffmpeg() -> String {
+    super::fixtures_dir()
+        .join("no-ffmpeg")
+        .to_str()
+        .expect("a Unicode path")
+        .to_owned()
+}
+
 /// An error that a [`FakeTranscoder`] returns in place of a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FakeFailure {
@@ -36,6 +50,7 @@ struct State {
     bytes: Vec<u8>,
     failure: Option<FakeFailure>,
     stays_open: bool,
+    known_length: bool,
     jobs: Vec<TranscodeJob>,
 }
 
@@ -57,6 +72,7 @@ impl Default for FakeTranscoder {
                 bytes: FAKE_TRANSCODE.to_vec(),
                 failure: None,
                 stays_open: false,
+                known_length: false,
                 jobs: Vec::new(),
             }),
             open: Arc::new(AtomicUsize::new(0)),
@@ -86,6 +102,15 @@ impl FakeTranscoder {
     /// when it is dropped.
     pub fn stay_open(&self) {
         self.state().stays_open = true;
+    }
+
+    /// Makes the streams that start from now on bodies of a known length:
+    /// one piece of the bytes, as `Body::from` builds it. A layer of the
+    /// server adds `Content-Length` to a response with such a body, unless
+    /// the handler builds the body of the response anew. Such a stream is
+    /// not counted by [`FakeTranscoder::open_streams`].
+    pub fn known_length(&self) {
+        self.state().known_length = true;
     }
 
     /// The jobs for which the transcoder started a stream, in their order.
@@ -131,6 +156,12 @@ impl Transcoder for FakeTranscoder {
             }
             let content_type = job.target.content_type();
             state.jobs.push(job);
+            if state.known_length {
+                return Ok(TranscodeStream {
+                    body: Body::from(state.bytes.clone()),
+                    content_type,
+                });
+            }
 
             let chunks: Vec<io::Result<Bytes>> = state
                 .bytes

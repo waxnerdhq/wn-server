@@ -21,6 +21,24 @@
 //! [`FfmpegTranscoder`] therefore starts no process for a path that is not
 //! absolute.
 //!
+//! # What ffmpeg may open
+//!
+//! ffmpeg decides the format of its input from the content of the file and
+//! not from its name. A file with the name of an audio file can therefore be
+//! a playlist or a script, which names other files and URLs for ffmpeg to
+//! open. Two input options keep a file of the library from making ffmpeg
+//! read another file or open a network connection:
+//!
+//! - `-protocol_whitelist file` ([`PROTOCOLS`]): ffmpeg opens the input, and
+//!   whatever the input names, through the `file` protocol only. That
+//!   excludes every network protocol and the protocols that wrap another
+//!   resource, such as `concat:`, `subfile:` and `data:`.
+//! - `-format_whitelist` with [`DEMUXERS`]: ffmpeg reads the input only with
+//!   the demuxer of an audio container that the scanner supports. It
+//!   refuses a file whose content is anything else, which includes every
+//!   playlist and script format. None of the listed demuxers opens another
+//!   file under the defaults of ffmpeg.
+//!
 //! # How many processes run
 //!
 //! A semaphore has one permit for each process that may run
@@ -32,17 +50,25 @@
 //!
 //! # How the process ends
 //!
-//! The body of the response owns the process. The process is killed when
-//! the body is dropped, which is what a client that disconnects causes, and
-//! when its output has ended. A task then waits for the process, so that
-//! the system keeps no entry for it, and returns the permit.
+//! The body of the response owns the process.
+//!
+//! - When the body is dropped before the output has ended, which is what a
+//!   client that disconnects causes, the process is killed.
+//! - When the output has ended, the process ends by itself. A process that
+//!   has not ended after [`EXIT_WAIT`] is killed.
+//!
+//! A task then waits for the process, so that the system keeps no entry for
+//! it, and returns the permit. A process that ended by itself with a
+//! failure status is logged once, at `warn`, with the status and the ID of
+//! the track ([`ProcessEnd`]). A process that the server killed is not a
+//! failure.
 
 use std::ffi::OsString;
 use std::future::Future;
 use std::io;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::process::Stdio;
+use std::process::{ExitStatus, Stdio};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -74,9 +100,40 @@ const VERSION_CHARS: usize = 100;
 /// in bytes. A longer line is logged in pieces.
 const STDERR_LINE_LIMIT: u64 = 1024;
 
-/// One transcode: the file, the format, the bitrate and the start.
+/// The longest time a process may take to end after its output has ended.
+/// ffmpeg ends at once after it closed its output. A process that has not
+/// ended by then is killed, so that it does not hold its permit.
+const EXIT_WAIT: Duration = Duration::from_secs(5);
+
+/// The value of `-protocol_whitelist`: the protocols through which ffmpeg
+/// may open the input and what the input names. The file of a track is a
+/// local file, so the one protocol is `file`.
+pub const PROTOCOLS: &str = "file";
+
+/// The value of `-format_whitelist`: the ffmpeg demuxers of the audio
+/// containers that the scanner supports (`docs/design.md` section 1.3), as
+/// `ffmpeg -demuxers` names them.
+///
+/// | Suffix | Demuxer |
+/// |---|---|
+/// | `aac` | `aac`, raw ADTS AAC |
+/// | `aif`, `aiff` | `aiff` |
+/// | `flac` | `flac` |
+/// | `m4a` | `mov`, which ffmpeg lists as `mov,mp4,m4a,3gp,3g2,mj2` |
+/// | `mp3` | `mp3` |
+/// | `ogg`, `opus` | `ogg` |
+/// | `wav` | `wav` |
+///
+/// ffmpeg matches an entry of the list against each name of a demuxer, so
+/// `mov` allows the demuxer of MP4 files.
+pub const DEMUXERS: &str = "aac,aiff,flac,mov,mp3,ogg,wav";
+
+/// One transcode: the track, the file, the format, the bitrate and the
+/// start.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TranscodeJob {
+    /// The ID of the track. The transcoder names it in its log.
+    pub track: String,
     /// The absolute path of the file.
     pub path: PathBuf,
     /// The format of the stream.
@@ -176,13 +233,17 @@ impl FfmpegTranscoder {
     /// arguments (`docs/design.md` section 3.9).
     ///
     /// ```text
-    /// ffmpeg -nostdin -v error [-ss <offset>] -i <path> -map 0:a:0 -vn -c:a <codec> -b:a <N>k -f <format> -
+    /// ffmpeg -nostdin -v error -protocol_whitelist file -format_whitelist <demuxers>
+    ///     [-ss <offset>] -i <path> -map 0:a:0 -vn -c:a <codec> -b:a <N>k -f <format> -
     /// ```
     ///
-    /// The program and the path are one element each. `-ss` precedes `-i`,
-    /// so ffmpeg seeks in the input, and it is absent for a stream that
-    /// starts at the start of the track. The last argument writes the stream
-    /// to the standard output.
+    /// The program and the path are one element each. The options between
+    /// `-v error` and `-i` are input options: ffmpeg applies an option to
+    /// the next file of the command line, so they precede `-i`. The two
+    /// whitelists are [`PROTOCOLS`] and [`DEMUXERS`]. With `-ss` before `-i`
+    /// ffmpeg seeks in the input, and the option is absent for a stream
+    /// that starts at the start of the track. The last argument writes the
+    /// stream to the standard output.
     pub fn argv(&self, job: &TranscodeJob) -> Vec<OsString> {
         let mut argv = vec![self.bin.clone()];
         argv.extend(arguments(job));
@@ -205,10 +266,14 @@ impl FfmpegTranscoder {
     /// permit builds no command and starts no process. The process reads
     /// nothing from its standard input. Its error output is logged at
     /// `debug` when that level is on, and is discarded otherwise.
+    ///
+    /// `report` is called once, with how the process ended, when the process
+    /// is gone. It is not called for a job that started no process.
     async fn start(
         &self,
         command: impl FnOnce() -> Command,
         content_type: &'static str,
+        report: Report,
     ) -> Result<TranscodeStream, TranscodeError> {
         let acquire = Arc::clone(&self.semaphore).acquire_owned();
         let permit = match tokio::time::timeout(self.permit_wait, acquire).await {
@@ -244,12 +309,37 @@ impl FfmpegTranscoder {
         }
         let output = ChildOutput {
             stdout: ReaderStream::new(stdout),
-            process: Some(Process { child, permit }),
+            process: Some(Process {
+                child,
+                permit,
+                report,
+            }),
         };
         Ok(TranscodeStream {
             body: Body::from_stream(output),
             content_type,
         })
+    }
+
+    /// Starts ffmpeg for `job` and calls `report` when its process is gone
+    /// (see [`Transcoder::spawn`] for the errors).
+    async fn run(
+        &self,
+        job: &TranscodeJob,
+        report: Report,
+    ) -> Result<TranscodeStream, TranscodeError> {
+        if !self.available {
+            return Err(TranscodeError::Unavailable);
+        }
+        if !job.path.is_absolute() {
+            let error = io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the path of the file is not absolute",
+            );
+            return Err(TranscodeError::Spawn(error));
+        }
+        let content_type = job.target.content_type();
+        self.start(|| self.command(job), content_type, report).await
     }
 }
 
@@ -260,20 +350,14 @@ impl Transcoder for FfmpegTranscoder {
     /// whose probe failed. [`TranscodeError::Spawn`] answers a path that is
     /// not absolute, before a permit is taken (see the module comment), and
     /// a process that the system does not start.
+    ///
+    /// A process that ends by itself with a failure status is logged at
+    /// `warn` with the status and the ID of the track ([`log_end`]).
     fn spawn(&self, job: TranscodeJob) -> TranscodeFuture<'_> {
         Box::pin(async move {
-            if !self.available {
-                return Err(TranscodeError::Unavailable);
-            }
-            if !job.path.is_absolute() {
-                let error = io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "the path of the file is not absolute",
-                );
-                return Err(TranscodeError::Spawn(error));
-            }
-            let content_type = job.target.content_type();
-            self.start(|| self.command(&job), content_type).await
+            let track = job.track.clone();
+            let report: Report = Box::new(move |end| log_end(&track, end));
+            self.run(&job, report).await
         })
     }
 }
@@ -284,7 +368,17 @@ fn arguments(job: &TranscodeJob) -> Vec<OsString> {
         Target::Opus => ("libopus", "ogg"),
         Target::Mp3 => ("libmp3lame", "mp3"),
     };
-    let mut arguments: Vec<OsString> = ["-nostdin", "-v", "error"].map(OsString::from).to_vec();
+    let mut arguments: Vec<OsString> = [
+        "-nostdin",
+        "-v",
+        "error",
+        "-protocol_whitelist",
+        PROTOCOLS,
+        "-format_whitelist",
+        DEMUXERS,
+    ]
+    .map(OsString::from)
+    .to_vec();
     if job.offset_s > 0 {
         arguments.push("-ss".into());
         arguments.push(job.offset_s.to_string().into());
@@ -365,10 +459,51 @@ async fn log_error_output(stderr: ChildStderr) {
     }
 }
 
-/// A transcode process and the permit under which it runs.
+/// How a transcode process ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProcessEnd {
+    /// The process ended by itself, with this status.
+    Exited(ExitStatus),
+    /// The server killed the process: the body was dropped before the
+    /// output had ended, or the process did not end after its output.
+    Killed,
+}
+
+/// Receives how the process of one stream ended. It is called once.
+type Report = Box<dyn FnOnce(ProcessEnd) + Send>;
+
+/// The status with which a transcode process failed: the status of a
+/// process that ended by itself without success. A process that the server
+/// killed did not fail, whatever status the system reports for it.
+fn failure(end: ProcessEnd) -> Option<ExitStatus> {
+    match end {
+        ProcessEnd::Exited(status) if !status.success() => Some(status),
+        ProcessEnd::Exited(_) | ProcessEnd::Killed => None,
+    }
+}
+
+/// The [`Report`] of the transcoder: logs the end of the process of the
+/// track `track`. A failure ([`failure`]) is one line at `warn` with the
+/// status and the ID of the track. The stream of such a process is empty or
+/// incomplete, and the response was HTTP 200 when ffmpeg failed.
+fn log_end(track: &str, end: ProcessEnd) {
+    match failure(end) {
+        Some(status) => tracing::warn!(
+            %track,
+            %status,
+            "ffmpeg ended with a failure, and the stream of the track is empty or incomplete. \
+             The messages of ffmpeg are logged at the debug level"
+        ),
+        None => tracing::debug!(%track, ?end, "the transcode process has ended"),
+    }
+}
+
+/// A transcode process, the permit under which it runs and the receiver of
+/// its end.
 struct Process {
     child: Child,
     permit: OwnedSemaphorePermit,
+    report: Report,
 }
 
 /// The standard output of a transcode process as a stream of chunks. The
@@ -380,32 +515,87 @@ struct ChildOutput {
 }
 
 impl ChildOutput {
-    /// Kills the process and hands it to a task that waits for it and then
-    /// returns the permit. The first call does this, and a later call does
-    /// nothing.
+    /// Lets go of the process. The first call does this, and a later call
+    /// does nothing. `output_ended` says whether the process has closed its
+    /// output.
     ///
-    /// The wait is what lets the system release the process, so the permit
-    /// returns when the process is gone and not while it ends. Without a
-    /// runtime there is no task: the process is killed, and the permit
-    /// returns at once.
-    fn release(&mut self) {
-        let Some(Process { mut child, permit }) = self.process.take() else {
+    /// - A process that has ended is waited for here, and its status is
+    ///   reported.
+    /// - A process that runs although the body is dropped is killed.
+    /// - A process whose output has ended is about to end by itself.
+    ///
+    /// In the last two cases a task waits for the process, reports its end
+    /// and then returns the permit. The wait is what lets the system
+    /// release the process, so the permit returns when the process is gone
+    /// and not while it ends. Without a runtime there is no task: the
+    /// process is killed, and the permit returns at once.
+    fn release(&mut self, output_ended: bool) {
+        let Some(process) = self.process.take() else {
             return;
         };
-        if let Err(error) = child.start_kill() {
-            // The process has ended and was waited for.
-            tracing::debug!(%error, "the transcode process was not killed");
+        let Process {
+            mut child,
+            permit,
+            report,
+        } = process;
+        // The check comes before the kill: on Windows the status of a
+        // process that the server killed equals a failure status of ffmpeg.
+        if let Ok(Some(status)) = child.try_wait() {
+            report(ProcessEnd::Exited(status));
+            return;
         }
-        if let Ok(runtime) = Handle::try_current() {
-            runtime.spawn(async move {
-                match child.wait().await {
-                    Ok(status) => tracing::debug!(%status, "the transcode process has ended"),
-                    Err(error) => {
-                        tracing::warn!(%error, "cannot wait for the transcode process");
-                    }
-                }
-                drop(permit);
-            });
+        let runtime = Handle::try_current().ok();
+        if !output_ended || runtime.is_none() {
+            kill(&mut child);
+        }
+        let Some(runtime) = runtime else {
+            report(ProcessEnd::Killed);
+            return;
+        };
+        runtime.spawn(async move {
+            let end = if output_ended {
+                ended_by_itself(&mut child, EXIT_WAIT).await
+            } else {
+                killed(&mut child).await
+            };
+            report(end);
+            drop(permit);
+        });
+    }
+}
+
+/// Sends the kill to `child`. The process ends at once; the caller waits
+/// for it.
+fn kill(child: &mut Child) {
+    if let Err(error) = child.start_kill() {
+        // The process has ended and was waited for.
+        tracing::debug!(%error, "the transcode process was not killed");
+    }
+}
+
+/// Waits for `child`, which was sent the kill.
+async fn killed(child: &mut Child) -> ProcessEnd {
+    if let Err(error) = child.wait().await {
+        tracing::warn!(%error, "cannot wait for the transcode process");
+    }
+    ProcessEnd::Killed
+}
+
+/// Waits for `child`, whose output has ended, to end by itself, for `wait`
+/// at most. A process that has not ended by then is killed.
+async fn ended_by_itself(child: &mut Child, wait: Duration) -> ProcessEnd {
+    match tokio::time::timeout(wait, child.wait()).await {
+        Ok(Ok(status)) => ProcessEnd::Exited(status),
+        Ok(Err(error)) => {
+            tracing::warn!(%error, "cannot wait for the transcode process");
+            ProcessEnd::Killed
+        }
+        Err(_) => {
+            tracing::warn!(
+                "the transcode process did not end {wait:?} after its output; it is killed"
+            );
+            kill(child);
+            killed(child).await
         }
     }
 }
@@ -418,7 +608,7 @@ impl Stream for ChildOutput {
         if matches!(next, Poll::Ready(None)) {
             // The process closed its output. The permit does not wait for
             // the response to be dropped.
-            self.release();
+            self.release(true);
         }
         next
     }
@@ -426,7 +616,7 @@ impl Stream for ChildOutput {
 
 impl Drop for ChildOutput {
     fn drop(&mut self) {
-        self.release();
+        self.release(false);
     }
 }
 
@@ -438,6 +628,7 @@ mod tests {
     use std::time::Instant;
 
     use http_body_util::BodyExt;
+    use tokio::sync::oneshot;
 
     use super::*;
 
@@ -451,6 +642,13 @@ mod tests {
     /// the lock when the process ends, so a test sees through the file
     /// whether the process exists.
     const LOCK_VARIABLE: &str = "WN_SERVER_TEST_LOCK";
+
+    /// The environment variable that names the exit status of the child
+    /// process. Without it the process ends with success.
+    const EXIT_VARIABLE: &str = "WN_SERVER_TEST_EXIT";
+
+    /// The ID of the track of the jobs of the tests.
+    const TRACK: &str = "tr-00000000000000000000000000000001";
 
     /// The name of [`child_process_of_the_tests`] as the test harness knows
     /// it.
@@ -475,7 +673,8 @@ mod tests {
     /// [`SLEEP_VARIABLE`] set. The test then locks the file of
     /// [`LOCK_VARIABLE`] when that variable is set, writes
     /// [`CHILD_STARTED`] and sleeps for that number of seconds. A process
-    /// that no test kills ends by itself after the sleep.
+    /// that no test kills ends by itself after the sleep, with the status
+    /// of [`EXIT_VARIABLE`] when that variable is set.
     ///
     /// In a run of the suite the variable is not set, and the test does
     /// nothing.
@@ -492,6 +691,12 @@ mod tests {
             });
             println!("{CHILD_STARTED}{}", std::process::id());
             std::thread::sleep(Duration::from_secs(seconds));
+            let status = std::env::var(EXIT_VARIABLE)
+                .ok()
+                .and_then(|status| status.parse::<i32>().ok());
+            if let Some(status) = status {
+                std::process::exit(status);
+            }
         }
     }
 
@@ -519,8 +724,41 @@ mod tests {
         FfmpegTranscoder::new(&config, true)
     }
 
+    /// The command of a child process that ends at once with the exit
+    /// status `status`.
+    fn failing_child(status: i32) -> Command {
+        let mut command = child(0);
+        command.env(EXIT_VARIABLE, status.to_string());
+        command
+    }
+
+    /// A [`Report`] that does nothing.
+    fn no_report() -> Report {
+        Box::new(|_| {})
+    }
+
+    /// A [`Report`] that sends the end of the process to the receiver.
+    fn recorded() -> (Report, oneshot::Receiver<ProcessEnd>) {
+        let (sender, receiver) = oneshot::channel();
+        let report: Report = Box::new(move |end| {
+            // A test that does not read the end has dropped the receiver.
+            let _ = sender.send(end);
+        });
+        (report, receiver)
+    }
+
+    /// Waits for the end that a [`recorded`] report receives, for [`LIMIT`]
+    /// at most. The report is called once, so the receiver holds one end.
+    async fn end_of(receiver: oneshot::Receiver<ProcessEnd>) -> ProcessEnd {
+        tokio::time::timeout(LIMIT, receiver)
+            .await
+            .expect("the end of the process is reported within the limit")
+            .expect("the report is called")
+    }
+
     fn job(path: &str, target: Target, bitrate_kbps: u32, offset_s: u32) -> TranscodeJob {
         TranscodeJob {
+            track: TRACK.to_owned(),
             path: PathBuf::from(path),
             target,
             bitrate_kbps,
@@ -640,64 +878,98 @@ mod tests {
     fn argv_is_the_command_line_of_the_design() {
         let transcoder = transcoder("ffmpeg", 2);
         let path = "/music/Aurora Field/01 Low Tide.flac";
+        // The options before `-i` are input options. The two whitelists are
+        // written out here, so that a change of a constant shows.
+        let input = [
+            "-protocol_whitelist",
+            "file",
+            "-format_whitelist",
+            "aac,aiff,flac,mov,mp3,ogg,wav",
+        ];
+        let expected = |seek: &[&'static str], output: [&'static str; 10]| -> Vec<&str> {
+            let mut argv = vec!["ffmpeg", "-nostdin", "-v", "error"];
+            argv.extend(input);
+            argv.extend(seek);
+            argv.extend(["-i", path]);
+            argv.extend(output);
+            argv
+        };
+        let opus = |bitrate| {
+            [
+                "-map", "0:a:0", "-vn", "-c:a", "libopus", "-b:a", bitrate, "-f", "ogg", "-",
+            ]
+        };
+        let mp3 = |bitrate| {
+            [
+                "-map",
+                "0:a:0",
+                "-vn",
+                "-c:a",
+                "libmp3lame",
+                "-b:a",
+                bitrate,
+                "-f",
+                "mp3",
+                "-",
+            ]
+        };
         assert_eq!(
             strings(&transcoder.argv(&job(path, Target::Opus, 96, 0))),
-            [
-                "ffmpeg", "-nostdin", "-v", "error", "-i", path, "-map", "0:a:0", "-vn", "-c:a",
-                "libopus", "-b:a", "96k", "-f", "ogg", "-",
-            ]
+            expected(&[], opus("96k"))
         );
         assert_eq!(
             strings(&transcoder.argv(&job(path, Target::Opus, 192, 30))),
-            [
-                "ffmpeg", "-nostdin", "-v", "error", "-ss", "30", "-i", path, "-map", "0:a:0",
-                "-vn", "-c:a", "libopus", "-b:a", "192k", "-f", "ogg", "-",
-            ]
+            expected(&["-ss", "30"], opus("192k"))
         );
         assert_eq!(
             strings(&transcoder.argv(&job(path, Target::Mp3, 320, 0))),
-            [
-                "ffmpeg",
-                "-nostdin",
-                "-v",
-                "error",
-                "-i",
-                path,
-                "-map",
-                "0:a:0",
-                "-vn",
-                "-c:a",
-                "libmp3lame",
-                "-b:a",
-                "320k",
-                "-f",
-                "mp3",
-                "-",
-            ]
+            expected(&[], mp3("320k"))
         );
         assert_eq!(
             strings(&transcoder.argv(&job(path, Target::Mp3, 32, 4_294_967_295))),
-            [
-                "ffmpeg",
-                "-nostdin",
-                "-v",
-                "error",
-                "-ss",
-                "4294967295",
-                "-i",
-                path,
-                "-map",
-                "0:a:0",
-                "-vn",
-                "-c:a",
-                "libmp3lame",
-                "-b:a",
-                "32k",
-                "-f",
-                "mp3",
-                "-",
-            ]
+            expected(&["-ss", "4294967295"], mp3("32k"))
         );
+
+        // The whole vector of one job, as one line.
+        assert_eq!(
+            strings(&transcoder.argv(&job("/music/a.flac", Target::Opus, 96, 30))).join(" "),
+            "ffmpeg -nostdin -v error -protocol_whitelist file \
+             -format_whitelist aac,aiff,flac,mov,mp3,ogg,wav -ss 30 -i /music/a.flac \
+             -map 0:a:0 -vn -c:a libopus -b:a 96k -f ogg -"
+        );
+    }
+
+    #[test]
+    fn whitelists_precede_the_input_and_name_local_files_and_audio_containers() {
+        assert_eq!(PROTOCOLS, "file");
+        // One demuxer for each audio container that the scanner supports,
+        // and no other: no playlist, no script and no network format.
+        let mut demuxers: Vec<&str> = DEMUXERS.split(',').collect();
+        demuxers.sort_unstable();
+        assert_eq!(
+            demuxers,
+            ["aac", "aiff", "flac", "mov", "mp3", "ogg", "wav"]
+        );
+
+        // Both options are input options, so they stand before `-i`.
+        for offset_s in [0, 30] {
+            let job = job("/music/a.flac", Target::Mp3, 128, offset_s);
+            let argv = transcoder("ffmpeg", 2).argv(&job);
+            let position = |argument: &str| {
+                argv.iter()
+                    .position(|element| element == argument)
+                    .unwrap_or_else(|| panic!("{argument} is absent"))
+            };
+            let input = position("-i");
+            for (option, value) in [
+                ("-protocol_whitelist", PROTOCOLS),
+                ("-format_whitelist", DEMUXERS),
+            ] {
+                let at = position(option);
+                assert!(at < input, "{option}");
+                assert_eq!(argv[at + 1], value, "{option}");
+            }
+        }
     }
 
     #[test]
@@ -736,7 +1008,7 @@ mod tests {
                     assert_eq!(argv[input + 1], path, "{path}");
                     // The vector has the length of the fixed arguments, so
                     // no path added an argument.
-                    let fixed = if offset_s == 0 { 16 } else { 18 };
+                    let fixed = if offset_s == 0 { 20 } else { 22 };
                     assert_eq!(argv.len(), fixed, "{program} {path}");
                     assert_eq!(
                         argv.iter().filter(|argument| *argument == "-i").count(),
@@ -766,14 +1038,15 @@ mod tests {
 
         let name = OsString::from_vec(b"/music/caf\xe9 \xff.flac".to_vec());
         let job = TranscodeJob {
+            track: TRACK.to_owned(),
             path: PathBuf::from(&name),
             target: Target::Mp3,
             bitrate_kbps: 128,
             offset_s: 0,
         };
         let argv = transcoder("ffmpeg", 2).argv(&job);
-        assert_eq!(argv[5], name);
-        assert_eq!(argv.len(), 16);
+        assert_eq!(argv[9], name);
+        assert_eq!(argv.len(), 20);
     }
 
     #[tokio::test]
@@ -814,7 +1087,7 @@ mod tests {
         };
         let transcoder = transcoder("unused", 1);
         let stream = transcoder
-            .start(locking_child, "audio/ogg")
+            .start(locking_child, "audio/ogg", no_report())
             .await
             .expect("the process starts");
         assert_eq!(stream.content_type, "audio/ogg");
@@ -849,10 +1122,13 @@ mod tests {
         );
 
         // A new job gets the permit and its process.
-        let stream = tokio::time::timeout(LIMIT, transcoder.start(locking_child, "audio/ogg"))
-            .await
-            .expect("the job does not wait")
-            .expect("the process starts");
+        let stream = tokio::time::timeout(
+            LIMIT,
+            transcoder.start(locking_child, "audio/ogg", no_report()),
+        )
+        .await
+        .expect("the job does not wait")
+        .expect("the process starts");
         let mut body = stream.body;
         started(&mut body).await;
         assert!(locked(&lock));
@@ -865,7 +1141,7 @@ mod tests {
     async fn job_past_the_limit_is_busy_and_starts_no_process() {
         let transcoder = transcoder("unused", 1);
         let mut first = transcoder
-            .start(|| child(10), "audio/ogg")
+            .start(|| child(10), "audio/ogg", no_report())
             .await
             .expect("the process starts")
             .body;
@@ -884,6 +1160,7 @@ mod tests {
                         child(10)
                     },
                     "audio/ogg",
+                    no_report(),
                 )
                 .await;
             let waited = asked.elapsed();
@@ -900,10 +1177,13 @@ mod tests {
 
         // After the first body is dropped, the next job gets its permit.
         drop(first);
-        let third = tokio::time::timeout(LIMIT, transcoder.start(|| child(10), "audio/ogg"))
-            .await
-            .expect("the job gets the permit when the process is gone")
-            .expect("the process starts");
+        let third = tokio::time::timeout(
+            LIMIT,
+            transcoder.start(|| child(10), "audio/ogg", no_report()),
+        )
+        .await
+        .expect("the job gets the permit when the process is gone")
+        .expect("the process starts");
         drop(third);
         assert!(all_permits_back(&transcoder, 1).await);
     }
@@ -914,7 +1194,7 @@ mod tests {
         let mut bodies = Vec::new();
         for _ in 0..2 {
             let stream = transcoder
-                .start(|| child(10), "audio/ogg")
+                .start(|| child(10), "audio/ogg", no_report())
                 .await
                 .expect("the process starts");
             bodies.push(stream.body);
@@ -922,15 +1202,20 @@ mod tests {
         for body in &mut bodies {
             started(body).await;
         }
-        let third = transcoder.start(|| child(10), "audio/ogg").await;
+        let third = transcoder
+            .start(|| child(10), "audio/ogg", no_report())
+            .await;
         assert!(matches!(third, Err(TranscodeError::Busy)), "{third:?}");
 
         // One process ends, and one job more may start.
         bodies.pop();
-        let third = tokio::time::timeout(LIMIT, transcoder.start(|| child(10), "audio/ogg"))
-            .await
-            .expect("the job gets the permit")
-            .expect("the process starts");
+        let third = tokio::time::timeout(
+            LIMIT,
+            transcoder.start(|| child(10), "audio/ogg", no_report()),
+        )
+        .await
+        .expect("the job gets the permit")
+        .expect("the process starts");
         drop(third);
         drop(bodies);
         assert!(all_permits_back(&transcoder, 2).await);
@@ -941,7 +1226,7 @@ mod tests {
         let transcoder = transcoder("unused", 1);
         // The process writes its output and ends at once.
         let stream = transcoder
-            .start(|| child(0), "audio/mpeg")
+            .start(|| child(0), "audio/mpeg", no_report())
             .await
             .expect("the process starts");
         let mut body = stream.body;
@@ -1039,62 +1324,389 @@ mod tests {
         assert!(asked.elapsed() < LIMIT);
     }
 
-    /// Runs real ffmpeg on the FLAC fixture and returns the first bytes of
-    /// the stream of `target`.
-    async fn real_transcode(target: Target, offset_s: u32) -> Vec<u8> {
+    /// Reads `body` to its end, for [`LIMIT`] at most.
+    async fn read_to_end(body: Body) -> Vec<u8> {
+        let read = tokio::time::timeout(LIMIT, body.collect())
+            .await
+            .expect("the output ends within the limit")
+            .expect("the output is read");
+        read.to_bytes().to_vec()
+    }
+
+    #[tokio::test]
+    async fn process_that_fails_is_reported_once_with_its_status() {
+        let transcoder = transcoder("unused", 1);
+        let (report, end) = recorded();
+        let stream = transcoder
+            .start(|| failing_child(3), "audio/ogg", report)
+            .await
+            .expect("the process starts");
+        // The client reads the output to its end. The process then ends by
+        // itself, with the status 3.
+        read_to_end(stream.body).await;
+        let end = end_of(end).await;
+        let ProcessEnd::Exited(status) = end else {
+            panic!("{end:?}");
+        };
+        assert_eq!(status.code(), Some(3));
+        // This end is the one that the transcoder logs at `warn`.
+        assert_eq!(failure(end), Some(status));
+        assert!(all_permits_back(&transcoder, 1).await);
+    }
+
+    #[tokio::test]
+    async fn process_that_failed_before_its_body_is_dropped_is_reported_with_its_status() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let lock = dir.path().join("child.lock");
+        let transcoder = transcoder("unused", 1);
+        let (report, end) = recorded();
+        let stream = transcoder
+            .start(
+                || {
+                    let mut command = failing_child(7);
+                    command.env(LOCK_VARIABLE, &lock);
+                    command
+                },
+                "audio/ogg",
+                report,
+            )
+            .await
+            .expect("the process starts");
+        // The process has ended, and nobody has read its output: the lock
+        // file exists, and the system released the lock.
+        let ended = async {
+            while !lock.exists() || locked(&lock) {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(LIMIT, ended)
+            .await
+            .expect("the process ends within the limit");
+
+        // The body is dropped before its end. The process is not reported
+        // as killed, because it had failed by itself.
+        drop(stream);
+        let end = end_of(end).await;
+        let ProcessEnd::Exited(status) = end else {
+            panic!("{end:?}");
+        };
+        assert_eq!(status.code(), Some(7));
+        assert_eq!(failure(end), Some(status));
+        assert!(all_permits_back(&transcoder, 1).await);
+    }
+
+    #[tokio::test]
+    async fn process_that_succeeds_and_process_that_the_server_kills_are_no_failures() {
+        let transcoder = transcoder("unused", 1);
+
+        // A process that ends by itself with success.
+        let (report, end) = recorded();
+        let stream = transcoder
+            .start(|| child(0), "audio/ogg", report)
+            .await
+            .expect("the process starts");
+        read_to_end(stream.body).await;
+        let end = end_of(end).await;
+        assert!(
+            matches!(end, ProcessEnd::Exited(status) if status.success()),
+            "{end:?}"
+        );
+        assert_eq!(failure(end), None);
+        assert!(all_permits_back(&transcoder, 1).await);
+
+        // A process that sleeps when the client disconnects. The status of
+        // a killed process is no success, and it is no failure of ffmpeg.
+        let (report, end) = recorded();
+        let stream = transcoder
+            .start(|| child(10), "audio/ogg", report)
+            .await
+            .expect("the process starts");
+        let mut body = stream.body;
+        started(&mut body).await;
+        drop(body);
+        let end = end_of(end).await;
+        assert_eq!(end, ProcessEnd::Killed);
+        assert_eq!(failure(end), None);
+        assert!(all_permits_back(&transcoder, 1).await);
+    }
+
+    #[tokio::test]
+    async fn process_whose_output_has_ended_is_waited_for_and_killed_after_the_wait() {
+        let spawned = |mut command: Command| {
+            command
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .kill_on_drop(true);
+            command.spawn().expect("the process starts")
+        };
+
+        // A process that ends by itself within the wait: its status.
+        let mut failing = spawned(failing_child(3));
+        let end = ended_by_itself(&mut failing, LIMIT).await;
+        let ProcessEnd::Exited(status) = end else {
+            panic!("{end:?}");
+        };
+        assert_eq!(status.code(), Some(3));
+        assert_eq!(failure(end), Some(status));
+
+        let mut succeeding = spawned(child(0));
+        let end = ended_by_itself(&mut succeeding, LIMIT).await;
+        assert!(
+            matches!(end, ProcessEnd::Exited(status) if status.success()),
+            "{end:?}"
+        );
+
+        // A process that runs on after the wait is killed and waited for,
+        // so that it does not hold its permit. It is no failure.
+        let mut sleeping = spawned(child(10));
+        let asked = Instant::now();
+        let end = ended_by_itself(&mut sleeping, Duration::from_millis(100)).await;
+        assert_eq!(end, ProcessEnd::Killed);
+        assert_eq!(failure(end), None);
+        assert!(asked.elapsed() >= Duration::from_millis(100));
+        assert!(asked.elapsed() < LIMIT, "{:?}", asked.elapsed());
+        let waited = sleeping.try_wait().expect("the state of the process");
+        assert!(waited.is_some(), "the process was not waited for");
+    }
+
+    /// The directory of the committed audio fixtures.
+    fn fixtures() -> PathBuf {
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("tests")
+            .join("fixtures")
+            .join("audio")
+    }
+
+    /// The transcoder of the default config, which runs `ffmpeg` from
+    /// `PATH`. The test fails when the probe finds no ffmpeg.
+    async fn real_transcoder() -> FfmpegTranscoder {
         let transcoder = FfmpegTranscoder::probe(&Transcoding::default()).await;
         assert!(
             transcoder.available,
             "this test needs ffmpeg on PATH (`ffmpeg -version` did not run)"
         );
-        let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("tests")
-            .join("fixtures")
-            .join("audio")
-            .join("a.flac");
-        let stream = transcoder
-            .spawn(TranscodeJob {
-                path: fixture,
-                target,
-                bitrate_kbps: 96,
-                offset_s,
-            })
-            .await
-            .expect("ffmpeg starts");
-        assert_eq!(stream.content_type, target.content_type());
-        let output = stream.body.collect().await.expect("the output is read");
-        assert!(all_permits_back(&transcoder, 2).await);
-        output.to_bytes().to_vec()
+        transcoder
     }
 
-    /// The one test that runs ffmpeg. It needs ffmpeg with libopus and
-    /// libmp3lame on PATH, so it is not part of the default suite:
-    /// `cargo test -- --ignored real_ffmpeg`.
+    /// Runs real ffmpeg on the file at `path` with the command line of the
+    /// server, and returns the stream of `target` and how the process
+    /// ended.
+    async fn real_transcode(
+        transcoder: &FfmpegTranscoder,
+        path: &Path,
+        target: Target,
+        offset_s: u32,
+    ) -> (Vec<u8>, ProcessEnd) {
+        let job = TranscodeJob {
+            track: TRACK.to_owned(),
+            path: path.to_path_buf(),
+            target,
+            bitrate_kbps: 96,
+            offset_s,
+        };
+        let (report, end) = recorded();
+        let stream = transcoder.run(&job, report).await.expect("ffmpeg starts");
+        assert_eq!(stream.content_type, target.content_type());
+        let output = stream.body.collect().await.expect("the output is read");
+        // ffmpeg is not held to the limit of the stand-in process.
+        let end = tokio::time::timeout(Duration::from_secs(10), end)
+            .await
+            .expect("ffmpeg ends")
+            .expect("the report is called");
+        (output.to_bytes().to_vec(), end)
+    }
+
+    /// Converts the FLAC fixture to the file `name` in `dir` with a plain
+    /// run of ffmpeg, which selects the container by the suffix of `name`.
+    /// The fixtures hold no file of these containers.
+    fn converted(dir: &Path, name: &str) -> PathBuf {
+        let path = dir.join(name);
+        let status = std::process::Command::new("ffmpeg")
+            .args(["-nostdin", "-v", "error", "-y", "-i"])
+            .arg(fixtures().join("a.flac"))
+            .arg(&path)
+            .status()
+            .expect("run ffmpeg");
+        assert!(status.success(), "{name}: {status}");
+        path
+    }
+
+    /// One of the two tests that run ffmpeg. They need ffmpeg with libopus
+    /// and libmp3lame on PATH, so they are not part of the default suite:
+    /// `cargo test --lib -- --ignored --nocapture real_ffmpeg`.
+    ///
+    /// The test transcodes a file of every audio container that the scanner
+    /// supports, under the two whitelists of the command line: the five
+    /// fixtures, and a WAV, an AIFF and an ADTS AAC file that ffmpeg makes
+    /// from the FLAC fixture.
     #[tokio::test]
     #[ignore = "runs ffmpeg, which the default suite does not need"]
-    async fn real_ffmpeg_transcodes_the_flac_fixture_to_opus_and_mp3() {
-        let opus = real_transcode(Target::Opus, 0).await;
-        assert!(
-            opus.starts_with(b"OggS"),
-            "{:?}",
-            &opus[..opus.len().min(8)]
-        );
-        assert!(
-            opus.windows(8).any(|window| window == b"OpusHead"),
-            "the stream holds no Opus header"
-        );
+    async fn real_ffmpeg_transcodes_every_supported_container_to_opus_and_mp3() {
+        let transcoder = real_transcoder().await;
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let mut files: Vec<PathBuf> = ["a.flac", "a.mp3", "a.m4a", "a.ogg", "a.opus"]
+            .map(|name| fixtures().join(name))
+            .to_vec();
+        for name in ["made.wav", "made.aiff", "made.aif", "made.aac"] {
+            files.push(converted(dir.path(), name));
+        }
 
-        let mp3 = real_transcode(Target::Mp3, 0).await;
-        assert!(
-            mp3.starts_with(&[0xff, 0xfb]) || mp3.starts_with(b"ID3"),
-            "{:?}",
-            &mp3[..mp3.len().min(8)]
-        );
+        for file in &files {
+            let name = file.file_name().expect("a file name").to_string_lossy();
+            let (opus, end) = real_transcode(&transcoder, file, Target::Opus, 0).await;
+            assert!(
+                matches!(end, ProcessEnd::Exited(status) if status.success()),
+                "{name}: {end:?}"
+            );
+            assert!(opus.starts_with(b"OggS"), "{name}");
+            assert!(
+                opus.windows(8).any(|window| window == b"OpusHead"),
+                "{name}: the stream holds no Opus header"
+            );
+
+            let (mp3, end) = real_transcode(&transcoder, file, Target::Mp3, 0).await;
+            assert!(
+                matches!(end, ProcessEnd::Exited(status) if status.success()),
+                "{name}: {end:?}"
+            );
+            assert!(
+                mp3.starts_with(&[0xff, 0xfb]) || mp3.starts_with(b"ID3"),
+                "{name}: {:?}",
+                &mp3[..mp3.len().min(8)]
+            );
+            println!("{name}: Opus {} bytes, MP3 {} bytes", opus.len(), mp3.len());
+        }
 
         // A stream that starts inside the track is shorter. The fixture
         // lasts half a second, so the offset of one second is past its end,
         // and ffmpeg writes a stream without audio.
-        let late = real_transcode(Target::Mp3, 1).await;
-        assert!(late.len() < mp3.len(), "{} {}", late.len(), mp3.len());
+        let flac = fixtures().join("a.flac");
+        let (whole, _) = real_transcode(&transcoder, &flac, Target::Mp3, 0).await;
+        let (late, end) = real_transcode(&transcoder, &flac, Target::Mp3, 1).await;
+        assert!(late.len() < whole.len(), "{} {}", late.len(), whole.len());
+        println!(
+            "a.flac from the second 1: MP3 {} bytes, {end:?}",
+            late.len()
+        );
+        assert!(all_permits_back(&transcoder, 2).await);
+    }
+
+    /// Runs ffmpeg on the file at `path` with the command line of the
+    /// server without the two whitelists, and describes what it did: the
+    /// length of its output, or that it did not end within ten seconds. The
+    /// test prints the text and asserts nothing about it: it shows what the
+    /// ffmpeg of the machine does with the file by default.
+    async fn without_the_whitelists(path: &Path) -> String {
+        let job = TranscodeJob {
+            track: TRACK.to_owned(),
+            path: path.to_path_buf(),
+            target: Target::Opus,
+            bitrate_kbps: 96,
+            offset_s: 0,
+        };
+        let mut arguments = arguments(&job);
+        for option in ["-protocol_whitelist", "-format_whitelist"] {
+            let at = arguments
+                .iter()
+                .position(|argument| argument == option)
+                .expect("the option");
+            arguments.drain(at..at + 2);
+        }
+        let mut command = Command::new("ffmpeg");
+        command
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        match tokio::time::timeout(Duration::from_secs(10), command.output()).await {
+            Ok(Ok(output)) => format!("{} bytes and {}", output.stdout.len(), output.status),
+            Ok(Err(error)) => format!("an error ({error})"),
+            Err(_) => "no end within ten seconds".to_owned(),
+        }
+    }
+
+    /// The number of connections that were opened to `listener` and that it
+    /// has not accepted yet. The listener does not wait.
+    fn connections(listener: &std::net::TcpListener) -> usize {
+        let mut count = 0;
+        loop {
+            match listener.accept() {
+                Ok(_) => count += 1,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => return count,
+                Err(error) => panic!("accept a connection: {error}"),
+            }
+        }
+    }
+
+    /// The second test that runs ffmpeg (see the first one). A file with
+    /// the name of an audio file that is a playlist or a script names
+    /// another local file and a URL. ffmpeg decides the format from the
+    /// content, so without the whitelists it reads such a file as what it
+    /// is. Under the command line of the server it fails: it writes no
+    /// byte, so its output holds nothing of the other file, and it opens no
+    /// connection to the URL.
+    #[tokio::test]
+    #[ignore = "runs ffmpeg, which the default suite does not need"]
+    async fn real_ffmpeg_does_not_follow_a_playlist_with_an_audio_file_name() {
+        let transcoder = real_transcoder().await;
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        // The file that the playlists name. ffmpeg can read it.
+        fs::copy(fixtures().join("a.flac"), dir.path().join("secret.flac")).expect("copy the file");
+        // The URL that the playlists name leads to a listener of this test,
+        // which sees every connection that is opened to it.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("a loopback port");
+        listener
+            .set_nonblocking(true)
+            .expect("a listener that does not wait");
+        let url = format!(
+            "http://{}/a.flac",
+            listener.local_addr().expect("the address of the listener")
+        );
+
+        let concat_local = "ffconcat version 1.0\nfile 'secret.flac'\n".to_owned();
+        let concat_url = format!("ffconcat version 1.0\nfile '{url}'\nfile 'secret.flac'\n");
+        let hls = format!(
+            "#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10,\n{url}\n\
+             #EXTINF:10,\nsecret.flac\n#EXT-X-ENDLIST\n"
+        );
+        let crafted = [
+            // A script of the concat demuxer that names the other file.
+            ("script.flac", &concat_local),
+            // The same with the URL.
+            ("script-with-url.flac", &concat_url),
+            // An HLS playlist that names the URL and the other file.
+            ("playlist.mp3", &hls),
+            ("playlist.ogg", &hls),
+        ];
+        for (name, content) in crafted {
+            let path = dir.path().join(name);
+            fs::write(&path, content).expect("write the crafted file");
+
+            let (output, end) = real_transcode(&transcoder, &path, Target::Opus, 0).await;
+            // ffmpeg failed and wrote nothing.
+            let ProcessEnd::Exited(status) = end else {
+                panic!("{name}: {end:?}");
+            };
+            assert!(!status.success(), "{name}: {status}");
+            assert_eq!(failure(end), Some(status), "{name}");
+            assert_eq!(output, b"", "{name}");
+            // No connection was opened to the URL.
+            assert_eq!(connections(&listener), 0, "{name}");
+
+            // What ffmpeg does with the file without the whitelists. A
+            // connection of that run is not one of the next file.
+            let plain = without_the_whitelists(&path).await;
+            let opened = connections(&listener);
+            println!(
+                "{name}: with the whitelists 0 bytes and {status}; \
+                 without them {plain}, {opened} connections"
+            );
+        }
+        // The other file itself is audio, and it is transcoded.
+        let secret = dir.path().join("secret.flac");
+        let (output, end) = real_transcode(&transcoder, &secret, Target::Opus, 0).await;
+        assert!(matches!(end, ProcessEnd::Exited(status) if status.success()));
+        assert!(output.starts_with(b"OggS"));
+        assert!(all_permits_back(&transcoder, 2).await);
     }
 }

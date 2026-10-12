@@ -7,10 +7,9 @@
 //! it. The unit tests in `src/media/transcode.rs` cover the transcoder that
 //! runs a process.
 //!
-//! Three tests open a socket on `127.0.0.1` with a port that the system
+//! Two tests open a socket on `127.0.0.1` with a port that the system
 //! chooses, because they check what a connection does: a client that
-//! disconnects, a stream that is shorter than its announced length, and a
-//! server that `run_server` starts without ffmpeg.
+//! disconnects, and a server that `run_server` starts without ffmpeg.
 
 mod common;
 
@@ -25,7 +24,6 @@ use axum::body::Body;
 use axum::http::header::HeaderName;
 use axum::http::{Method, Request, StatusCode, header};
 use axum::response::Response;
-use http_body_util::BodyExt;
 use rusqlite::params;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -191,18 +189,18 @@ fn resolved(server: &ScannedServer, track: &Track) -> PathBuf {
     fs::canonicalize(server.path(&track.rel_path)).expect("the path of the file")
 }
 
-/// Sets `duration_ms` of the track `id`.
-async fn set_duration(db: &Db, id: &str, duration_ms: i64) {
+/// Sets `bitrate_kbps` of the track `id`.
+async fn set_bitrate(db: &Db, id: &str, bitrate_kbps: u32) {
     let id = id.to_owned();
     db.write(move |conn| {
         conn.execute(
-            "UPDATE tracks SET duration_ms = ?1 WHERE id = ?2",
-            params![duration_ms, id],
+            "UPDATE tracks SET bitrate_kbps = ?1 WHERE id = ?2",
+            params![bitrate_kbps, id],
         )?;
         Ok(())
     })
     .await
-    .expect("set the duration");
+    .expect("set the bitrate");
 }
 
 /// `len` bytes that repeat after 251 bytes. The size of a chunk of the
@@ -212,8 +210,17 @@ fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|index| (index % 251) as u8).collect()
 }
 
-fn job(path: PathBuf, target: Target, bitrate_kbps: u32, offset_s: u32) -> TranscodeJob {
+/// The job of a transcode of the file at `path`, which is the file of the
+/// track `track`.
+fn job(
+    track: &str,
+    path: PathBuf,
+    target: Target,
+    bitrate_kbps: u32,
+    offset_s: u32,
+) -> TranscodeJob {
     TranscodeJob {
+        track: track.to_owned(),
         path,
         target,
         bitrate_kbps,
@@ -241,7 +248,7 @@ async fn request_for_a_format_gets_the_stream_of_the_transcoder() {
     assert_eq!(body_bytes(response).await, FAKE_TRANSCODE);
     assert_eq!(
         server.transcoder().jobs(),
-        [job(file.clone(), Target::Opus, 96, 0)]
+        [job(id, file.clone(), Target::Opus, 96, 0)]
     );
 
     // `timeOffset` reaches the job.
@@ -255,7 +262,7 @@ async fn request_for_a_format_gets_the_stream_of_the_transcoder() {
     assert_eq!(body_bytes(response).await, FAKE_TRANSCODE);
     assert_eq!(
         server.transcoder().jobs().last(),
-        Some(&job(file.clone(), Target::Opus, 96, 30))
+        Some(&job(id, file.clone(), Target::Opus, 96, 30))
     );
 
     // `format=mp3` without a limit: MP3 at the bitrate of the config.
@@ -265,7 +272,7 @@ async fn request_for_a_format_gets_the_stream_of_the_transcoder() {
     assert_eq!(body_bytes(response).await, FAKE_TRANSCODE);
     assert_eq!(
         server.transcoder().jobs().last(),
-        Some(&job(file.clone(), Target::Mp3, 320, 0))
+        Some(&job(id, file.clone(), Target::Mp3, 320, 0))
     );
 
     // `format=opus` without a limit, by POST and with the `.view` suffix.
@@ -281,7 +288,7 @@ async fn request_for_a_format_gets_the_stream_of_the_transcoder() {
         assert_eq!(body_bytes(response).await, FAKE_TRANSCODE, "{case}");
         assert_eq!(
             server.transcoder().jobs().last(),
-            Some(&job(file.clone(), Target::Opus, 192, 0)),
+            Some(&job(id, file.clone(), Target::Opus, 192, 0)),
             "{case}"
         );
     }
@@ -331,7 +338,7 @@ async fn limit_below_the_bitrate_of_the_file_selects_opus_and_a_limit_at_it_the_
             assert_eq!(body_bytes(response).await, FAKE_TRANSCODE, "{case}");
             assert_eq!(
                 server.transcoder().jobs().last(),
-                Some(&job(file.clone(), Target::Opus, kbps, 0)),
+                Some(&job(id, file.clone(), Target::Opus, kbps, 0)),
                 "{case}"
             );
         }
@@ -340,126 +347,69 @@ async fn limit_below_the_bitrate_of_the_file_selects_opus_and_a_limit_at_it_the_
 }
 
 #[tokio::test]
-async fn estimate_content_length_sets_the_header_and_cuts_the_body_at_it() {
+async fn estimate_content_length_has_no_effect_on_a_transcode() {
     let server = TestServer::standard().await;
     let id = server.track.low_tide.as_str();
-    // Ten seconds at 96 kbps are 120 000 bytes.
-    set_duration(server.db(), id, 10_000).await;
-    let estimate = 120_000;
-    let params = [
-        ("format", "opus"),
-        ("maxBitRate", "96"),
-        ("estimateContentLength", "true"),
-    ];
-
-    // A stream that is longer than the estimate, and that stays open after
-    // its bytes as the output of a process that runs does. The estimate
-    // ends inside a chunk of the stream.
-    let bytes = pattern(estimate + 3 * FAKE_CHUNK);
-    assert_ne!(estimate % FAKE_CHUNK, 0);
+    // A stream of several chunks, whose last chunk is not whole.
+    let bytes = pattern(3 * FAKE_CHUNK + 123);
     server.transcoder().set_bytes(bytes.clone());
-    server.transcoder().stay_open();
-    for method in [Method::GET, Method::POST] {
-        let response = stream_as(&server, method.clone(), id, &params, &[]).await;
-        assert_transcode_headers(&response, "audio/ogg", "a longer stream");
+
+    // With the parameter, with `false` and without it, the response has no
+    // `Content-Length`, and the body is every byte of the transcoder.
+    let cases: [Pairs; 4] = [
+        &[("format", "opus"), ("estimateContentLength", "true")],
+        &[
+            ("format", "mp3"),
+            ("maxBitRate", "96"),
+            ("timeOffset", "30"),
+            ("estimateContentLength", "true"),
+        ],
+        &[("format", "opus"), ("estimateContentLength", "false")],
+        &[("format", "opus")],
+    ];
+    for params in cases {
+        for method in [Method::GET, Method::POST] {
+            let case = format!("{method} {params:?}");
+            let response = stream_as(&server, method, id, params, &[]).await;
+            assert_eq!(response.status(), StatusCode::OK, "{case}");
+            assert_eq!(
+                header_of(&response, &header::ACCEPT_RANGES),
+                Some("none"),
+                "{case}"
+            );
+            assert_eq!(
+                header_of(&response, &header::CONTENT_LENGTH),
+                None,
+                "{case}"
+            );
+            let body = tokio::time::timeout(SECOND, body_bytes(response))
+                .await
+                .expect("the body ends with its stream");
+            assert_eq!(body.len(), bytes.len(), "{case}");
+            assert!(body == bytes, "{case}");
+        }
+    }
+    assert_eq!(server.transcoder().jobs().len(), 8);
+    assert_eq!(server.transcoder().open_streams(), 0);
+
+    // A transcoder whose stream has a known length: the response still has
+    // no `Content-Length`, with and without the parameter.
+    server.transcoder().known_length();
+    for params in cases {
+        let response = stream(&server, id, params).await;
         assert_eq!(
             header_of(&response, &header::CONTENT_LENGTH),
-            Some(estimate.to_string().as_str()),
-            "{method}"
+            None,
+            "{params:?}"
         );
-        // The body ends at the estimate although its stream does not end.
-        let mut body = response.into_body();
-        let mut received = Vec::new();
-        let read = async {
-            while let Some(frame) = body.frame().await {
-                let data = frame.expect("a frame").into_data().expect("a data frame");
-                received.extend_from_slice(&data);
-            }
-        };
-        tokio::time::timeout(SECOND, read)
-            .await
-            .expect("the body ends at the estimate");
-        assert_eq!(received.len(), estimate, "{method}");
-        assert!(received == bytes[..estimate], "{method}");
-        // The stream of the transcoder is dropped at the cut, while the
-        // response still exists: the transcode does not run on.
-        assert_eq!(server.transcoder().open_streams(), 0, "{method}");
-        drop(body);
+        assert!(body_bytes(response).await == bytes, "{params:?}");
     }
 
-    // Without the parameter, and with `false`, the response has no length
-    // and the body is the whole stream.
-    server.transcoder().set_bytes(bytes.clone());
-    for params in [
-        vec![("format", "opus"), ("maxBitRate", "96")],
-        vec![
-            ("format", "opus"),
-            ("maxBitRate", "96"),
-            ("estimateContentLength", "false"),
-        ],
-    ] {
-        let response = stream(&server, id, &params).await;
-        assert_eq!(header_of(&response, &header::CONTENT_LENGTH), None);
-        let mut body = response.into_body();
-        let mut received = Vec::new();
-        while received.len() < bytes.len() {
-            let frame = tokio::time::timeout(SECOND, body.frame())
-                .await
-                .expect("the stream goes on")
-                .expect("a frame");
-            let data = frame.expect("a frame").into_data().expect("a data frame");
-            received.extend_from_slice(&data);
-        }
-        assert!(received == bytes, "{params:?}");
-        assert_eq!(server.transcoder().open_streams(), 1);
-        drop(body);
-        assert_eq!(server.transcoder().open_streams(), 0);
-    }
-}
-
-#[tokio::test]
-async fn estimate_counts_the_rest_of_the_track_and_a_shorter_stream_ends_the_body() {
-    let server = TestServer::standard().await;
-    let id = server.track.meridian.as_str();
-    // Three minutes. From the second 30 on, 150 seconds are left: 2 400 000
-    // bytes at 128 kbps.
-    set_duration(server.db(), id, 180_000).await;
-    let params = [
-        ("format", "mp3"),
-        ("maxBitRate", "128"),
-        ("timeOffset", "30"),
-        ("estimateContentLength", "true"),
-    ];
-
-    // The stream of the transcoder has 24 bytes and ends. The response
-    // announces the estimate, and its body ends with the stream: it does
-    // not wait for the bytes that do not come.
-    let response = stream(&server, id, &params).await;
-    assert_transcode_headers(&response, "audio/mpeg", "a shorter stream");
-    assert_eq!(
-        header_of(&response, &header::CONTENT_LENGTH),
-        Some("2400000")
-    );
-    let body = tokio::time::timeout(SECOND, body_bytes(response))
-        .await
-        .expect("the body ends with its stream");
-    assert_eq!(body, FAKE_TRANSCODE);
-    assert_eq!(server.transcoder().open_streams(), 0);
-
-    // A start at or after the end of the track: the estimate is 0, and the
-    // body is empty.
-    let late = [
-        ("format", "mp3"),
-        ("timeOffset", "180"),
-        ("estimateContentLength", "true"),
-    ];
-    let response = stream(&server, id, &late).await;
-    assert_eq!(header_of(&response, &header::CONTENT_LENGTH), Some("0"));
-    let body = tokio::time::timeout(SECOND, body_bytes(response))
-        .await
-        .expect("the body ends");
-    assert_eq!(body, b"");
-    assert_eq!(server.transcoder().open_streams(), 0);
+    // A HEAD request has no length either.
+    let params = [("format", "opus"), ("estimateContentLength", "true")];
+    let response = stream_as(&server, Method::HEAD, id, &params, &[]).await;
+    assert_transcode_headers(&response, "audio/ogg", "HEAD");
+    assert_eq!(header_of(&response, &header::CONTENT_LENGTH), None);
 
     // The original file has its own length, whatever the parameter says.
     let track = row(server.db(), id).await;
@@ -469,6 +419,75 @@ async fn estimate_counts_the_rest_of_the_track_and_a_shorter_stream_ends_the_bod
         header_of(&response, &header::CONTENT_LENGTH),
         Some(track.size.to_string().as_str())
     );
+    assert_eq!(header_of(&response, &header::ACCEPT_RANGES), Some("bytes"));
+}
+
+#[tokio::test]
+async fn request_for_the_format_that_the_file_has_gets_the_original_file() {
+    let server = TestServer::standard().await;
+    // The MP3 fixture and the Opus fixture, with the format of each.
+    for (id, format, other, other_mime) in [
+        (&server.track.meridian, "mp3", "opus", "audio/ogg"),
+        (&server.track.last_train, "opus", "mp3", "audio/mpeg"),
+    ] {
+        // The fixtures have about 30 kbps, which is below the lowest
+        // bitrate of a transcode. The row gets a bitrate that a limit can
+        // be below.
+        let bitrate = 128;
+        set_bitrate(server.db(), id, bitrate).await;
+        let track = row(server.db(), id).await;
+        assert_eq!(track.suffix, format);
+        let file = resolved(&server, &track);
+        let original = fs::read(&file).expect("read the file");
+        let jobs_before = server.transcoder().jobs().len();
+
+        // The format of the file, without a limit and with a limit that the
+        // file is within: the file itself, with its ranges.
+        let at = bitrate.to_string();
+        let upper = format.to_uppercase();
+        let cases: [Pairs; 5] = [
+            &[("format", format)],
+            &[("format", &upper)],
+            &[("format", format), ("maxBitRate", "0")],
+            &[("format", format), ("maxBitRate", &at)],
+            &[("format", format), ("maxBitRate", "320")],
+        ];
+        for params in cases {
+            let case = format!("{params:?}");
+            let response = stream(&server, id, params).await;
+            assert_eq!(content_type(&response), track.content_type, "{case}");
+            assert_eq!(
+                header_of(&response, &header::ACCEPT_RANGES),
+                Some("bytes"),
+                "{case}"
+            );
+            assert_eq!(body_bytes(response).await, original, "{case}");
+        }
+        assert_eq!(server.transcoder().jobs().len(), jobs_before);
+
+        // A limit below the bitrate of the file: the same format at the
+        // limit.
+        let target = if format == "mp3" {
+            Target::Mp3
+        } else {
+            Target::Opus
+        };
+        let below = (bitrate - 1).to_string();
+        let params = [("format", format), ("maxBitRate", below.as_str())];
+        let response = stream(&server, id, &params).await;
+        assert_transcode_headers(&response, &track.content_type, format);
+        assert_eq!(
+            server.transcoder().jobs().last(),
+            Some(&job(id, file.clone(), target, bitrate - 1, 0))
+        );
+
+        // The other format: a transcode, although the file is within the
+        // limit.
+        let params = [("format", other), ("maxBitRate", "320")];
+        let response = stream(&server, id, &params).await;
+        assert_transcode_headers(&response, other_mime, other);
+        assert_eq!(server.transcoder().jobs().len(), jobs_before + 2);
+    }
 }
 
 #[tokio::test]
@@ -612,25 +631,14 @@ async fn request_headers_do_not_change_a_transcode() {
 async fn head_request_for_a_transcode_gets_the_headers_and_starts_no_transcode() {
     let server = TestServer::standard().await;
     let id = server.track.low_tide.as_str();
-    set_duration(server.db(), id, 10_000).await;
 
-    let response = stream_as(&server, Method::HEAD, id, &[("format", "opus")], &[]).await;
-    assert_transcode_headers(&response, "audio/ogg", "HEAD");
-    assert_eq!(header_of(&response, &header::CONTENT_LENGTH), None);
-    assert_eq!(body_bytes(response).await, b"");
-
-    let params = [
-        ("format", "mp3"),
-        ("maxBitRate", "96"),
-        ("estimateContentLength", "true"),
-    ];
-    let response = stream_as(&server, Method::HEAD, id, &params, &[]).await;
-    assert_transcode_headers(&response, "audio/mpeg", "HEAD with an estimate");
-    assert_eq!(
-        header_of(&response, &header::CONTENT_LENGTH),
-        Some("120000")
-    );
-    assert_eq!(body_bytes(response).await, b"");
+    for (format, mime) in [("opus", "audio/ogg"), ("mp3", "audio/mpeg")] {
+        let params = [("format", format), ("maxBitRate", "96")];
+        let response = stream_as(&server, Method::HEAD, id, &params, &[]).await;
+        assert_transcode_headers(&response, mime, format);
+        assert_eq!(header_of(&response, &header::CONTENT_LENGTH), None);
+        assert_eq!(body_bytes(response).await, b"");
+    }
 
     // The request does not reach the transcoder, so it does not report a
     // transcoder that is busy.
@@ -814,7 +822,7 @@ async fn link_out_of_the_music_folder_is_not_given_to_the_transcoder() {
     let breakwater = fs::canonicalize(album.join("02 Breakwater.flac")).unwrap();
     assert_eq!(
         server.transcoder().jobs(),
-        [job(breakwater, Target::Opus, 192, 0)]
+        [job(&id, breakwater, Target::Opus, 192, 0)]
     );
 }
 
@@ -949,36 +957,6 @@ async fn client_that_disconnects_ends_the_stream_of_the_transcoder() {
     tokio::time::timeout(SECOND, ended)
         .await
         .expect("the stream of the transcoder is dropped within one second");
-}
-
-#[tokio::test]
-async fn stream_shorter_than_its_estimate_ends_the_connection() {
-    let server = Arc::new(TestServer::standard().await);
-    let id = server.track.low_tide.clone();
-    // Ten seconds at 96 kbps are 120 000 bytes. The stream of the
-    // transcoder has 24 bytes and ends.
-    set_duration(server.db(), &id, 10_000).await;
-    let addr = listen(Arc::clone(&server)).await;
-
-    let path = format!(
-        "/rest/stream?{}",
-        query(&[
-            ("id", &id),
-            ("format", "opus"),
-            ("maxBitRate", "96"),
-            ("estimateContentLength", "true"),
-        ])
-    );
-    // The client keeps the connection open, as a player does. The server
-    // closes it, because the response cannot reach its announced length: a
-    // client that waits for the rest does not wait for ever.
-    let mut client = send_get(addr, &path, &[]).await;
-    let (head, body) = read_response(&mut client, SECOND).await;
-    assert!(head.starts_with("http/1.1 200 ok\r\n"), "{head}");
-    assert!(head.contains("content-length: 120000"), "{head}");
-    assert!(!head.contains("transfer-encoding"), "{head}");
-    assert_eq!(body, FAKE_TRANSCODE);
-    assert_eq!(server.transcoder().open_streams(), 0);
 }
 
 #[tokio::test]

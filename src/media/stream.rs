@@ -29,15 +29,12 @@ use std::fs;
 use std::io;
 use std::ops::{Range, RangeInclusive};
 use std::path::{Path, PathBuf};
-use std::pin::Pin;
-use std::task::{Context, Poll};
 use std::time::UNIX_EPOCH;
 
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Method, Request, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
-use futures_util::Stream;
 use mime_guess::mime::{self, Mime};
 use tower::ServiceExt;
 use tower_http::services::ServeFile;
@@ -89,8 +86,9 @@ pub struct StreamRequest {
     /// `timeOffset`: the second of the track at which a transcoded stream
     /// starts.
     pub time_offset_s: Option<u32>,
-    /// `estimateContentLength`: whether a transcoded stream reports an
-    /// estimated length.
+    /// `estimateContentLength`: whether the client asks for an estimated
+    /// length of a transcoded stream. The value is read and has no effect
+    /// (see [`transcoded`]).
     pub estimate_content_length: bool,
 }
 
@@ -120,6 +118,25 @@ pub enum Target {
 }
 
 impl Target {
+    /// The target that the `format` value `name` names, in lower case.
+    fn named(name: &str) -> Option<Self> {
+        match name {
+            "opus" => Some(Self::Opus),
+            "mp3" => Some(Self::Mp3),
+            _ => None,
+        }
+    }
+
+    /// The suffix of a file that has this format already. An Opus stream
+    /// in a file with the suffix `ogg` is not told from a Vorbis stream,
+    /// because the track row holds no codec.
+    fn suffix(self) -> &'static str {
+        match self {
+            Self::Opus => "opus",
+            Self::Mp3 => "mp3",
+        }
+    }
+
     /// The content type of a stream in this format.
     pub fn content_type(self) -> &'static str {
         match self {
@@ -144,14 +161,17 @@ pub enum StreamPlan {
 }
 
 /// Decides between the original file of `track` and a transcode. The
-/// original file is the answer unless the request asks for a format or for
-/// a bitrate below the bitrate of the file.
+/// original file is the answer unless the request asks for another format
+/// than the file has, or for a bitrate below the bitrate of the file.
 ///
 /// `format` is compared without regard to ASCII case:
 ///
 /// - `raw` is the original file, whatever `maxBitRate` is.
 /// - `opus` and `mp3` are a transcode to that format, at `maxBitRate`, or at
 ///   the bitrate of `config` for the format when the request has no limit.
+///   A file that has the format already (the suffix `opus` or `mp3`) is the
+///   original file instead, unless its bitrate exceeds the limit: a second
+///   lossy encoding of the same format gives the client nothing.
 /// - No `format`, and a `format` that names none of the three, leave the
 ///   decision to `maxBitRate`. `format` is the format that a client
 ///   prefers, and the server cannot meet a preference for a format that it
@@ -170,9 +190,9 @@ pub enum StreamPlan {
 /// - A limit above 320 kbps is compared as it is: a track of 500 kbps is the
 ///   original file for `maxBitRate=1000`.
 ///
-/// The bitrate of a track that the scan could not read is not known. Such a
-/// track is transcoded for a limit when it is lossless, and it is the
-/// original file when it is lossy.
+/// The bitrate of a track that the scan could not read is not known. For a
+/// limit, such a track counts as above it when it is lossless and as within
+/// it when it is lossy.
 ///
 /// Remote-mode seam: remote mode adds an argument for the kind of the
 /// connection to this function, which then forces a lossy transcode for a
@@ -180,49 +200,43 @@ pub enum StreamPlan {
 /// only function that decides between the original file and a transcode.
 pub fn decide(track: &Track, request: &StreamRequest, config: &Transcoding) -> StreamPlan {
     let limit = request.max_bitrate_kbps.filter(|&kbps| kbps > 0);
+    // Whether the bitrate of the track is above `limit`.
+    let exceeds = |limit: u32| {
+        let lowest = limit.max(*BITRATE_KBPS.start());
+        track
+            .bitrate_kbps
+            .map_or(track.lossless, |kbps| kbps > lowest)
+    };
     let transcode = |target, bitrate_kbps| StreamPlan::Transcode {
         target,
         bitrate_kbps: clamp_bitrate(bitrate_kbps),
         offset_s: request.time_offset_s.unwrap_or(0),
     };
     let format = request.format.as_deref().map(str::to_ascii_lowercase);
-    match (format.as_deref(), limit) {
-        (Some("raw"), _) => StreamPlan::Raw,
-        (Some("opus"), _) => transcode(Target::Opus, limit.unwrap_or(config.opus_bitrate_kbps)),
-        (Some("mp3"), _) => transcode(Target::Mp3, limit.unwrap_or(config.mp3_bitrate_kbps)),
-        (_, None) => StreamPlan::Raw,
-        (_, Some(limit)) => {
-            let lowest = limit.max(*BITRATE_KBPS.start());
-            let above = track
-                .bitrate_kbps
-                .map_or(track.lossless, |kbps| kbps > lowest);
-            if above {
-                transcode(Target::Opus, limit)
-            } else {
-                StreamPlan::Raw
+    if format.as_deref() == Some("raw") {
+        return StreamPlan::Raw;
+    }
+    match (format.as_deref().and_then(Target::named), limit) {
+        (Some(target), limit) => {
+            let has_the_format = track.suffix == target.suffix();
+            if has_the_format && !limit.is_some_and(exceeds) {
+                return StreamPlan::Raw;
             }
+            let bitrate = match target {
+                Target::Opus => config.opus_bitrate_kbps,
+                Target::Mp3 => config.mp3_bitrate_kbps,
+            };
+            transcode(target, limit.unwrap_or(bitrate))
         }
+        (None, None) => StreamPlan::Raw,
+        (None, Some(limit)) if exceeds(limit) => transcode(Target::Opus, limit),
+        (None, Some(_)) => StreamPlan::Raw,
     }
 }
 
 /// Moves `kbps` into [`BITRATE_KBPS`].
 fn clamp_bitrate(kbps: u32) -> u32 {
     kbps.clamp(*BITRATE_KBPS.start(), *BITRATE_KBPS.end())
-}
-
-/// The length that a transcode at `bitrate_kbps` of a track of `duration_ms`
-/// milliseconds is estimated to have, in bytes, when it starts at the second
-/// `offset_s`: the bitrate times the rest of the duration, divided by 8.
-/// The result is rounded down, and it is 0 for a start at or after the end
-/// of the track.
-///
-/// The value does not count what the container adds, and the encoder does
-/// not hold the bitrate exactly. The stream of ffmpeg is therefore longer
-/// or shorter than the estimate.
-pub fn estimated_length(bitrate_kbps: u32, duration_ms: u64, offset_s: u32) -> u64 {
-    let rest_ms = duration_ms.saturating_sub(u64::from(offset_s) * 1000);
-    // kbps × 1000 ÷ 8 is bytes in a second, and ms ÷ 1000 is seconds.
-    u64::from(bitrate_kbps).saturating_mul(rest_ms) / 8
 }
 
 /// Why the file of a track is not served.
@@ -322,16 +336,14 @@ pub async fn raw(
 /// transcode is started for it.
 ///
 /// - The response has the content type of the target, `Accept-Ranges: none`
-///   and `Cache-Control: no-store`. It has no length and no validator: the
-///   server does not know the length of a stream that ffmpeg has not
-///   written. A `Range` header is not read, and the body is the whole
-///   stream from `job.offset_s` on.
-/// - With `estimate_length`, the response has the `Content-Length` of
-///   [`estimated_length`], and the body ends at that length ([`Cut`]). A
-///   stream that is longer is cut there, and its transcode is ended. A
-///   stream that is shorter ends before the announced length, and the HTTP
-///   server then closes the connection, so the client does not wait for
-///   the rest.
+///   and `Cache-Control: no-store`. A `Range` header is not read, and the
+///   body is the whole stream from `job.offset_s` on.
+/// - The response never has a `Content-Length`, and the body is every byte
+///   that the transcoder produces. The server does not know the length of
+///   a stream that ffmpeg has not written, and `estimateContentLength` does
+///   not change that: an estimate from the bitrate and the duration is
+///   wrong by several percent for Opus, and a body that is cut at it loses
+///   the end of the track (`docs/design.md` section 3.9).
 /// - A HEAD request gets the headers. It starts no transcode, so it reports
 ///   neither a transcoder that is busy nor one that is not available.
 /// - The body of the response owns the transcode. Dropping the body, which
@@ -345,31 +357,19 @@ pub async fn transcoded(
     job: TranscodeJob,
     folders: &[PathBuf],
     method: &Method,
-    estimate_length: bool,
     transcoder: &dyn Transcoder,
 ) -> Result<Response, ApiError> {
     let path = checked_file(track, job.path, folders).await?;
     let job = TranscodeJob { path, ..job };
-    let length = estimate_length
-        .then(|| estimated_length(job.bitrate_kbps, track.duration_ms, job.offset_s));
     if method == Method::HEAD {
-        // The router removes the body of a HEAD response. A body that is
-        // built from a stream has no known length, so no layer adds
-        // `Content-Length: 0` for a stream whose length is not known.
-        let body = Body::from_stream(futures_util::stream::empty::<io::Result<Bytes>>());
-        return Ok(transcode_response(job.target.content_type(), length, body));
+        let content_type = job.target.content_type();
+        return Ok(transcode_response(content_type, no_bytes()));
     }
 
     match transcoder.spawn(job).await {
         Ok(stream) => {
-            let chunks = stream.body.into_data_stream();
-            // A body that is built from a stream has no known length, so no
-            // layer adds a `Content-Length` of its own.
-            let body = match length {
-                Some(length) => Body::from_stream(Cut::new(chunks, length)),
-                None => Body::from_stream(chunks),
-            };
-            Ok(transcode_response(stream.content_type, length, body))
+            let body = Body::from_stream(stream.body.into_data_stream());
+            Ok(transcode_response(stream.content_type, body))
         }
         Err(TranscodeError::Busy) => {
             tracing::info!(
@@ -388,18 +388,25 @@ pub async fn transcoded(
 }
 
 /// The response of a transcode: HTTP 200 with `content_type`,
-/// `Accept-Ranges: none`, `Cache-Control: no-store`, and `Content-Length`
-/// when `length` is given.
-fn transcode_response(content_type: &'static str, length: Option<u64>, body: Body) -> Response {
+/// `Accept-Ranges: none` and `Cache-Control: no-store`.
+///
+/// `body` is built from a stream. Such a body has no known length, so no
+/// layer adds a `Content-Length` to the response, whatever body the
+/// transcoder returned.
+fn transcode_response(content_type: &'static str, body: Body) -> Response {
     let mut response = Response::new(body);
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
     headers.insert(header::ACCEPT_RANGES, HeaderValue::from_static("none"));
     headers.insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
-    if let Some(length) = length {
-        headers.insert(header::CONTENT_LENGTH, HeaderValue::from(length));
-    }
     response
+}
+
+/// The body of the response to a HEAD request for a transcode: a stream
+/// without a chunk. The router removes the body of a HEAD response, and it
+/// adds `Content-Length: 0` for a body whose length is known to be 0.
+fn no_bytes() -> Body {
+    Body::from_stream(futures_util::stream::empty::<io::Result<Bytes>>())
 }
 
 /// The response to a transcode request that got no permit: HTTP 503 with
@@ -412,78 +419,6 @@ fn busy_response() -> Response {
         HeaderValue::from_static(RETRY_AFTER_SECONDS),
     );
     response
-}
-
-/// A stream of chunks that ends after a number of bytes of another stream.
-///
-/// The chunk that reaches the length is cut to it, and the inner stream is
-/// dropped at that moment and not when the response is dropped. For the
-/// body of a transcode the drop ends the process. An inner stream that ends
-/// earlier ends this stream: nothing is added to reach the length.
-///
-/// The stream is the body of a response that announces the length. hyper
-/// closes the connection when such a body ends early, and it discards the
-/// chunks that it holds and has not written at that moment. The stream
-/// therefore reports the early end one poll after its last chunk: hyper
-/// writes what it holds between the two polls, when the socket takes it.
-struct Cut<S> {
-    /// The inner stream, until this stream has ended.
-    inner: Option<S>,
-    /// The bytes that this stream may still yield.
-    remaining: u64,
-}
-
-impl<S> Cut<S> {
-    /// The first `length` bytes of `inner`.
-    fn new(inner: S, length: u64) -> Self {
-        Self {
-            inner: Some(inner),
-            remaining: length,
-        }
-    }
-}
-
-impl<S, E> Stream for Cut<S>
-where
-    S: Stream<Item = Result<Bytes, E>> + Unpin,
-{
-    type Item = Result<Bytes, E>;
-
-    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let this = &mut *self;
-        if this.remaining == 0 {
-            this.inner = None;
-        }
-        let Some(inner) = this.inner.as_mut() else {
-            return Poll::Ready(None);
-        };
-        let next = match Pin::new(inner).poll_next(cx) {
-            Poll::Pending => return Poll::Pending,
-            Poll::Ready(next) => next,
-        };
-        match next {
-            Some(Ok(mut chunk)) => {
-                // A length above `usize::MAX` cuts no chunk.
-                chunk.truncate(usize::try_from(this.remaining).unwrap_or(usize::MAX));
-                this.remaining -= chunk.len() as u64;
-                if this.remaining == 0 {
-                    this.inner = None;
-                }
-                Poll::Ready(Some(Ok(chunk)))
-            }
-            Some(Err(error)) => {
-                this.inner = None;
-                Poll::Ready(Some(Err(error)))
-            }
-            None => {
-                // The length is not reached. The next poll ends the stream
-                // (see the comment of the type).
-                this.inner = None;
-                cx.waker().wake_by_ref();
-                Poll::Pending
-            }
-        }
-    }
 }
 
 /// Runs the two checks of the module comment on the file of `track` at
@@ -726,11 +661,8 @@ pub fn percent_encode(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::{Duration, SystemTime};
 
-    use futures_util::{StreamExt, stream};
     use tempfile::TempDir;
 
     use super::*;
@@ -775,6 +707,15 @@ mod tests {
         track(false, Some(bitrate_kbps))
     }
 
+    /// A lossy track whose file has the suffix `suffix`. The tracks of the
+    /// other helpers have the suffix `flac`.
+    fn file(suffix: &str, bitrate_kbps: Option<u32>) -> Track {
+        Track {
+            suffix: suffix.to_owned(),
+            ..track(false, bitrate_kbps)
+        }
+    }
+
     /// A request with `format` and `maxBitRate`.
     fn asks(format: Option<&str>, max_bitrate_kbps: Option<u32>) -> StreamRequest {
         StreamRequest {
@@ -798,9 +739,10 @@ mod tests {
         use Target::{Mp3, Opus};
 
         // The config bitrates are 192 kbps for Opus and 320 kbps for MP3.
-        // `flac()` is a lossless track of 900 kbps.
+        // `flac()` is a lossless track of 900 kbps. The file of every track
+        // has the suffix `flac`, except for the tracks of `file`.
         let config = Transcoding::default();
-        let cases: [(&str, Track, StreamRequest, StreamPlan); 37] = [
+        let cases: [(&str, Track, StreamRequest, StreamPlan); 54] = [
             // Without a format and without a limit, the original file.
             ("no parameter", flac(), asks(None, None), Raw),
             (
@@ -860,6 +802,112 @@ mod tests {
                 mp3(320),
                 asks(Some("mp3"), Some(128)),
                 transcode(Mp3, 128),
+            ),
+            // A file that has the format already is the original file,
+            // unless its bitrate exceeds the limit.
+            (
+                "format=mp3 on an MP3 file",
+                file("mp3", Some(128)),
+                asks(Some("mp3"), None),
+                Raw,
+            ),
+            (
+                "format=mp3 on an MP3 file above the config bitrate",
+                file("mp3", Some(500)),
+                asks(Some("mp3"), None),
+                Raw,
+            ),
+            (
+                "format=mp3 with maxBitRate=0 on an MP3 file",
+                file("mp3", Some(128)),
+                asks(Some("mp3"), Some(0)),
+                Raw,
+            ),
+            (
+                "format=mp3 with a limit at the bitrate of an MP3 file",
+                file("mp3", Some(128)),
+                asks(Some("mp3"), Some(128)),
+                Raw,
+            ),
+            (
+                "format=mp3 with a limit above the bitrate of an MP3 file",
+                file("mp3", Some(128)),
+                asks(Some("mp3"), Some(320)),
+                Raw,
+            ),
+            (
+                "format=mp3 with a limit below the bitrate of an MP3 file",
+                file("mp3", Some(128)),
+                asks(Some("mp3"), Some(64)),
+                transcode(Mp3, 64),
+            ),
+            (
+                "format=mp3 with maxBitRate=8 on an MP3 file of 32 kbps",
+                file("mp3", Some(32)),
+                asks(Some("mp3"), Some(8)),
+                Raw,
+            ),
+            (
+                "format=mp3 with a limit on an MP3 file without a known bitrate",
+                file("mp3", None),
+                asks(Some("mp3"), Some(64)),
+                Raw,
+            ),
+            (
+                "format=MP3 on an MP3 file",
+                file("mp3", Some(128)),
+                asks(Some("MP3"), None),
+                Raw,
+            ),
+            (
+                "format=opus on an Opus file",
+                file("opus", Some(96)),
+                asks(Some("opus"), None),
+                Raw,
+            ),
+            (
+                "format=opus with a limit at the bitrate of an Opus file",
+                file("opus", Some(96)),
+                asks(Some("opus"), Some(96)),
+                Raw,
+            ),
+            (
+                "format=opus with a limit below the bitrate of an Opus file",
+                file("opus", Some(96)),
+                asks(Some("opus"), Some(64)),
+                transcode(Opus, 64),
+            ),
+            // A file of another format is transcoded, also from one target
+            // to the other. The suffix `ogg` does not say Opus.
+            (
+                "format=opus on an MP3 file",
+                file("mp3", Some(128)),
+                asks(Some("opus"), None),
+                transcode(Opus, 192),
+            ),
+            (
+                "format=mp3 on an Opus file",
+                file("opus", Some(96)),
+                asks(Some("mp3"), None),
+                transcode(Mp3, 320),
+            ),
+            (
+                "format=opus on a file with the suffix ogg",
+                file("ogg", Some(96)),
+                asks(Some("opus"), None),
+                transcode(Opus, 192),
+            ),
+            (
+                "format=mp3 on an M4A file within the limit",
+                file("m4a", Some(128)),
+                asks(Some("mp3"), Some(320)),
+                transcode(Mp3, 320),
+            ),
+            (
+                "format=raw on an MP3 file above the limit",
+                file("mp3", Some(320)),
+                asks(Some("raw"), Some(64)),
+                Raw,
             ),
             // A limit below the bitrate of the track is a transcode to Opus.
             (
@@ -1149,146 +1197,6 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn estimated_length_is_the_bitrate_times_the_rest_of_the_duration() {
-        // 96 kbps are 12 000 bytes in a second.
-        assert_eq!(estimated_length(96, 1000, 0), 12_000);
-        assert_eq!(estimated_length(96, 500, 0), 6000);
-        assert_eq!(estimated_length(320, 180_000, 0), 7_200_000);
-        // The stream starts at the offset, so the rest is shorter.
-        assert_eq!(estimated_length(320, 180_000, 30), 6_000_000);
-        assert_eq!(estimated_length(128, 10_500, 10), 8000);
-        // The result is rounded down.
-        assert_eq!(estimated_length(33, 1, 0), 4);
-        // A start at or after the end of the track.
-        assert_eq!(estimated_length(96, 30_000, 30), 0);
-        assert_eq!(estimated_length(96, 500, 1), 0);
-        assert_eq!(estimated_length(96, 0, 0), 0);
-        assert_eq!(estimated_length(96, 500, u32::MAX), 0);
-        // A duration that no file has does not overflow.
-        assert_eq!(estimated_length(320, u64::MAX, 0), u64::MAX / 8);
-    }
-
-    /// A stream of `chunks` that then ends, or that then stays open when
-    /// `open` is set. `dropped` is set when the stream is dropped.
-    fn chunked(
-        chunks: &[&'static [u8]],
-        open: bool,
-        dropped: &Arc<AtomicBool>,
-    ) -> impl Stream<Item = Result<Bytes, io::Error>> + Unpin + use<> {
-        struct SetOnDrop(Arc<AtomicBool>);
-        impl Drop for SetOnDrop {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
-            }
-        }
-
-        let flag = SetOnDrop(Arc::clone(dropped));
-        let chunks: Vec<Result<Bytes, io::Error>> = chunks
-            .iter()
-            .map(|chunk| Ok(Bytes::from_static(chunk)))
-            .collect();
-        let end: Pin<Box<dyn Stream<Item = Result<Bytes, io::Error>> + Send>> = if open {
-            Box::pin(stream::pending())
-        } else {
-            Box::pin(stream::empty())
-        };
-        // The closure owns the flag, and the stream owns the closure.
-        stream::iter(chunks).chain(end).map(move |chunk| {
-            let _owned = &flag;
-            chunk
-        })
-    }
-
-    /// The chunks that `cut` yields until it ends.
-    async fn chunks_of<S>(cut: &mut Cut<S>) -> Vec<Vec<u8>>
-    where
-        S: Stream<Item = Result<Bytes, io::Error>> + Unpin,
-    {
-        let mut chunks = Vec::new();
-        let read = async {
-            while let Some(chunk) = cut.next().await {
-                chunks.push(chunk.expect("a chunk").to_vec());
-            }
-        };
-        tokio::time::timeout(Duration::from_secs(1), read)
-            .await
-            .expect("the stream ends");
-        chunks
-    }
-
-    #[tokio::test]
-    async fn cut_ends_the_stream_at_the_length_and_drops_the_inner_stream() {
-        // The length is reached inside a chunk, at the end of a chunk, at
-        // the end of the last chunk, and it is 0. The inner stream stays
-        // open after its chunks, as the output of a process that runs does.
-        for (length, expected) in [
-            (6, vec![b"abcd".to_vec(), b"ef".to_vec()]),
-            (8, vec![b"abcd".to_vec(), b"efgh".to_vec()]),
-            (
-                12,
-                vec![b"abcd".to_vec(), b"efgh".to_vec(), b"ijkl".to_vec()],
-            ),
-            (1, vec![b"a".to_vec()]),
-            (0, vec![]),
-        ] {
-            let dropped = Arc::new(AtomicBool::new(false));
-            let inner = chunked(&[b"abcd", b"efgh", b"ijkl"], true, &dropped);
-            let mut cut = Cut::new(inner, length);
-            assert_eq!(chunks_of(&mut cut).await, expected, "{length}");
-            // The inner stream is gone although the cut stream is not.
-            assert!(dropped.load(Ordering::SeqCst), "{length}");
-            assert!(cut.next().await.is_none(), "{length}");
-        }
-    }
-
-    #[tokio::test]
-    async fn cut_drops_the_inner_stream_with_the_chunk_that_reaches_the_length() {
-        let dropped = Arc::new(AtomicBool::new(false));
-        let inner = chunked(&[b"abcd", b"efgh", b"ijkl"], true, &dropped);
-        let mut cut = Cut::new(inner, 6);
-        assert_eq!(cut.next().await.unwrap().unwrap(), "abcd");
-        assert!(!dropped.load(Ordering::SeqCst));
-        // The stream is not polled again after this chunk.
-        assert_eq!(cut.next().await.unwrap().unwrap(), "ef");
-        assert!(dropped.load(Ordering::SeqCst));
-    }
-
-    #[tokio::test]
-    async fn cut_of_a_shorter_stream_ends_with_it_and_adds_nothing() {
-        let dropped = Arc::new(AtomicBool::new(false));
-        let inner = chunked(&[b"abcd", b"ef"], false, &dropped);
-        let mut cut = Cut::new(inner, 6000);
-        assert_eq!(
-            chunks_of(&mut cut).await,
-            [b"abcd".to_vec(), b"ef".to_vec()]
-        );
-        assert!(dropped.load(Ordering::SeqCst));
-        assert_eq!(cut.remaining, 5994);
-    }
-
-    #[tokio::test]
-    async fn cut_waits_for_a_stream_that_has_no_chunk_yet_and_passes_an_error() {
-        let dropped = Arc::new(AtomicBool::new(false));
-        let inner = chunked(&[b"abcd"], true, &dropped);
-        let mut cut = Cut::new(inner, 100);
-        assert_eq!(cut.next().await.unwrap().unwrap(), "abcd");
-        // The inner stream is open and has no chunk.
-        let waited = tokio::time::timeout(Duration::from_millis(20), cut.next()).await;
-        assert!(waited.is_err(), "the cut stream ended or yielded");
-        assert!(!dropped.load(Ordering::SeqCst));
-
-        let failing = stream::iter([
-            Ok(Bytes::from_static(b"abcd")),
-            Err(io::Error::other("the pipe broke")),
-            Ok(Bytes::from_static(b"efgh")),
-        ]);
-        let mut cut = Cut::new(failing, 100);
-        assert_eq!(cut.next().await.unwrap().unwrap(), "abcd");
-        assert!(cut.next().await.unwrap().is_err());
-        assert!(cut.next().await.is_none());
     }
 
     #[test]

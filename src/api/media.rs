@@ -35,14 +35,15 @@ use crate::media::transcode::TranscodeJob;
 ///
 /// - The original file is the answer of `stream::raw`. `Range`, `If-Range`,
 ///   `If-None-Match` and `If-Modified-Since` are the request headers that
-///   it depends on. `timeOffset` and `estimateContentLength` are read and
-///   have no effect on it.
+///   it depends on. `timeOffset` is read and has no effect on it.
 /// - A transcode is the answer of `stream::transcoded`, with the transcoder
 ///   of the state. The stream starts at the second `timeOffset` of the
-///   track, and `estimateContentLength=true` gives the response an
-///   estimated `Content-Length`. No request header changes it. HTTP 503
-///   with `Retry-After: 5` answers a request for which no transcode slot is
-///   free, and error 0 answers a request on a server without ffmpeg.
+///   track. No request header changes it. HTTP 503 with `Retry-After: 5`
+///   answers a request for which no transcode slot is free, and error 0
+///   answers a request on a server without ffmpeg.
+///
+/// `estimateContentLength` is read and has no effect on either answer: the
+/// original file has its own length, and a transcode has none.
 ///
 /// The request is a GET, a HEAD or a POST with a form body. The method
 /// counts no play.
@@ -65,14 +66,14 @@ pub async fn stream(
             offset_s,
         } => {
             let job = TranscodeJob {
+                track: track.id.clone(),
                 path,
                 target,
                 bitrate_kbps,
                 offset_s,
             };
-            let estimate = request.estimate_content_length;
             let transcoder = state.transcoder.as_ref();
-            stream::transcoded(&track, job, folders, &method, estimate, transcoder).await
+            stream::transcoded(&track, job, folders, &method, transcoder).await
         }
     }
 }
