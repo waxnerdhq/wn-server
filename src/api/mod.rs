@@ -40,7 +40,7 @@ pub mod browse;
 
 // folders
 
-// lists
+pub mod lists;
 
 // search
 
@@ -258,13 +258,13 @@ pub const METHODS: &[(&str, Handler)] = &[
 
     ("getTopSongs", handler!(stubs::get_top_songs)),
 
-    ("getAlbumList", not_implemented),
+    ("getAlbumList", handler!(lists::get_album_list)),
 
-    ("getAlbumList2", not_implemented),
+    ("getAlbumList2", handler!(lists::get_album_list2)),
 
-    ("getRandomSongs", not_implemented),
+    ("getRandomSongs", handler!(lists::get_random_songs)),
 
-    ("getSongsByGenre", not_implemented),
+    ("getSongsByGenre", handler!(lists::get_songs_by_genre)),
 
     ("getNowPlaying", handler!(stubs::get_now_playing)),
 
