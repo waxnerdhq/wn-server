@@ -66,7 +66,9 @@ const CACHE_CONTROL: &str = "public, max-age=86400";
 /// or `image/webp`. With another `size` the body is a JPEG at the step of
 /// the size: the smallest of 80, 160, 320, 640, 1280 and 2000 pixels that is
 /// not smaller than `size`, and 2000 pixels for a larger `size`. Its longer
-/// side is at most the step, and it is not enlarged. The content type is the
+/// side is at most the step, and it is not enlarged. The JPEG has the
+/// orientation applied that the Exif metadata of a JPEG source declares; the
+/// image as its source stores it keeps its bytes. The content type is the
 /// one that the service reports.
 ///
 /// The response has `Content-Length`, `Cache-Control` and `ETag`. A request
@@ -140,20 +142,25 @@ fn unavailable(id: &str, error: &CoverError) -> ApiError {
 }
 
 /// Returns the entity tag of the cover `id` for a request with `size`,
-/// without the quotes: `<id>-<size>-<mtime>`.
+/// without the quotes: `<id>-0-<mtime>` for the image as its source stores
+/// it, which a request without `size` and with `size=0` gets, and
+/// `<id>-<step>-<mtime>-<version>` for a resized cover.
 ///
-/// `<size>` is the size that the cover is served at: 0 for the image as its
-/// source stores it, which a request without `size` and with `size=0` gets,
-/// and otherwise the step of the size ([`covers::served_size`]). Two
-/// requests that get the same bytes have the same tag, so every size of one
-/// step has one tag. `mtime` is the modification time that the last scan
-/// stored for the source of the cover. The three parts are the ones in the
-/// name of the cache file of a resized cover.
+/// `<step>` is the step of the size ([`covers::served_size`]). Two requests
+/// that get the same bytes have the same tag, so every size of one step has
+/// one tag. `mtime` is the modification time that the last scan stored for
+/// the source of the cover. `<version>` is [`covers::CACHE_VERSION`]. The
+/// four parts of the tag of a resized cover are the ones in the name of its
+/// cache file. The tag of a resized cover that an older version of the
+/// server made is therefore not the tag of the cover now, and a client that
+/// holds such a cover gets the new one and not HTTP 304.
 ///
 /// `id` has the form that [`ids::parse`] accepts.
 fn entity_tag(id: &str, size: Option<u32>, mtime: i64) -> String {
-    let served = covers::served_size(size).unwrap_or(0);
-    format!("{id}-{served}-{mtime}")
+    match covers::served_size(size) {
+        None => format!("{id}-0-{mtime}"),
+        Some(step) => format!("{id}-{step}-{mtime}-{}", covers::CACHE_VERSION),
+    }
 }
 
 /// Returns whether an `If-None-Match` header of `headers` names the entity
@@ -337,7 +344,7 @@ mod tests {
 
         /// The path of the cache file of the cover `id` at the step `size`.
         fn cache_file_of(&self, id: &str, size: u32) -> PathBuf {
-            self.cache_dir().join(format!("{id}-{size}-{MTIME}.jpg"))
+            self.cache_dir().join(format!("{id}-{size}-{MTIME}-2.jpg"))
         }
 
         /// The names of the entries of the directory `path`, in order.
@@ -421,8 +428,8 @@ mod tests {
     }
 
     #[test]
-    fn entity_tag_holds_the_id_the_served_size_and_the_time() {
-        // The image as it is stored has the size 0.
+    fn entity_tag_holds_the_id_the_served_size_the_time_and_the_version() {
+        // The image as it is stored has the size 0 and no version.
         assert_eq!(
             entity_tag(ALBUM, None, MTIME),
             "al-0123456789abcdef0123456789abcdef-0-1700000000"
@@ -432,8 +439,9 @@ mod tests {
             entity_tag(ALBUM, None, MTIME)
         );
         // A size has the tag of its step, so the sizes of one step have one
-        // tag.
-        let step_320 = "al-0123456789abcdef0123456789abcdef-320-1700000000";
+        // tag. The tag ends with the version of the resized covers.
+        assert_eq!(covers::CACHE_VERSION, 2);
+        let step_320 = "al-0123456789abcdef0123456789abcdef-320-1700000000-2";
         for size in [161, 290, 300, 310, 320] {
             assert_eq!(entity_tag(ALBUM, Some(size), MTIME), step_320, "{size}");
         }
@@ -442,11 +450,11 @@ mod tests {
         for step in covers::SIZE_STEPS {
             assert_eq!(
                 entity_tag(ALBUM, Some(step), MTIME),
-                format!("{ALBUM}-{step}-{MTIME}")
+                format!("{ALBUM}-{step}-{MTIME}-2")
             );
         }
         // A size over the largest step counts as that step.
-        let largest = "al-0123456789abcdef0123456789abcdef-2000-1700000000";
+        let largest = "al-0123456789abcdef0123456789abcdef-2000-1700000000-2";
         for size in [1281, 1999, 2000, 2001, 5000, u32::MAX] {
             assert_eq!(entity_tag(ALBUM, Some(size), MTIME), largest, "{size}");
         }
@@ -454,8 +462,15 @@ mod tests {
         // A file can have a time before 1970.
         assert_eq!(
             entity_tag(ALBUM, Some(1), -5),
-            "al-0123456789abcdef0123456789abcdef-80--5"
+            "al-0123456789abcdef0123456789abcdef-80--5-2"
         );
+        // The tag of a resized cover of the version before, which had no
+        // version, is not a tag of this version.
+        let before = format!("{ALBUM}-320-{MTIME}");
+        assert!(!lists_tag(
+            &format!("\"{before}\""),
+            &entity_tag(ALBUM, Some(320), MTIME)
+        ));
     }
 
     #[test]
@@ -553,7 +568,8 @@ mod tests {
         assert_eq!(body_of(response).await, library.image);
 
         // A resized cover is a JPEG, and it is the file of the cache. Its
-        // tag and its file have the step of the size.
+        // tag and its file have the step of the size and the version of the
+        // resized covers.
         let response = library
             .call(&format!("id={id}&size=64"))
             .await
@@ -562,7 +578,7 @@ mod tests {
             header_of(&response, header::CONTENT_TYPE),
             Some("image/jpeg")
         );
-        let tag = format!("\"{id}-80-{MTIME}\"");
+        let tag = format!("\"{id}-80-{MTIME}-2\"");
         assert_eq!(header_of(&response, header::ETAG), Some(tag.as_str()));
         let cached = fs::read(library.cache_file(80)).expect("read the cache file");
         assert_eq!(

@@ -11,6 +11,7 @@
 mod common;
 
 use std::fs;
+use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -147,6 +148,26 @@ fn write_image(path: &Path, width: u32, height: u32) {
         .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
 }
 
+/// Returns the JPEG file `jpeg` with Exif metadata that declares
+/// `orientation`, a value from 1 to 8. The metadata is an APP1 segment after
+/// the start marker of the file. It holds `Exif`, two zero bytes and the
+/// Exif data: the byte order of Intel, the offset of the first directory,
+/// and that directory with one entry, which has the tag 0x0112, the format
+/// of a 16-bit number, one value and the orientation.
+fn with_orientation(jpeg: &[u8], orientation: u8) -> Vec<u8> {
+    assert_eq!(jpeg[..2], [0xff, 0xd8], "the start marker of a JPEG");
+    let mut exif = b"Exif\0\0II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
+    exif.extend([orientation, 0, 0, 0]);
+    // The offset of the next directory: there is none.
+    exif.extend([0; 4]);
+    let length = u16::try_from(exif.len() + 2).expect("a short segment");
+    let mut bytes = vec![0xff, 0xd8, 0xff, 0xe1];
+    bytes.extend(length.to_be_bytes());
+    bytes.extend(exif);
+    bytes.extend(&jpeg[2..]);
+    bytes
+}
+
 /// Adds a front cover with the content `bytes` to the tag of the audio file
 /// at `path`. The tag names `mime` as the type of the picture.
 fn embed_picture(path: &Path, bytes: &[u8], mime: MimeType) {
@@ -254,7 +275,7 @@ async fn a_sized_cover_is_a_jpeg_of_at_most_its_step_and_the_second_request_read
         assert_eq!(jpeg_dimensions(&cover), dimensions, "{name}");
         assert_eq!(cover.mtime, source_mtime);
 
-        let name = format!("{id}-80-{source_mtime}.jpg");
+        let name = format!("{id}-80-{source_mtime}-2.jpg");
         let cached = scanned.data_dir.covers_cache_dir().join(&name);
         assert_eq!(cover.bytes, fs::read(&cached).expect("read the cache file"));
 
@@ -285,7 +306,7 @@ async fn requests_for_the_sizes_290_300_and_310_create_one_cache_file() {
     }
     assert_eq!(
         scanned.cache_files(),
-        [format!("{id}-320-{}.jpg", mtime(&cover_file))]
+        [format!("{id}-320-{}-2.jpg", mtime(&cover_file))]
     );
 }
 
@@ -321,6 +342,63 @@ async fn a_size_above_the_largest_step_is_the_largest_step_or_the_size_of_the_im
 }
 
 #[tokio::test]
+async fn a_cover_file_and_an_embedded_picture_with_an_orientation_are_turned_when_resized() {
+    // The image is stored 48 pixels wide and 32 pixels high, with a dark
+    // left half and a light right half. Its metadata declares the
+    // orientation 6: a viewer turns the image by a quarter clockwise and
+    // shows it 32 pixels wide and 48 pixels high, with the dark half at the
+    // top.
+    let stored = RgbImage::from_fn(48, 32, |x, _| Rgb([if x < 24 { 20 } else { 230 }; 3]));
+    let mut jpeg = Cursor::new(Vec::new());
+    stored
+        .write_to(&mut jpeg, ImageFormat::Jpeg)
+        .expect("encode the image");
+    let source = with_orientation(jpeg.get_ref(), 6);
+
+    // "Glass Harbour" gets the image as its cover file, and its first track
+    // gets it as its embedded picture.
+    let library = LibraryBuilder::standard().build();
+    let cover_file = file(&library, "Aurora Field", "Glass Harbour", "cover.jpg");
+    fs::write(&cover_file, &source).expect("write the cover file");
+    let track_file = file(
+        &library,
+        "Aurora Field",
+        "Glass Harbour",
+        "01 Low Tide.flac",
+    );
+    embed_picture(&track_file, &source, MimeType::Jpeg);
+    let scanned = Scanned::of(library).await;
+    let album = scanned.album("Glass Harbour").await;
+    let track = scanned.track("Low Tide").await;
+    assert_eq!(
+        scanned
+            .cover_source("Glass Harbour")
+            .await
+            .map(PathBuf::from),
+        Some(cover_file)
+    );
+
+    for (id, name) in [(&album, "cover file"), (&track, "embedded picture")] {
+        // Without a size the cover is the source with its metadata.
+        let original = scanned.get(id, None).await.expect("a cover");
+        assert_eq!(original.bytes, source, "{name}");
+        assert_eq!(original.content_type, "image/jpeg", "{name}");
+
+        // With a size the image is turned.
+        let resized = scanned.get(id, Some(64)).await.expect("a resized cover");
+        assert_eq!(jpeg_dimensions(&resized), (32, 48), "{name}");
+        let pixels = image::load_from_memory(&resized.bytes)
+            .expect("decode the JPEG")
+            .into_luma8();
+        let (top, bottom) = (pixels.get_pixel(0, 0).0[0], pixels.get_pixel(0, 47).0[0]);
+        assert!(top < 64 && bottom > 192, "{name}: {top} {bottom}");
+
+        // The source is served as before.
+        assert_eq!(scanned.get(id, None).await, Some(original), "{name}");
+    }
+}
+
+#[tokio::test]
 async fn a_track_cover_is_the_embedded_picture_of_the_track() {
     let scanned = Scanned::standard().await;
     let file = scanned.file("Marlow Quartet", "Slow Rivers", "02 Delta.m4a");
@@ -336,7 +414,7 @@ async fn a_track_cover_is_the_embedded_picture_of_the_track() {
     assert_eq!(jpeg_dimensions(&resized), (2, 2));
     assert_eq!(
         scanned.cache_files(),
-        [format!("{pictured}-80-{}.jpg", mtime(&file))]
+        [format!("{pictured}-80-{}-2.jpg", mtime(&file))]
     );
 
     // A track without a picture, an album without a cover file and without
@@ -420,7 +498,7 @@ async fn a_scan_removes_the_cached_cover_of_a_cover_file_that_changed() {
     let new = scanned.get(&album, Some(64)).await.expect("a cover");
     assert_eq!(jpeg_dimensions(&new), (80, 40));
     assert_eq!(new.mtime, new_time);
-    let mut names = vec![format!("{album}-80-{new_time}.jpg"), kept_name];
+    let mut names = vec![format!("{album}-80-{new_time}-2.jpg"), kept_name];
     names.sort();
     assert_eq!(scanned.cache_files(), names);
     assert_eq!(scanned.get(&other, Some(64)).await, Some(kept));
