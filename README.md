@@ -187,7 +187,7 @@ Every API method needs a user, except `getOpenSubsonicExtensions`. The server ch
 
 The response does not tell an unknown user from a wrong password. A failed attempt is logged at the `info` level with the values of `u` and `c`, each cut to 64 characters, and the error code. A password, a token or a salt is never logged and is never part of an error message.
 
-`auth.disabled_unsafe = true` turns authentication off. This is unsafe: every request that has `v` and `c` then acts as the owner without a password, for anyone who can reach the port. That includes any web page that is open in a browser on the network: every response carries `Access-Control-Allow-Origin: *` (see [API](#api)), so the browser lets the page read the responses. Such a page can then use the server as the owner. It can read and stream the library, and it can call every method, including the methods that change state: stars, ratings, plays, playlists and scans. `run` logs a warning at startup while the setting is on.
+`auth.disabled_unsafe = true` turns authentication off. This is unsafe: every request that has `v` and `c` then acts as the owner without a password, for anyone who can reach the port. That includes any web page that is open in a browser on the network: every response carries `Access-Control-Allow-Origin: *` (see [API](#api)), so the browser lets the page read the responses. Such a page can then use the server as the owner. It can read and stream the library, and it can call every method, including the methods that change state: stars, ratings, plays, playlists, the play queue and scans. `run` logs a warning at startup while the setting is on.
 
 ## API
 
