@@ -642,11 +642,11 @@ async fn every_method_that_is_not_public_needs_a_user() {
 #[tokio::test]
 async fn method_without_a_handler_answers_not_supported_only_to_a_user() {
     let server = server().await;
-    let response = server.get_json_noauth("getPodcasts", &[V, C]).await;
+    let response = server.get_json_noauth("getVideos", &[V, C]).await;
     assert_eq!(response["error"], error_10("u"));
 
     let response = server
-        .get_json_noauth("getPodcasts", &[("u", OWNER), ("p", OWNER_PASSWORD), V, C])
+        .get_json_noauth("getVideos", &[("u", OWNER), ("p", OWNER_PASSWORD), V, C])
         .await;
     assert_eq!(response["error"], error(0, "not supported"));
 

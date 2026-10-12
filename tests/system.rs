@@ -207,12 +207,12 @@ async fn method_names_are_case_sensitive() {
 #[tokio::test]
 async fn listed_method_without_a_handler_is_error_0_not_supported() {
     let server = server().await;
-    let response = server.get_json("getPodcasts", &[]).await;
+    let response = server.get_json("getVideos", &[]).await;
     assert_eq!(response["status"], "failed");
     assert_eq!(response["error"], error_0("not supported"));
 
     assert_eq!(
-        server.get_xml("getPodcasts", &[]).await,
+        server.get_xml("getVideos", &[]).await,
         xml_error_0("not supported")
     );
 }

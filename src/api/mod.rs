@@ -52,9 +52,9 @@ pub mod system;
 
 // lyrics
 
-// users
+pub mod users;
 
-// stubs
+pub mod stubs;
 
 // media
 
@@ -241,19 +241,19 @@ pub const METHODS: &[(&str, Handler)] = &[
 
     ("getVideoInfo", not_implemented),
 
-    ("getArtistInfo", not_implemented),
+    ("getArtistInfo", handler!(stubs::get_artist_info)),
 
-    ("getArtistInfo2", not_implemented),
+    ("getArtistInfo2", handler!(stubs::get_artist_info2)),
 
-    ("getAlbumInfo", not_implemented),
+    ("getAlbumInfo", handler!(stubs::get_album_info)),
 
-    ("getAlbumInfo2", not_implemented),
+    ("getAlbumInfo2", handler!(stubs::get_album_info2)),
 
-    ("getSimilarSongs", not_implemented),
+    ("getSimilarSongs", handler!(stubs::get_similar_songs)),
 
-    ("getSimilarSongs2", not_implemented),
+    ("getSimilarSongs2", handler!(stubs::get_similar_songs2)),
 
-    ("getTopSongs", not_implemented),
+    ("getTopSongs", handler!(stubs::get_top_songs)),
 
     ("getAlbumList", not_implemented),
 
@@ -263,7 +263,7 @@ pub const METHODS: &[(&str, Handler)] = &[
 
     ("getSongsByGenre", not_implemented),
 
-    ("getNowPlaying", not_implemented),
+    ("getNowPlaying", handler!(stubs::get_now_playing)),
 
     ("getStarred", not_implemented),
 
@@ -287,7 +287,7 @@ pub const METHODS: &[(&str, Handler)] = &[
 
     ("stream", not_implemented),
 
-    ("download", not_implemented),
+    ("download", handler!(stubs::download)),
 
     ("hls", not_implemented),
 
@@ -299,7 +299,7 @@ pub const METHODS: &[(&str, Handler)] = &[
 
     ("getLyricsBySongId", not_implemented),
 
-    ("getAvatar", not_implemented),
+    ("getAvatar", handler!(stubs::get_avatar)),
 
     ("star", not_implemented),
 
@@ -309,15 +309,15 @@ pub const METHODS: &[(&str, Handler)] = &[
 
     ("scrobble", not_implemented),
 
-    ("getShares", not_implemented),
+    ("getShares", handler!(stubs::get_shares)),
 
-    ("getPodcasts", not_implemented),
+    ("getPodcasts", handler!(stubs::get_podcasts)),
 
-    ("getNewestPodcasts", not_implemented),
+    ("getNewestPodcasts", handler!(stubs::get_newest_podcasts)),
 
-    ("getInternetRadioStations", not_implemented),
+    ("getInternetRadioStations", handler!(stubs::get_internet_radio_stations)),
 
-    ("getBookmarks", not_implemented),
+    ("getBookmarks", handler!(stubs::get_bookmarks)),
 
     ("createShare", not_implemented),
 
@@ -351,17 +351,17 @@ pub const METHODS: &[(&str, Handler)] = &[
 
     ("deleteBookmark", not_implemented),
 
-    ("getUser", not_implemented),
+    ("getUser", handler!(users::get_user)),
 
-    ("getUsers", not_implemented),
+    ("getUsers", handler!(users::get_users)),
 
-    ("createUser", not_implemented),
+    ("createUser", handler!(stubs::user_management)),
 
-    ("updateUser", not_implemented),
+    ("updateUser", handler!(stubs::user_management)),
 
-    ("deleteUser", not_implemented),
+    ("deleteUser", handler!(stubs::user_management)),
 
-    ("changePassword", not_implemented),
+    ("changePassword", handler!(stubs::user_management)),
 
     ("getPlayQueue", not_implemented),
 
