@@ -85,10 +85,20 @@ pub fn placeholder_path(id: &str) -> String {
 /// Every reader of `tracks` asks here before it builds a file path
 /// (`docs/design.md` section 3.4). A placeholder path is never joined to a
 /// folder path, because `Path::join` replaces the folder with a root path.
-/// In SQL the same test is `rel_path NOT LIKE '/%'`.
+/// In SQL the same test is [`HAS_FILE_SQL`].
 pub fn has_file(rel_path: &str) -> bool {
     !rel_path.starts_with('/')
 }
+
+/// The SQL test for a track row that has a file: the test of [`has_file`] as
+/// a condition on the `rel_path` column.
+///
+/// Every statement of a query module that needs files holds this text, and
+/// no module spells the test itself (`docs/design.md` section 3.4). The
+/// column name carries no table name. `tracks` is the one table with a
+/// `rel_path` column, so the text also serves a statement that joins other
+/// tables or names `tracks` by an alias.
+pub(super) const HAS_FILE_SQL: &str = "rel_path NOT LIKE '/%'";
 
 /// The values of a track row that come from the content of its file.
 #[derive(Debug, Clone, Copy)]
@@ -106,11 +116,13 @@ pub struct TrackContent<'a> {
     pub album_id: &'a str,
 }
 
-/// The columns of [`Track`] in the order [`track_from_row`] reads them.
-const TRACK_COLUMNS: &str = "id, folder_id, rel_path, fingerprint, title, album_id, artist_id, \
-     artist_name, album_name, track_no, disc_no, year, genre, duration_ms, bitrate_kbps, \
-     sample_rate, bit_depth, channels, size, suffix, content_type, lossless, has_picture, \
-     has_lyrics, mtime, created_at, updated_at";
+/// The columns of [`Track`] in the order [`track_from_row`] reads them. The
+/// names carry no table name, so the text serves a statement whose `FROM`
+/// clause names `tracks` and no other table.
+pub(super) const TRACK_COLUMNS: &str = "id, folder_id, rel_path, fingerprint, title, album_id, \
+     artist_id, artist_name, album_name, track_no, disc_no, year, genre, duration_ms, \
+     bitrate_kbps, sample_rate, bit_depth, channels, size, suffix, content_type, lossless, \
+     has_picture, has_lyrics, mtime, created_at, updated_at";
 
 /// Returns the index entry of every track, in no particular order.
 pub fn load_index(conn: &Connection) -> Result<Vec<IndexEntry>> {
@@ -284,7 +296,9 @@ pub fn count_tracks_in_folder(conn: &Connection, folder_id: i64) -> Result<u64> 
     )?)
 }
 
-fn track_from_row(row: &Row<'_>) -> rusqlite::Result<Track> {
+/// Reads a [`Track`] from the first columns of `row`, which are
+/// [`TRACK_COLUMNS`].
+pub(super) fn track_from_row(row: &Row<'_>) -> rusqlite::Result<Track> {
     Ok(Track {
         id: row.get(0)?,
         folder_id: row.get(1)?,
@@ -558,8 +572,9 @@ mod tests {
         let with_file: Vec<String> = fixture
             .db
             .with_reader(|conn| {
-                let mut select =
-                    conn.prepare("SELECT id FROM tracks WHERE rel_path NOT LIKE '/%' ORDER BY id")?;
+                let mut select = conn.prepare(&format!(
+                    "SELECT id FROM tracks WHERE {HAS_FILE_SQL} ORDER BY id"
+                ))?;
                 let ids = select
                     .query_map([], |row| row.get(0))?
                     .collect::<rusqlite::Result<_>>()?;
@@ -577,6 +592,32 @@ mod tests {
         expected.sort();
         assert_eq!(with_file, expected);
         assert_eq!(with_file, [FIRST]);
+    }
+
+    #[test]
+    fn the_sql_test_for_a_file_agrees_with_has_file_for_each_kind_of_path() {
+        let db = Db::open_memory().unwrap();
+        let placeholder = placeholder_path(FIRST);
+        // `%` and `_` are the wildcards of `LIKE`. In a path they are text.
+        let paths = [
+            "a.flac",
+            "a/b.flac",
+            "%/a.flac",
+            "_",
+            "a//b.flac",
+            placeholder.as_str(),
+            "/",
+            "/%",
+        ];
+        for rel_path in paths {
+            let in_sql: bool = db
+                .with_reader(|conn| {
+                    let sql = format!("SELECT ?1 AS rel_path WHERE {HAS_FILE_SQL}");
+                    Ok(conn.prepare(&sql)?.exists([rel_path])?)
+                })
+                .unwrap();
+            assert_eq!(in_sql, has_file(rel_path), "{rel_path}");
+        }
     }
 
     #[test]

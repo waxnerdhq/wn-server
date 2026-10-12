@@ -351,6 +351,391 @@ fn write_tags(path: &Path, track: &TrackSpec) {
         .unwrap_or_else(|error| panic!("write the tag of {}: {error}", path.display()));
 }
 
+// A test binary that names none of these types has no use for the re-export.
+#[allow(unused_imports)]
+pub use scanned::{
+    Catalogue, ScannedServer, StandardAlbums, StandardArtists, StandardServer, StandardTracks,
+    body_bytes, get_request,
+};
+
+/// The servers over a scanned library, and what the tests of the methods
+/// that read the library share.
+///
+/// The module is one block of this file with its own imports, so that a
+/// change to another part of the file does not touch its lines.
+mod scanned {
+    use std::ops::Deref;
+    use std::path::{Path, PathBuf};
+    use std::sync::{Arc, Mutex, PoisonError, Weak};
+
+    use axum::body::Body;
+    use axum::http::Request;
+    use axum::response::Response;
+    use tokio_util::sync::CancellationToken;
+    use wn_server::config::Config;
+    use wn_server::db::Db;
+    use wn_server::db::queries::browse::{self, Album, Artist, Folder, Song};
+    use wn_server::library::scanner::{self, ScanOptions, ScanSummary};
+
+    use super::{AuthDefaults, LibraryBuilder, TestLibrary, TestServer, urlencode};
+
+    /// A [`TestServer`] over a library that was scanned into its database.
+    /// The config of the server names the directory of the library as its
+    /// one music folder.
+    ///
+    /// The value dereferences to the [`TestServer`], so `get_json` and the
+    /// other request methods are called on it.
+    pub struct ScannedServer {
+        server: TestServer,
+        library: Arc<TestLibrary>,
+        /// The ID of the music folder row of the library.
+        pub folder_id: i64,
+    }
+
+    impl Deref for ScannedServer {
+        type Target = TestServer;
+
+        fn deref(&self) -> &TestServer {
+            &self.server
+        }
+    }
+
+    impl ScannedServer {
+        /// The directory of the library, which is the music folder.
+        pub fn root(&self) -> &Path {
+            self.library.root.path()
+        }
+
+        /// The absolute path of `rel_path`, a path below the music folder
+        /// with `/` between its components, as `tracks.rel_path` holds it.
+        pub fn path(&self, rel_path: &str) -> PathBuf {
+            let mut path = self.root().to_path_buf();
+            path.extend(rel_path.split('/'));
+            path
+        }
+
+        /// The absolute path of each track of the library, in the order the
+        /// tracks were added to the builder.
+        pub fn files(&self) -> &[PathBuf] {
+            &self.library.files
+        }
+
+        /// Scans the music folder again and returns the summary of the scan.
+        /// A test calls it after it changed a file of a library of its own.
+        /// The scan is a call of the scanner and not of the scan controller
+        /// of the server, so `scanning` and `count` of `getScanStatus` do
+        /// not report it.
+        pub async fn rescan(&self) -> ScanSummary {
+            scan(self.db(), self.root()).await
+        }
+
+        /// Reads the rows of the library as the database holds them now.
+        pub async fn catalogue(&self) -> Catalogue {
+            self.db()
+                .read(|conn| {
+                    let artists = browse::list_artists(conn, None)?;
+                    let mut albums = Vec::new();
+                    for artist in &artists {
+                        albums.extend(browse::albums_of_artist(conn, &artist.id)?);
+                    }
+                    let mut songs = Vec::new();
+                    for album in &albums {
+                        songs.extend(browse::tracks_of_album(conn, &album.id)?);
+                    }
+                    Ok(Catalogue {
+                        folders: browse::folders(conn)?,
+                        artists,
+                        albums,
+                        songs,
+                    })
+                })
+                .await
+                .expect("read the library")
+        }
+    }
+
+    /// The rows of a scanned library: the music folders in ID order, the
+    /// artists in the order of `browse::list_artists`, the albums of each
+    /// artist in the order of `browse::albums_of_artist`, and the tracks of
+    /// each album in the order of `browse::tracks_of_album`.
+    pub struct Catalogue {
+        pub folders: Vec<Folder>,
+        pub artists: Vec<Artist>,
+        pub albums: Vec<Album>,
+        pub songs: Vec<Song>,
+    }
+
+    impl Catalogue {
+        /// The artist with the name `name`. Panics unless one artist has it.
+        pub fn artist(&self, name: &str) -> &Artist {
+            only(
+                self.artists.iter().filter(|row| row.name == name),
+                "artist",
+                name,
+            )
+        }
+
+        /// The album with the title `title`. Panics unless one album has it.
+        pub fn album(&self, title: &str) -> &Album {
+            only(
+                self.albums.iter().filter(|row| row.name == title),
+                "album",
+                title,
+            )
+        }
+
+        /// The track with the title `title`. Panics unless one track has it.
+        pub fn song(&self, title: &str) -> &Song {
+            let titled = self.songs.iter().filter(|row| row.track.title == title);
+            only(titled, "track", title)
+        }
+    }
+
+    /// The one item of `rows`. Panics when `rows` holds none or several.
+    fn only<'a, T>(mut rows: impl Iterator<Item = &'a T>, kind: &str, name: &str) -> &'a T {
+        let first = rows
+            .next()
+            .unwrap_or_else(|| panic!("the library has no {kind} named {name:?}"));
+        assert!(
+            rows.next().is_none(),
+            "the library has several {kind}s named {name:?}"
+        );
+        first
+    }
+
+    /// The IDs of the artists of [`LibraryBuilder::standard`]. They are the
+    /// album artists: "Tessa Lund" is a track artist only and has no row.
+    pub struct StandardArtists {
+        pub aurora_field: String,
+        pub marlow_quartet: String,
+        pub various_artists: String,
+    }
+
+    /// The IDs of the albums of [`LibraryBuilder::standard`].
+    pub struct StandardAlbums {
+        /// By Aurora Field, 2019: three FLAC tracks and the file `cover.jpg`.
+        pub glass_harbour: String,
+        /// By Aurora Field, 2021: three MP3 tracks on two discs, no cover.
+        pub paper_maps: String,
+        /// By Marlow Quartet, 2015: two M4A tracks with an embedded picture.
+        pub slow_rivers: String,
+        /// By Various Artists, 2020: an Ogg Vorbis and an Opus track, no
+        /// cover.
+        pub summer_sampler: String,
+    }
+
+    /// The IDs of the tracks of [`LibraryBuilder::standard`], in the order
+    /// the builder adds them. Each field has the title of its track.
+    pub struct StandardTracks {
+        /// "Glass Harbour", track 1, FLAC.
+        pub low_tide: String,
+        /// "Glass Harbour", track 2, FLAC.
+        pub breakwater: String,
+        /// "Glass Harbour", track 3, FLAC.
+        pub night_ferry: String,
+        /// "Paper Maps", disc 1, track 1, MP3.
+        pub meridian: String,
+        /// "Paper Maps", disc 1, track 2, MP3.
+        pub contour: String,
+        /// "Paper Maps", disc 2, track 1, MP3.
+        pub legend: String,
+        /// "Slow Rivers", track 1, M4A.
+        pub upstream: String,
+        /// "Slow Rivers", track 2, M4A.
+        pub delta: String,
+        /// "Summer Sampler", track 1, Ogg Vorbis, by Tessa Lund, with lyrics.
+        pub open_road: String,
+        /// "Summer Sampler", track 2, Opus, by Aurora Field.
+        pub last_train: String,
+    }
+
+    /// A [`ScannedServer`] over the library of [`LibraryBuilder::standard`],
+    /// with the IDs that the scan gave its artists, albums and tracks.
+    ///
+    /// The value dereferences to the [`ScannedServer`] and through it to the
+    /// [`TestServer`].
+    pub struct StandardServer {
+        server: ScannedServer,
+        /// The IDs of the three artists.
+        pub artist: StandardArtists,
+        /// The IDs of the four albums.
+        pub album: StandardAlbums,
+        /// The IDs of the ten tracks.
+        pub track: StandardTracks,
+    }
+
+    impl Deref for StandardServer {
+        type Target = ScannedServer;
+
+        fn deref(&self) -> &ScannedServer {
+            &self.server
+        }
+    }
+
+    impl TestServer {
+        /// A server over the scanned standard library
+        /// ([`LibraryBuilder::standard`]). Every call returns a server with
+        /// a database of its own, so a test writes annotations, playlists
+        /// and other rows without an effect on another test.
+        ///
+        /// The files of the library are shared: the tests of one test binary
+        /// that hold a server at the same time read the same directory,
+        /// which is written once for them. A test therefore does not change,
+        /// add or remove a file below [`ScannedServer::root`]. A test that
+        /// does so calls [`TestServer::standard_with_own_files`].
+        pub async fn standard() -> StandardServer {
+            standard_server(shared_standard_library()).await
+        }
+
+        /// A server over the scanned standard library, as
+        /// [`TestServer::standard`] returns it, with a copy of the files that
+        /// no other test reads. The test changes the files and calls
+        /// [`ScannedServer::rescan`].
+        pub async fn standard_with_own_files() -> StandardServer {
+            standard_server(Arc::new(LibraryBuilder::standard().build())).await
+        }
+
+        /// A server over `library`, scanned. The scan must report no error.
+        /// A test of names or files that the standard library does not have
+        /// builds its library with [`LibraryBuilder`] and finds the IDs with
+        /// [`ScannedServer::catalogue`].
+        pub async fn scanned(library: TestLibrary) -> ScannedServer {
+            scanned_server(Arc::new(library)).await
+        }
+
+        /// Sends `GET /rest/<method>` with `params` and the auth defaults in
+        /// the query string, and with `headers` as request headers. A test
+        /// of `Range` or `If-None-Match` uses it.
+        pub async fn get_with_headers(
+            &self,
+            method: &str,
+            params: &[(&str, &str)],
+            headers: &[(&str, &str)],
+        ) -> Response {
+            let auth = AuthDefaults::new();
+            let request = get_request(method, &auth.after(params), headers);
+            self.request(request).await
+        }
+    }
+
+    /// A `GET /rest/<method>` request with `params` in the query string,
+    /// with `headers` as its headers and with no other parameter.
+    pub fn get_request(
+        method: &str,
+        params: &[(&str, &str)],
+        headers: &[(&str, &str)],
+    ) -> Request<Body> {
+        let path = format!("/rest/{method}?{}", urlencode(params));
+        let mut request = Request::get(&path);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        request
+            .body(Body::empty())
+            .unwrap_or_else(|error| panic!("GET {path}: {error}"))
+    }
+
+    /// Reads the body of `response` as bytes. A test of a method that
+    /// returns a file or an image uses it.
+    pub async fn body_bytes(response: Response) -> Vec<u8> {
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("read the response body")
+            .to_vec()
+    }
+
+    /// The standard library that the servers of [`TestServer::standard`]
+    /// share. The library is written when no server holds it, and its
+    /// directory is deleted when the last server that holds it is dropped.
+    /// The tests of a binary run on several threads and overlap, so the
+    /// library is written once for a run of the binary in most runs, and no
+    /// directory is left behind when the process ends.
+    fn shared_standard_library() -> Arc<TestLibrary> {
+        static SHARED: Mutex<Weak<TestLibrary>> = Mutex::new(Weak::new());
+        // A test that panicked while it held the lock left the value intact.
+        let mut shared = SHARED.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(library) = shared.upgrade() {
+            return library;
+        }
+        let library = Arc::new(LibraryBuilder::standard().build());
+        *shared = Arc::downgrade(&library);
+        library
+    }
+
+    async fn standard_server(library: Arc<TestLibrary>) -> StandardServer {
+        let server = scanned_server(library).await;
+        let catalogue = server.catalogue().await;
+        let artist = |name: &str| catalogue.artist(name).id.clone();
+        let album = |title: &str| catalogue.album(title).id.clone();
+        let track = |title: &str| catalogue.song(title).track.id.clone();
+        StandardServer {
+            artist: StandardArtists {
+                aurora_field: artist("Aurora Field"),
+                marlow_quartet: artist("Marlow Quartet"),
+                various_artists: artist("Various Artists"),
+            },
+            album: StandardAlbums {
+                glass_harbour: album("Glass Harbour"),
+                paper_maps: album("Paper Maps"),
+                slow_rivers: album("Slow Rivers"),
+                summer_sampler: album("Summer Sampler"),
+            },
+            track: StandardTracks {
+                low_tide: track("Low Tide"),
+                breakwater: track("Breakwater"),
+                night_ferry: track("Night Ferry"),
+                meridian: track("Meridian"),
+                contour: track("Contour"),
+                legend: track("Legend"),
+                upstream: track("Upstream"),
+                delta: track("Delta"),
+                open_road: track("Open Road"),
+                last_train: track("Last Train"),
+            },
+            server,
+        }
+    }
+
+    async fn scanned_server(library: Arc<TestLibrary>) -> ScannedServer {
+        let root = library.root.path().to_path_buf();
+        let mut config = Config::default();
+        config.library.folders = vec![root.clone()];
+        let server = TestServer::bare(config).await;
+
+        let summary = scan(server.db(), &root).await;
+        assert_eq!(
+            summary.errors,
+            [] as [&str; 0],
+            "the scan of {}",
+            root.display()
+        );
+        let folders = server
+            .db()
+            .read(browse::folders)
+            .await
+            .expect("read the music folders");
+        assert_eq!(folders.len(), 1, "the scan stores one music folder");
+        ScannedServer {
+            server,
+            library,
+            folder_id: folders[0].id,
+        }
+    }
+
+    /// Scans the music folder `root` into `db` on a blocking thread.
+    async fn scan(db: &Db, root: &Path) -> ScanSummary {
+        let db = db.clone();
+        let folders = vec![root.to_path_buf()];
+        tokio::task::spawn_blocking(move || {
+            let cancel = CancellationToken::new();
+            scanner::scan(&db, &folders, &cancel, false, ScanOptions::default())
+        })
+        .await
+        .expect("the scan does not panic")
+        .expect("the scan reads and writes the database")
+    }
+}
+
 /// The name of the owner account of a [`TestServer`].
 pub const OWNER: &str = "owner";
 

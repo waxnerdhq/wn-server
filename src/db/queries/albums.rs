@@ -8,17 +8,16 @@
 use rusqlite::{Connection, params};
 
 use super::int;
+use super::tracks::HAS_FILE_SQL;
 use crate::db::Result;
 use crate::ids::{self, Kind};
 
 /// The order of the tracks of one album: by disc number, where a track
 /// without one counts as disc 1, then by track number, where a track without
-/// one follows the numbered tracks, then by locator.
-const TRACK_ORDER: &str = "coalesce(disc_no, 1), track_no IS NULL, track_no, folder_id, rel_path";
-
-/// The SQL test for a track that has a file. It is the test of
-/// `tracks::has_file` (`docs/design.md` section 3.4).
-const HAS_FILE: &str = "rel_path NOT LIKE '/%'";
+/// one follows the numbered tracks, then by locator (`docs/design.md`
+/// section 1.3). `browse::tracks_of_album` lists the tracks in this order.
+pub(super) const TRACK_ORDER: &str =
+    "coalesce(disc_no, 1), track_no IS NULL, track_no, folder_id, rel_path";
 
 /// The stored cover of one album and the tracks that decide its cover.
 ///
@@ -185,10 +184,10 @@ pub fn cover_inputs(conn: &Connection) -> Result<Vec<CoverInputs>> {
            pictured.id, pictured.mtime
          FROM albums a
          LEFT JOIN tracks first ON first.id = (
-           SELECT id FROM tracks WHERE album_id = a.id AND {HAS_FILE}
+           SELECT id FROM tracks WHERE album_id = a.id AND {HAS_FILE_SQL}
            ORDER BY {TRACK_ORDER} LIMIT 1)
          LEFT JOIN tracks pictured ON pictured.id = (
-           SELECT id FROM tracks WHERE album_id = a.id AND {HAS_FILE} AND has_picture = 1
+           SELECT id FROM tracks WHERE album_id = a.id AND {HAS_FILE_SQL} AND has_picture = 1
            ORDER BY {TRACK_ORDER} LIMIT 1)
          ORDER BY a.id"
     ))?;

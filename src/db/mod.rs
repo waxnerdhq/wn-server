@@ -9,17 +9,9 @@ use std::time::Duration;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard};
 
-/// Query functions, one module per group of tables.
-pub mod queries {
-    pub mod albums;
-    pub mod annotations;
-    pub mod artists;
-    pub mod folders;
-    mod int;
-    pub mod scans;
-    pub mod tracks;
-    pub mod users;
-}
+// The list of the query modules is in `queries/mod.rs`, which holds nothing
+// else. A change that adds a query module edits that file and not this one.
+pub mod queries;
 
 /// The migrations in order. Migration `n` (counted from 1) moves the schema
 /// from version `n - 1` to version `n`. `PRAGMA user_version` holds the
