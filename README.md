@@ -129,7 +129,8 @@ These signals stop the server. The limit is the time that the server gives its r
 | SIGTERM, which `kill`, systemd, launchd and `docker stop` send | Linux, macOS | 10 seconds |
 | Ctrl-Break | Windows | 10 seconds |
 | Closing the console window | Windows | 1.5 seconds |
-| Shutting the system down | Windows | 1.5 seconds |
+
+Logging off and shutting the system down are not in the table. On Windows either one may end the server without the steps below. Microsoft documents that a console program that has loaded `user32.dll` receives no signal for a logoff or a shutdown, and that Windows ends the programs of a user at logoff before it sends one. The database is consistent after that, and the next start reads the write-ahead log.
 
 The server stops in this order:
 
@@ -140,7 +141,7 @@ The server stops in this order:
 
 `run` then exits with status 0. A second signal during the stop ends the server at once: it skips the steps that have not run and exits with status 1. The advertisement is withdrawn in that case as well. The database is consistent after that, and also after the system has ended the process. A scan that was cut short is finished by the next scan.
 
-Windows ends a console program 5 seconds after its window is closed or the system shuts down. The limit of 1.5 seconds is for these two signals: steps 1 to 3 end within 3 seconds, which leaves 2 seconds for step 4. Step 4 takes longer than that only while a database read or write of the server still runs, or while another program, such as `wn-server scan`, uses the database. Windows then ends the server before the write-ahead log is moved; the log keeps every change, and the next start reads it.
+Windows ends a console program 5 seconds after its window is closed. The limit of 1.5 seconds is for that signal: steps 1 to 3 end within 3 seconds, which leaves 2 seconds for step 4. Step 4 takes longer than that only while a database read or write of the server still runs, or while another program, such as `wn-server scan`, uses the database. Windows then ends the server before the write-ahead log is moved; the log keeps every change, and the next start reads it.
 
 Logs go to stderr. `server.log_level` is the log filter, for example `info` or `warn,wn_server=debug`. The `RUST_LOG` environment variable replaces it when it is set and not empty. The log has one line for each request, at the level `info`: the method, the client (`c`) and the user (`u`), each cut to 64 characters, the HTTP status, and the milliseconds until the response headers. The lines of `stream` and `getCoverArt` have the level `debug`. The log never holds the query string, the form body or a password, a token, a salt or an API key.
 

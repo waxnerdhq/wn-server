@@ -90,7 +90,7 @@ const SHORT: Duration = Duration::from_millis(50);
 const HOUR_MS: u64 = 3_600_000;
 
 /// The time after which Windows ends a console process that received the
-/// close event or the shutdown event (`docs/design.md` section 3.13).
+/// close event (`docs/design.md` section 3.13).
 const WINDOWS_LIMIT: Duration = Duration::from_secs(5);
 
 /// One test of this file runs at a time. A test checks that the port of its

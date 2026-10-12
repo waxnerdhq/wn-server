@@ -502,7 +502,10 @@ impl StopSignal {
 
     /// The Windows console event `CTRL_SHUTDOWN_EVENT`: the system shuts
     /// down. Windows ends the process 5 seconds after the event, and a
-    /// service process 20 seconds after it.
+    /// service process 20 seconds after it. By the documentation of Windows
+    /// the event reaches services only, and no process that has loaded
+    /// `user32.dll`, so the server may never receive it (`docs/design.md`
+    /// section 3.13).
     // Windows: Unix has no console events.
     #[cfg_attr(not(windows), allow(dead_code))]
     const SYSTEM_SHUTDOWN: Self = Self {
@@ -650,7 +653,9 @@ impl OtherStopSignals {
 /// so this type differs there.
 ///
 /// The process does not listen for the logoff event. That event keeps the
-/// action of the system, which ends the process without the stop.
+/// action of the system, which ends the process without the stop. By the
+/// documentation of Windows the shutdown event may not reach the process
+/// either ([`StopSignal::SYSTEM_SHUTDOWN`]).
 #[cfg(windows)]
 struct OtherStopSignals {
     ctrl_break: tokio::signal::windows::CtrlBreak,
