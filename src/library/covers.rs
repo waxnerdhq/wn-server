@@ -1413,10 +1413,10 @@ mod tests {
         encoded(picture(width, height), ImageFormat::Jpeg)
     }
 
-    /// Returns a JPEG whose header declares 65535 × 65535 pixels, the
-    /// largest size of the format. The file holds the data of 8 × 8 pixels,
-    /// so it is a few hundred bytes long.
-    fn jpeg_that_declares_the_largest_size() -> Vec<u8> {
+    /// Returns a JPEG whose header declares `width` × `height` pixels. The
+    /// file holds the data of 8 × 8 pixels, so it is a few hundred bytes
+    /// long.
+    fn jpeg_that_declares(width: u16, height: u16) -> Vec<u8> {
         let mut bytes = jpeg(8, 8);
         // The frame header starts with the marker FF C0. Two length bytes
         // and the precision byte follow, then the height and the width.
@@ -1424,8 +1424,42 @@ mod tests {
             .windows(2)
             .position(|pair| pair == [0xff, 0xc0])
             .expect("a baseline frame header");
-        bytes[marker + 5..marker + 9].fill(0xff);
+        bytes[marker + 5..marker + 7].copy_from_slice(&height.to_be_bytes());
+        bytes[marker + 7..marker + 9].copy_from_slice(&width.to_be_bytes());
         bytes
+    }
+
+    /// Returns a JPEG whose header declares 65535 × 65535 pixels, the
+    /// largest size of the format ([`jpeg_that_declares`]). Its pixels
+    /// would take 12 GiB.
+    ///
+    /// A test decodes this image under [`decode_limits`] only. Two checks
+    /// then refuse it before a pixel is allocated: the limit on the sides
+    /// and the limit on the memory. A change that loses one of the two
+    /// fails a test of that check and allocates nothing here. The test of
+    /// the limit on the memory alone decodes
+    /// [`jpeg_over_the_memory_limit`].
+    fn jpeg_that_declares_the_largest_size() -> Vec<u8> {
+        jpeg_that_declares(u16::MAX, u16::MAX)
+    }
+
+    /// The side of [`jpeg_over_the_memory_limit`], in pixels.
+    const SIDE_OVER_THE_MEMORY_LIMIT: u16 = 4730;
+
+    /// Returns a JPEG whose header declares a square of
+    /// [`SIDE_OVER_THE_MEMORY_LIMIT`] pixels ([`jpeg_that_declares`]). Its
+    /// pixels would take 10 KiB more than [`MAX_DECODE_BYTES`], so the
+    /// limit on the memory refuses the image.
+    ///
+    /// A decode that does not compare the size with the limit allocates
+    /// these 64 MiB, as the decode of an image at both limits does, and then
+    /// returns, so its test fails at once. A square whose side is one
+    /// pixel shorter is within the limit.
+    fn jpeg_over_the_memory_limit() -> Vec<u8> {
+        let side = u64::from(SIDE_OVER_THE_MEMORY_LIMIT);
+        assert_eq!(side * side * 3 - MAX_DECODE_BYTES, 9836);
+        assert!((side - 1) * (side - 1) * 3 < MAX_DECODE_BYTES);
+        jpeg_that_declares(SIDE_OVER_THE_MEMORY_LIMIT, SIDE_OVER_THE_MEMORY_LIMIT)
     }
 
     /// The colours of the four quarters of [`quartered`], in the order top
@@ -1625,6 +1659,22 @@ mod tests {
             }
         }
         !crc
+    }
+
+    /// Returns the refusal of the decode of `bytes` under `limits`.
+    ///
+    /// A decode that returns an image fails the test with the size of the
+    /// image. The message does not hold the pixels, which `expect_err`
+    /// prints: for [`jpeg_over_the_memory_limit`] they are 64 MiB.
+    fn refusal_of(bytes: &[u8], limits: Limits) -> ImageRefusal {
+        match decode(bytes, limits) {
+            Ok((image, _)) => panic!(
+                "an image of {} × {} pixels was decoded",
+                image.width(),
+                image.height()
+            ),
+            Err(refusal) => refusal,
+        }
     }
 
     /// Checks that `error` says that an image is over a limit of the
@@ -2081,12 +2131,13 @@ mod tests {
         assert_eq!(orientation, Orientation::Rotate90);
 
         // The image that declares the largest size is refused before its
-        // pixels are allocated, by the limit on the sides and by the limit
-        // on the memory alone.
+        // pixels are allocated. The limit on the memory alone, without the
+        // limit on the sides, refuses an image that is over it.
         let bomb = with_exif(&jpeg_that_declares_the_largest_size(), &exif);
+        let over_the_memory = with_exif(&jpeg_over_the_memory_limit(), &exif);
         let start = Instant::now();
         assert_over_a_limit(&decode(&bomb, decode_limits()).expect_err("over a limit"));
-        assert_over_a_limit(&decode(&bomb, header_limits()).expect_err("over the limit"));
+        assert_over_a_limit(&refusal_of(&over_the_memory, header_limits()));
         assert!(start.elapsed() < Duration::from_secs(1));
 
         // The limit on a side is one on the image as it is stored. A
@@ -2231,9 +2282,11 @@ mod tests {
         assert_over_a_limit(&decode(&bomb, decode_limits()).expect_err("over a limit"));
         assert!(start.elapsed() < Duration::from_secs(1));
 
-        // The memory limit alone refuses the image, without the limit on
-        // the sides.
-        assert_over_a_limit(&decode(&bomb, header_limits()).expect_err("over the limit"));
+        // The memory limit alone refuses an image, without the limit on the
+        // sides. The image is 10 KiB over the limit and not 12 GiB, so a
+        // decode that lost the comparison fails this test at once.
+        let over_the_memory = jpeg_over_the_memory_limit();
+        assert_over_a_limit(&refusal_of(&over_the_memory, header_limits()));
 
         // An image within the sides whose pixels are just over the memory
         // limit: 3345 × 3344 pixels of six bytes are 5 KiB more than 64 MiB.
