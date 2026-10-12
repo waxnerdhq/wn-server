@@ -56,7 +56,7 @@ pub mod users;
 
 pub mod stubs;
 
-// media
+pub mod media;
 
 pub mod covers;
 
@@ -296,7 +296,7 @@ pub const METHODS: &[(&str, Handler)] = &[
 
     ("deletePlaylist", handler!(playlists::delete_playlist)),
 
-    ("stream", not_implemented),
+    ("stream", handler!(media::stream)),
 
     ("download", handler!(stubs::download)),
 
