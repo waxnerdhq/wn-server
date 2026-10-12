@@ -10,4 +10,4 @@
 
 pub mod stream;
 
-// transcode
+pub mod transcode;

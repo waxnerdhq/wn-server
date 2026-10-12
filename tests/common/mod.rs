@@ -5,6 +5,8 @@
 // The items one binary does not use are not dead code.
 #![allow(dead_code)]
 
+pub mod transcoder;
+
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -26,6 +28,7 @@ use serde_json::Value;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
+use transcoder::FakeTranscoder;
 use wn_server::api::{self, AppState};
 use wn_server::config::Config;
 use wn_server::db::Db;
@@ -794,6 +797,9 @@ impl AuthDefaults {
 ///
 /// The server starts no scan by itself. [`TestServer::scan_and_wait`] and
 /// the `startScan` method scan the music folders of the config.
+///
+/// The transcoder of the server is a [`FakeTranscoder`], so no request
+/// starts ffmpeg. [`TestServer::transcoder`] returns it.
 pub struct TestServer {
     /// The directory of the cover cache. Dropping the server deletes it.
     _cache_dir: TempDir,
@@ -801,6 +807,7 @@ pub struct TestServer {
     db: Db,
     scan: ScanController,
     scan_poll_ms: u64,
+    transcoder: Arc<FakeTranscoder>,
 }
 
 impl TestServer {
@@ -834,6 +841,7 @@ impl TestServer {
         adjust(&mut settings);
         let scan = ScanController::new(settings);
         let scan_poll_ms = config.library.scan_poll_ms;
+        let transcoder = Arc::new(FakeTranscoder::default());
 
         // The fields follow the layout rule in the module comment of
         // `wn_server::api`.
@@ -845,7 +853,7 @@ impl TestServer {
 
             covers: wn_server::library::covers::Covers::new(cache_dir.path(), db.clone()),
 
-            // transcoder
+            transcoder: transcoder.clone(),
 
             scan: scan.clone(),
 
@@ -859,12 +867,19 @@ impl TestServer {
             db,
             scan,
             scan_poll_ms,
+            transcoder,
         }
     }
 
     /// The database of the server.
     pub fn db(&self) -> &Db {
         &self.db
+    }
+
+    /// The transcoder of the server. It starts no process: a test sets the
+    /// bytes of its streams and reads the jobs that reached it.
+    pub fn transcoder(&self) -> &FakeTranscoder {
+        &self.transcoder
     }
 
     /// The controller of the scans of the server.

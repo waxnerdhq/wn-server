@@ -2,7 +2,8 @@
 //! section 3.13), and the start of a server whose music folder is
 //! unavailable (section 3.10).
 //!
-//! The tests of this file are the only ones of the suite that open a socket.
+//! The tests of this file and two tests of `tests/transcode.rs` are the only
+//! ones of the suite that open a socket.
 //! Each one runs `run_server` on `127.0.0.1` with port 0, so the system
 //! chooses a free port, and speaks HTTP/1.1 over a `TcpStream`. No test
 //! starts the mDNS daemon: the step that withdraws the advertisement is a
@@ -48,6 +49,7 @@ use wn_server::library::scan_controller::ScanHooks;
 use wn_server::library::scanner::CANCELLED;
 use wn_server::server::{ServerError, ServerOptions, StopStep, run_server};
 
+use common::transcoder::no_ffmpeg;
 use common::{
     API_VERSION, CLIENT, LibraryBuilder, OWNER, OWNER_PASSWORD, captured_log, fixtures_dir,
     subsonic_response, token, urlencode,
@@ -133,13 +135,16 @@ fn wal_len(data_dir: &DataDir) -> u64 {
 }
 
 /// The config of the servers of this file: `127.0.0.1` with a port that the
-/// system chooses, a grace of one hour and no scan at startup.
+/// system chooses, a grace of one hour, no scan at startup and no ffmpeg.
 fn config() -> Config {
     let mut config = Config::default();
     config.server.bind = "127.0.0.1".parse().expect("an address");
     config.server.port = 0;
     config.server.shutdown_grace_ms = HOUR_MS;
     config.library.scan_on_start = false;
+    // The server probes this path for ffmpeg and finds no program, so no
+    // test of this file starts the ffmpeg of the machine.
+    config.transcoding.ffmpeg = no_ffmpeg();
     config
 }
 
@@ -829,14 +834,15 @@ fn set_mode(path: &Path, mode: u32) {
 }
 
 /// Loads the config file at `path` as `run` does, and gives the server the
-/// address and the grace of the servers of this file. The file cannot name
-/// port 0.
+/// address, the grace and the ffmpeg path of the servers of this file. The
+/// file cannot name port 0.
 fn load_config(path: &Path) -> Config {
     let mut loaded = Config::load(path).expect("the config loads");
     let test = config();
     loaded.server.bind = test.server.bind;
     loaded.server.port = test.server.port;
     loaded.server.shutdown_grace_ms = test.server.shutdown_grace_ms;
+    loaded.transcoding.ffmpeg = test.transcoding.ffmpeg;
     loaded
 }
 

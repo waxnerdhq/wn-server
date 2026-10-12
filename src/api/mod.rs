@@ -120,7 +120,9 @@ pub struct AppState {
     /// The cover art service: it resolves, resizes and caches covers.
     pub covers: crate::library::covers::Covers,
 
-    // transcoder
+    /// The transcoder: it runs ffmpeg for a `stream` request that selects a
+    /// transcode.
+    pub transcoder: Arc<dyn crate::media::transcode::Transcoder>,
 
     /// The scans of the server. It runs at most one at a time.
     pub scan: ScanController,
@@ -402,7 +404,7 @@ pub const PUBLIC_METHODS: &[&str] = &["getOpenSubsonicExtensions"];
 pub const EXTENSIONS: &[(&str, &[u32])] = &[
     ("formPost", &[1]),
 
-    // transcodeOffset
+    ("transcodeOffset", &[1]),
 ];
 
 /// Builds the router of the server: one route for `/rest/{method}` that
