@@ -1,14 +1,19 @@
-//! The annotation methods: `star`, `unstar`, `setRating`, `getStarred` and
-//! `getStarred2` (`docs/design.md` section 4).
+//! The annotation methods: `star`, `unstar`, `setRating`, `getStarred`,
+//! `getStarred2` and `scrobble` (`docs/design.md` section 4).
 //!
-//! A star and a rating belong to the user of the request. The three methods
-//! that write check every ID of the request and write in one transaction
-//! (`annotations::apply`), so a request changes every item it names or none.
+//! A star, a rating and a play belong to the user of the request. The four
+//! methods that write check every ID of the request and write in one
+//! transaction (`annotations::apply`, `annotations::record_plays`), so a
+//! request changes every item it names or none.
 //!
 //! An ID is the ID of a track, an album or an artist, and its prefix names
 //! the kind (`docs/design.md` section 3.3). The folder methods list albums
 //! and artists as directories under the same IDs, so the star of an album is
 //! one star, whether a client sets it through `id` or through `albumId`.
+//!
+//! `scrobble` takes the IDs of tracks only. It counts a play in the row of
+//! the track, and the plays of an album are those of its tracks
+//! (`db::queries::annotations`).
 
 use std::collections::HashMap;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -22,12 +27,25 @@ use super::params::Params;
 use super::{ApiResult, AppState, Payload};
 use crate::auth::extract::Authed;
 use crate::db::Db;
-use crate::db::queries::annotations::{self, Annotation, Change, Item, ItemKind, Rating};
+use crate::db::queries::annotations::{self, Annotation, Change, Item, ItemKind, Play, Rating};
 use crate::db::queries::browse;
 
 /// The message of the error that `setRating` returns for a rating outside 0
 /// to 5.
 const RATING_RANGE: &str = "parameter rating must be an integer from 0 to 5";
+
+/// The largest `time` that `scrobble` takes, in milliseconds since 1970: the
+/// last millisecond of the year 9999. The year of a later time has more than
+/// four digits, and `model::iso8601` writes a year of four.
+const MAX_TIME_MS: i64 = 253_402_300_799_999;
+
+/// The message of the error that `scrobble` returns for a `time` that is no
+/// integer from 0 to [`MAX_TIME_MS`].
+const TIME_RANGE: &str = "parameter time must be an integer from 0 to 253402300799999";
+
+/// The message of the error that `scrobble` returns when the number of its
+/// `time` values is neither 0 nor the number of its `id` values.
+const TIME_COUNT: &str = "parameter time must occur once for each id or not at all";
 
 /// The `starred2` element of `getStarred2`: the starred items in the forms
 /// of the ID3 methods.
@@ -165,6 +183,118 @@ pub async fn get_starred(
     Ok(Payload::new("starred", starred))
 }
 
+/// `scrobble`: counts a play of each track that the request names, for the
+/// user (<https://opensubsonic.netlify.app/docs/endpoints/scrobble/>).
+///
+/// - `id` is required and takes the ID of a track. It may occur several
+///   times. A track that the request names twice gets two plays.
+/// - `time` is the time of a play in milliseconds since 1970. The request
+///   has no `time`, or one for each `id`: the first `time` is the time of
+///   the first `id`, and so on. A play without a `time` has the time of the
+///   request. An empty value counts as absent.
+/// - `submission` is `true` without a value. With `false` the request is a
+///   "now playing" notification: it is checked as a submission is, and it
+///   writes nothing. The server keeps no list of the songs that play.
+/// - Every request that passes the checks counts its plays. The API has no
+///   value that tells a repeated request from a second play, so the same
+///   request sent twice counts twice.
+///
+/// An absent `id` is error 10. A `submission` that is no boolean, a `time`
+/// that is no integer from 0 to 253402300799999, and a number of `time`
+/// values that is not the number of `id` values are error 0. A value of `id`
+/// that is not the ID of an existing track is error 70. After an error no
+/// play of the request is counted.
+pub async fn scrobble(
+    State(state): State<AppState>,
+    Authed(user): Authed,
+    params: Params,
+) -> ApiResult {
+    let Scrobble { submission, plays } = Scrobble::parse(&params)?;
+    let found = if submission {
+        // The time of a play without `time` is read once the write
+        // connection is held, as the time of a star is.
+        state
+            .db
+            .write(move |conn| annotations::record_plays(conn, user.id, &plays, unix_now()))
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "cannot write the plays");
+                ApiError::Other("the server cannot store the change".to_owned())
+            })?
+    } else {
+        state
+            .db
+            .read(move |conn| annotations::all_exist(conn, plays.iter().map(Play::track)))
+            .await
+            .map_err(|error| {
+                tracing::error!(%error, "cannot read the tracks of a scrobble request");
+                ApiError::Other("the server cannot read its library".to_owned())
+            })?
+    };
+    if found {
+        Ok(Payload::empty())
+    } else {
+        Err(ApiError::NotFound)
+    }
+}
+
+/// What a `scrobble` request asks for.
+#[derive(Debug, PartialEq, Eq)]
+struct Scrobble {
+    /// Whether the request reports plays. `false` is a "now playing"
+    /// notification.
+    submission: bool,
+    /// One play for each `id` of the request, in the order of the values.
+    plays: Vec<Play>,
+}
+
+impl Scrobble {
+    /// Reads the parameters of a `scrobble` request.
+    ///
+    /// The checks run in this order, and the first that fails is the error:
+    /// an absent `id` (error 10), then `submission`, each `time` and the
+    /// number of the `time` values (error 0), then each `id` (error 70). An
+    /// `id` that is not the ID of a track is error 70: a text that
+    /// `ids::parse` rejects, an empty value, and the ID of an album, an
+    /// artist or a playlist.
+    fn parse(params: &Params) -> Result<Self, ApiError> {
+        let ids = params.all("id");
+        if ids.is_empty() {
+            return Err(ApiError::MissingParam("id".to_owned()));
+        }
+        let submission = params.opt_bool("submission")?.unwrap_or(true);
+        let times = params
+            .all("time")
+            .into_iter()
+            .filter(|time| !time.is_empty())
+            .map(play_time)
+            .collect::<Result<Vec<i64>, ApiError>>()?;
+        if !times.is_empty() && times.len() != ids.len() {
+            return Err(ApiError::Other(TIME_COUNT.to_owned()));
+        }
+        let plays = ids
+            .into_iter()
+            .enumerate()
+            .map(|(place, id)| {
+                Item::parse(id)
+                    .and_then(|track| Play::new(track, times.get(place).copied()))
+                    .ok_or(ApiError::NotFound)
+            })
+            .collect::<Result<_, _>>()?;
+        Ok(Self { submission, plays })
+    }
+}
+
+/// The time of a play in Unix seconds, from a value of `time`: an integer of
+/// milliseconds since 1970, from 0 to [`MAX_TIME_MS`]. The part of the value
+/// below a second is dropped, because the server stores a time in seconds.
+fn play_time(time: &str) -> Result<i64, ApiError> {
+    match time.parse::<i64>() {
+        Ok(milliseconds) if (0..=MAX_TIME_MS).contains(&milliseconds) => Ok(milliseconds / 1000),
+        _ => Err(ApiError::Other(TIME_RANGE.to_owned())),
+    }
+}
+
 /// The items that a `star` or an `unstar` request names: the values of
 /// `id`, then of `albumId`, then of `artistId`.
 ///
@@ -275,4 +405,195 @@ async fn starred_rows(db: &Db, user_id: i64, params: &Params) -> Result<StarredR
         tracing::error!(%error, "cannot read the starred items");
         ApiError::Other("the server cannot read the starred items".to_owned())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const TRACK: &str = "tr-0123456789abcdef0123456789abcdef";
+    const OTHER_TRACK: &str = "tr-fedcba9876543210fedcba9876543210";
+    const ALBUM: &str = "al-0123456789abcdef0123456789abcdef";
+    const ARTIST: &str = "ar-0123456789abcdef0123456789abcdef";
+    const PLAYLIST: &str = "pl-0123456789abcdef0123456789abcdef";
+
+    fn parse(query: &str) -> Result<Scrobble, ApiError> {
+        Scrobble::parse(&Params::from_query(query))
+    }
+
+    fn play(id: &str, at: Option<i64>) -> Play {
+        let track = Item::parse(id).expect("an ID");
+        Play::new(track, at).expect("the ID of a track")
+    }
+
+    fn other(message: &str) -> ApiError {
+        ApiError::Other(message.to_owned())
+    }
+
+    #[test]
+    fn a_scrobble_request_is_a_submission_unless_submission_is_false() {
+        let plays = vec![play(TRACK, None)];
+        for (query, submission) in [
+            (format!("id={TRACK}"), true),
+            (format!("id={TRACK}&submission="), true),
+            (format!("id={TRACK}&submission=true"), true),
+            (format!("id={TRACK}&submission=TRUE"), true),
+            (format!("id={TRACK}&submission=false"), false),
+            (format!("submission=False&id={TRACK}"), false),
+        ] {
+            assert_eq!(
+                parse(&query),
+                Ok(Scrobble {
+                    submission,
+                    plays: plays.clone()
+                }),
+                "{query}"
+            );
+        }
+        for value in ["1", "0", "yes", "no", "truee", " true"] {
+            assert_eq!(
+                parse(&format!("id={TRACK}&submission={value}")),
+                Err(other("parameter submission must be true or false")),
+                "{value}"
+            );
+        }
+    }
+
+    #[test]
+    fn each_id_is_one_play_with_the_time_at_its_place() {
+        // The time is in milliseconds, and the play has it in seconds.
+        let request = parse(&format!(
+            "id={TRACK}&time=1700000000000&id={OTHER_TRACK}&id={TRACK}&time=86400999&time=0"
+        ))
+        .unwrap();
+        assert_eq!(
+            request.plays,
+            [
+                play(TRACK, Some(1_700_000_000)),
+                play(OTHER_TRACK, Some(86_400)),
+                play(TRACK, Some(0)),
+            ]
+        );
+
+        // Without `time`, and with empty values only, no play has a time.
+        for times in ["", "&time=", "&time=&time=&time="] {
+            let request = parse(&format!("id={TRACK}&id={OTHER_TRACK}{times}")).unwrap();
+            assert_eq!(
+                request.plays,
+                [play(TRACK, None), play(OTHER_TRACK, None)],
+                "{times}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_number_of_times_is_0_or_the_number_of_ids() {
+        for query in [
+            format!("id={TRACK}&time=1&time=2"),
+            format!("id={TRACK}&id={OTHER_TRACK}&time=1"),
+            format!("id={TRACK}&id={OTHER_TRACK}&time=1&time=2&time=3"),
+            // An empty value is absent, so one time is left for two IDs.
+            format!("id={TRACK}&id={OTHER_TRACK}&time=&time=2"),
+        ] {
+            assert_eq!(parse(&query), Err(other(TIME_COUNT)), "{query}");
+        }
+    }
+
+    #[test]
+    fn a_time_is_an_integer_of_milliseconds_from_0_to_the_end_of_the_year_9999() {
+        assert_eq!(play_time("0"), Ok(0));
+        assert_eq!(play_time("999"), Ok(0));
+        assert_eq!(play_time("1000"), Ok(1));
+        assert_eq!(play_time("1700000000123"), Ok(1_700_000_000));
+        // 9999-12-31T23:59:59Z.
+        assert_eq!(play_time("253402300799999"), Ok(253_402_300_799));
+        assert_eq!(
+            crate::api::model::iso8601(253_402_300_799),
+            "9999-12-31T23:59:59Z"
+        );
+
+        for value in [
+            "-1",
+            "253402300800000",
+            "9223372036854775807",
+            "9223372036854775808",
+            "1.5",
+            "1e3",
+            "0x10",
+            "now",
+            " 1",
+            "2023-11-14T22:13:20Z",
+        ] {
+            assert_eq!(play_time(value), Err(other(TIME_RANGE)), "{value}");
+            assert_eq!(
+                parse(&format!("id={TRACK}&time={value}")),
+                Err(other(TIME_RANGE)),
+                "{value}"
+            );
+        }
+        assert_eq!(MAX_TIME_MS.to_string(), "253402300799999");
+        assert!(TIME_RANGE.ends_with(&MAX_TIME_MS.to_string()));
+    }
+
+    #[test]
+    fn an_id_that_is_not_the_id_of_a_track_is_error_70() {
+        for id in [
+            "",
+            "1",
+            "tr-",
+            ALBUM,
+            ARTIST,
+            PLAYLIST,
+            "tr-0123456789abcdef0123456789abcdeg",
+            "TR-0123456789ABCDEF0123456789ABCDEF",
+            "tr-0123456789abcdef0123456789abcdef0",
+            "'%20OR%201=1%20--",
+        ] {
+            assert_eq!(parse(&format!("id={id}")), Err(ApiError::NotFound), "{id}");
+            // The value is the first, the middle and the last of three.
+            for query in [
+                format!("id={id}&id={TRACK}&id={OTHER_TRACK}"),
+                format!("id={TRACK}&id={id}&id={OTHER_TRACK}"),
+                format!("id={TRACK}&id={OTHER_TRACK}&id={id}"),
+            ] {
+                assert_eq!(parse(&query), Err(ApiError::NotFound), "{query}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_checks_of_a_scrobble_request_run_in_one_order() {
+        let missing = ApiError::MissingParam("id".to_owned());
+        // An absent `id` comes first.
+        for query in ["", "time=1", "submission=maybe&time=x", "songId=1"] {
+            assert_eq!(parse(query), Err(missing.clone()), "{query}");
+        }
+        // Then `submission`, then each `time`, then the number of times.
+        assert_eq!(
+            parse(&format!("id={ALBUM}&submission=maybe&time=x&time=1")),
+            Err(other("parameter submission must be true or false"))
+        );
+        assert_eq!(
+            parse(&format!("id={ALBUM}&time=x&time=1")),
+            Err(other(TIME_RANGE))
+        );
+        assert_eq!(
+            parse(&format!("id={ALBUM}&time=1&time=1")),
+            Err(other(TIME_COUNT))
+        );
+        // The IDs come last.
+        assert_eq!(
+            parse(&format!("id={ALBUM}&time=1")),
+            Err(ApiError::NotFound)
+        );
+        // A "now playing" notification is checked in the same way.
+        assert_eq!(
+            parse(&format!("id={ALBUM}&submission=false")),
+            Err(ApiError::NotFound)
+        );
+        assert_eq!(
+            parse(&format!("id={TRACK}&submission=false&time=-1")),
+            Err(other(TIME_RANGE))
+        );
+    }
 }

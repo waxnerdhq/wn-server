@@ -318,7 +318,7 @@ pub const METHODS: &[(&str, Handler)] = &[
 
     ("setRating", handler!(annotate::set_rating)),
 
-    ("scrobble", not_implemented),
+    ("scrobble", handler!(annotate::scrobble)),
 
     ("getShares", handler!(stubs::get_shares)),
 
