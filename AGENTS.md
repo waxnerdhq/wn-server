@@ -14,7 +14,7 @@ wn-server is a headless music server. It scans a local music collection into SQL
 - `src/discovery.rs`, `src/server.rs`: mDNS and composition.
 - `docs/design.md`: the design. An issue cites it by section heading.
 - `tests/`: router-level integration tests. `tests/fixtures/audio/`: five tiny audio files. `tests/common/mod.rs`: `LibraryBuilder` and `TestServer`.
-- `examples/e2e.rs`: the end-to-end client session.
+- `examples/make-library.rs`: writes the library of the end-to-end session. `examples/e2e.rs`: the end-to-end client session.
 - `xtask/`: the `cargo xtask check` command. `scripts/check.sh`: its Unix wrapper. `scripts/make-fixtures.sh`: regenerates the fixtures (maintainer tool, Unix).
 - `scripts/orchestrator/`: the scripts of the merge sequence (see Orchestration).
 - `.woodpecker/`: CI pipelines.
