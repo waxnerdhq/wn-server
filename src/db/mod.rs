@@ -655,7 +655,7 @@ mod tests {
     /// The columns that the migrations after the first one add, as a table
     /// and a column. SQLite adds a column after the columns that a table
     /// has. A row that was written at schema version 1 holds NULL in each.
-    const ADDED_SINCE_V1: [(&str, &str); 1] = [("tracks", "album_artist_name")];
+    const ADDED_SINCE_V1: &[(&str, &str)] = &[("tracks", "album_artist_name")];
 
     /// The rows of every table: for each row in rowid order, the name and
     /// the value of every column.
