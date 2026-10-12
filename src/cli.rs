@@ -337,10 +337,11 @@ fn execute(cli: &Cli, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<()
 /// folders.
 ///
 /// A stop signal ([`forward_stop_signals`]) stops the server in the order of
-/// `docs/design.md` section 3.13, and the command then succeeds. A second
-/// signal during the stop ends the command with an error
-/// ([`run_until_stopped`]). The mDNS advertisement is withdrawn before the
-/// command returns in every case.
+/// `docs/design.md` section 3.13, and the command then succeeds. After a
+/// signal with a short limit ([`StopSignal::short`]) the stop takes the short
+/// limits of the server. A second signal during the stop ends the command
+/// with an error ([`run_until_stopped`]). The mDNS advertisement is withdrawn
+/// before the command returns in every case.
 fn serve(data_dir: &DataDir) -> Result<(), CliError> {
     let config = Config::load(&data_dir.config_path())?;
     init_tracing(&config.server.log_level)?;
@@ -377,11 +378,9 @@ fn serve(data_dir: &DataDir) -> Result<(), CliError> {
         ..ServerOptions::default()
     };
     let outcome = runtime.block_on(async {
-        let cancel = CancellationToken::new();
         let (signals, received) = mpsc::channel(1);
         tokio::spawn(forward_stop_signals(signals));
-        let server = server::run_server(config, data_dir, cancel.clone(), options);
-        run_until_stopped(server, &cancel, received).await
+        serve_until_stopped(config, data_dir, options, received).await
     });
     // The stop of the server withdraws the advertisement as its first step.
     // A server that did not start has not done so, and after a second signal
@@ -394,6 +393,30 @@ fn serve(data_dir: &DataDir) -> Result<(), CliError> {
     // the process, as the scan of a process that is killed does.
     runtime.shutdown_background();
     outcome
+}
+
+/// Runs the server on the database of `data_dir` until it ends, and stops it
+/// at the first stop signal that `signals` yields ([`run_until_stopped`]).
+///
+/// The function makes the two tokens of the stop. The server gets the token
+/// of the short limits in [`ServerOptions::hurry`], in place of the one in
+/// `options`, and `run_until_stopped` gets the same token. A signal with a
+/// short limit therefore reaches the limits of the server, and the path
+/// from the signal to the limits is the same code on every OS.
+async fn serve_until_stopped(
+    config: Config,
+    data_dir: &DataDir,
+    options: ServerOptions,
+    signals: mpsc::Receiver<StopSignal>,
+) -> Result<(), CliError> {
+    let cancel = CancellationToken::new();
+    let hurry = CancellationToken::new();
+    let options = ServerOptions {
+        hurry: hurry.clone(),
+        ..options
+    };
+    let server = server::run_server(config, data_dir, cancel.clone(), options);
+    run_until_stopped(server, &cancel, &hurry, signals).await
 }
 
 /// A step that blocks, that several places ask for, and that runs once.
@@ -418,49 +441,131 @@ impl RunOnce {
     }
 }
 
-/// Runs `server` to its end and returns its result. `signals` yields the
-/// name of each stop signal that the process receives.
+/// A stop signal that the process received.
+///
+/// The constants are every stop signal of every OS. They are compiled on
+/// every OS, so the tests of this file check on every OS which signals have
+/// a short limit. The listeners are what differs between the systems
+/// ([`OtherStopSignals`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct StopSignal {
+    /// The name of the signal in the log and in the error of a stop that
+    /// was cut short.
+    name: &'static str,
+    /// Whether the operating system ends the process a fixed time after the
+    /// signal, whatever the process does. The stop then takes the short
+    /// limits of the server (`server.shutdown_grace_short_ms`), so that it
+    /// reaches its last step within that time.
+    short: bool,
+}
+
+impl StopSignal {
+    // A constant that the listeners of one OS send is unused in a build for
+    // another OS, where it is compiled for the tests. The `allow` on such a
+    // constant applies to those builds only. The build for its own OS still
+    // reports the constant when no listener sends it.
+
+    /// Ctrl-C on every OS, which is SIGINT on Unix. No system limits the
+    /// time after it.
+    const CTRL_C: Self = Self {
+        name: "Ctrl-C",
+        short: false,
+    };
+
+    /// SIGTERM. The sender decides what follows: `docker stop` and a service
+    /// manager send SIGKILL after a time that their configuration sets.
+    // Unix: Windows has no SIGTERM.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    const SIGTERM: Self = Self {
+        name: "SIGTERM",
+        short: false,
+    };
+
+    /// The Windows console event `CTRL_BREAK_EVENT`. Windows does not limit
+    /// the time after it.
+    // Windows: Unix has no console events.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    const CTRL_BREAK: Self = Self {
+        name: "Ctrl-Break",
+        short: false,
+    };
+
+    /// The Windows console event `CTRL_CLOSE_EVENT`: the user closed the
+    /// console window or ended the task. Windows ends the process 5 seconds
+    /// after the event.
+    // Windows: Unix has no console events.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    const CONSOLE_CLOSE: Self = Self {
+        name: "the close of the console",
+        short: true,
+    };
+
+    /// The Windows console event `CTRL_SHUTDOWN_EVENT`: the system shuts
+    /// down. Windows ends the process 5 seconds after the event, and a
+    /// service process 20 seconds after it.
+    // Windows: Unix has no console events.
+    #[cfg_attr(not(windows), allow(dead_code))]
+    const SYSTEM_SHUTDOWN: Self = Self {
+        name: "the shutdown of the system",
+        short: true,
+    };
+}
+
+/// Runs `server` to its end and returns its result. `signals` yields each
+/// stop signal that the process receives.
 ///
 /// The first signal cancels `cancel`, which asks the server to stop, and the
-/// function keeps waiting for the server. A second signal before the server
-/// has ended is an error: the function returns at once and drops `server`,
-/// so the steps of the stop that have not run are skipped.
+/// function keeps waiting for the server. When that signal has a short limit
+/// ([`StopSignal::short`]), the function cancels `hurry` before `cancel`, so
+/// the server that reads `hurry` when its stop begins finds it set. A second
+/// signal before the server has ended is an error: the function returns at
+/// once and drops `server`, so the steps of the stop that have not run are
+/// skipped.
 async fn run_until_stopped(
     server: impl Future<Output = Result<(), ServerError>>,
     cancel: &CancellationToken,
-    mut signals: mpsc::Receiver<&'static str>,
+    hurry: &CancellationToken,
+    mut signals: mpsc::Receiver<StopSignal>,
 ) -> Result<(), CliError> {
     let mut server = pin!(server);
-    tokio::select! {
+    let first = tokio::select! {
         result = &mut server => return Ok(result?),
         signal = signals.recv() => match signal {
-            Some(signal) => tracing::info!(
-                "received {signal}: the server stops. A second signal ends it at once"
-            ),
+            Some(signal) => signal,
             // No signal can arrive. The server runs until it ends by itself.
             None => return Ok(server.await?),
         },
+    };
+    tracing::info!(
+        "received {}: the server stops. A second signal ends it at once",
+        first.name
+    );
+    if first.short {
+        hurry.cancel();
     }
     cancel.cancel();
     tokio::select! {
         result = &mut server => Ok(result?),
         Some(signal) = signals.recv() => {
-            tracing::warn!("received {signal} during the stop: the server ends now");
-            Err(CliError::StopCutShort(signal))
+            tracing::warn!(
+                "received {} during the stop: the server ends now",
+                signal.name
+            );
+            Err(CliError::StopCutShort(signal.name))
         }
     }
 }
 
-/// Sends the name of each stop signal that the process receives to
-/// `signals`, until the receiver is gone. Ctrl-C is a stop signal on every
-/// OS. [`OtherStopSignals`] holds the ones that differ.
+/// Sends each stop signal that the process receives to `signals`, until the
+/// receiver is gone. Ctrl-C is a stop signal on every OS.
+/// [`OtherStopSignals`] holds the ones that differ.
 ///
 /// The two listeners do not depend on each other. When the process cannot
 /// listen for Ctrl-C, or cannot listen for the other signals, the function
 /// logs one warning and listens for the rest. A signal without a listener
 /// keeps the action of the system, which ends the process without the stop.
 /// The function returns when it can listen for no signal.
-async fn forward_stop_signals(signals: mpsc::Sender<&'static str>) {
+async fn forward_stop_signals(signals: mpsc::Sender<StopSignal>) {
     // One future listens for Ctrl-C while the other signals arrive, so a
     // Ctrl-C that comes together with another signal is not lost. A new
     // future takes its place after each Ctrl-C.
@@ -478,7 +583,7 @@ async fn forward_stop_signals(signals: mpsc::Sender<&'static str>) {
             result = &mut ctrl_c, if ctrl_c_listens => match result {
                 Ok(()) => {
                     ctrl_c.set(tokio::signal::ctrl_c());
-                    "Ctrl-C"
+                    StopSignal::CTRL_C
                 }
                 Err(error) => {
                     tracing::warn!("cannot listen for Ctrl-C: {error}");
@@ -495,9 +600,9 @@ async fn forward_stop_signals(signals: mpsc::Sender<&'static str>) {
     tracing::warn!("the server cannot listen for a stop signal");
 }
 
-/// Waits for the next signal of `others` and returns its name. `None`
-/// without a listener.
-async fn next_signal(others: &mut Option<OtherStopSignals>) -> Option<&'static str> {
+/// Waits for the next signal of `others` and returns it. `None` without a
+/// listener.
+async fn next_signal(others: &mut Option<OtherStopSignals>) -> Option<StopSignal> {
     match others {
         Some(others) => Some(others.recv().await),
         None => None,
@@ -523,10 +628,10 @@ impl OtherStopSignals {
         })
     }
 
-    /// Waits for the next signal and returns its name.
-    async fn recv(&mut self) -> &'static str {
+    /// Waits for the next signal and returns it.
+    async fn recv(&mut self) -> StopSignal {
         match self.terminate.recv().await {
-            Some(()) => "SIGTERM",
+            Some(()) => StopSignal::SIGTERM,
             // The listener has ended and yields no signal.
             None => std::future::pending().await,
         }
@@ -538,11 +643,14 @@ impl OtherStopSignals {
 /// Windows: the console events Ctrl-Break, close and shutdown. The system
 /// sends the close event when the user closes the console window and the
 /// shutdown event when the system shuts down. After one of these two it
-/// ends the process when the process has not exited within 5 seconds, a
-/// system parameter with that default. The stop of the server can take
-/// longer, and the system then ends it before its last steps
-/// (`docs/design.md` section 3.13). Unix has no console events, so this
-/// type differs there.
+/// ends the process when the process has not exited within 5 seconds. The
+/// constants of [`StopSignal`] hold that: this type only pairs each
+/// listener with its constant, and it is the one part of the stop that no
+/// test runs (`docs/design.md` section 3.13). Unix has no console events,
+/// so this type differs there.
+///
+/// The process does not listen for the logoff event. That event keeps the
+/// action of the system, which ends the process without the stop.
 #[cfg(windows)]
 struct OtherStopSignals {
     ctrl_break: tokio::signal::windows::CtrlBreak,
@@ -562,15 +670,15 @@ impl OtherStopSignals {
         })
     }
 
-    /// Waits for the next event and returns its name.
-    async fn recv(&mut self) -> &'static str {
+    /// Waits for the next event and returns its signal.
+    async fn recv(&mut self) -> StopSignal {
         let event = tokio::select! {
-            event = self.ctrl_break.recv() => event.map(|()| "Ctrl-Break"),
-            event = self.close.recv() => event.map(|()| "the close of the console"),
-            event = self.shutdown.recv() => event.map(|()| "the shutdown of the system"),
+            event = self.ctrl_break.recv() => event.map(|()| StopSignal::CTRL_BREAK),
+            event = self.close.recv() => event.map(|()| StopSignal::CONSOLE_CLOSE),
+            event = self.shutdown.recv() => event.map(|()| StopSignal::SYSTEM_SHUTDOWN),
         };
         match event {
-            Some(name) => name,
+            Some(signal) => signal,
             // The listener has ended and yields no event.
             None => std::future::pending().await,
         }
@@ -1041,7 +1149,7 @@ fn write_new_file(path: &Path, text: &str) -> Result<bool, CliError> {
 mod tests {
     use super::*;
     use crate::db::queries::scans;
-    use crate::library::scan_controller::testing::music_folder;
+    use crate::library::scan_controller::testing::{Gate, music_folder};
     use clap::CommandFactory;
 
     fn parse(args: &[&str]) -> Result<Cli, clap::Error> {
@@ -1626,26 +1734,250 @@ mod tests {
 
     #[tokio::test]
     async fn first_signal_asks_the_server_to_stop_and_the_command_succeeds() {
-        let cancel = CancellationToken::new();
+        let (cancel, hurry) = (CancellationToken::new(), CancellationToken::new());
         let (signals, received) = mpsc::channel(1);
-        let run = run_until_stopped(server_until(cancel.clone(), Ok(())), &cancel, received);
+        let server = server_until(cancel.clone(), Ok(()));
+        let run = run_until_stopped(server, &cancel, &hurry, received);
         let run = tokio::time::timeout(WAIT, run);
 
-        signals.send("SIGTERM").await.expect("the run listens");
+        signals
+            .send(StopSignal::SIGTERM)
+            .await
+            .expect("the run listens");
         run.await
             .expect("the run ends")
             .expect("the command succeeds");
         assert!(cancel.is_cancelled());
     }
 
+    /// Runs a server that stops when it is asked to, sends it `signal`
+    /// through the channel that stands for the signals of the system, and
+    /// returns whether the run cancelled the stop token and whether it
+    /// cancelled `hurry`. The server reads `hurry` at the moment its stop
+    /// begins, as `run_server` does, and the second value is what it read.
+    async fn tokens_after(signal: StopSignal) -> (bool, bool) {
+        let (cancel, hurry) = (CancellationToken::new(), CancellationToken::new());
+        let (signals, received) = mpsc::channel(1);
+        let read_at_the_stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let server = {
+            let (cancel, hurry) = (cancel.clone(), hurry.clone());
+            let read = Arc::clone(&read_at_the_stop);
+            async move {
+                cancel.cancelled().await;
+                read.store(hurry.is_cancelled(), std::sync::atomic::Ordering::SeqCst);
+                Ok(())
+            }
+        };
+        let run = run_until_stopped(server, &cancel, &hurry, received);
+        let run = tokio::time::timeout(WAIT, run);
+
+        signals.send(signal).await.expect("the run listens");
+        run.await
+            .expect("the run ends")
+            .expect("the command succeeds");
+        let read = read_at_the_stop.load(std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(read, hurry.is_cancelled(), "{signal:?}");
+        (cancel.is_cancelled(), read)
+    }
+
+    #[tokio::test]
+    async fn signal_with_a_short_limit_cancels_hurry_and_the_stop_token() {
+        let signal = StopSignal {
+            name: "a signal with a limit",
+            short: true,
+        };
+        assert_eq!(tokens_after(signal).await, (true, true));
+        // The two console events of Windows after which the system ends the
+        // process.
+        for signal in [StopSignal::CONSOLE_CLOSE, StopSignal::SYSTEM_SHUTDOWN] {
+            assert_eq!(tokens_after(signal).await, (true, true), "{signal:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn signal_without_a_limit_cancels_the_stop_token_only() {
+        let signal = StopSignal {
+            name: "a signal without a limit",
+            short: false,
+        };
+        assert_eq!(tokens_after(signal).await, (true, false));
+        // The stop signals of Linux and macOS, and Ctrl-Break of Windows.
+        // The stop after each of them has the long limits.
+        for signal in [
+            StopSignal::CTRL_C,
+            StopSignal::SIGTERM,
+            StopSignal::CTRL_BREAK,
+        ] {
+            assert_eq!(tokens_after(signal).await, (true, false), "{signal:?}");
+        }
+    }
+
+    #[test]
+    fn only_the_close_and_the_shutdown_of_a_windows_console_have_a_short_limit() {
+        // Every stop signal of every OS, with its name in the log.
+        let signals = [
+            (StopSignal::CTRL_C, "Ctrl-C", false),
+            (StopSignal::SIGTERM, "SIGTERM", false),
+            (StopSignal::CTRL_BREAK, "Ctrl-Break", false),
+            (StopSignal::CONSOLE_CLOSE, "the close of the console", true),
+            (
+                StopSignal::SYSTEM_SHUTDOWN,
+                "the shutdown of the system",
+                true,
+            ),
+        ];
+        for (signal, name, short) in signals {
+            assert_eq!(signal, StopSignal { name, short });
+        }
+    }
+
+    /// A data directory whose database holds the owner account, and the
+    /// config of a server that scans the music folder `folder` at startup.
+    /// The server listens on `127.0.0.1` with a port that the system
+    /// chooses. Its grace is one hour and its short grace is `short`. It
+    /// finds no ffmpeg.
+    async fn server_setup(
+        folder: &Path,
+        short: std::time::Duration,
+    ) -> (tempfile::TempDir, DataDir, Config) {
+        let (dir, data_dir, mut config) = scan_setup(folder);
+        let db = Db::open(data_dir.db_path()).expect("open the database");
+        db.write(|conn| users::insert_owner(conn, DEFAULT_USERNAME, "sesame"))
+            .await
+            .expect("insert the owner")
+            .expect("a new database has no owner");
+        config.server.bind = "127.0.0.1".parse().expect("an address");
+        config.server.port = 0;
+        config.server.shutdown_grace_ms = 3_600_000;
+        config.server.shutdown_grace_short_ms =
+            u64::try_from(short.as_millis()).expect("a short time");
+        // The server probes this path for ffmpeg. The data directory holds
+        // no such file, so the test starts no ffmpeg of the machine.
+        let no_ffmpeg = data_dir.path().join("no-ffmpeg");
+        config.transcoding.ffmpeg = no_ffmpeg.to_str().expect("a Unicode path").to_owned();
+        assert!(config.library.scan_on_start);
+        (dir, data_dir, config)
+    }
+
+    /// Reads the `scans` rows of `data_dir` from an async test.
+    async fn read_scan_rows(data_dir: &DataDir) -> Vec<scans::Scan> {
+        let db = Db::open(data_dir.db_path()).expect("open the database");
+        db.read(scans::list).await.expect("read the scans")
+    }
+
+    /// Waits until the one scan of `data_dir` has closed its row, and
+    /// returns the error of the row.
+    async fn scan_closed(data_dir: &DataDir) -> Option<String> {
+        let closed = async {
+            loop {
+                let mut rows = read_scan_rows(data_dir).await;
+                assert_eq!(rows.len(), 1);
+                if rows[0].finished_at.is_some() {
+                    return rows.remove(0).error;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(WAIT, closed)
+            .await
+            .expect("the scan ends")
+    }
+
+    #[tokio::test]
+    async fn close_of_the_console_stops_the_running_server_with_its_short_limits() {
+        let folder = music_folder(3);
+        let short = std::time::Duration::from_millis(50);
+        let (_dir, data_dir, config) = server_setup(folder.path(), short).await;
+        // The scan at startup stores its first batch and then waits in its
+        // hook, as a file read that does not return holds a scan.
+        let (hooks, mut gate) = Gate::hooks();
+        let options = ServerOptions {
+            scan: hooks,
+            ..ServerOptions::default()
+        };
+        let (signals, received) = mpsc::channel(1);
+        let mut run = pin!(serve_until_stopped(config, &data_dir, options, received));
+        tokio::select! {
+            result = &mut run => panic!("the server ended: {result:?}"),
+            () = gate.reached() => {}
+        }
+
+        // The signal of the close event arrives as the listener of Windows
+        // sends it. The grace of the server is one hour, so a server that
+        // ends has taken its short limit for the scan.
+        signals
+            .send(StopSignal::CONSOLE_CLOSE)
+            .await
+            .expect("the run listens");
+        let began = std::time::Instant::now();
+        tokio::time::timeout(WAIT, &mut run)
+            .await
+            .expect("the server ends long before its grace of one hour")
+            .expect("the command succeeds");
+        // The scan had the short limit. A wait does not end early, so a
+        // slow machine cannot fail this.
+        assert!(began.elapsed() >= short, "{:?}", began.elapsed());
+        // The stop left the scan behind: its row has no end time.
+        let rows = read_scan_rows(&data_dir).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].finished_at, None);
+
+        // A process ends the thread of the scan by exiting. The test lets
+        // the scan end, so that it does not outlive the data directory.
+        gate.open();
+        assert_eq!(
+            scan_closed(&data_dir).await.as_deref(),
+            Some(scanner::CANCELLED)
+        );
+    }
+
+    #[tokio::test]
+    async fn sigterm_stops_the_running_server_with_its_long_limits() {
+        let folder = music_folder(3);
+        // The short grace is 1 ms and is over long before the wait below
+        // ends, so a server that took it would have ended.
+        let short = std::time::Duration::from_millis(1);
+        let (_dir, data_dir, config) = server_setup(folder.path(), short).await;
+        let (hooks, mut gate) = Gate::hooks();
+        let options = ServerOptions {
+            scan: hooks,
+            ..ServerOptions::default()
+        };
+        let (signals, received) = mpsc::channel(1);
+        let mut run = pin!(serve_until_stopped(config, &data_dir, options, received));
+        tokio::select! {
+            result = &mut run => panic!("the server ended: {result:?}"),
+            () = gate.reached() => {}
+        }
+
+        // The stop signal of Linux and macOS. The server waits for the
+        // scan, which the hook holds.
+        signals
+            .send(StopSignal::SIGTERM)
+            .await
+            .expect("the run listens");
+        let waited = tokio::time::timeout(SHORT, &mut run).await;
+        assert!(waited.is_err(), "the server ended: {waited:?}");
+
+        // The scan ends as a cancelled scan, and the server ends after it.
+        gate.open();
+        tokio::time::timeout(WAIT, &mut run)
+            .await
+            .expect("the server ends with the scan")
+            .expect("the command succeeds");
+        let rows = read_scan_rows(&data_dir).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].error.as_deref(), Some(scanner::CANCELLED));
+    }
+
     #[tokio::test]
     async fn no_signal_leaves_the_server_running_and_its_error_is_the_error_of_the_command() {
-        let cancel = CancellationToken::new();
+        let (cancel, hurry) = (CancellationToken::new(), CancellationToken::new());
         let (_signals, received) = mpsc::channel(1);
         let server = server_until(CancellationToken::new(), Ok(()));
 
         // The server runs and no signal arrives.
-        let run = run_until_stopped(server, &cancel, received);
+        let run = run_until_stopped(server, &cancel, &hurry, received);
         let waited = tokio::time::timeout(SHORT, run).await;
         assert!(waited.is_err(), "the run ended without a signal");
         assert!(!cancel.is_cancelled());
@@ -1655,7 +1987,7 @@ mod tests {
         let ended = CancellationToken::new();
         ended.cancel();
         let failed = Err(ServerError::NoOwner(PathBuf::from("library.db")));
-        let error = run_until_stopped(server_until(ended, failed), &cancel, received)
+        let error = run_until_stopped(server_until(ended, failed), &cancel, &hurry, received)
             .await
             .expect_err("the server failed");
         assert!(
@@ -1663,11 +1995,12 @@ mod tests {
             "{error}"
         );
         assert!(!cancel.is_cancelled());
+        assert!(!hurry.is_cancelled());
     }
 
     #[tokio::test]
     async fn second_signal_during_the_stop_drops_the_server_and_is_an_error() {
-        let cancel = CancellationToken::new();
+        let (cancel, hurry) = (CancellationToken::new(), CancellationToken::new());
         let (signals, received) = mpsc::channel(1);
         let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
         // A server whose stop does not end.
@@ -1678,16 +2011,22 @@ mod tests {
                 std::future::pending::<Result<(), ServerError>>().await
             }
         };
-        let mut run = pin!(run_until_stopped(server, &cancel, received));
+        let mut run = pin!(run_until_stopped(server, &cancel, &hurry, received));
 
         // The first signal starts the stop, and the run waits for the server.
-        signals.send("SIGTERM").await.expect("the run listens");
+        signals
+            .send(StopSignal::SIGTERM)
+            .await
+            .expect("the run listens");
         let waited = tokio::time::timeout(SHORT, &mut run).await;
         assert!(waited.is_err(), "the run ended after one signal");
         assert!(cancel.is_cancelled());
         assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
 
-        signals.send("Ctrl-C").await.expect("the run listens");
+        signals
+            .send(StopSignal::CTRL_C)
+            .await
+            .expect("the run listens");
         let error = tokio::time::timeout(WAIT, &mut run)
             .await
             .expect("the run ends at the second signal")
@@ -1702,13 +2041,13 @@ mod tests {
 
     #[tokio::test]
     async fn run_without_a_signal_source_waits_for_the_server() {
-        let cancel = CancellationToken::new();
-        let (signals, received) = mpsc::channel::<&'static str>(1);
+        let (cancel, hurry) = (CancellationToken::new(), CancellationToken::new());
+        let (signals, received) = mpsc::channel::<StopSignal>(1);
         // The process cannot listen for a signal.
         drop(signals);
         let ended = CancellationToken::new();
         let server = server_until(ended.clone(), Ok(()));
-        let mut run = pin!(run_until_stopped(server, &cancel, received));
+        let mut run = pin!(run_until_stopped(server, &cancel, &hurry, received));
 
         let waited = tokio::time::timeout(SHORT, &mut run).await;
         assert!(waited.is_err(), "the run ended while the server runs");

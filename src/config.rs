@@ -105,9 +105,16 @@ pub struct Server {
     /// The log filter. `RUST_LOG` overrides it when set.
     pub log_level: String,
     /// The milliseconds that the requests in progress have to finish after
-    /// the server is asked to stop. It is not a config key; tests set it.
+    /// the server is asked to stop, and that the running scan then has to
+    /// stop. It is not a config key; tests set it.
     #[serde(skip)]
     pub shutdown_grace_ms: u64,
+    /// The milliseconds that take the place of `shutdown_grace_ms` in a
+    /// stop after a signal that gives the process a fixed time to exit. The
+    /// close and the shutdown of a Windows console are such signals. It is
+    /// not a config key; tests set it.
+    #[serde(skip)]
+    pub shutdown_grace_short_ms: u64,
 }
 
 /// The `[auth]` table.
@@ -170,6 +177,7 @@ impl Default for Server {
             name: DEFAULT_NAME.to_owned(),
             log_level: "info".to_owned(),
             shutdown_grace_ms: 10_000,
+            shutdown_grace_short_ms: 1500,
         }
     }
 }
@@ -689,6 +697,7 @@ mod tests {
         assert_eq!(config.server.name, "wn-server");
         assert_eq!(config.server.log_level, "info");
         assert_eq!(config.server.shutdown_grace_ms, 10_000);
+        assert_eq!(config.server.shutdown_grace_short_ms, 1500);
         assert!(!config.auth.disabled_unsafe);
         assert!(config.library.folders.is_empty());
         assert!(config.library.scan_on_start);
@@ -767,6 +776,7 @@ mod tests {
         let config = Config::load(&path).expect("load");
         assert_eq!(config, valid_config(music.path()));
         assert_eq!(config.server.shutdown_grace_ms, 10_000);
+        assert_eq!(config.server.shutdown_grace_short_ms, 1500);
         assert_eq!(config.library.scan_poll_ms, 250);
         assert_eq!(config.transcoding.permit_wait_ms, 5000);
     }
@@ -841,6 +851,7 @@ mdns = true
                 name: "living \"room\"".to_owned(),
                 log_level: "wn_server=debug".to_owned(),
                 shutdown_grace_ms: 10_000,
+                shutdown_grace_short_ms: 1500,
             },
             auth: Auth {
                 disabled_unsafe: true,
@@ -875,10 +886,12 @@ mdns = true
     fn internal_timing_fields_are_not_rendered() {
         let mut config = valid_config(Path::new("/music"));
         config.server.shutdown_grace_ms = 30;
+        config.server.shutdown_grace_short_ms = 40;
         config.library.scan_poll_ms = 10;
         config.transcoding.permit_wait_ms = 20;
         let text = config.to_toml().expect("to_toml");
         assert!(!text.contains("shutdown_grace_ms"));
+        assert!(!text.contains("shutdown_grace_short_ms"));
         assert!(!text.contains("scan_poll_ms"));
         assert!(!text.contains("permit_wait_ms"));
     }
@@ -1027,6 +1040,7 @@ mdns = true
     fn internal_timing_fields_are_not_config_keys() {
         for text in [
             "[server]\nshutdown_grace_ms = 10\n",
+            "[server]\nshutdown_grace_short_ms = 10\n",
             "[library]\nscan_poll_ms = 10\n",
             "[transcoding]\npermit_wait_ms = 10\n",
         ] {

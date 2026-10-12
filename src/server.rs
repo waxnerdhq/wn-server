@@ -19,7 +19,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
 use crate::api::{self, AppState};
-use crate::config::{Config, DataDir, Library};
+use crate::config::{self, Config, DataDir, Library};
 use crate::db::queries::{folders, users};
 use crate::db::{Db, DbError};
 use crate::library::scan_controller::{ScanController, ScanHooks, ScanSettings};
@@ -89,6 +89,50 @@ pub struct ServerOptions {
     pub routes: Router<AppState>,
     /// The test hooks of the scans.
     pub scan: ScanHooks,
+    /// Makes the stop take its short limits. `run_server` reads the token
+    /// when the stop begins: steps 2 and 3 have
+    /// `server.shutdown_grace_short_ms` each when it is cancelled, and
+    /// `server.shutdown_grace_ms` otherwise. The `run` command cancels it
+    /// before it asks the server to stop, when the operating system ends
+    /// the process a fixed time after the stop signal. The default is a
+    /// token that nothing cancels.
+    pub hurry: CancellationToken,
+}
+
+/// The time limit of step 2 and of step 3 of the stop.
+///
+/// This type decides which limit a stop has, and no part of it depends on
+/// the operating system. The caller of [`run_server`] cancels
+/// [`ServerOptions::hurry`], and the type reads the token.
+#[derive(Debug, Clone)]
+struct Grace {
+    /// `server.shutdown_grace_ms`.
+    long: Duration,
+    /// `server.shutdown_grace_short_ms`.
+    short: Duration,
+    /// [`ServerOptions::hurry`].
+    hurry: CancellationToken,
+}
+
+impl Grace {
+    /// The limits of `server`, and the token that selects the short one.
+    fn new(server: &config::Server, hurry: CancellationToken) -> Self {
+        Self {
+            long: Duration::from_millis(server.shutdown_grace_ms),
+            short: Duration::from_millis(server.shutdown_grace_short_ms),
+            hurry,
+        }
+    }
+
+    /// The limit of a step that begins now: the short one when `hurry` is
+    /// cancelled, and the long one otherwise.
+    fn limit(&self) -> Duration {
+        if self.hurry.is_cancelled() {
+            self.short
+        } else {
+            self.long
+        }
+    }
 }
 
 /// The address the listener binds: `server.bind` and `server.port`.
@@ -124,13 +168,17 @@ pub fn bind_addr(config: &Config) -> SocketAddr {
 ///
 /// 1. It calls `options.withdraw` ([`withdraw_at_stop`]). The server accepts
 ///    no connection from this moment, so it is no longer advertised.
-/// 2. It closes the listener. The requests in progress have
-///    `server.shutdown_grace_ms` to finish. Then the connections that are
-///    still open are closed ([`serve`]).
+/// 2. It closes the listener. The requests in progress have the grace to
+///    finish. Then the connections that are still open are closed
+///    ([`serve`]).
 /// 3. It waits for the running scan, which `cancel` has cancelled, to end as
-///    a cancelled scan. It waits `server.shutdown_grace_ms` at most.
+///    a cancelled scan. It waits the length of the grace at most.
 /// 4. When step 1 has ended, it checkpoints the write-ahead log and closes
 ///    the database.
+///
+/// The grace is `server.shutdown_grace_ms`. It is
+/// `server.shutdown_grace_short_ms` when `options.hurry` is cancelled at the
+/// moment the step begins ([`Grace`]).
 ///
 /// Steps 3 and 4 are [`stop`]. A caller that drops the future during the
 /// stop skips the steps that have not run. The database is consistent after
@@ -180,7 +228,7 @@ pub async fn run_server(
         auth = if config.auth.disabled_unsafe { "none" } else { "password" },
         "listening on {local_addr}"
     );
-    let grace = Duration::from_millis(config.server.shutdown_grace_ms);
+    let grace = Grace::new(&config.server, options.hurry);
     // This handle stays out of the state, so that the stop can close the
     // database when the router and its state are gone.
     let closing = db.clone();
@@ -213,7 +261,7 @@ pub async fn run_server(
         let _ = listening.send(local_addr);
     }
     let withdrawn = tokio::spawn(withdraw_at_stop(stopping.clone(), options.withdraw));
-    let served = serve(listener, router, &cancel, grace).await;
+    let served = serve(listener, router, &cancel, &grace).await;
     stopping.cancel();
     let stopped = stop(scan, withdrawn, closing, grace).await;
     tracing::info!("the server has stopped");
@@ -245,14 +293,16 @@ async fn withdraw_at_stop(stopping: CancellationToken, withdraw: Option<StopStep
 /// progress is answered, and its connection is closed after the response.
 ///
 /// The function returns when every connection is closed. Connections that
-/// are still open `grace` after the cancellation are closed then, with one
-/// warning: the request of such a connection is dropped, and its client
-/// reads the end of the connection in place of the rest of the response.
+/// are still open one limit of `grace` after the cancellation are closed
+/// then, with one warning: the request of such a connection is dropped, and
+/// its client reads the end of the connection in place of the rest of the
+/// response. The limit is the one that `grace` has at the moment of the
+/// cancellation.
 async fn serve(
     listener: TcpListener,
     router: Router,
     cancel: &CancellationToken,
-    grace: Duration,
+    grace: &Grace,
 ) -> io::Result<()> {
     let close = CancellationToken::new();
     let listener = ClosableListener {
@@ -264,14 +314,16 @@ async fn serve(
         .into_future();
     let grace_over = async {
         cancel.cancelled().await;
-        tokio::time::sleep(grace).await;
+        let limit = grace.limit();
+        tokio::time::sleep(limit).await;
+        limit
     };
-    tokio::select! {
+    let limit = tokio::select! {
         result = &mut served => return result,
-        () = grace_over => {}
-    }
+        limit = grace_over => limit,
+    };
     tracing::warn!(
-        "requests were still in progress {grace:?} after the stop began; \
+        "requests were still in progress {limit:?} after the stop began; \
          their connections are closed"
     );
     close.cancel();
@@ -280,14 +332,15 @@ async fn serve(
 
 /// Steps 3 and 4 of the stop. `withdrawn` is the task of step 1.
 ///
-/// 3. Waits for the periodic scans and for the running scan to end, for
-///    `scan_limit` at most. The token of the scans is cancelled, so the
-///    scanner stops at its next check and closes its `scans` row as
-///    `cancelled`. A scan that has not ended after `scan_limit` is left
-///    behind with one warning: it reads a file that does not answer, or a
-///    batch that takes longer. Its thread ends with the process, its `scans`
-///    row keeps no end time, and the next scan finishes the work, as after a
-///    process that was killed during a scan.
+/// 3. Waits for the periodic scans and for the running scan to end, for one
+///    limit of `grace` at most: the one that `grace` has when the function
+///    is called. The token of the scans is cancelled, so the scanner stops
+///    before its next file read and closes its `scans` row as `cancelled`.
+///    A scan that has not ended after the limit is left behind with one
+///    warning: it reads a file that does not answer, or one of its write
+///    transactions takes longer. Its thread ends with the process, its
+///    `scans` row keeps no end time, and the next scan finishes the work, as
+///    after a process that was killed during a scan.
 /// 4. Waits for step 1, so that the process does not exit before the goodbye
 ///    packet is sent. Then moves the write-ahead log into the database file
 ///    and closes the database. `db` is the last handle of the database when
@@ -298,8 +351,9 @@ async fn stop(
     scan: ScanController,
     withdrawn: JoinHandle<()>,
     db: Db,
-    scan_limit: Duration,
+    grace: Grace,
 ) -> Result<(), ServerError> {
+    let scan_limit = grace.limit();
     if scan.status().scanning {
         tracing::info!("waiting for the running scan to stop");
     }
@@ -1053,6 +1107,16 @@ mod tests {
     /// whose stop hangs.
     const LIMIT: Duration = Duration::from_secs(10);
 
+    /// The grace of a stop whose two limits are `limit`, so the stop has
+    /// that limit with and without [`ServerOptions::hurry`].
+    fn fixed(limit: Duration) -> Grace {
+        Grace {
+            long: limit,
+            short: limit,
+            hurry: CancellationToken::new(),
+        }
+    }
+
     /// The task of step 1 of a stop that has nothing to withdraw.
     fn nothing_to_withdraw(stopping: &CancellationToken) -> JoinHandle<()> {
         tokio::spawn(withdraw_at_stop(stopping.clone(), None))
@@ -1126,7 +1190,7 @@ mod tests {
             .await
             .expect("the hook cancels the token");
         let withdrawn = nothing_to_withdraw(&stopping);
-        tokio::time::timeout(LIMIT, stop(scan, withdrawn, db.clone(), LIMIT))
+        tokio::time::timeout(LIMIT, stop(scan, withdrawn, db.clone(), fixed(LIMIT)))
             .await
             .expect("the stop ends")
             .expect("the stop succeeds");
@@ -1180,7 +1244,7 @@ mod tests {
         assert!(scan.status().scanning);
 
         // Step 3 waits for the scan.
-        let stopped = tokio::spawn(stop(scan.clone(), withdrawn, db.clone(), LIMIT));
+        let stopped = tokio::spawn(stop(scan.clone(), withdrawn, db.clone(), fixed(LIMIT)));
         settle().await;
         assert!(!stopped.is_finished());
 
@@ -1231,7 +1295,8 @@ mod tests {
         let limit = Duration::from_millis(50);
         let began = Instant::now();
         let withdrawn = nothing_to_withdraw(&stopping);
-        tokio::time::timeout(LIMIT, stop(scan.clone(), withdrawn, db.clone(), limit))
+        let stopping_now = stop(scan.clone(), withdrawn, db.clone(), fixed(limit));
+        tokio::time::timeout(LIMIT, stopping_now)
             .await
             .expect("the stop ends without the scan")
             .expect("the stop succeeds");
@@ -1292,6 +1357,179 @@ mod tests {
         idle(&scan).await;
     }
 
+    /// One hour: a limit that no test waits for.
+    const HOUR: Duration = Duration::from_secs(3600);
+
+    /// A scan at startup that the hook of its first batch holds, as a file
+    /// read that does not return holds a scan.
+    struct HeldScan {
+        scan: ScanController,
+        /// Lets the scan go on.
+        gate: Gate,
+        /// The token of the scans, which the stop cancels.
+        stopping: CancellationToken,
+        db: Db,
+        data_dir: DataDir,
+        /// The music folder and the data directory.
+        _dirs: [TempDir; 2],
+    }
+
+    /// Starts the scan at startup of a server with a music folder of three
+    /// files, and returns when the scan has stored its first batch of one
+    /// file and waits in the hook.
+    async fn held_scan() -> HeldScan {
+        let folder = music_folder(3);
+        let (dir, data_dir, db) = library();
+        let mut config = config(&[folder.path()]);
+        config.library.scan_on_start = true;
+        let (hooks, mut gate) = Gate::hooks();
+        let stopping = CancellationToken::new();
+        let minute = Duration::from_millis(20);
+        let scan = start_scans(&config, &data_dir, &db, stopping.clone(), minute, hooks)
+            .await
+            .expect("the scans start");
+        gate.reached().await;
+        HeldScan {
+            scan,
+            gate,
+            stopping,
+            db,
+            data_dir,
+            _dirs: [folder, dir],
+        }
+    }
+
+    #[tokio::test]
+    async fn stop_with_hurry_leaves_a_held_scan_behind_after_the_short_limit() {
+        let HeldScan {
+            scan,
+            gate,
+            stopping,
+            db,
+            data_dir,
+            _dirs,
+        } = held_scan().await;
+        let committed = index(&db).await;
+        assert_eq!(committed.len(), 1);
+
+        // The long limit is one hour. The signal has a short limit, so the
+        // caller has cancelled `hurry` before it asks the server to stop.
+        let short = Duration::from_millis(50);
+        let grace = Grace {
+            long: HOUR,
+            short,
+            hurry: CancellationToken::new(),
+        };
+        grace.hurry.cancel();
+        stopping.cancel();
+        let began = Instant::now();
+        let withdrawn = nothing_to_withdraw(&stopping);
+        tokio::time::timeout(LIMIT, stop(scan.clone(), withdrawn, db.clone(), grace))
+            .await
+            .expect("the stop ends without the scan, long before the long limit")
+            .expect("the stop succeeds");
+        // The stop gave the scan the short limit. A wait does not end
+        // early, so a slow machine cannot fail this.
+        assert!(began.elapsed() >= short, "{:?}", began.elapsed());
+
+        // The scan is left behind as after the long limit: it has not
+        // ended, its row has no end time, the log is in the database file,
+        // and the file holds the batch that the scan committed.
+        assert!(scan.status().scanning);
+        let rows = scan_rows(&db).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            (rows[0].finished_at, rows[0].error.as_deref()),
+            (None, None)
+        );
+        assert_eq!(wal_len(&data_dir), 0);
+        assert_sound(&db).await;
+        assert_eq!(index(&db).await, committed);
+
+        gate.open();
+        idle(&scan).await;
+    }
+
+    #[tokio::test]
+    async fn stop_without_hurry_waits_for_a_held_scan_past_the_short_limit() {
+        let HeldScan {
+            scan,
+            gate,
+            stopping,
+            db,
+            data_dir,
+            _dirs,
+        } = held_scan().await;
+
+        // The stop after Ctrl-C and after SIGTERM: nothing cancels `hurry`.
+        // The short limit is 1 ms and is over long before the wait below
+        // ends, so a stop that took it would have ended.
+        let grace = Grace {
+            long: HOUR,
+            short: Duration::from_millis(1),
+            hurry: CancellationToken::new(),
+        };
+        stopping.cancel();
+        let withdrawn = nothing_to_withdraw(&stopping);
+        let stopped = tokio::spawn(stop(scan.clone(), withdrawn, db.clone(), grace));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!stopped.is_finished());
+        assert!(scan.status().scanning);
+        assert!(wal_len(&data_dir) > 0);
+
+        // The scan ends, and the stop goes on to its last step.
+        gate.open();
+        tokio::time::timeout(LIMIT, stopped)
+            .await
+            .expect("the stop ends with the scan")
+            .expect("the stop does not panic")
+            .expect("the stop succeeds");
+        assert!(!scan.status().scanning);
+        assert_eq!(wal_len(&data_dir), 0);
+        let rows = scan_rows(&db).await;
+        assert_eq!(rows[0].error.as_deref(), Some(CANCELLED));
+    }
+
+    #[test]
+    fn grace_is_the_long_limit_until_hurry_is_cancelled() {
+        let hurry = CancellationToken::new();
+        let grace = Grace::new(&Config::default().server, hurry.clone());
+        // The stop after every signal of Linux and macOS, and after Ctrl-C
+        // and Ctrl-Break on Windows.
+        assert_eq!(grace.limit(), Duration::from_secs(10));
+        // The stop after the close and the shutdown of a Windows console.
+        hurry.cancel();
+        assert_eq!(grace.limit(), Duration::from_millis(1500));
+
+        let mut server = Config::default().server;
+        server.shutdown_grace_ms = 70;
+        server.shutdown_grace_short_ms = 30;
+        let hurry = CancellationToken::new();
+        let grace = Grace::new(&server, hurry.clone());
+        assert_eq!(grace.limit(), Duration::from_millis(70));
+        hurry.cancel();
+        assert_eq!(grace.limit(), Duration::from_millis(30));
+    }
+
+    #[test]
+    fn short_limits_reach_the_checkpoint_two_seconds_before_windows_ends_the_process() {
+        // Windows ends a console process 5 s after the close event and
+        // after the shutdown event (`docs/design.md` section 3.13).
+        let windows_limit = Duration::from_secs(5);
+        // Step 1 runs during steps 2 and 3 and takes 2.2 s at most
+        // (`Advertiser::stop`).
+        let withdrawal = Duration::from_millis(2200);
+
+        let hurry = CancellationToken::new();
+        hurry.cancel();
+        let grace = Grace::new(&Config::default().server, hurry);
+        // Steps 2 and 3 run one after the other with one limit each. Step 4
+        // begins when steps 1 and 3 have ended.
+        let checkpoint_begins = (2 * grace.limit()).max(withdrawal);
+        assert_eq!(checkpoint_begins, Duration::from_secs(3));
+        assert!(windows_limit - checkpoint_begins >= Duration::from_secs(2));
+    }
+
     #[tokio::test]
     async fn stop_of_an_idle_server_checkpoints_the_database() {
         let folder = music_folder(1);
@@ -1307,7 +1545,7 @@ mod tests {
 
         stopping.cancel();
         let withdrawn = nothing_to_withdraw(&stopping);
-        tokio::time::timeout(LIMIT, stop(scan, withdrawn, db.clone(), LIMIT))
+        tokio::time::timeout(LIMIT, stop(scan, withdrawn, db.clone(), fixed(LIMIT)))
             .await
             .expect("the stop ends")
             .expect("the stop succeeds");
@@ -1350,7 +1588,7 @@ mod tests {
         });
         stopping.cancel();
         let withdrawn = tokio::spawn(withdraw_at_stop(stopping.clone(), Some(withdraw)));
-        tokio::time::timeout(LIMIT, stop(scan, withdrawn, db.clone(), LIMIT))
+        tokio::time::timeout(LIMIT, stop(scan, withdrawn, db.clone(), fixed(LIMIT)))
             .await
             .expect("the stop ends")
             .expect("a blocked checkpoint is no error");
@@ -1381,6 +1619,8 @@ mod tests {
         assert!(!options.routes.has_routes());
         assert!(options.scan.batch_size.is_none());
         assert!(options.scan.on_batch.is_none());
+        // Nothing holds a clone of the token, so nothing cancels it.
+        assert!(!options.hurry.is_cancelled());
     }
 
     #[test]

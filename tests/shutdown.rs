@@ -3,19 +3,32 @@
 //! unavailable (section 3.10).
 //!
 //! The tests of this file and two tests of `tests/transcode.rs` are the only
-//! ones of the suite that open a socket.
-//! Each one runs `run_server` on `127.0.0.1` with port 0, so the system
-//! chooses a free port, and speaks HTTP/1.1 over a `TcpStream`. No test
-//! starts the mDNS daemon: the step that withdraws the advertisement is a
-//! closure of the test.
+//! ones of the suite that connect to a socket. Each one runs `run_server` on
+//! `127.0.0.1` with port 0, so the system chooses a free port, and speaks
+//! HTTP/1.1 over a `TcpStream`. No test starts the mDNS daemon: the step that
+//! withdraws the advertisement is a closure of the test.
 //!
 //! A test holds a request in progress with a route that it adds to the
 //! server, and a scan with the batch hook of the scanner. The tests assert
-//! the order of events: what has happened when another thing happens. No
-//! assertion requires that something is done within a time. The times of
-//! the file are the limit that ends a test whose server hangs ([`LIMIT`]),
-//! two waits that must not end early (a grace of 100 ms), and short waits
-//! in which a server that must wait does not end ([`SHORT`]).
+//! the order of events: what has happened when another thing happens. The
+//! times of the file are the limit that ends a test whose server hangs
+//! ([`LIMIT`]), waits that must not end early (a grace of 100 ms, 120 ms or
+//! 130 ms), and short waits in which a server that must wait does not end
+//! ([`SHORT`]).
+//!
+//! Two tests require that something is done within a time, because the
+//! short limits of a stop exist to meet a time: the 5 s after which Windows
+//! ends a console process ([`WINDOWS_LIMIT`]). Their servers have a grace of
+//! one hour and a short grace of 120 ms or 130 ms. One requires that a
+//! request is dropped within 1 s. The other requires that a stop with two
+//! waits of 130 ms ends within 2.26 s, which is the 5 s less the 2.74 s by
+//! which the default short grace makes the two waits longer. Each bound is
+//! many times what the work takes.
+//!
+//! The log of the test process is one buffer for every test of the file, and
+//! a test counts the warnings of its server by the length of the grace in
+//! them. The servers that log such a warning therefore have graces of
+//! different lengths.
 
 mod common;
 
@@ -75,6 +88,10 @@ const SHORT: Duration = Duration::from_millis(50);
 /// waits that long, so a server that ends within [`LIMIT`] did not wait for
 /// its grace.
 const HOUR_MS: u64 = 3_600_000;
+
+/// The time after which Windows ends a console process that received the
+/// close event or the shutdown event (`docs/design.md` section 3.13).
+const WINDOWS_LIMIT: Duration = Duration::from_secs(5);
 
 /// One test of this file runs at a time. A test checks that the port of its
 /// server refuses a connection after the listener is closed, and the server
@@ -717,6 +734,250 @@ async fn scan_that_does_not_stop_within_its_limit_is_left_behind() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].finished_at, None);
     assert_eq!(rows[0].error, None);
+
+    // A process ends the thread of the scan by exiting. The test lets the
+    // scan end, which closes its row, so that the thread does not outlive
+    // the data directory.
+    drop(release);
+    let closed = async {
+        while read_scans(&db_path)[0].finished_at.is_none() {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(LIMIT, closed)
+        .await
+        .expect("the scan ends");
+}
+
+/// A route whose handler never returns. `entered` receives a unit when a
+/// request reaches the handler, and `dropped` when the server drops it.
+fn stuck_route(entered: UnboundedSender<()>, dropped: UnboundedSender<()>) -> Router<AppState> {
+    Router::new().route(
+        "/stuck",
+        get(move || {
+            let (entered, signal) = (entered.clone(), DropSignal(dropped.clone()));
+            async move {
+                let _signal = signal;
+                let _ = entered.send(());
+                std::future::pending::<&'static str>().await
+            }
+        }),
+    )
+}
+
+#[tokio::test]
+async fn stop_with_hurry_drops_a_request_after_the_short_grace() {
+    let _one = one_server().await;
+    captured_log();
+    let (entered, mut requests) = unbounded_channel();
+    let (dropped, mut drops) = unbounded_channel();
+    // The grace is one hour, and the short grace is 120 ms.
+    let mut config = config();
+    config.server.shutdown_grace_short_ms = 120;
+    let hurry = CancellationToken::new();
+    let options = ServerOptions {
+        routes: stuck_route(entered, dropped),
+        hurry: hurry.clone(),
+        ..ServerOptions::default()
+    };
+    let mut server = start(config, CancellationToken::new(), options).await;
+
+    let mut stuck = send_get(server.addr, "/stuck").await;
+    event(&mut requests, "the request reaches its route").await;
+
+    // The stop signal has a short limit, so `hurry` is cancelled before the
+    // token of the stop, as `run` does it.
+    hurry.cancel();
+    let stop_began = Instant::now();
+    server.cancel.cancel();
+    event(&mut drops, "the server drops the request").await;
+    let dropped_after = stop_began.elapsed();
+    server.ended().await.expect("the server stops in order");
+
+    // The request had the short grace, which does not end early, and it did
+    // not have the hour.
+    assert!(
+        dropped_after >= Duration::from_millis(120),
+        "{dropped_after:?}"
+    );
+    assert!(dropped_after < Duration::from_secs(1), "{dropped_after:?}");
+    assert_eq!(read_to_end(&mut stuck).await, "");
+    let warnings = grace_warnings("120ms");
+    assert_eq!(warnings.len(), 1, "{warnings:?}");
+    assert!(warnings[0].contains(" WARN "), "{}", warnings[0]);
+}
+
+#[tokio::test]
+async fn stop_without_hurry_waits_for_a_request_past_the_short_grace() {
+    let _one = one_server().await;
+    captured_log();
+    // A route that answers when the test says so. `dropped` receives a unit
+    // when its handler ends, with an answer or without one.
+    let (entered, mut requests) = unbounded_channel();
+    let (dropped, mut drops) = unbounded_channel();
+    let answer = Arc::new(Notify::new());
+    let routes = Router::new().route(
+        "/held",
+        get({
+            let answer = Arc::clone(&answer);
+            move || {
+                let (entered, answer) = (entered.clone(), Arc::clone(&answer));
+                let signal = DropSignal(dropped.clone());
+                async move {
+                    let _signal = signal;
+                    let _ = entered.send(());
+                    answer.notified().await;
+                    "the held route answered"
+                }
+            }
+        }),
+    );
+    // The grace is one hour. The short grace is 10 ms, which is over long
+    // before the wait below ends.
+    let mut config = config();
+    config.server.shutdown_grace_short_ms = 10;
+    // The stop after Ctrl-C and after SIGTERM: `run` has a token for the
+    // short limits and does not cancel it.
+    let hurry = CancellationToken::new();
+    let options = ServerOptions {
+        routes,
+        hurry: hurry.clone(),
+        ..ServerOptions::default()
+    };
+    let mut server = start(config, CancellationToken::new(), options).await;
+
+    let mut client = send_get(server.addr, "/held").await;
+    event(&mut requests, "the request reaches the route").await;
+    server.cancel.cancel();
+
+    // A server that took the short grace would have dropped the request and
+    // ended by now. This one waits for the request.
+    server.does_not_end().await;
+    assert!(drops.try_recv().is_err(), "the request was dropped");
+
+    answer.notify_one();
+    let response = read_to_end(&mut client).await;
+    assert!(response.starts_with("HTTP/1.1 200 OK\r\n"), "{response}");
+    assert!(response.ends_with("the held route answered"), "{response}");
+    server.ended().await.expect("the server stops in order");
+    assert!(!hurry.is_cancelled());
+    assert_eq!(grace_warnings("10ms"), Vec::<String>::new());
+}
+
+#[tokio::test]
+async fn stop_with_hurry_during_a_scan_and_open_requests_ends_within_the_time_of_windows() {
+    let _one = one_server().await;
+    let log = captured_log();
+    let folder = music_folder();
+    let mut config = config();
+    config.library.folders = vec![folder.path().to_path_buf()];
+    config.library.scan_on_start = true;
+    // The grace is one hour. The short grace is 130 ms in place of the
+    // 1.5 s of a server, so that the test does not wait 3 s.
+    let default_short = Duration::from_millis(config.server.shutdown_grace_short_ms);
+    let short = Duration::from_millis(130);
+    config.server.shutdown_grace_short_ms = 130;
+
+    // The scan at startup commits a batch of one file. Its hook then holds
+    // it until the test drops `release`, as a file read that does not
+    // return holds a scan.
+    let (reached, mut batches) = unbounded_channel();
+    let (release, released) = std::sync::mpsc::channel::<()>();
+    let released = std::sync::Mutex::new(released);
+    let scan = ScanHooks {
+        batch_size: Some(1),
+        on_batch: Some(Arc::new(move || {
+            let _ = reached.send(());
+            let _ = released.lock().expect("the lock of the hook").recv();
+        })),
+    };
+    // A request whose handler never returns, and a stream whose body never
+    // ends.
+    let (entered, mut requests) = unbounded_channel();
+    let (dropped, mut drops) = unbounded_channel();
+    let routes = stuck_route(entered.clone(), dropped.clone()).route(
+        "/endless",
+        get(move || {
+            let (entered, dropped) = (entered.clone(), dropped.clone());
+            async move {
+                let _ = entered.send(());
+                endless_body("the first chunk", dropped)
+            }
+        }),
+    );
+    let hurry = CancellationToken::new();
+    let options = ServerOptions {
+        routes,
+        scan,
+        hurry: hurry.clone(),
+        ..ServerOptions::default()
+    };
+    let mut server = start(config, CancellationToken::new(), options).await;
+    event(&mut batches, "the scan commits its first batch").await;
+    let mut stuck = send_get(server.addr, "/stuck").await;
+    let mut endless = send_get(server.addr, "/endless").await;
+    let mut received = Vec::new();
+    read_until(&mut endless, &mut received, "the first chunk").await;
+    event(&mut requests, "the first request reaches its route").await;
+    event(&mut requests, "the second request reaches its route").await;
+
+    // The console of the server is closed: `hurry` is cancelled before the
+    // token of the stop. Neither the requests nor the scan end by
+    // themselves.
+    hurry.cancel();
+    let stop_began = Instant::now();
+    server.cancel.cancel();
+    event(&mut drops, "the server drops the first request").await;
+    event(&mut drops, "the server drops the second request").await;
+    server.ended().await.expect("the server stops in order");
+    let stopped_after = stop_began.elapsed();
+
+    // Step 2 and step 3 waited one short grace each. A wait does not end
+    // early, so a slow machine cannot fail this.
+    assert!(stopped_after >= 2 * short, "{stopped_after:?}");
+    for warning in [
+        "requests were still in progress 130ms after the stop began",
+        "the scan has not stopped after 130ms",
+    ] {
+        let warnings = log.lines_with(warning);
+        assert_eq!(warnings.len(), 1, "{warning}: {warnings:?}");
+        assert!(warnings[0].contains(" WARN "), "{}", warnings[0]);
+    }
+    // A server with the default short grace waits 1.5 s in each of the two
+    // steps, where this one waited 130 ms. Its stop takes that much longer,
+    // and it ends before Windows ends the process.
+    let with_default_limits = stopped_after + 2 * (default_short - short);
+    assert!(
+        with_default_limits < WINDOWS_LIMIT,
+        "{stopped_after:?}, {with_default_limits:?}"
+    );
+
+    // The stop reached its last step: the log is in the database file. The
+    // file is sound and holds the batch that the scan committed, and the
+    // row of the scan has no end time.
+    let db_path = server.data_dir.db_path();
+    assert_eq!(server.wal_len(), 0);
+    let connection = rusqlite::Connection::open(&db_path).expect("open the database");
+    let integrity: String = connection
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .expect("check the database");
+    assert_eq!(integrity, "ok");
+    assert_eq!(tracks::count_tracks(&connection).expect("count"), 1);
+    drop(connection);
+    let rows = read_scans(&db_path);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (rows[0].finished_at, rows[0].error.as_deref()),
+        (None, None)
+    );
+    // The clients read the end of their connections.
+    assert_eq!(read_to_end(&mut stuck).await, "");
+    let mut response = String::from_utf8_lossy(&received).into_owned();
+    response.push_str(&read_to_end(&mut endless).await);
+    assert!(
+        response.trim_end().ends_with("the first chunk"),
+        "{response}"
+    );
 
     // A process ends the thread of the scan by exiting. The test lets the
     // scan end, which closes its row, so that the thread does not outlive
