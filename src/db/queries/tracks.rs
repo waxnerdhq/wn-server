@@ -61,6 +61,35 @@ pub struct Track {
     pub updated_at: i64,
 }
 
+impl Track {
+    /// Returns whether the track has a file. [`has_file`] is the test.
+    pub fn has_file(&self) -> bool {
+        has_file(&self.rel_path)
+    }
+}
+
+/// Returns the `rel_path` of the track `id` while the track has no file: a
+/// `/` and the ID.
+///
+/// A relative path is built from the names of path components and never
+/// starts with `/`, so no file has this path. No other row has it, because
+/// the ID is unique. The scanner gives it to a row that it can neither
+/// relink nor delete (`docs/design.md` section 3.10).
+pub fn placeholder_path(id: &str) -> String {
+    format!("/{id}")
+}
+
+/// Returns whether a track with this `rel_path` has a file, which is the
+/// case when the value is not a placeholder path.
+///
+/// Every reader of `tracks` asks here before it builds a file path
+/// (`docs/design.md` section 3.4). A placeholder path is never joined to a
+/// folder path, because `Path::join` replaces the folder with a root path.
+/// In SQL the same test is `rel_path NOT LIKE '/%'`.
+pub fn has_file(rel_path: &str) -> bool {
+    !rel_path.starts_with('/')
+}
+
 /// The values of a track row that come from the content of its file.
 #[derive(Debug, Clone, Copy)]
 pub struct TrackContent<'a> {
@@ -490,6 +519,64 @@ mod tests {
             }
         );
         assert_eq!(fixture.title_lc(FIRST), "low tide");
+    }
+
+    #[test]
+    fn has_file_is_false_for_a_placeholder_path_only() {
+        assert!(has_file("Glass Harbour/01 Low Tide.flac"));
+        assert!(has_file("a.flac"));
+        assert!(has_file("tr-00000000000000000000000000000001"));
+        assert_eq!(placeholder_path(FIRST), format!("/{FIRST}"));
+        assert!(!has_file(&placeholder_path(FIRST)));
+
+        let fixture = fixture();
+        fixture.insert(FIRST, fixture.folders[0], "a.flac");
+        assert!(fixture.get(FIRST).unwrap().has_file());
+        fixture
+            .db
+            .with_writer(|conn| {
+                let placeholder = placeholder_path(FIRST);
+                relink_track(conn, FIRST, fixture.folders[0], &placeholder, 1000, 100)
+            })
+            .unwrap();
+        assert!(!fixture.get(FIRST).unwrap().has_file());
+    }
+
+    #[test]
+    fn the_sql_filter_for_tracks_with_a_file_agrees_with_has_file() {
+        let fixture = fixture();
+        fixture.insert(FIRST, fixture.folders[0], "sub/a.flac");
+        fixture.insert(SECOND, fixture.folders[0], "b.flac");
+        fixture
+            .db
+            .with_writer(|conn| {
+                let placeholder = placeholder_path(SECOND);
+                relink_track(conn, SECOND, fixture.folders[0], &placeholder, 1000, 100)
+            })
+            .unwrap();
+
+        let with_file: Vec<String> = fixture
+            .db
+            .with_reader(|conn| {
+                let mut select =
+                    conn.prepare("SELECT id FROM tracks WHERE rel_path NOT LIKE '/%' ORDER BY id")?;
+                let ids = select
+                    .query_map([], |row| row.get(0))?
+                    .collect::<rusqlite::Result<_>>()?;
+                Ok(ids)
+            })
+            .unwrap();
+        let mut expected: Vec<String> = fixture
+            .db
+            .with_reader(load_index)
+            .unwrap()
+            .into_iter()
+            .filter(|entry| has_file(&entry.rel_path))
+            .map(|entry| entry.id)
+            .collect();
+        expected.sort();
+        assert_eq!(with_file, expected);
+        assert_eq!(with_file, [FIRST]);
     }
 
     #[test]

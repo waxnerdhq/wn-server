@@ -1617,8 +1617,10 @@ fn a_track_whose_path_another_track_takes_has_no_file_while_a_folder_cannot_be_r
     assert_eq!((summary.moved, summary.removed), (1, 0));
     assert_eq!(env.id_at(aurora_id, first), Some(moved.clone()));
     assert_eq!(env.id_at(aurora_id, second), None);
-    let placeholder = format!("/{overwritten}");
+    let placeholder = tracks::placeholder_path(&overwritten);
     assert_eq!(env.track(&overwritten).rel_path, placeholder);
+    assert!(!env.track(&overwritten).has_file());
+    assert!(env.track(&moved).has_file());
     assert_eq!(
         attached(&env.db, &overwritten),
         Some((aurora_id, placeholder.clone()))

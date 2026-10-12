@@ -665,7 +665,9 @@ impl Scanner<'_> {
             return;
         };
         // The walk skips these names, so an entry with one of them that
-        // cannot be read is no unread path.
+        // cannot be read is no unread path. The walk skips a system name
+        // only for a directory. Here the type of the entry is unknown,
+        // because the entry could not be read, so the name alone decides.
         let skipped = |name: &OsStr| is_hidden(name) || is_system_directory(name);
         if relative.file_name().is_some_and(skipped) {
             return;
@@ -1149,7 +1151,8 @@ fn store(conn: &mut Connection, writes: &[Write<'_>]) -> Result<ScanCounts> {
                 mtime,
                 size,
             } => {
-                tracks::relink_track(&tx, id, *folder_id, &placeholder_path(id), *mtime, *size)?;
+                let placeholder = tracks::placeholder_path(id);
+                tracks::relink_track(&tx, id, *folder_id, &placeholder, *mtime, *size)?;
             }
             Write::Relink {
                 id,
@@ -1158,7 +1161,8 @@ fn store(conn: &mut Connection, writes: &[Write<'_>]) -> Result<ScanCounts> {
                 ..
             } => {
                 let (folder_id, mtime) = (file.folder_id, file.mtime);
-                tracks::relink_track(&tx, id, folder_id, &placeholder_path(id), mtime, file.size)?;
+                let placeholder = tracks::placeholder_path(id);
+                tracks::relink_track(&tx, id, folder_id, &placeholder, mtime, file.size)?;
             }
             _ => {}
         }
@@ -1294,19 +1298,12 @@ fn join_components<'a>(components: impl IntoIterator<Item = Component<'a>>) -> O
     (!joined.is_empty()).then_some(joined)
 }
 
-/// Returns the path of the row `id` while the row has no file: a `/` and the
-/// ID. A relative path never starts with `/`, so no file has this path and
-/// no other row has it.
-fn placeholder_path(id: &str) -> String {
-    format!("/{id}")
-}
-
 /// Returns whether `name` starts with `.`. The scan skips such an entry.
 fn is_hidden(name: &OsStr) -> bool {
     name.as_encoded_bytes().first() == Some(&b'.')
 }
 
-/// The directories at the root of a volume that Windows keeps for itself.
+/// The directories that Windows keeps for itself at the root of a volume.
 /// Their names are matched without regard to case.
 const WINDOWS_SYSTEM_DIRECTORIES: [&str; 2] = ["System Volume Information", "$RECYCLE.BIN"];
 
@@ -1314,9 +1311,11 @@ const WINDOWS_SYSTEM_DIRECTORIES: [&str; 2] = ["System Volume Information", "$RE
 /// files. Its name is matched in this spelling.
 const LOST_AND_FOUND: &str = "lost+found";
 
-/// Returns whether `name` is the name of a directory that the operating
-/// system keeps at the root of a volume. The scan skips such a directory:
-/// it holds no music, and the user of the server cannot list it.
+/// Returns whether `name` is the name of a directory that an operating
+/// system keeps at the root of a volume. The scan skips a directory with
+/// such a name at every depth, because a volume can be mounted below a
+/// music folder. The directory holds no music, and the user of the server
+/// cannot list it.
 fn is_system_directory(name: &OsStr) -> bool {
     name.to_str().is_some_and(|name| {
         name == LOST_AND_FOUND
@@ -1958,10 +1957,13 @@ mod tests {
     }
 
     #[test]
-    fn the_placeholder_path_is_no_relative_path() {
-        let path = placeholder_path("tr-0123");
-        assert_eq!(path, "/tr-0123");
-        assert_eq!(rel_path(Path::new(&path)), None);
+    fn no_walked_file_has_a_placeholder_path() {
+        // The walk builds every relative path with `rel_path`.
+        let placeholder = tracks::placeholder_path("tr-0123");
+        assert!(!tracks::has_file(&placeholder));
+        assert_eq!(rel_path(Path::new(&placeholder)), None);
+        let walked = rel_path(Path::new("tr-0123")).unwrap();
+        assert!(tracks::has_file(&walked));
     }
 
     /// Returns a WAV file with `samples` samples of the value `fill`: mono,
@@ -2313,7 +2315,10 @@ mod tests {
         assert_eq!(counts(&summary), (0, 0, 1, 0));
         assert_eq!(library.id_at("a.wav"), Some(b.clone()));
         assert_eq!(library.id_at("b.wav"), None);
-        assert_eq!(library.id_at(&format!("/{a}")), Some(a.clone()));
+        assert_eq!(
+            library.id_at(&tracks::placeholder_path(&a)),
+            Some(a.clone())
+        );
         assert_eq!(
             summary.errors,
             [format!(
@@ -2356,7 +2361,10 @@ mod tests {
         assert_eq!(counts(&summary), (1, 0, 0, 0));
         let placed = library.id_at("a.wav").expect("the new file has a row");
         assert_ne!(placed, a);
-        assert_eq!(library.id_at(&format!("/{a}")), Some(a.clone()));
+        assert_eq!(
+            library.id_at(&tracks::placeholder_path(&a)),
+            Some(a.clone())
+        );
         assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
         assert!(summary.errors[0].contains(&a));
         assert!(summary.errors[0].contains("\"moved/a.wav\""));
@@ -2392,7 +2400,10 @@ mod tests {
         // track is.
         assert_eq!(counts(&summary), (0, 0, 1, 0));
         assert_eq!(library.id_at("a.wav"), Some(b.clone()));
-        assert_eq!(library.id_at(&format!("/{a}")), Some(a.clone()));
+        let placeholder = tracks::placeholder_path(&a);
+        assert_eq!(library.id_at(&placeholder), Some(a.clone()));
+        assert!(!library.track_at(&placeholder).has_file());
+        assert!(library.track_at("a.wav").has_file());
         assert_eq!(summary.errors.len(), 2, "{:?}", summary.errors);
         assert!(summary.errors[0].contains("\"moved/a.wav\""));
         assert_eq!(
@@ -2410,7 +2421,7 @@ mod tests {
         assert_eq!(counts(&summary), (0, 0, 1, 0));
         assert_eq!(summary.errors, [""; 0]);
         assert_eq!(library.id_at("moved/a.wav"), Some(a.clone()));
-        assert_eq!(library.id_at(&format!("/{a}")), None);
+        assert_eq!(library.id_at(&tracks::placeholder_path(&a)), None);
         assert_eq!(library.id_at("a.wav"), Some(b));
     }
 
@@ -2432,7 +2443,10 @@ mod tests {
             .insert(library.path("c.wav"));
         let summary = library.scan();
         assert_eq!(counts(&summary), (0, 0, 1, 0));
-        assert_eq!(library.id_at(&format!("/{a}")), Some(a.clone()));
+        assert_eq!(
+            library.id_at(&tracks::placeholder_path(&a)),
+            Some(a.clone())
+        );
 
         // The new file is read. It is another file, so the first track is
         // gone.
