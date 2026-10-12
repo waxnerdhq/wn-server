@@ -36,7 +36,7 @@ pub mod xml;
 
 pub mod system;
 
-// browse
+pub mod browse;
 
 // folders
 
@@ -223,17 +223,17 @@ pub const METHODS: &[(&str, Handler)] = &[
 
     ("tokenInfo", not_implemented),
 
-    ("getMusicFolders", not_implemented),
+    ("getMusicFolders", handler!(browse::get_music_folders)),
 
-    ("getArtists", not_implemented),
+    ("getArtists", handler!(browse::get_artists)),
 
-    ("getArtist", not_implemented),
+    ("getArtist", handler!(browse::get_artist)),
 
-    ("getAlbum", not_implemented),
+    ("getAlbum", handler!(browse::get_album)),
 
-    ("getSong", not_implemented),
+    ("getSong", handler!(browse::get_song)),
 
-    ("getGenres", not_implemented),
+    ("getGenres", handler!(browse::get_genres)),
 
     ("getIndexes", not_implemented),
 

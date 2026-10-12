@@ -772,7 +772,16 @@ Amperfy calls `ping, getOpenSubsonicExtensions, getMusicFolders, getIndexes, get
 
 <!-- The comment lines below hold the places of the handler modules that have no text in this section yet. A change replaces the line of its module with its text and keeps the blank lines (section 3.8). -->
 
-<!-- api/browse.rs -->
+Browse methods (`api/browse.rs`): the six methods of the ID3 model read the library with `db::queries::browse` and build their elements with the constructors of `api/model.rs` (§3.8). A method that returns artists, albums or songs reads the annotations of the user of the request for the IDs of its answer with `annotations::get_many`, so the elements carry `starred`, `userRating`, `playCount` and `played` as §3.8 describes them.
+
+- `getMusicFolders` returns `musicFolders`, whose `musicFolder` list holds the rows of the `folders` table in ID order, each with its integer `id` and its `name`. `run` stores the folders of the config before it serves (§3.10), so the list holds them before the first scan. A folder that left the config is listed while its row exists, which is until a scan removes the row (§3.10 step 5); its tracks are in the library for the same time. The IDs are the ones that `getUser` reports as `folder` and that `musicFolderId` names.
+- `getArtists` returns `artists` with `ignoredArticles` and the `index` list of `model::index` (§3.8). `musicFolderId` limits the list to the artists that have a track with a file in that folder, and `albumCount` stays the stored count. An ID that no folder has gives `artists` without an index: no artist is in such a folder. An empty value counts as absent, and a value that is no integer is error 0 that names the parameter (§3.8).
+- `getArtist` returns `artist` with its `album` list in the order of `albums_of_artist`. `getAlbum` returns `album` with its `song` list in the order of `tracks_of_album`, which is the track order of §1.3. `getSong` returns `song`. A track without a file is listed by `getAlbum` and returned by `getSong`, without `path` (§3.4).
+- `getArtist`, `getAlbum` and `getSong` require `id`, and an absent one is error 10. Error 70 answers an ID that no row of the kind of the method has. That includes a value without the shape of an ID (§3.3), an empty value and the ID of an item of another kind: `ids::parse` rejects them before a statement runs.
+- `getGenres` returns `genres`, whose `genre` list holds the rows of `browse::genres`. In XML the name of a genre is the text of its element (§3.8).
+- A list without an item is `[]` in JSON and absent in XML (§3.8). A server without a library answers `getArtists` with `ignoredArticles` and no index, and `getMusicFolders` and `getGenres` with an element that holds nothing.
+- Each handler runs its statements in one read transaction (`read_library` in `api/browse.rs`), so the rows of one answer are of one state of the database. A scan that commits between two statements of a request does not change the answer. A database that cannot be read is error 0 with the message `the server cannot read its library`.
+- The order of every list is the order of its query, which ends with a unique column (§3.8, Library queries), and of `model::index`, which ends with the ID. Two requests on a library that did not change return the same document.
 
 <!-- api/folders.rs -->
 
@@ -821,7 +830,7 @@ Scan methods (`api/scan.rs`): `startScan` and `getScanStatus` return the `scanSt
 
 <!-- The comment lines below hold the places of the test files that have no text in this section yet. A change replaces the line of its test file with its text and keeps the blank lines (section 3.8). -->
 
-<!-- tests/browse.rs -->
+- `tests/browse.rs` covers the six browse methods over the router. For each method it compares the whole response with the document that the standard library gives, in JSON and in XML: the music folder, the three artists in their indexes, each artist with its albums, each album with its songs, each of the ten songs, and the genres. Tables in the test file hold what `LibraryBuilder::standard` writes and what the five fixture files are; the IDs, the creation times and the file sizes are read from the rows and the files. Other tests build a library for one rule: the index of a name with an article, a digit or a diacritic; the albums of an artist by year and title; genres in the order of their names, with a name that XML escapes and a genre of no album. A server with two music folders, scanned with `scan_and_wait`, covers `musicFolderId`: the artists of each folder, the stored `albumCount`, an ID that no folder has, an empty value and a value that is no integer. The remaining tests cover the folder rows of a server that has not scanned, a server without a library, an `id` that is absent (error 10), unknown, malformed or of another kind (error 70) in both formats, a form body, the four annotation values on an artist, an album and a song, a track that is given a placeholder path, and two calls that return the same document. The unit tests in `src/api/browse.rs` cover the check of `id` and the read transaction: a write that commits between two statements of one read, on a temp-file database, is not seen by the second statement.
 
 <!-- tests/folders.rs -->
 

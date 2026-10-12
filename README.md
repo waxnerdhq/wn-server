@@ -183,7 +183,11 @@ The server answers OpenSubsonic requests at `/rest/<method>` and `/rest/<method>
 
 <!-- The comment lines below hold the places of the methods that have no text in this section yet. A change that adds a handler module replaces the line of the module with its text and keeps the blank lines (docs/design.md section 3.8). -->
 
-<!-- api/browse.rs -->
+- `getMusicFolders` lists the music folders of `config.toml`, each with an integer `id` and the last component of its path as `name`. The list is there before the first scan. A folder that was removed from `config.toml` is listed until a scan has removed its tracks.
+- `getArtists` returns the album artists in indexes by the first letter of the name. A leading `The`, `El`, `La`, `Los`, `Las`, `Le` or `Les` is not part of the name for that, a letter with a diacritic counts as its base letter, and a name that starts with no letter from A to Z is in the index `#`. `ignoredArticles` holds the seven articles. `musicFolderId` limits the answer to the artists that have a file in that folder; an ID that no folder has gives no artist, and a value that is no integer returns error 0. An artist has no `coverArt`.
+- `getArtist` returns an artist with its albums by year and then by title; an album without a year follows the others. `getAlbum` returns an album with its songs by disc number, then by track number, then by path. `getSong` returns one song. The three need `id`: an absent `id` returns error 10, and a value that is the ID of no such item returns error 70.
+- A song has `duration` in whole seconds, `suffix`, `contentType`, `bitRate`, `size`, `discNumber` (1 without a disc number tag), and `bitDepth`, `samplingRate` and `channelCount`, which are 0 when the file gives none. `path` is the path of the file below its music folder, with `/` between the components. A track that a scan kept after another file took its path has no `path`; the errors of that scan name the track. `artist` is the track artist and `artistId` is the ID of the album artist. `starred`, `userRating`, `playCount` and `played` are the values of the user of the request.
+- `getGenres` returns each genre tag of the songs with `songCount` and `albumCount`, in the order of the names without regard to case. An album counts for the genre that most of its songs have.
 
 <!-- api/folders.rs -->
 
