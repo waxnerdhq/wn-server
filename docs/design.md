@@ -159,7 +159,7 @@ All dependencies are declared in the root `Cargo.toml` from the start and `Cargo
 | mdns-sd | 0.21 | MIT/Apache-2.0 | DNS-SD responder; macOS, Linux, Windows |
 | toml, serde (`derive`), serde_json | 1 | MIT/Apache-2.0 | config and models |
 | clap | 4.6 (`derive`, `env`) | MIT/Apache-2.0 | CLI |
-| gethostname | 1 | Apache-2.0 | default instance name; mDNS host label |
+| gethostname | 1 | Apache-2.0 | none; the crate is declared and no code uses it |
 | md-5 | 0.11 | MIT/Apache-2.0 | Subsonic token check |
 | sha2, hex | 0.11 / 0.4 | MIT/Apache-2.0 | fingerprints; the digests that a credential comparison compares |
 | rand | 0.10 | MIT/Apache-2.0 | surrogate IDs, generated passwords, the instance UUID |
@@ -347,7 +347,7 @@ Data directory, in order: `--data-dir`, `WN_SERVER_DATA_DIR`, then `directories:
 <data-dir>/
   config.toml
   library.db  (+ -wal, -shm)
-  instance.id          UUID string created by init, and by run when it is missing; the mDNS TXT id
+  instance.id          UUID string created by init, and by run when it is missing; the mDNS TXT id and the source of the SRV target
   cache/covers/        <coverId>-<size>-<coverMtime>.jpg
 ```
 
@@ -357,7 +357,7 @@ Data directory, in order: `--data-dir`, `WN_SERVER_DATA_DIR`, then `directories:
 [server]
 bind = "0.0.0.0"
 port = 4200
-name = "<host label>"           # instance name shown by discovery
+name = "wn-server"              # instance name shown by discovery
 log_level = "info"              # RUST_LOG overrides when set
 
 [auth]
@@ -378,7 +378,7 @@ mp3_bitrate_kbps = 320          # used when format=mp3 and maxBitRate is absent
 mdns = true
 ```
 
-The default `server.name` is the first label of the system host name (`studio` for `studio.example.com`), cut to 63 bytes at a UTF-8 character boundary. It is `wn-server` when that label is empty or the host name is not valid Unicode. `init` writes the default to `config.toml`, and a config that omits the key gets it at load. `config::host_label` returns the first label for the default name and for the mDNS target (§3.12).
+The default `server.name` is the fixed string `wn-server` (`config::DEFAULT_NAME`). `init` writes it to `config.toml`, and a config that omits the key gets it at load. An owner changes the name in `config.toml`. A name that `config.toml` holds is kept as written. No default and no other value of the configuration is taken from the host name of the machine, and no code reads that name.
 
 Validation at load: at least one folder; each folder exists and is a directory; `port != 0`; `server.name` is 1 to 63 bytes long; `max_concurrent >= 1`; bitrates 32–320. `server.name` is the DNS-SD instance name and the TXT `name` value (§3.12), and each holds at most 63 bytes. The error for `server.name` states the length of the name and names the key, the table and the file to edit. Unknown keys are an error (`deny_unknown_fields`). Internal timing values (transcode permit wait, scan poll) are fields of the config structs with defaults but are not config keys; tests set them.
 
@@ -540,7 +540,7 @@ Folder sync at `run` and at the start of every scan: folders from config are ups
 
 ### 3.12 mDNS
 
-No DNS-SD type exists for Subsonic servers; the server registers its own and the mobile app browses for it. This section is the contract between the server and a client that discovers it, and a client can be written from it alone. Unit tests in `discovery` pin the service type, the TXT record and the address choice.
+No DNS-SD type exists for Subsonic servers; the server registers its own and the mobile app browses for it. This section is the contract between the server and a client that discovers it, and a client can be written from it alone. Unit tests in `discovery` pin the service type, the SRV target, the TXT record and the address choice.
 
 #### Records
 
@@ -549,13 +549,15 @@ A client browses the service type `_waxnerd._tcp` in the domain `local.`. The se
 | Record | Content |
 |---|---|
 | PTR `_waxnerd._tcp.local.` | `<instance name>._waxnerd._tcp.local.` |
-| SRV | priority 0, weight 0, port `server.port`, target `<label>.local.` |
+| SRV | priority 0, weight 0, port `server.port`, target `wn-server-<hex>.local.` |
 | TXT | the keys of the next table |
 | A and AAAA of the target | the addresses under Addresses |
 
-- The instance name is `server.name`: 1 to 63 bytes of UTF-8, which the validation at load enforces (§3.5). When another responder on the link holds that name with other records, the daemon renames the instance by appending ` (2)`, then ` (3)` and so on. TXT `name` keeps `server.name`. A client does not identify a server by its instance name.
-- The target label is the first label of the system host name (`studio` for `studio.example.com`). The daemon changes the label to `<label>-2`, then `<label>-3` and so on, when another responder answers its probe for the host name with an address record of the same type and another address. A client takes the target from the SRV record and builds it from no other value.
-- A client connects to an address of the A and AAAA records of the target, on the SRV port. The records can hold addresses that the server does not listen on: the responder of the operating system, where one runs, publishes the same host name with the addresses of the machine, such as IPv6 addresses when `server.bind` is an IPv4 address. A client therefore follows three rules.
+- The instance name is `server.name`: 1 to 63 bytes of UTF-8, which the validation at load enforces (§3.5). When another responder on the link holds that name with other records, the daemon renames the instance by appending ` (2)`, then ` (3)` and so on. Two servers on one link that keep the default name `wn-server` are such a case. TXT `name` keeps `server.name`. A client does not identify a server by its instance name.
+- The target is the server's own host name, `wn-server-<hex>.local.`. `<hex>` is the first 8 hexadecimal digits of the UUID in `instance.id`: the target for an `instance.id` of `1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d` is `wn-server-1a2b3c4d.local.`. `discovery::host_name` builds the name from the instance ID and from no other input. The A and AAAA records that the server publishes are records of this name only.
+- The server never claims the host name of the machine. It does not read that name, and it publishes no record for it and answers no query for it. The responder of the operating system owns the machine's host name, and a second responder that publishes records for that name makes the operating system rename the machine: macOS changes the local host name `studio` to `studio-2`.
+- The target says nothing about the machine. It is not the machine's host name, and a client derives no name and no property of the machine from it. A client takes the target from the SRV record and builds it from no other value. It resolves the target to the A and AAAA records and connects to one of their addresses, on the SRV port.
+- The A and AAAA records that the server publishes for the target hold the addresses under Addresses and no other. An address can still fail for a client: a link-local IPv6 address needs a zone index, and a server that binds `::` on Windows does not accept its IPv4 addresses. A client therefore follows three rules.
   1. It skips every link-local IPv6 address (`fe80::/10`). A connection to such an address needs a zone index, and the URL of this contract carries none.
   2. It tries the other addresses one after the other, in an order of its own choice. It bounds each attempt with a timeout of its own choice.
   3. It goes on to the next address when an attempt fails for any reason: the connection is refused, the attempt times out, the address is unreachable, or any other error occurs. The server is unreachable for the client when no address is left.
@@ -576,7 +578,7 @@ A client browses the service type `_waxnerd._tcp` in the domain `local.`. The se
 - The record holds no other key today. Every device on the network can read the record, so no key carries a credential, an account name or a folder path.
 - `txtvers` is the first key. The order of the other keys is not part of the contract. Each key appears once. The keys are lower-case ASCII, and a client compares keys without regard to case (RFC 6763 section 6.4). The values are UTF-8; only `name` can hold characters outside ASCII.
 - A new key does not change `txtvers`, and a client ignores a key it does not know. `txtvers` increases when a key is removed or when the format or the meaning of a key changes.
-- `id` stays the same across restarts and across changes of `server.name`, the host name, the port and the addresses. It is new after `init` on a new data directory, and after `run` wrote a missing `instance.id`.
+- `id` stays the same across restarts and across changes of `server.name`, the machine's host name, the port and the addresses. It is new after `init` on a new data directory, and after `run` wrote a missing `instance.id`. The SRV target is built from `id` and changes only when `id` does.
 
 #### Addresses
 
@@ -591,15 +593,15 @@ A client browses the service type `_waxnerd._tcp` in the domain `local.`. The se
 
 - The daemon announces an address on the interface whose subnet holds it and on no other. A client therefore receives the addresses of the link it is on. A server that binds one address is announced on the link of that address only: a server on `127.0.0.1` is visible to clients on the same machine and not on the LAN.
 - The daemon does not use point-to-point interfaces, such as VPN tunnels, or the Apple peer-to-peer interfaces `awdl` and `llw`.
-- The daemon publishes the link-local IPv6 addresses of a server that binds `::`. The responder of the operating system publishes them for the host name whatever `server.bind` is. A client skips them (Records, rule 1).
+- The daemon publishes the link-local IPv6 addresses of a server that binds `::`. A client skips them (Records, rule 1).
 - Windows: a listener on `::` accepts IPv6 connections only, because Windows sets `IPV6_V6ONLY` on a new socket and the listener does not clear it. The A records of a server that binds `::` on Windows therefore name addresses that the listener does not accept. Linux and macOS accept both families on that listener.
 
 #### Start, failure and stop
 
-- `discovery::TxtRecord::build`, `discovery::addresses` and `discovery::interface_kinds` are pure. `discovery::Advertiser` owns the `mdns-sd` `ServiceDaemon`, which runs on its own thread. For `0.0.0.0` and `::` the registration names no address and uses `enable_addr_auto()`. For another address the registration names that address. For an IPv4 bind the daemon disables IPv6 interfaces (`disable_interface(IfKind::IPv6)`).
+- `discovery::TxtRecord::build`, `discovery::host_name`, `discovery::addresses` and `discovery::interface_kinds` are pure. `discovery::Advertiser` owns the `mdns-sd` `ServiceDaemon`, which runs on its own thread. For `0.0.0.0` and `::` the registration names no address and uses `enable_addr_auto()`. For another address the registration names that address. For an IPv4 bind the daemon disables IPv6 interfaces (`disable_interface(IfKind::IPv6)`).
 - The `run` command starts the advertisement before `run_server` when `discovery.mdns` is on, and withdraws it when `run_server` has returned. Before the start it writes a new `instance.id` when the file is missing and `library.db` exists, and logs one warning. `init` refuses a data directory that has a config file and an owner account, so no other command restores the file. The ID must be a UUID in the form `init` writes.
 - The daemon probes for its names for 750 ms to one second and then announces the instance (RFC 6762 section 8.1).
-- The server runs without the advertisement when the advertisement cannot start. `run` logs one warning when `instance.id` cannot be read or is not a UUID, when the host label is longer than 63 bytes, or when `mdns-sd` returns an error. `discovery` checks the length of `server.name` as well and reports it the same way. `run` does not reach that check with a name outside 1 to 63 bytes, because the validation at load fails first (§3.5). `mdns-sd` opens its multicast sockets on the daemon thread and reports a socket it cannot open in its debug log only, so a second thread waits for the first announcement: it logs the announced name at `info`, or one warning when nothing was announced within 10 s.
+- The server runs without the advertisement when the advertisement cannot start. `run` logs one warning when `instance.id` cannot be read or is not a UUID, or when `mdns-sd` returns an error. No host name is built from a text that is not a UUID. `discovery` checks the length of `server.name` as well and reports it the same way. `run` does not reach that check with a name outside 1 to 63 bytes, because the validation at load fails first (§3.5). `mdns-sd` opens its multicast sockets on the daemon thread and reports a socket it cannot open in its debug log only, so a second thread waits for the first announcement: it logs the announced name at `info`, or one warning when nothing was announced within 10 s.
 - Withdrawal: `unregister` sends a goodbye packet on every interface, the daemon repeats it after 120 ms, and `shutdown` ends the daemon thread. A client then sees the instance removed. A stop before the first announcement sends no goodbye packet, because nothing was announced. The thread that waits for the first announcement records it; a stop after the 10 s of that thread always sends the packet. A goodbye packet for an instance that was not announced would remove the records of another running server with the same instance name from the clients, for example when `run` is started twice and the second server cannot bind its port.
 - A server that ends without the goodbye packet stays in the caches of clients until its records expire. `mdns-sd` sets 120 s for the SRV and address records and 4500 s for the PTR and TXT records. These times are not part of the contract, and a client does not depend on them.
 - Windows Firewall prompts on first start for TCP 4200 and UDP 5353.

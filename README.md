@@ -79,7 +79,7 @@ The password is stored in plain text in `library.db`. Subsonic token authenticat
 |---|---|---|
 | `server.bind` | `"0.0.0.0"` | IP address the server listens on |
 | `server.port` | `4200` | TCP port; not 0 |
-| `server.name` | the first label of the host name | instance name shown by discovery; 1 to 63 bytes |
+| `server.name` | `"wn-server"` | instance name shown by discovery; 1 to 63 bytes |
 | `server.log_level` | `"info"` | log filter; `RUST_LOG` overrides it when set |
 | `auth.disabled_unsafe` | `false` | `true` turns authentication off; unsafe, see [Authentication](#authentication) |
 | `library.folders` | `[]` | music folders; at least one, and each is an existing directory |
@@ -93,7 +93,7 @@ The password is stored in plain text in `library.db`. Subsonic token authenticat
 
 The file is checked when a command loads it. An error names the key or the folder path.
 
-The default `server.name` is the first label of the system host name: `studio` when the host name is `studio.example.com`. It is cut to 63 bytes, and it is `wn-server` when that label is empty or the host name is not valid Unicode. `init` writes it to `config.toml`.
+The default `server.name` is `wn-server` on every machine. `init` writes it to `config.toml`. Edit `name` in the `[server]` table to give the server another name, for example when two servers run on one network. A name that the file holds is kept as written. The server takes no name from the host name of the machine.
 
 `server.name` holds 1 to 63 bytes of UTF-8. A character outside ASCII takes 2 to 4 bytes. A command that loads the file fails when the name is empty or longer, and the error names `server.name` and the length of the name. Set `name` in the `[server]` table to a name within the limit, or remove the key to get the default. `wn-server config path` prints the path of the file.
 
@@ -161,7 +161,9 @@ While `wn-server run` is up, it advertises the server on the local network over 
 
 - Service type: `_waxnerd._tcp` in the domain `local.`
 - Instance name: `server.name`. The mDNS responder appends ` (2)` when another server on the network has the same name.
-- Host: the first label of the system host name, followed by `.local.`. Port: `server.port`.
+- Host: `wn-server-<hex>.local.`, where `<hex>` is the first 8 hex digits of the UUID in `instance.id`. Port: `server.port`.
+
+The host is a name of the server, not of the machine. The server publishes its address records under this name only. It never uses the host name of the machine, because a second mDNS responder for that name makes the operating system rename the machine. A client takes the host from the SRV record of the instance and resolves it to the addresses of the server.
 
 The advertised addresses follow `server.bind`:
 
@@ -188,9 +190,9 @@ The TXT record holds these keys, in this order:
 
 Every device on the network can read the record. It holds no password and no account name. Section 3.12 of [docs/design.md](docs/design.md) states what a client does with each key.
 
-`id` identifies the server to clients. It stays the same across restarts and renames. `run` writes a new `instance.id` when the file is missing and `library.db` exists, and logs one warning. Clients then see a new server.
+`id` identifies the server to clients. It stays the same across restarts and renames. `run` writes a new `instance.id` when the file is missing and `library.db` exists, and logs one warning. Clients then see a new server, and the host of the advertisement changes with the ID.
 
-The server runs without the advertisement when the advertisement cannot start, and logs one warning that names the cause: `instance.id` cannot be read or does not hold a UUID, the first label of the system host name is longer than 63 bytes, or nothing was announced within 10 seconds. `RUST_LOG=info,mdns_sd=debug` shows the messages of the mDNS responder.
+The server runs without the advertisement when the advertisement cannot start, and logs one warning that names the cause: `instance.id` cannot be read or does not hold a UUID, or nothing was announced within 10 seconds. `RUST_LOG=info,mdns_sd=debug` shows the messages of the mDNS responder.
 
 Ctrl-C withdraws the advertisement. On macOS, `dns-sd -B _waxnerd._tcp` lists the servers on the network.
 
