@@ -30,9 +30,10 @@
 //! `getMusicDirectory` reads the albums of an artist in the order of
 //! `getArtist` and the songs of an album in the order of `getAlbum`.
 //!
-//! An answer takes the same number of statements for a directory of any
-//! size: the row of the directory, its children, and the annotations of all
-//! of them.
+//! The number of statements of an answer does not depend on the size of the
+//! directory. A handler reads the row of the directory with one statement
+//! and its children with one, and it reads the annotations of the directory
+//! and of all children with one call of `annotations::get_many`.
 //!
 //! # Tracks without a file
 //!
@@ -202,8 +203,8 @@ fn directory_id(params: &Params) -> Result<DirectoryId, ApiError> {
 /// `None` when no artist has the ID.
 ///
 /// The children are every album row of the artist, as `getArtist` lists
-/// them. The function runs three statements for an artist with any number
-/// of albums.
+/// them. The artist, the albums and the annotations of all of them are one
+/// read each, for an artist with any number of albums.
 fn artist_directory(
     conn: &Connection,
     user_id: i64,
@@ -231,8 +232,9 @@ fn artist_directory(
 /// `None` when no album has the ID.
 ///
 /// The children are the tracks of the album that have a file: a track
-/// without one is in no directory (`docs/design.md` section 3.4). The
-/// function runs three statements for an album with any number of tracks.
+/// without one is in no directory (`docs/design.md` section 3.4). The album,
+/// the tracks and the annotations of all of them are one read each, for an
+/// album with any number of tracks.
 fn album_directory(
     conn: &Connection,
     user_id: i64,

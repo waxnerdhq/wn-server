@@ -48,33 +48,29 @@ use crate::db::Result;
 /// the same second, so the milliseconds that it adds stay below one second.
 const SCANS_PER_SECOND: i64 = 1000;
 
-/// Returns the SQL text of [`last_modified`].
+/// The statement of [`last_modified`]. `?1` is [`SCANS_PER_SECOND`].
 ///
 /// The statement reads the scans from the last one backwards, by the row ID,
 /// and stops at the first that counts (see the module comment). Its two
 /// subqueries read rows by their ID: the scan before the one that is tested,
-/// and the at most [`SCANS_PER_SECOND`] scans before the one that is found.
-fn last_modified_sql() -> String {
-    format!(
-        "SELECT scans.finished_at,
-           (SELECT count(*) FROM scans AS earlier
-            WHERE earlier.id < scans.id AND earlier.id > scans.id - {SCANS_PER_SECOND}
-              AND earlier.finished_at = scans.finished_at)
-         FROM scans
-         WHERE scans.finished_at IS NOT NULL
-           AND (scans.tracks_added > 0 OR scans.tracks_changed > 0
-                OR scans.tracks_moved > 0 OR scans.tracks_removed > 0
-                OR scans.error IS NOT NULL
-                OR NOT coalesce(
-                     (SELECT previous.finished_at IS NOT NULL AND previous.error IS NULL
-                      FROM scans AS previous
-                      WHERE previous.id < scans.id
-                      ORDER BY previous.id DESC LIMIT 1),
-                     0))
-         ORDER BY scans.id DESC
-         LIMIT 1"
-    )
-}
+/// and the at most `?1` scans before the one that is found.
+const LAST_MODIFIED_SQL: &str = "SELECT scans.finished_at,
+       (SELECT count(*) FROM scans AS earlier
+        WHERE earlier.id < scans.id AND earlier.id > scans.id - ?1
+          AND earlier.finished_at = scans.finished_at)
+     FROM scans
+     WHERE scans.finished_at IS NOT NULL
+       AND (scans.tracks_added > 0 OR scans.tracks_changed > 0
+            OR scans.tracks_moved > 0 OR scans.tracks_removed > 0
+            OR scans.error IS NOT NULL
+            OR NOT coalesce(
+                 (SELECT previous.finished_at IS NOT NULL AND previous.error IS NULL
+                  FROM scans AS previous
+                  WHERE previous.id < scans.id
+                  ORDER BY previous.id DESC LIMIT 1),
+                 0))
+     ORDER BY scans.id DESC
+     LIMIT 1";
 
 /// Returns the time at which the artists of the library last changed, in
 /// milliseconds since the Unix epoch, or `None` when no scan has ended.
@@ -86,8 +82,8 @@ fn last_modified_sql() -> String {
 /// change, also when both scans ended in the same second.
 pub fn last_modified(conn: &Connection) -> Result<Option<i64>> {
     let found: Option<(i64, i64)> = conn
-        .prepare_cached(&last_modified_sql())?
-        .query_row([], |row| Ok((row.get(0)?, row.get(1)?)))
+        .prepare_cached(LAST_MODIFIED_SQL)?
+        .query_row([SCANS_PER_SECOND], |row| Ok((row.get(0)?, row.get(1)?)))
         .optional()?;
     Ok(found.map(|(finished_at, earlier)| {
         // The end time in milliseconds, and one millisecond for each scan
@@ -357,8 +353,8 @@ mod tests {
         let plan: Vec<String> = db
             .with_reader(|conn| {
                 let rows = conn
-                    .prepare(&format!("EXPLAIN QUERY PLAN {}", last_modified_sql()))?
-                    .query_map([], |row| row.get(3))?
+                    .prepare(&format!("EXPLAIN QUERY PLAN {LAST_MODIFIED_SQL}"))?
+                    .query_map([SCANS_PER_SECOND], |row| row.get(3))?
                     .collect::<rusqlite::Result<_>>()?;
                 Ok(rows)
             })

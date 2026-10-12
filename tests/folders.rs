@@ -1207,8 +1207,16 @@ async fn folder_methods_report_what_the_user_attached_to_an_item() {
                 0,
                 None::<i64>
             ])?;
+            // A play is the play of a track: the row of the album holds a
+            // star and a rating, and the row of the track holds the plays.
             insert.execute(params![
-                user_id, album, "album", STARRED_AT, 4, 7, PLAYED_AT
+                user_id,
+                album,
+                "album",
+                STARRED_AT,
+                4,
+                0,
+                None::<i64>
             ])?;
             insert.execute(params![
                 user_id, track, "track", STARRED_AT, 5, 3, PLAYED_AT
@@ -1239,8 +1247,15 @@ async fn folder_methods_report_what_the_user_attached_to_an_item() {
         json!([{ "id": server.artist.marlow_quartet, "name": "Marlow Quartet" }])
     );
 
+    // The plays of the album as `getAlbum` reports them. Both forms of an
+    // album report the same plays.
+    let response = server.get_json("getAlbum", &[("id", album)]).await;
+    let album_id3 = &response["album"];
+    assert_eq!(album_id3["starred"], starred);
+    assert!(album_id3["playCount"].is_u64(), "{album_id3}");
+
     // The directory of the artist: the star and the rating, and no play
-    // count. The album in it has the four values.
+    // count. The album in it has the star, the rating and the plays.
     let artist_dir = directory(&server, artist).await;
     assert_eq!(artist_dir["starred"], starred);
     assert_eq!(artist_dir["userRating"], 3);
@@ -1249,8 +1264,8 @@ async fn folder_methods_report_what_the_user_attached_to_an_item() {
     assert_eq!(child["id"], album);
     assert_eq!(child["starred"], starred);
     assert_eq!(child["userRating"], 4);
-    assert_eq!(child["playCount"], 7);
-    assert_eq!(child["played"], played);
+    assert_eq!(child["playCount"], album_id3["playCount"]);
+    assert_eq!(child.get("played"), album_id3.get("played"));
     // The other album has no value of the user.
     let other = &artist_dir["child"][1];
     assert!(other.get("starred").is_none(), "{other}");
@@ -1261,7 +1276,7 @@ async fn folder_methods_report_what_the_user_attached_to_an_item() {
     let album_dir = directory(&server, album).await;
     assert_eq!(album_dir["starred"], starred);
     assert_eq!(album_dir["userRating"], 4);
-    assert_eq!(album_dir["playCount"], 7);
+    assert_eq!(album_dir["playCount"], album_id3["playCount"]);
     // The song in it is the song of `getSong`, with the four values.
     let song = &album_dir["child"][1];
     assert_eq!(song["id"], server.track.breakwater.as_str());
@@ -1291,12 +1306,18 @@ async fn folder_methods_report_what_the_user_attached_to_an_item() {
         xml.contains(&format!(
             concat!(
                 r#"<directory id="{album}" name="Glass Harbour" parent="{artist}""#,
-                r#" playCount="7" starred="{starred}" userRating="4">"#
+                r#" playCount="{plays}" starred="{starred}" userRating="4">"#
             ),
             album = album,
             artist = artist,
+            plays = album_dir["playCount"],
             starred = starred,
         )),
+        "{xml}"
+    );
+    // The song has its plays as attributes.
+    assert!(
+        xml.contains(&format!(r#" playCount="3" played="{played}" "#)),
         "{xml}"
     );
 }
