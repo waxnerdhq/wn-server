@@ -12,6 +12,7 @@ use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard};
 /// Query functions, one module per group of tables.
 pub mod queries {
     pub mod albums;
+    pub mod annotations;
     pub mod artists;
     pub mod folders;
     mod int;

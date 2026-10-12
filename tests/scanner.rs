@@ -5,7 +5,12 @@
 //! whole seconds, and a test runs in less than one. A test that changes a
 //! file in place therefore moves its modification time with
 //! [`shift_mtime`], and a test that copies a file gives the copy the time of
-//! the original with [`copy_with_mtime`].
+//! the original with [`copy_with_mtime`]. [`retag`] moves the time of the
+//! file it changes.
+//!
+//! The first part of the file tests the track rows. The second part, from
+//! [`Album`] on, tests the album rows, the artist rows, the annotations and
+//! the covers that the scan derives from the tracks.
 
 mod common;
 
@@ -29,6 +34,7 @@ use wn_server::db::queries::tracks::{IndexEntry, Track};
 use wn_server::db::queries::{folders, scans, tracks};
 use wn_server::ids::{self, Kind};
 use wn_server::library::scanner::{self, CANCELLED, ScanOptions, ScanSummary};
+use wn_server::library::tags;
 
 /// The relative paths of the standard catalogue, in the order
 /// `LibraryBuilder::standard` adds the tracks.
@@ -187,12 +193,20 @@ impl Scanned {
     }
 }
 
-/// Returns a summary with `seen` files and no other count.
-fn seen(seen: u64) -> ScanSummary {
+/// Returns the summary of a scan that left the four albums and the three
+/// artists of the standard catalogue in the database, with no other count.
+fn standard() -> ScanSummary {
     ScanSummary {
-        seen,
+        albums: 4,
+        artists: 3,
         ..ScanSummary::default()
     }
+}
+
+/// Returns a summary with `seen` files, the albums and the artists of the
+/// standard catalogue, and no other count.
+fn seen(seen: u64) -> ScanSummary {
+    ScanSummary { seen, ..standard() }
 }
 
 /// Returns the modification time of a file in Unix seconds.
@@ -339,7 +353,7 @@ fn first_scan_inserts_the_ten_standard_tracks() {
             seen: 10,
             added: 10,
             tags_read: 10,
-            ..ScanSummary::default()
+            ..standard()
         }
     );
     assert_eq!(progress.load(Ordering::Relaxed), 10);
@@ -484,7 +498,7 @@ fn a_retagged_file_keeps_its_row_and_its_id() {
             seen: 10,
             changed: 1,
             tags_read: 1,
-            ..ScanSummary::default()
+            ..standard()
         }
     );
     let after = scanned.track_at(LOW_TIDE);
@@ -520,7 +534,7 @@ fn a_touched_file_keeps_its_row_and_has_its_tags_read_again() {
             seen: 10,
             changed: 1,
             tags_read: 1,
-            ..ScanSummary::default()
+            ..standard()
         }
     );
     let after = scanned.track_at(LOW_TIDE);
@@ -550,6 +564,8 @@ fn a_file_with_other_content_at_the_same_path_keeps_the_row_when_the_old_bytes_a
             seen: 10,
             changed: 1,
             tags_read: 1,
+            albums: 5,
+            artists: 4,
             ..ScanSummary::default()
         }
     );
@@ -568,7 +584,7 @@ fn assert_moved(scanned: &Scanned, id: &str, from: &str, to: &str) {
         ScanSummary {
             seen: 10,
             moved: 1,
-            ..ScanSummary::default()
+            ..standard()
         }
     );
     assert_eq!(summary.removed, 0);
@@ -647,7 +663,7 @@ fn a_file_moved_to_a_second_music_folder_keeps_its_id() {
         ScanSummary {
             seen: 9,
             moved: 1,
-            ..ScanSummary::default()
+            ..standard()
         }
     );
     assert_eq!(summary.removed, 0);
@@ -682,7 +698,7 @@ fn a_changed_folder_path_keeps_every_track_id() {
         ScanSummary {
             seen: 10,
             moved: 10,
-            ..ScanSummary::default()
+            ..standard()
         }
     );
     // The row of the old path is gone and the tracks are in the new row.
@@ -718,7 +734,7 @@ fn the_row_of_a_deleted_file_is_deleted() {
         ScanSummary {
             seen: 9,
             removed: 1,
-            ..ScanSummary::default()
+            ..standard()
         }
     );
     assert_eq!(scanned.find(LOW_TIDE), None);
@@ -751,6 +767,8 @@ fn a_file_placed_at_the_old_path_of_a_moved_track_gets_a_new_id() {
             added: 1,
             moved: 1,
             tags_read: 1,
+            albums: 5,
+            artists: 4,
             ..ScanSummary::default()
         }
     );
@@ -823,7 +841,7 @@ fn exchange_two_paths(batch_size: usize) {
         ScanSummary {
             seen: 10,
             moved: 2,
-            ..ScanSummary::default()
+            ..standard()
         }
     );
     assert_eq!(batches, 1);
@@ -873,7 +891,7 @@ fn move_over_another_track(batch_size: usize) {
             seen: 9,
             moved: 1,
             removed: 1,
-            ..ScanSummary::default()
+            ..standard()
         }
     );
     assert_eq!(batches, 1);
@@ -899,7 +917,7 @@ fn a_copy_gets_a_new_id_and_the_original_keeps_its_id() {
             seen: 11,
             added: 1,
             tags_read: 1,
-            ..ScanSummary::default()
+            ..standard()
         }
     );
     assert_eq!(scanned.track_at(LOW_TIDE), original);
@@ -934,7 +952,7 @@ fn one_of_two_identical_files_moves_and_keeps_its_own_id() {
         ScanSummary {
             seen: 11,
             moved: 1,
-            ..ScanSummary::default()
+            ..standard()
         }
     );
     assert_eq!(scanned.id_at(to), copied.id);
@@ -967,7 +985,7 @@ fn a_moved_track_with_two_copies_follows_the_copy_with_its_file_name() {
             added: 1,
             moved: 1,
             tags_read: 1,
-            ..ScanSummary::default()
+            ..standard()
         }
     );
     assert_eq!(scanned.id_at(same_name), id);
@@ -998,7 +1016,7 @@ fn a_retag_and_a_move_in_one_interval_make_a_new_track() {
             added: 1,
             removed: 1,
             tags_read: 1,
-            ..ScanSummary::default()
+            ..standard()
         }
     );
     assert_ne!(scanned.id_at(to), id);
@@ -1072,6 +1090,8 @@ fn a_file_larger_than_128_kib_is_identified_by_its_first_and_last_64_kib() {
             seen: 1,
             changed: 1,
             tags_read: 1,
+            albums: 1,
+            artists: 1,
             ..ScanSummary::default()
         }
     );
@@ -1090,6 +1110,8 @@ fn a_file_larger_than_128_kib_is_identified_by_its_first_and_last_64_kib() {
         ScanSummary {
             seen: 1,
             moved: 1,
+            albums: 1,
+            artists: 1,
             ..ScanSummary::default()
         }
     );
@@ -1267,6 +1289,8 @@ fn the_tracks_and_the_row_of_a_folder_removed_from_the_config_are_deleted() {
         ScanSummary {
             seen: 2,
             removed: 7,
+            albums: 1,
+            artists: 1,
             ..ScanSummary::default()
         }
     );
@@ -1324,6 +1348,8 @@ fn tracks_of_a_removed_folder_are_kept_while_a_configured_folder_has_no_supporte
         ScanSummary {
             seen: 7,
             moved: 7,
+            albums: 3,
+            artists: 2,
             ..ScanSummary::default()
         }
     );
@@ -1441,7 +1467,7 @@ fn a_missing_file_keeps_its_row_while_a_folder_cannot_be_read() {
             seen: 8,
             moved: 1,
             removed: 1,
-            ..ScanSummary::default()
+            ..standard()
         }
     );
     assert_eq!(two.env.id_at(marlow_id, moved_to), Some(moved.clone()));
@@ -1580,7 +1606,7 @@ fn a_changed_file_that_cannot_be_read_keeps_its_row_and_deletes_nothing() {
             seen: 10,
             changed: 1,
             tags_read: 1,
-            ..ScanSummary::default()
+            ..standard()
         }
     );
     assert_eq!(scanned.track_at(LOW_TIDE).id, row.id);
@@ -1666,7 +1692,7 @@ fn a_track_whose_path_another_track_takes_has_no_file_while_a_folder_cannot_be_r
         ScanSummary {
             seen: 7,
             removed: 2,
-            ..ScanSummary::default()
+            ..standard()
         }
     );
     assert!(!env.locators().contains_key(&overwritten));
@@ -1725,7 +1751,7 @@ fn an_entry_that_the_walk_skips_and_cannot_read_does_not_hold_deletions_back() {
             ScanSummary {
                 seen: 9,
                 removed: 1,
-                ..ScanSummary::default()
+                ..standard()
             },
             "{name}"
         );
@@ -1791,7 +1817,7 @@ fn a_system_directory_that_cannot_be_listed_does_not_hold_deletions_back() {
         ScanSummary {
             seen: 9,
             removed: 1,
-            ..ScanSummary::default()
+            ..standard()
         }
     );
     assert_eq!(scanned.find(LOW_TIDE), None);
@@ -1828,7 +1854,7 @@ fn a_directory_with_an_ordinary_name_that_cannot_be_listed_holds_deletions_back(
             added: 1,
             removed: 1,
             tags_read: 1,
-            ..ScanSummary::default()
+            ..standard()
         }
     );
 }
@@ -1856,6 +1882,7 @@ fn cancelling_after_the_first_batch_keeps_the_rows_of_that_batch_only() {
                 hook_token.cancel();
             })),
             progress: Arc::clone(&progress),
+            ..ScanOptions::default()
         },
     )
     .unwrap();
@@ -1867,6 +1894,9 @@ fn cancelling_after_the_first_batch_keeps_the_rows_of_that_batch_only() {
             seen: 10,
             added: 2,
             tags_read: 2,
+            // The album and the artist of the two tracks of the batch.
+            albums: 1,
+            artists: 1,
             errors: vec![CANCELLED.to_owned()],
             ..ScanSummary::default()
         }
@@ -1903,7 +1933,7 @@ fn cancelling_after_the_first_batch_keeps_the_rows_of_that_batch_only() {
             seen: 10,
             added: 8,
             tags_read: 8,
-            ..ScanSummary::default()
+            ..standard()
         }
     );
     let complete = env.index();
@@ -1982,7 +2012,7 @@ fn a_full_scan_reads_every_file_again_and_keeps_every_id() {
             seen: 10,
             changed: 10,
             tags_read: 10,
-            ..ScanSummary::default()
+            ..standard()
         }
     );
     assert_eq!(scanned.env.index(), before);
@@ -2061,7 +2091,7 @@ fn names_that_are_not_valid_unicode_are_skipped() {
             seen: 10,
             added: 10,
             tags_read: 10,
-            ..ScanSummary::default()
+            ..standard()
         }
     );
     assert_eq!(env.count(), 10);
@@ -2085,7 +2115,7 @@ fn a_file_that_cannot_be_parsed_is_skipped_and_the_row_at_its_path_stays() {
         ScanSummary {
             seen: 11,
             tags_read: 2,
-            ..ScanSummary::default()
+            ..standard()
         }
     );
     assert_eq!(scanned.track_at(LOW_TIDE), before);
@@ -2116,4 +2146,1713 @@ async fn scan_runs_on_a_blocking_thread_of_the_runtime() {
 
     assert_eq!(summary.added, 10);
     assert_eq!(env.db.read(tracks::count_tracks).await.unwrap(), 10);
+}
+
+/// An album row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Album {
+    id: String,
+    artist_id: String,
+    name: String,
+    artist_name: String,
+    year: Option<i64>,
+    genre: Option<String>,
+    song_count: i64,
+    duration_ms: i64,
+    compilation: bool,
+    cover_source: Option<String>,
+    cover_mtime: Option<i64>,
+}
+
+/// An artist row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Artist {
+    id: String,
+    name: String,
+    album_count: i64,
+}
+
+impl TestDb {
+    /// Returns every album by `<artist name>/<album name>`.
+    fn albums(&self) -> BTreeMap<String, Album> {
+        self.db
+            .with_reader(|conn| {
+                let mut select = conn.prepare(
+                    "SELECT id, artist_id, name, artist_name, year, genre, song_count,
+                       duration_ms, compilation, cover_source, cover_mtime
+                     FROM albums",
+                )?;
+                let albums = select
+                    .query_map([], |row| {
+                        Ok(Album {
+                            id: row.get(0)?,
+                            artist_id: row.get(1)?,
+                            name: row.get(2)?,
+                            artist_name: row.get(3)?,
+                            year: row.get(4)?,
+                            genre: row.get(5)?,
+                            song_count: row.get(6)?,
+                            duration_ms: row.get(7)?,
+                            compilation: row.get(8)?,
+                            cover_source: row.get(9)?,
+                            cover_mtime: row.get(10)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<Album>>>()?;
+                Ok(albums)
+            })
+            .unwrap()
+            .into_iter()
+            .map(|album| (format!("{}/{}", album.artist_name, album.name), album))
+            .collect()
+    }
+
+    /// Returns the album `<artist name>/<album name>`.
+    fn album(&self, key: &str) -> Album {
+        self.albums()
+            .remove(key)
+            .unwrap_or_else(|| panic!("no album is {key}"))
+    }
+
+    /// Returns every artist by name.
+    fn artists(&self) -> BTreeMap<String, Artist> {
+        self.db
+            .with_reader(|conn| {
+                let mut select = conn.prepare("SELECT id, name, album_count FROM artists")?;
+                let artists = select
+                    .query_map([], |row| {
+                        Ok(Artist {
+                            id: row.get(0)?,
+                            name: row.get(1)?,
+                            album_count: row.get(2)?,
+                        })
+                    })?
+                    .collect::<rusqlite::Result<Vec<Artist>>>()?;
+                Ok(artists)
+            })
+            .unwrap()
+            .into_iter()
+            .map(|artist| (artist.name.clone(), artist))
+            .collect()
+    }
+
+    /// Returns the name and the album count of every artist in name order.
+    fn album_counts(&self) -> Vec<(String, i64)> {
+        self.artists()
+            .into_values()
+            .map(|artist| (artist.name, artist.album_count))
+            .collect()
+    }
+
+    /// Returns the tracks of the album `album_id` by title.
+    fn tracks_of(&self, album_id: &str) -> BTreeMap<String, Track> {
+        self.index()
+            .into_values()
+            .map(|entry| self.track(&entry.id))
+            .filter(|track| track.album_id == album_id)
+            .map(|track| (track.title.clone(), track))
+            .collect()
+    }
+}
+
+/// Returns the absolute path of `rel_path` below `root`, joined component
+/// by component, which is the form of a stored `cover_source`.
+fn below(root: &Path, rel_path: &str) -> PathBuf {
+    let mut path = root.to_path_buf();
+    path.extend(rel_path.split('/'));
+    path
+}
+
+/// Returns `path` as the text that the database stores for it.
+fn text(path: &Path) -> String {
+    path.to_str().expect("a Unicode path").to_owned()
+}
+
+/// Changes tags of an audio file: a key with a text gets the text, and a
+/// key with `None` is removed. The tags are in the part of the file that the
+/// fingerprint covers. The file gets a later modification time than it had,
+/// so that the scanner sees the change.
+fn retag(path: &Path, changes: &[(ItemKey, Option<&str>)]) {
+    let before = fs::metadata(path).unwrap().modified().unwrap();
+    let mut file = lofty::read_from_path(path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let tag = file
+        .primary_tag_mut()
+        .unwrap_or_else(|| panic!("{} has no primary tag", path.display()));
+    for (key, value) in changes {
+        match value {
+            Some(value) => {
+                tag.insert_text(*key, (*value).to_owned());
+            }
+            None => tag.remove_key(*key),
+        }
+    }
+    tag.save_to_path(path, WriteOptions::default())
+        .unwrap_or_else(|error| panic!("write the tag of {}: {error}", path.display()));
+    set_mtime(path, before + Duration::from_secs(5));
+}
+
+/// Gives the item `id` what a user attaches to an album or an artist: a
+/// star and a rating. `item_type` is `album` or `artist`.
+fn star(db: &Db, id: &str, item_type: &str) {
+    db.with_writer(|conn| {
+        conn.execute(
+            "INSERT OR IGNORE INTO users (id, name, role, password, created_at, updated_at)
+             VALUES (1, 'adnan', 'owner', 'secret', 0, 0)",
+            [],
+        )?;
+        conn.execute(
+            "INSERT INTO annotations (user_id, item_id, item_type, starred_at, rating)
+             VALUES (1, ?1, ?2, 100, 4)",
+            [id, item_type],
+        )?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// Returns whether the item `id` has the star and the rating that [`star`]
+/// gave it.
+fn starred(db: &Db, id: &str) -> bool {
+    db.with_reader(|conn| {
+        Ok(conn.query_row(
+            "SELECT count(*) FROM annotations
+             WHERE item_id = ?1 AND starred_at = 100 AND rating = 4",
+            [id],
+            |row| row.get::<_, i64>(0),
+        )? == 1)
+    })
+    .unwrap()
+}
+
+/// Fails every statement that writes an album row or an artist row or
+/// deletes an annotation on the write connection, which the scanner uses.
+fn forbid_album_and_artist_writes(db: &Db) {
+    db.with_writer(|conn| {
+        for table in ["albums", "artists"] {
+            for (event, verb) in [
+                ("INSERT", "inserted"),
+                ("UPDATE", "updated"),
+                ("DELETE", "deleted"),
+            ] {
+                conn.execute_batch(&format!(
+                    "CREATE TEMP TRIGGER no_{table}_{verb} BEFORE {event} ON {table}
+                     BEGIN SELECT RAISE(ABORT, 'a row of {table} was {verb}'); END;"
+                ))?;
+            }
+        }
+        conn.execute_batch(
+            "CREATE TEMP TRIGGER no_annotation_deleted BEFORE DELETE ON annotations
+             BEGIN SELECT RAISE(ABORT, 'an annotation was deleted'); END;",
+        )?;
+        Ok(())
+    })
+    .unwrap();
+}
+
+/// Returns the sum of the durations of the audio files `files`, read from
+/// the files.
+fn duration_of(files: &[PathBuf]) -> i64 {
+    files
+        .iter()
+        .map(|path| {
+            let meta = tags::read(path).unwrap_or_else(|error| panic!("{error}"));
+            i64::try_from(meta.duration_ms).unwrap()
+        })
+        .sum()
+}
+
+#[test]
+fn the_standard_library_has_three_artists_and_four_albums_with_their_aggregates() {
+    let library = LibraryBuilder::standard().build();
+    let env = TestDb::new();
+    let summary = env.scan(&[library.root.path()]);
+    assert_eq!((summary.albums, summary.artists), (4, 3));
+    let folder_id = env.folder_id(library.root.path());
+
+    // The album, the files of the album as a range of the standard
+    // catalogue, the year, the genre and the compilation flag.
+    let expected = [
+        (
+            "Aurora Field/Glass Harbour",
+            0..3,
+            2019,
+            "Electronic",
+            false,
+        ),
+        ("Aurora Field/Paper Maps", 3..6, 2021, "Electronic", false),
+        ("Marlow Quartet/Slow Rivers", 6..8, 2015, "Jazz", false),
+        // The compilation has no album-artist tag and two track artists.
+        ("Various Artists/Summer Sampler", 8..10, 2020, "Pop", true),
+    ];
+    let albums = env.albums();
+    let artists = env.artists();
+    assert_eq!(
+        albums.keys().map(String::as_str).collect::<Vec<_>>(),
+        expected.iter().map(|album| album.0).collect::<Vec<_>>()
+    );
+    for (key, files, year, genre, compilation) in expected {
+        let album = &albums[key];
+        assert_eq!(
+            ids::parse(&album.id).map(|(kind, _)| kind),
+            Some(Kind::Album)
+        );
+        let song_count = i64::try_from(files.len()).unwrap();
+        let duration_ms = duration_of(&library.files[files.clone()]);
+        assert!(duration_ms > 0, "{key}");
+        assert_eq!(
+            (
+                album.song_count,
+                album.duration_ms,
+                album.year,
+                album.genre.as_deref(),
+                album.compilation
+            ),
+            (
+                song_count,
+                duration_ms,
+                Some(year),
+                Some(genre),
+                compilation
+            ),
+            "{key}"
+        );
+        // The album belongs to the row of its artist, and each of its
+        // tracks names both rows.
+        assert_eq!(album.artist_id, artists[&album.artist_name].id, "{key}");
+        for rel_path in &STANDARD[files] {
+            let track = env.track(&env.id_at(folder_id, rel_path).unwrap());
+            assert_eq!(track.album_id, album.id, "{rel_path}");
+            assert_eq!(track.artist_id, album.artist_id, "{rel_path}");
+        }
+    }
+
+    // A track artist that is no album artist has no row: Tessa Lund sings
+    // on the compilation only.
+    assert_eq!(
+        env.album_counts(),
+        [
+            ("Aurora Field".to_owned(), 2),
+            ("Marlow Quartet".to_owned(), 1),
+            ("Various Artists".to_owned(), 1)
+        ]
+    );
+    for artist in artists.values() {
+        assert_eq!(
+            ids::parse(&artist.id).map(|(kind, _)| kind),
+            Some(Kind::Artist)
+        );
+    }
+}
+
+#[test]
+fn removing_every_file_of_an_album_removes_the_album_and_its_annotation() {
+    let scanned = Scanned::new();
+    let db = &scanned.env.db;
+    let before = scanned.env.albums();
+    let artist = scanned.env.artists()["Aurora Field"].clone();
+    let gone = &before["Aurora Field/Paper Maps"];
+    let kept = &before["Aurora Field/Glass Harbour"];
+    star(db, &gone.id, "album");
+    star(db, &kept.id, "album");
+    star(db, &artist.id, "artist");
+
+    for rel_path in &STANDARD[3..6] {
+        fs::remove_file(scanned.path(rel_path)).unwrap();
+    }
+    let summary = scanned.rescan();
+
+    assert_eq!(
+        summary,
+        ScanSummary {
+            seen: 7,
+            removed: 3,
+            albums: 3,
+            artists: 3,
+            ..ScanSummary::default()
+        }
+    );
+    let mut expected = before.clone();
+    expected.remove("Aurora Field/Paper Maps");
+    // Every other album keeps its row as it was.
+    assert_eq!(scanned.env.albums(), expected);
+    assert!(!starred(db, &gone.id));
+    assert!(starred(db, &kept.id));
+
+    // The artist has another album. It keeps its row and its star.
+    assert_eq!(
+        scanned.env.artists()["Aurora Field"],
+        Artist {
+            album_count: 1,
+            ..artist.clone()
+        }
+    );
+    assert!(starred(db, &artist.id));
+}
+
+#[test]
+fn removing_the_last_album_of_an_artist_removes_the_artist_and_its_annotation() {
+    let scanned = Scanned::new();
+    let db = &scanned.env.db;
+    let albums = scanned.env.albums();
+    let artists = scanned.env.artists();
+    let album = &albums["Marlow Quartet/Slow Rivers"];
+    let artist = &artists["Marlow Quartet"];
+    let track_id = scanned.id_at(STANDARD[6]);
+    star(db, &album.id, "album");
+    star(db, &artist.id, "artist");
+    attach(db, &track_id);
+    star(db, &artists["Aurora Field"].id, "artist");
+    assert_eq!(count_rows(db, "annotations"), 4);
+
+    for rel_path in &STANDARD[6..8] {
+        fs::remove_file(scanned.path(rel_path)).unwrap();
+    }
+    let summary = scanned.rescan();
+
+    assert_eq!(
+        summary,
+        ScanSummary {
+            seen: 8,
+            removed: 2,
+            albums: 3,
+            artists: 2,
+            ..ScanSummary::default()
+        }
+    );
+    assert_eq!(
+        scanned.env.album_counts(),
+        [
+            ("Aurora Field".to_owned(), 2),
+            ("Various Artists".to_owned(), 1)
+        ]
+    );
+    // The annotations of the artist, of the album and of the track are
+    // gone. The annotation of the other artist stays.
+    assert!(!starred(db, &artist.id));
+    assert!(!starred(db, &album.id));
+    assert_eq!(attached(db, &track_id), None);
+    assert!(starred(db, &artists["Aurora Field"].id));
+    assert_eq!(count_rows(db, "annotations"), 1);
+}
+
+#[test]
+fn an_artist_whose_only_tracks_are_on_a_compilation_has_no_row() {
+    let scanned = Scanned::new();
+    // Aurora Field keeps one track, on the compilation of Various Artists.
+    for rel_path in &STANDARD[..6] {
+        fs::remove_file(scanned.path(rel_path)).unwrap();
+    }
+    let summary = scanned.rescan();
+
+    assert_eq!((summary.albums, summary.artists), (2, 2));
+    assert_eq!(
+        scanned.env.album_counts(),
+        [
+            ("Marlow Quartet".to_owned(), 1),
+            ("Various Artists".to_owned(), 1)
+        ]
+    );
+    let track = scanned.track_at(STANDARD[9]);
+    assert_eq!(track.artist_name, "Aurora Field");
+    assert_eq!(
+        track.album_id,
+        scanned.env.album("Various Artists/Summer Sampler").id
+    );
+}
+
+#[test]
+fn retagging_the_title_of_an_album_moves_its_tracks_to_a_new_album() {
+    let scanned = Scanned::new();
+    let db = &scanned.env.db;
+    let old = scanned.env.album("Aurora Field/Glass Harbour");
+    let artist = scanned.env.artists()["Aurora Field"].clone();
+    let track_ids: Vec<String> = STANDARD[..3]
+        .iter()
+        .map(|rel_path| scanned.id_at(rel_path))
+        .collect();
+    attach(db, &track_ids[0]);
+    star(db, &old.id, "album");
+    star(db, &artist.id, "artist");
+
+    for rel_path in &STANDARD[..3] {
+        retag(
+            &scanned.path(rel_path),
+            &[(ItemKey::AlbumTitle, Some("Glass Harbor"))],
+        );
+    }
+    let summary = scanned.rescan();
+
+    assert_eq!(
+        summary,
+        ScanSummary {
+            seen: 10,
+            changed: 3,
+            tags_read: 3,
+            ..standard()
+        }
+    );
+    let albums = scanned.env.albums();
+    assert!(!albums.contains_key("Aurora Field/Glass Harbour"));
+    assert!(albums.values().all(|album| album.id != old.id));
+    let new = &albums["Aurora Field/Glass Harbor"];
+    assert_ne!(new.id, old.id);
+    // The new album has the values of the old one. Its cover is the cover
+    // file of the directory, which the tracks did not leave.
+    assert_eq!(
+        *new,
+        Album {
+            id: new.id.clone(),
+            name: "Glass Harbor".to_owned(),
+            ..old.clone()
+        }
+    );
+    // The tracks keep their IDs and name the new album.
+    for (rel_path, id) in STANDARD[..3].iter().zip(&track_ids) {
+        let track = scanned.track_at(rel_path);
+        assert_eq!(track.id, *id);
+        assert_eq!(track.album_id, new.id);
+        assert_eq!(track.artist_id, artist.id);
+    }
+    // The star of the track survives and the star of the old album is
+    // gone. The artist is the same row and keeps its star.
+    assert_eq!(
+        attached(db, &track_ids[0]),
+        Some((scanned.folder_id, LOW_TIDE.to_owned()))
+    );
+    assert!(!starred(db, &old.id));
+    assert!(starred(db, &artist.id));
+    assert_eq!(scanned.env.artists()["Aurora Field"], artist);
+}
+
+#[test]
+fn an_album_keeps_its_row_while_one_track_refers_to_it() {
+    let scanned = Scanned::new();
+    let db = &scanned.env.db;
+    let old = scanned.env.album("Aurora Field/Glass Harbour");
+    star(db, &old.id, "album");
+    let retitle_album = |rel_path: &str| {
+        retag(
+            &scanned.path(rel_path),
+            &[(ItemKey::AlbumTitle, Some("Glass Harbor"))],
+        );
+    };
+
+    // Two of the three tracks get another album title.
+    retitle_album(STANDARD[1]);
+    retitle_album(STANDARD[2]);
+    let summary = scanned.rescan();
+
+    assert_eq!((summary.albums, summary.artists), (5, 3));
+    let albums = scanned.env.albums();
+    let remaining = &albums["Aurora Field/Glass Harbour"];
+    let new = albums["Aurora Field/Glass Harbor"].clone();
+    assert_eq!(remaining.id, old.id);
+    assert_eq!((remaining.song_count, new.song_count), (1, 2));
+    assert_eq!(
+        remaining.duration_ms + new.duration_ms,
+        old.duration_ms,
+        "{albums:?}"
+    );
+    assert!(starred(db, &old.id));
+    assert_eq!(
+        scanned.env.album_counts()[0],
+        ("Aurora Field".to_owned(), 3)
+    );
+    // Both albums have their first track in the directory of the cover
+    // file.
+    assert_eq!(remaining.cover_source, old.cover_source);
+    assert_eq!(new.cover_source, old.cover_source);
+
+    // The last track follows. No track refers to the old album.
+    retitle_album(STANDARD[0]);
+    let summary = scanned.rescan();
+
+    assert_eq!((summary.albums, summary.artists), (4, 3));
+    let albums = scanned.env.albums();
+    assert!(!albums.contains_key("Aurora Field/Glass Harbour"));
+    assert!(!starred(db, &old.id));
+    // The new album is the row it was, with three tracks.
+    assert_eq!(
+        albums["Aurora Field/Glass Harbor"],
+        Album {
+            song_count: 3,
+            duration_ms: old.duration_ms,
+            ..new
+        }
+    );
+    assert_eq!(
+        scanned.env.album_counts()[0],
+        ("Aurora Field".to_owned(), 2)
+    );
+}
+
+#[test]
+fn retagging_the_album_artist_makes_a_new_artist_and_a_new_album() {
+    let scanned = Scanned::new();
+    let db = &scanned.env.db;
+    let old_album = scanned.env.album("Marlow Quartet/Slow Rivers");
+    let old_artist = scanned.env.artists()["Marlow Quartet"].clone();
+    let track_ids: Vec<String> = STANDARD[6..8]
+        .iter()
+        .map(|rel_path| scanned.id_at(rel_path))
+        .collect();
+    star(db, &old_album.id, "album");
+    star(db, &old_artist.id, "artist");
+
+    for rel_path in &STANDARD[6..8] {
+        retag(
+            &scanned.path(rel_path),
+            &[(ItemKey::AlbumArtist, Some("Marlow Quintet"))],
+        );
+    }
+    let summary = scanned.rescan();
+
+    assert_eq!((summary.albums, summary.artists), (4, 3));
+    let artists = scanned.env.artists();
+    assert!(!artists.contains_key("Marlow Quartet"));
+    let new_artist = &artists["Marlow Quintet"];
+    assert_ne!(new_artist.id, old_artist.id);
+    assert_eq!(new_artist.album_count, 1);
+    let new_album = scanned.env.album("Marlow Quintet/Slow Rivers");
+    assert_ne!(new_album.id, old_album.id);
+    assert_eq!(new_album.artist_id, new_artist.id);
+    assert_eq!(new_album.song_count, 2);
+    assert!(!starred(db, &old_album.id));
+    assert!(!starred(db, &old_artist.id));
+    for (rel_path, id) in STANDARD[6..8].iter().zip(&track_ids) {
+        let track = scanned.track_at(rel_path);
+        assert_eq!(track.id, *id);
+        assert_eq!(track.album_id, new_album.id);
+        assert_eq!(track.artist_id, new_artist.id);
+        // The track artist tag is as it was.
+        assert_eq!(track.artist_name, "Marlow Quartet");
+    }
+}
+
+#[test]
+fn a_rescan_without_changes_keeps_every_album_and_artist_and_writes_no_row() {
+    let scanned = Scanned::new();
+    let db = &scanned.env.db;
+    let albums = scanned.env.albums();
+    let artists = scanned.env.artists();
+    for album in albums.values() {
+        star(db, &album.id, "album");
+    }
+    for artist in artists.values() {
+        star(db, &artist.id, "artist");
+    }
+    forbid_album_and_artist_writes(db);
+
+    for _ in 0..2 {
+        assert_eq!(scanned.rescan(), seen(10));
+        assert_eq!(scanned.env.latest_scan().error, None);
+    }
+
+    assert_eq!(scanned.env.albums(), albums);
+    assert_eq!(scanned.env.artists(), artists);
+    assert_eq!(count_rows(db, "annotations"), 7);
+    // The triggers are in force: an update of an album row fails.
+    let error = db
+        .with_writer(|conn| Ok(conn.execute("UPDATE albums SET song_count = 0", [])?))
+        .unwrap_err();
+    assert!(
+        error.to_string().contains("a row of albums was updated"),
+        "{error}"
+    );
+}
+
+#[test]
+fn a_full_scan_keeps_every_album_and_artist() {
+    let scanned = Scanned::new();
+    let albums = scanned.env.albums();
+    let artists = scanned.env.artists();
+
+    let summary = scanned
+        .env
+        .scan_with(&[scanned.root()], true, ScanOptions::default());
+
+    assert_eq!(summary.changed, 10);
+    assert_eq!(scanned.env.albums(), albums);
+    assert_eq!(scanned.env.artists(), artists);
+}
+
+#[test]
+fn adding_a_track_to_an_album_keeps_the_album_id() {
+    let scanned = Scanned::new();
+    let db = &scanned.env.db;
+    let before = scanned.env.album("Aurora Field/Glass Harbour");
+    let artists = scanned.env.artists();
+    star(db, &before.id, "album");
+
+    // A fourth track of the album, with an earlier year and another genre.
+    let added = LibraryBuilder::new()
+        .track("Aurora Field", "Glass Harbour", "Undertow", 4, "flac")
+        .year(2018)
+        .genre("Ambient")
+        .build();
+    let rel_path = "Aurora Field/Glass Harbour/04 Undertow.flac";
+    fs::copy(&added.files[0], scanned.path(rel_path)).unwrap();
+    let summary = scanned.rescan();
+
+    assert_eq!(
+        summary,
+        ScanSummary {
+            seen: 11,
+            added: 1,
+            tags_read: 1,
+            ..standard()
+        }
+    );
+    let after = scanned.env.album("Aurora Field/Glass Harbour");
+    assert_eq!(
+        after,
+        Album {
+            song_count: 4,
+            duration_ms: before.duration_ms + duration_of(&added.files),
+            // The smallest year of a track. Three of four tracks have the
+            // genre that the album had.
+            year: Some(2018),
+            ..before.clone()
+        }
+    );
+    assert_eq!(scanned.track_at(rel_path).album_id, before.id);
+    assert!(starred(db, &before.id));
+    assert_eq!(scanned.env.artists(), artists);
+}
+
+#[test]
+fn a_track_moved_to_another_music_folder_keeps_its_album() {
+    let two = TwoFolders::new();
+    let db = &two.env.db;
+    let (aurora_id, marlow_id) = (
+        two.env.folder_id(&two.aurora),
+        two.env.folder_id(&two.marlow),
+    );
+    let albums = two.env.albums();
+    let artists = two.env.artists();
+    let album = albums["Aurora Field/Glass Harbour"].clone();
+    assert_eq!(
+        album.cover_source,
+        Some(text(&below(&two.aurora, "Glass Harbour/cover.jpg")))
+    );
+    star(db, &album.id, "album");
+    let track_ids: Vec<String> = [
+        "01 Low Tide.flac",
+        "02 Breakwater.flac",
+        "03 Night Ferry.flac",
+    ]
+    .iter()
+    .map(|name| {
+        two.env
+            .id_at(aurora_id, &format!("Glass Harbour/{name}"))
+            .unwrap()
+    })
+    .collect();
+
+    // The second track of the album moves to the other folder.
+    move_file(
+        &two.aurora.join("Glass Harbour/02 Breakwater.flac"),
+        &two.marlow.join("Imports/02 Breakwater.flac"),
+    );
+    let summary = two.rescan();
+
+    assert_eq!(
+        summary,
+        ScanSummary {
+            seen: 9,
+            moved: 1,
+            ..standard()
+        }
+    );
+    // No album row and no artist row changed. The first track of the album
+    // is where it was, so the cover is too.
+    assert_eq!(two.env.albums(), albums);
+    assert_eq!(two.env.artists(), artists);
+    assert_eq!(
+        two.env.id_at(marlow_id, "Imports/02 Breakwater.flac"),
+        Some(track_ids[1].clone())
+    );
+    assert_eq!(two.env.track(&track_ids[1]).album_id, album.id);
+
+    // The other tracks and the cover file follow.
+    for name in ["01 Low Tide.flac", "03 Night Ferry.flac", "cover.jpg"] {
+        move_file(
+            &two.aurora.join("Glass Harbour").join(name),
+            &two.marlow.join("Imports").join(name),
+        );
+    }
+    let summary = two.rescan();
+
+    assert_eq!(
+        summary,
+        ScanSummary {
+            seen: 9,
+            moved: 2,
+            ..standard()
+        }
+    );
+    // The album is the row it was. Its cover is the file at its new path.
+    let mut expected = albums.clone();
+    expected.insert(
+        "Aurora Field/Glass Harbour".to_owned(),
+        Album {
+            cover_source: Some(text(&below(&two.marlow, "Imports/cover.jpg"))),
+            ..album.clone()
+        },
+    );
+    assert_eq!(two.env.albums(), expected);
+    assert_eq!(two.env.artists(), artists);
+    for id in &track_ids {
+        assert_eq!(two.env.track(id).album_id, album.id);
+        assert_eq!(two.env.track(id).folder_id, marlow_id);
+    }
+    assert!(starred(db, &album.id));
+}
+
+#[test]
+fn a_changed_folder_path_keeps_every_album_and_artist() {
+    let library = LibraryBuilder::standard().build();
+    let old = library.root.path();
+    let env = TestDb::new();
+    env.scan(&[old]);
+    let albums = env.albums();
+    let artists = env.artists();
+
+    let new = old.join("moved");
+    fs::create_dir(&new).unwrap();
+    for artist in ["Aurora Field", "Marlow Quartet", "Tessa Lund"] {
+        fs::rename(old.join(artist), new.join(artist)).unwrap();
+    }
+    let summary = env.scan(&[&new]);
+
+    assert_eq!((summary.moved, summary.albums, summary.artists), (10, 4, 3));
+    // The cover file is at its path below the new folder path. Every other
+    // value is as it was.
+    let mut expected = albums.clone();
+    let cover = below(&new, "Aurora Field/Glass Harbour/cover.jpg");
+    expected
+        .get_mut("Aurora Field/Glass Harbour")
+        .unwrap()
+        .cover_source = Some(text(&cover));
+    assert_eq!(env.albums(), expected);
+    assert_eq!(env.artists(), artists);
+}
+
+#[test]
+fn a_compilation_is_one_album_of_various_artists() {
+    // The standard compilation has the compilation flag and no album-artist
+    // tag. The second one has no flag and an album-artist tag in two
+    // spellings.
+    let library = LibraryBuilder::standard()
+        .track("Nadia Ortiz", "Winter Sampler", "First Snow", 1, "flac")
+        .album_artist("VARIOUS ARTISTS")
+        .track("Tessa Lund", "Winter Sampler", "Thaw", 2, "flac")
+        .album_artist("various artists")
+        .build();
+    let scanned = Scanned::of(library);
+
+    // The four track artists of the two compilations share one artist row.
+    assert_eq!(
+        scanned.env.album_counts(),
+        [
+            ("Aurora Field".to_owned(), 2),
+            ("Marlow Quartet".to_owned(), 1),
+            ("Various Artists".to_owned(), 2)
+        ]
+    );
+    let various = scanned.env.artists()["Various Artists"].clone();
+    let albums = scanned.env.albums();
+    for (key, titles, artist_names) in [
+        (
+            "Various Artists/Summer Sampler",
+            ["Last Train", "Open Road"],
+            ["Aurora Field", "Tessa Lund"],
+        ),
+        (
+            "Various Artists/Winter Sampler",
+            ["First Snow", "Thaw"],
+            ["Nadia Ortiz", "Tessa Lund"],
+        ),
+    ] {
+        let album = &albums[key];
+        assert!(album.compilation, "{key}");
+        assert_eq!(album.song_count, 2, "{key}");
+        assert_eq!(album.artist_id, various.id, "{key}");
+        let tracks = scanned.env.tracks_of(&album.id);
+        assert_eq!(tracks.keys().collect::<Vec<_>>(), titles, "{key}");
+        // A track keeps its track artist as text and names the artist row
+        // of the album.
+        let names: Vec<&str> = tracks
+            .values()
+            .map(|track| track.artist_name.as_str())
+            .collect();
+        assert_eq!(names, artist_names, "{key}");
+        assert!(tracks.values().all(|track| track.artist_id == various.id));
+    }
+    // The tracks of the standard compilation are in two directories.
+    assert_eq!(
+        scanned.track_at(STANDARD[8]).album_id,
+        scanned.track_at(STANDARD[9]).album_id
+    );
+}
+
+#[test]
+fn the_discs_of_an_album_are_one_album_whose_first_track_is_on_the_first_disc() {
+    let library = LibraryBuilder::new()
+        .track("Aurora Field", "Long Play", "Side C", 1, "flac")
+        .disc(2)
+        .picture()
+        .track("Aurora Field", "Long Play", "Side A", 1, "mp3")
+        .disc(1)
+        .track("Aurora Field", "Long Play", "Side B", 2, "flac")
+        .disc(1)
+        .picture()
+        .build();
+    // Each disc has its directory. The cover file is in the directory of
+    // the second disc.
+    let album_dir = library.root.path().join("Aurora Field").join("Long Play");
+    move_file(
+        &album_dir.join("01 Side C.flac"),
+        &album_dir.join("CD2").join("01 Side C.flac"),
+    );
+    for name in ["01 Side A.mp3", "02 Side B.flac"] {
+        move_file(&album_dir.join(name), &album_dir.join("CD1").join(name));
+    }
+    fs::write(album_dir.join("CD2").join("cover.jpg"), b"image").unwrap();
+    let scanned = Scanned::of(library);
+
+    let albums = scanned.env.albums();
+    assert_eq!(albums.len(), 1);
+    let album = &albums["Aurora Field/Long Play"];
+    assert_eq!(album.song_count, 3);
+    assert_eq!(scanned.env.album_counts(), [("Aurora Field".to_owned(), 1)]);
+    // The directory of the album is the one of track 1 of disc 1, which
+    // holds no cover file. The first track with a picture is track 2 of
+    // disc 1, although track 1 of disc 2 has the lower track number.
+    let side_b = scanned.track_at("Aurora Field/Long Play/CD1/02 Side B.flac");
+    assert_eq!(album.cover_source, Some(format!("embedded:{}", side_b.id)));
+    assert_eq!(album.cover_mtime, Some(side_b.mtime));
+
+    // A cover file in the directory of the first disc is the cover.
+    let cover = album_dir.join("CD1").join("folder.png");
+    fs::write(&cover, b"image").unwrap();
+    assert_eq!(scanned.rescan().seen, 3);
+    let after = scanned.env.album("Aurora Field/Long Play");
+    assert_eq!(
+        after,
+        Album {
+            cover_source: Some(text(&cover)),
+            cover_mtime: Some(mtime(&cover)),
+            ..album.clone()
+        }
+    );
+}
+
+#[test]
+fn tracks_without_an_album_or_an_artist_tag_are_in_the_rows_of_the_unknown_names() {
+    let library = LibraryBuilder::standard().build();
+    let root = library.root.path();
+    // Two files without a tag, in two directories.
+    for (fixture, to) in [
+        ("a.flac", "Loose/first.flac"),
+        ("a.mp3", "Inbox/second.mp3"),
+    ] {
+        let to = root.join(to);
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        fs::copy(common::fixtures_dir().join(fixture), to).unwrap();
+    }
+    // One file with an artist tag and no album tag, and one with the album
+    // tag of a standard album and no artist tag.
+    let tagged = LibraryBuilder::new()
+        .track("Tessa Lund", "Removed", "Single", 1, "flac")
+        .track("Removed", "Glass Harbour", "Stray", 1, "ogg")
+        .build();
+    retag(&tagged.files[0], &[(ItemKey::AlbumTitle, None)]);
+    retag(&tagged.files[1], &[(ItemKey::TrackArtist, None)]);
+    fs::copy(&tagged.files[0], root.join("Loose/01 Single.flac")).unwrap();
+    fs::copy(&tagged.files[1], root.join("Inbox/01 Stray.ogg")).unwrap();
+    let scanned = Scanned::of(library);
+
+    assert_eq!(
+        scanned.env.album_counts(),
+        [
+            ("Aurora Field".to_owned(), 2),
+            ("Marlow Quartet".to_owned(), 1),
+            ("Tessa Lund".to_owned(), 1),
+            ("Various Artists".to_owned(), 1),
+            ("[Unknown Artist]".to_owned(), 2),
+        ]
+    );
+    let albums = scanned.env.albums();
+    assert_eq!(albums.len(), 7);
+    let song_count = |key: &str| albums[key].song_count;
+    // The files without a tag are one album, whatever their directories.
+    assert_eq!(song_count("[Unknown Artist]/[Unknown Album]"), 2);
+    let untagged = scanned
+        .env
+        .tracks_of(&albums["[Unknown Artist]/[Unknown Album]"].id);
+    // The title of a file without a title tag is its file stem.
+    assert_eq!(untagged.keys().collect::<Vec<_>>(), ["first", "second"]);
+    // The album without a title of an artist is an album of that artist.
+    assert_eq!(song_count("Tessa Lund/[Unknown Album]"), 1);
+    // An album title belongs to its album artist: the track without an
+    // artist tag is not on the album of Aurora Field.
+    assert_eq!(song_count("[Unknown Artist]/Glass Harbour"), 1);
+    assert_eq!(song_count("Aurora Field/Glass Harbour"), 3);
+    assert_ne!(
+        albums["[Unknown Artist]/Glass Harbour"].id,
+        albums["Aurora Field/Glass Harbour"].id
+    );
+}
+
+#[test]
+fn one_album_title_under_two_album_artists_is_two_albums() {
+    let library = LibraryBuilder::new()
+        .track("Aurora Field", "Greatest Hits", "One", 1, "flac")
+        .year(2001)
+        .track("Aurora Field", "Greatest Hits", "Two", 2, "flac")
+        .year(2001)
+        .track("Marlow Quartet", "Greatest Hits", "Three", 1, "mp3")
+        .year(1999)
+        .cover_file("Marlow Quartet", "Greatest Hits", "cover.jpg")
+        .build();
+    let scanned = Scanned::of(library);
+    let db = &scanned.env.db;
+
+    let albums = scanned.env.albums();
+    assert_eq!(albums.len(), 2);
+    let aurora = albums["Aurora Field/Greatest Hits"].clone();
+    let marlow = albums["Marlow Quartet/Greatest Hits"].clone();
+    assert_ne!(aurora.id, marlow.id);
+    assert_ne!(aurora.artist_id, marlow.artist_id);
+    assert_eq!((aurora.song_count, aurora.year), (2, Some(2001)));
+    assert_eq!((marlow.song_count, marlow.year), (1, Some(1999)));
+    // The cover file is in the directory of one of the two albums.
+    assert_eq!(aurora.cover_source, None);
+    let cover = below(scanned.root(), "Marlow Quartet/Greatest Hits/cover.jpg");
+    assert_eq!(marlow.cover_source, Some(text(&cover)));
+    assert_eq!(
+        scanned.env.album_counts(),
+        [
+            ("Aurora Field".to_owned(), 1),
+            ("Marlow Quartet".to_owned(), 1)
+        ]
+    );
+
+    // One of the two albums goes. The other one is the row it was.
+    star(db, &aurora.id, "album");
+    star(db, &marlow.id, "album");
+    fs::remove_file(scanned.path("Marlow Quartet/Greatest Hits/01 Three.mp3")).unwrap();
+    let summary = scanned.rescan();
+    assert_eq!((summary.albums, summary.artists), (1, 1));
+    assert!(starred(db, &aurora.id));
+    assert!(!starred(db, &marlow.id));
+    assert_eq!(
+        scanned.env.albums().into_values().collect::<Vec<_>>(),
+        [aurora]
+    );
+}
+
+#[test]
+fn names_that_differ_by_case_and_surrounding_space_are_one_album_and_one_artist() {
+    let scanned = Scanned::new();
+    let db = &scanned.env.db;
+    let albums = scanned.env.albums();
+    let artists = scanned.env.artists();
+    let album = &albums["Aurora Field/Glass Harbour"];
+    star(db, &album.id, "album");
+    star(db, &artists["Aurora Field"].id, "artist");
+    let respell = |rel_path: &str| {
+        retag(
+            &scanned.path(rel_path),
+            &[
+                (ItemKey::AlbumTitle, Some("  GLASS harbour ")),
+                (ItemKey::TrackArtist, Some("\taurora FIELD")),
+            ],
+        );
+    };
+
+    // One track of the album gets another spelling of both names.
+    respell(STANDARD[1]);
+    let summary = scanned.rescan();
+    assert_eq!(
+        summary,
+        ScanSummary {
+            seen: 10,
+            changed: 1,
+            tags_read: 1,
+            ..standard()
+        }
+    );
+    // The rows are as they were: the same IDs and the first spelling.
+    assert_eq!(scanned.env.albums(), albums);
+    assert_eq!(scanned.env.artists(), artists);
+    let track = scanned.track_at(STANDARD[1]);
+    assert_eq!(track.album_id, album.id);
+    // The track row holds the text of its tags, without the outer space.
+    assert_eq!(track.album_name, "GLASS harbour");
+    assert_eq!(track.artist_name, "aurora FIELD");
+
+    // Every track of the album has the other spelling. The key of the
+    // album is the same, so the row and its star stay.
+    respell(STANDARD[0]);
+    respell(STANDARD[2]);
+    assert_eq!(scanned.rescan().changed, 2);
+    assert_eq!(scanned.env.albums(), albums);
+    assert_eq!(scanned.env.artists(), artists);
+    assert!(starred(db, &album.id));
+    assert!(starred(db, &artists["Aurora Field"].id));
+
+    // Space inside a name is part of the key.
+    retag(
+        &scanned.path(STANDARD[0]),
+        &[(ItemKey::AlbumTitle, Some("Glass  Harbour"))],
+    );
+    assert_eq!(scanned.rescan().albums, 5);
+}
+
+#[test]
+fn names_outside_ascii_are_keyed_in_their_composed_lower_case_form() {
+    // "é" as one character and as "e" with a combining accent.
+    let composed = "Zo\u{eb} \u{c5}kesson";
+    let decomposed = "Zoe\u{308} A\u{30a}kesson";
+    assert_ne!(composed, decomposed);
+    let library = LibraryBuilder::new()
+        .track(composed, "\u{dc}berg\u{e4}nge", "Erster", 1, "flac")
+        .track(composed, "\u{dc}berg\u{e4}nge", "Zweiter", 2, "flac")
+        .cover_file(composed, "\u{dc}berg\u{e4}nge", "cover.jpg")
+        .track(
+            "\u{590f}\u{306e}\u{5ead}",
+            "\u{96e8}\u{97f3}",
+            "\u{671d}",
+            1,
+            "mp3",
+        )
+        .build();
+    // The second track names the artist in the decomposed form and the
+    // album in upper case.
+    retag(
+        &library.files[1],
+        &[
+            (ItemKey::TrackArtist, Some(decomposed)),
+            (ItemKey::AlbumTitle, Some("\u{dc}BERG\u{c4}NGE")),
+        ],
+    );
+    let scanned = Scanned::of(library);
+    let db = &scanned.env.db;
+
+    assert_eq!(
+        scanned.env.album_counts(),
+        [
+            (composed.to_owned(), 1),
+            ("\u{590f}\u{306e}\u{5ead}".to_owned(), 1)
+        ]
+    );
+    let albums = scanned.env.albums();
+    assert_eq!(albums.len(), 2);
+    let album = albums[&format!("{composed}/\u{dc}berg\u{e4}nge")].clone();
+    assert_eq!(album.song_count, 2);
+    assert_eq!(
+        albums["\u{590f}\u{306e}\u{5ead}/\u{96e8}\u{97f3}"].song_count,
+        1
+    );
+    // The cover file is found below directories with these names. A file
+    // system may store a name in another form than the one it was given, so
+    // the test opens the stored path instead of comparing it.
+    let cover = PathBuf::from(album.cover_source.clone().expect("the album has a cover"));
+    assert_eq!(
+        cover.file_name().and_then(|name| name.to_str()),
+        Some("cover.jpg")
+    );
+    assert_eq!(album.cover_mtime, Some(mtime(&cover)));
+
+    // A rescan and a full scan find the same rows.
+    star(db, &album.id, "album");
+    assert_eq!(scanned.rescan().albums, 2);
+    scanned
+        .env
+        .scan_with(&[scanned.root()], true, ScanOptions::default());
+    assert_eq!(scanned.env.albums(), albums);
+    assert!(starred(db, &album.id));
+}
+
+/// Scans the one folder of `scanned` with `cache` as the cover cache.
+fn rescan_with_cache(scanned: &Scanned, cache: &Path) -> ScanSummary {
+    scanned.env.scan_with(
+        &[scanned.root()],
+        false,
+        ScanOptions {
+            covers_cache_dir: Some(cache.to_path_buf()),
+            ..ScanOptions::default()
+        },
+    )
+}
+
+/// Writes a resized cover of the cover ID `id` to the cache `cache`, as
+/// `getCoverArt` names it, and returns its path.
+fn cache_cover(cache: &Path, id: &str, size: u32, cover_mtime: i64) -> PathBuf {
+    let path = cache.join(format!("{id}-{size}-{cover_mtime}.jpg"));
+    fs::write(&path, b"resized").unwrap();
+    path
+}
+
+#[test]
+fn the_cover_of_an_album_is_its_cover_file_or_its_first_embedded_picture() {
+    let scanned = Scanned::new();
+    let albums = scanned.env.albums();
+
+    // The album with a `cover.jpg` file in its directory.
+    let cover = below(scanned.root(), "Aurora Field/Glass Harbour/cover.jpg");
+    let with_file = &albums["Aurora Field/Glass Harbour"];
+    assert_eq!(with_file.cover_source, Some(text(&cover)));
+    assert_eq!(with_file.cover_mtime, Some(mtime(&cover)));
+
+    // The album whose two tracks have an embedded picture: the first one
+    // is the source.
+    let upstream = scanned.track_at(STANDARD[6]);
+    let embedded = &albums["Marlow Quartet/Slow Rivers"];
+    assert_eq!(
+        embedded.cover_source,
+        Some(format!("embedded:{}", upstream.id))
+    );
+    assert_eq!(embedded.cover_mtime, Some(upstream.mtime));
+
+    for key in ["Aurora Field/Paper Maps", "Various Artists/Summer Sampler"] {
+        assert_eq!(
+            (&albums[key].cover_source, albums[key].cover_mtime),
+            (&None, None),
+            "{key}"
+        );
+    }
+}
+
+#[test]
+fn replacing_the_cover_file_changes_the_cover_time_and_removes_the_resized_covers() {
+    let scanned = Scanned::new();
+    let cache = tempfile::tempdir().unwrap();
+    let before = scanned.env.albums();
+    let album = before["Aurora Field/Glass Harbour"].clone();
+    let other = before["Marlow Quartet/Slow Rivers"].clone();
+    let old_mtime = album.cover_mtime.expect("the album has a cover");
+    let stale = [
+        cache_cover(cache.path(), &album.id, 300, old_mtime),
+        cache_cover(cache.path(), &album.id, 64, old_mtime),
+    ];
+    let fresh = [
+        cache_cover(cache.path(), &other.id, 300, other.cover_mtime.unwrap()),
+        cache_cover(cache.path(), &scanned.id_at(LOW_TIDE), 300, old_mtime),
+    ];
+
+    // A scan that finds the cover as it was removes no file.
+    assert_eq!(rescan_with_cache(&scanned, cache.path()), seen(10));
+    assert!(stale.iter().chain(&fresh).all(|path| path.exists()));
+
+    // The cover file is replaced by a newer file. No track changes.
+    let cover = below(scanned.root(), "Aurora Field/Glass Harbour/cover.jpg");
+    fs::write(&cover, b"another image").unwrap();
+    set_mtime(
+        &cover,
+        UNIX_EPOCH + Duration::from_secs(u64::try_from(old_mtime).unwrap() + 10),
+    );
+    let summary = rescan_with_cache(&scanned, cache.path());
+
+    assert_eq!(summary, seen(10));
+    let mut expected = before.clone();
+    expected.insert(
+        "Aurora Field/Glass Harbour".to_owned(),
+        Album {
+            cover_mtime: Some(old_mtime + 10),
+            ..album.clone()
+        },
+    );
+    assert_eq!(scanned.env.albums(), expected);
+    for path in &stale {
+        assert!(!path.exists(), "{}", path.display());
+    }
+    for path in &fresh {
+        assert!(path.exists(), "{}", path.display());
+    }
+}
+
+#[test]
+fn a_cover_file_that_is_removed_or_added_changes_the_cover_and_removes_the_resized_covers() {
+    let scanned = Scanned::new();
+    let cache = tempfile::tempdir().unwrap();
+    let before = scanned.env.albums();
+    let with_file = before["Aurora Field/Glass Harbour"].clone();
+    let embedded = before["Marlow Quartet/Slow Rivers"].clone();
+    let without = before["Aurora Field/Paper Maps"].clone();
+    let cached = [
+        cache_cover(
+            cache.path(),
+            &with_file.id,
+            300,
+            with_file.cover_mtime.unwrap(),
+        ),
+        cache_cover(
+            cache.path(),
+            &embedded.id,
+            300,
+            embedded.cover_mtime.unwrap(),
+        ),
+    ];
+
+    // The first album loses its cover file. Its tracks hold no picture.
+    fs::remove_file(below(
+        scanned.root(),
+        "Aurora Field/Glass Harbour/cover.jpg",
+    ))
+    .unwrap();
+    // The second album gets a cover file, which precedes the embedded
+    // picture. The file has the modification time of the picture's track,
+    // so the name of a resized cover would stay the same.
+    let folder_png = below(scanned.root(), "Marlow Quartet/Slow Rivers/Folder.PNG");
+    fs::write(&folder_png, b"image").unwrap();
+    set_mtime(
+        &folder_png,
+        UNIX_EPOCH + Duration::from_secs(u64::try_from(embedded.cover_mtime.unwrap()).unwrap()),
+    );
+    // The third album gets two cover files. `front` precedes `album`.
+    let paper_maps = below(scanned.root(), "Aurora Field/Paper Maps");
+    fs::write(paper_maps.join("album.jpg"), b"image").unwrap();
+    fs::write(paper_maps.join("front.webp"), b"image").unwrap();
+    // A file with another name is no cover file.
+    fs::write(paper_maps.join("cover.gif"), b"image").unwrap();
+    fs::write(paper_maps.join("back.jpg"), b"image").unwrap();
+    let summary = rescan_with_cache(&scanned, cache.path());
+
+    assert_eq!(summary, seen(10));
+    let after = scanned.env.albums();
+    assert_eq!(
+        after["Aurora Field/Glass Harbour"],
+        Album {
+            cover_source: None,
+            cover_mtime: None,
+            ..with_file
+        }
+    );
+    assert_eq!(
+        after["Marlow Quartet/Slow Rivers"],
+        Album {
+            cover_source: Some(text(&folder_png)),
+            ..embedded
+        }
+    );
+    let front = paper_maps.join("front.webp");
+    assert_eq!(
+        after["Aurora Field/Paper Maps"],
+        Album {
+            cover_source: Some(text(&front)),
+            cover_mtime: Some(mtime(&front)),
+            ..without
+        }
+    );
+    // The resized covers of both albums whose cover changed are gone, also
+    // where the modification time of the cover is the same.
+    for path in &cached {
+        assert!(!path.exists(), "{}", path.display());
+    }
+}
+
+#[test]
+fn an_album_that_gets_a_cover_loses_the_resized_covers_that_an_earlier_scan_left() {
+    let scanned = Scanned::new();
+    let cache = tempfile::tempdir().unwrap();
+    let albums = scanned.env.albums();
+    let album = albums["Aurora Field/Glass Harbour"].clone();
+    let other = &albums["Marlow Quartet/Slow Rivers"];
+    let old_mtime = album.cover_mtime.expect("the album has a cover");
+    let stale = cache_cover(cache.path(), &album.id, 300, old_mtime);
+    let fresh = cache_cover(cache.path(), &other.id, 300, other.cover_mtime.unwrap());
+
+    // The cover file is gone, and a scan without a cache directory stores
+    // that the album has no cover. The resized cover stays in the cache.
+    let cover = below(scanned.root(), "Aurora Field/Glass Harbour/cover.jpg");
+    fs::remove_file(&cover).unwrap();
+    assert_eq!(scanned.rescan(), seen(10));
+    assert_eq!(
+        scanned.env.album("Aurora Field/Glass Harbour"),
+        Album {
+            cover_source: None,
+            cover_mtime: None,
+            ..album.clone()
+        }
+    );
+    assert!(stale.exists());
+
+    // Another image with the modification time of the old one is the cover
+    // file. Its resized cover has the name of the file in the cache.
+    fs::write(&cover, b"another image").unwrap();
+    set_mtime(
+        &cover,
+        UNIX_EPOCH + Duration::from_secs(u64::try_from(old_mtime).unwrap()),
+    );
+    let summary = rescan_with_cache(&scanned, cache.path());
+
+    assert_eq!(summary, seen(10));
+    assert_eq!(scanned.env.album("Aurora Field/Glass Harbour"), album);
+    assert!(!stale.exists());
+    assert!(fresh.exists());
+}
+
+#[test]
+fn a_deleted_album_loses_its_resized_covers() {
+    let scanned = Scanned::new();
+    let cache = tempfile::tempdir().unwrap();
+    let albums = scanned.env.albums();
+    let gone = &albums["Marlow Quartet/Slow Rivers"];
+    let kept = &albums["Aurora Field/Glass Harbour"];
+    let stale = cache_cover(cache.path(), &gone.id, 300, gone.cover_mtime.unwrap());
+    let fresh = cache_cover(cache.path(), &kept.id, 300, kept.cover_mtime.unwrap());
+
+    for rel_path in &STANDARD[6..8] {
+        fs::remove_file(scanned.path(rel_path)).unwrap();
+    }
+    let summary = rescan_with_cache(&scanned, cache.path());
+
+    assert_eq!((summary.removed, summary.albums), (2, 3));
+    assert!(!stale.exists());
+    assert!(fresh.exists());
+}
+
+#[test]
+fn a_scan_without_a_cover_cache_sets_the_covers_and_removes_no_file() {
+    let scanned = Scanned::new();
+    let album = scanned.env.album("Aurora Field/Glass Harbour");
+    let cover = below(scanned.root(), "Aurora Field/Glass Harbour/cover.jpg");
+    shift_mtime(&cover, 10);
+
+    assert_eq!(scanned.rescan(), seen(10));
+    assert_eq!(
+        scanned.env.album("Aurora Field/Glass Harbour"),
+        Album {
+            cover_mtime: Some(album.cover_mtime.unwrap() + 10),
+            ..album
+        }
+    );
+}
+
+#[test]
+fn an_album_in_a_renamed_directory_keeps_its_id_and_has_the_cover_file_there() {
+    let scanned = Scanned::new();
+    let db = &scanned.env.db;
+    let before = scanned.env.album("Aurora Field/Glass Harbour");
+    star(db, &before.id, "album");
+
+    fs::rename(
+        scanned.path("Aurora Field/Glass Harbour"),
+        scanned.path("Aurora Field/Glass Harbour (2019)"),
+    )
+    .unwrap();
+    let summary = scanned.rescan();
+
+    assert_eq!(
+        summary,
+        ScanSummary {
+            seen: 10,
+            moved: 3,
+            ..standard()
+        }
+    );
+    let cover = below(
+        scanned.root(),
+        "Aurora Field/Glass Harbour (2019)/cover.jpg",
+    );
+    assert_eq!(
+        scanned.env.album("Aurora Field/Glass Harbour"),
+        Album {
+            cover_source: Some(text(&cover)),
+            ..before.clone()
+        }
+    );
+    assert!(starred(db, &before.id));
+}
+
+#[test]
+fn the_cover_of_an_album_in_a_folder_that_cannot_be_read_stays() {
+    let two = TwoFolders::new();
+    let cache = tempfile::tempdir().unwrap();
+    let albums = two.env.albums();
+    let album = &albums["Aurora Field/Glass Harbour"];
+    assert!(album.cover_source.is_some());
+    let cached = cache_cover(cache.path(), &album.id, 300, album.cover_mtime.unwrap());
+    let rescan = || {
+        two.env.scan_with(
+            &[&two.aurora, &two.marlow],
+            false,
+            ScanOptions {
+                covers_cache_dir: Some(cache.path().to_path_buf()),
+                ..ScanOptions::default()
+            },
+        )
+    };
+
+    // The path of the first folder does not exist, which is the state of
+    // a volume that is not mounted. The scan does not know which cover
+    // files the folder holds.
+    fs::rename(&two.aurora, two.outside("unmounted")).unwrap();
+    let summary = rescan();
+    assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+    assert_eq!((summary.albums, summary.artists), (4, 3));
+    assert_eq!(two.env.albums(), albums);
+    assert!(cached.exists());
+
+    // The directory of the folder exists and is empty, which is the state
+    // of a mount point without its volume.
+    fs::create_dir(&two.aurora).unwrap();
+    let summary = rescan();
+    assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+    assert_eq!(two.env.albums(), albums);
+    assert!(cached.exists());
+
+    // The folder is back.
+    fs::remove_dir(&two.aurora).unwrap();
+    fs::rename(two.outside("unmounted"), &two.aurora).unwrap();
+    assert_eq!(rescan(), seen(9));
+    assert_eq!(two.env.albums(), albums);
+    assert!(cached.exists());
+}
+
+/// Scans the one folder of `scanned` in batches of `batch_size` and cancels
+/// the scan after the first batch.
+fn rescan_and_cancel_after_the_first_batch(scanned: &Scanned, batch_size: usize) -> ScanSummary {
+    let cancel = CancellationToken::new();
+    let hook_token = cancel.clone();
+    scanner::scan(
+        &scanned.env.db,
+        &[scanned.root().to_path_buf()],
+        &cancel,
+        false,
+        ScanOptions {
+            batch_size,
+            on_batch: Some(Box::new(move || hook_token.cancel())),
+            ..ScanOptions::default()
+        },
+    )
+    .expect("the scan returns a summary")
+}
+
+#[test]
+fn a_cancelled_scan_deletes_no_album_and_the_next_scan_gives_the_album_its_track() {
+    let scanned = Scanned::new();
+    let db = &scanned.env.db;
+    let before = scanned.env.albums();
+    let old = before["Marlow Quartet/Slow Rivers"].clone();
+    star(db, &old.id, "album");
+
+    // The two tracks of the album get another album title. A track of
+    // another album gets the title and the artist of the album. The walk
+    // reaches that file last.
+    for rel_path in &STANDARD[6..8] {
+        retag(
+            &scanned.path(rel_path),
+            &[(ItemKey::AlbumTitle, Some("Slow Streams"))],
+        );
+    }
+    retag(
+        &scanned.path(STANDARD[8]),
+        &[
+            (ItemKey::AlbumTitle, Some("Slow Rivers")),
+            (ItemKey::AlbumArtist, Some("Marlow Quartet")),
+        ],
+    );
+
+    // The first batch holds the two tracks that leave the album. The scan
+    // is cancelled before it stores the track that joins the album.
+    let summary = rescan_and_cancel_after_the_first_batch(&scanned, 2);
+    assert_eq!(
+        summary,
+        ScanSummary {
+            seen: 10,
+            changed: 2,
+            tags_read: 2,
+            albums: 5,
+            artists: 3,
+            errors: vec![CANCELLED.to_owned()],
+            ..ScanSummary::default()
+        }
+    );
+    let albums = scanned.env.albums();
+    // The album has no track and keeps its row, its ID and its star. Its
+    // counts are those of an album without tracks.
+    assert_eq!(
+        albums["Marlow Quartet/Slow Rivers"],
+        Album {
+            song_count: 0,
+            duration_ms: 0,
+            year: None,
+            genre: None,
+            ..old.clone()
+        }
+    );
+    assert!(starred(db, &old.id));
+    // The new album has the counts of its two tracks and no cover yet,
+    // although both tracks hold a picture.
+    let new = albums["Marlow Quartet/Slow Streams"].clone();
+    assert_eq!(
+        (new.song_count, new.duration_ms, new.year),
+        (2, old.duration_ms, old.year)
+    );
+    assert_eq!((&new.cover_source, new.cover_mtime), (&None, None));
+    // The album of the track that the scan did not store is as it was.
+    assert_eq!(
+        albums["Various Artists/Summer Sampler"],
+        before["Various Artists/Summer Sampler"]
+    );
+
+    // The next scan stores the third file. Its album is the row that the
+    // cancelled scan kept.
+    let summary = scanned.rescan();
+    assert_eq!(
+        summary,
+        ScanSummary {
+            seen: 10,
+            changed: 1,
+            tags_read: 1,
+            albums: 5,
+            artists: 3,
+            ..ScanSummary::default()
+        }
+    );
+    let albums = scanned.env.albums();
+    let kept = &albums["Marlow Quartet/Slow Rivers"];
+    assert_eq!(kept.id, old.id);
+    assert_eq!((kept.song_count, kept.year), (1, Some(2020)));
+    assert!(starred(db, &old.id));
+    assert_eq!(scanned.track_at(STANDARD[8]).album_id, old.id);
+    // The scan completed, so the new album has its cover.
+    let upstream = scanned.track_at(STANDARD[6]);
+    assert_eq!(
+        albums["Marlow Quartet/Slow Streams"],
+        Album {
+            cover_source: Some(format!("embedded:{}", upstream.id)),
+            cover_mtime: Some(upstream.mtime),
+            ..new
+        }
+    );
+    assert_eq!(albums["Various Artists/Summer Sampler"].song_count, 1);
+}
+
+#[test]
+fn a_scan_that_completes_deletes_the_album_that_a_cancelled_scan_left_without_tracks() {
+    let scanned = Scanned::new();
+    let db = &scanned.env.db;
+    let old = scanned.env.album("Marlow Quartet/Slow Rivers");
+    star(db, &old.id, "album");
+    for rel_path in &STANDARD[6..8] {
+        retag(
+            &scanned.path(rel_path),
+            &[(ItemKey::AlbumTitle, Some("Slow Streams"))],
+        );
+    }
+    // A third change, which the walk reaches last, so that the scan has a
+    // second batch.
+    retag(
+        &scanned.path(STANDARD[8]),
+        &[(ItemKey::TrackTitle, Some("Closed Road"))],
+    );
+
+    let summary = rescan_and_cancel_after_the_first_batch(&scanned, 2);
+    assert_eq!((summary.changed, summary.albums), (2, 5));
+    assert_eq!(
+        scanned.env.album("Marlow Quartet/Slow Rivers").song_count,
+        0
+    );
+    assert!(starred(db, &old.id));
+
+    let summary = scanned.rescan();
+    assert_eq!(
+        (summary.changed, summary.albums, summary.artists),
+        (1, 4, 3)
+    );
+    assert!(
+        !scanned
+            .env
+            .albums()
+            .contains_key("Marlow Quartet/Slow Rivers")
+    );
+    assert!(!starred(db, &old.id));
+}
+
+#[test]
+fn a_scan_sets_the_cover_of_an_album_whose_tracks_a_cancelled_scan_stored() {
+    let library = LibraryBuilder::standard().build();
+    let root = library.root.path().to_path_buf();
+    let env = TestDb::new();
+    let cancel = CancellationToken::new();
+    let hook_token = cancel.clone();
+
+    // The first batch holds the three tracks of the album with the cover
+    // file. The scan is cancelled after it.
+    let summary = scanner::scan(
+        &env.db,
+        std::slice::from_ref(&root),
+        &cancel,
+        false,
+        ScanOptions {
+            batch_size: 3,
+            on_batch: Some(Box::new(move || hook_token.cancel())),
+            ..ScanOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!((summary.added, summary.albums, summary.artists), (3, 1, 1));
+    let stored = env.album("Aurora Field/Glass Harbour");
+    assert_eq!(stored.song_count, 3);
+    assert_eq!(stored.duration_ms, duration_of(&library.files[..3]));
+    assert_eq!((&stored.cover_source, stored.cover_mtime), (&None, None));
+    assert_eq!(env.album_counts(), [("Aurora Field".to_owned(), 1)]);
+
+    // The next scan stores no track of the album and sets its cover.
+    let summary = env.scan(&[&root]);
+    assert_eq!(
+        summary,
+        ScanSummary {
+            seen: 10,
+            added: 7,
+            tags_read: 7,
+            ..standard()
+        }
+    );
+    let cover = below(&root, "Aurora Field/Glass Harbour/cover.jpg");
+    assert_eq!(
+        env.album("Aurora Field/Glass Harbour"),
+        Album {
+            cover_source: Some(text(&cover)),
+            cover_mtime: Some(mtime(&cover)),
+            ..stored
+        }
+    );
+}
+
+#[test]
+fn a_scan_that_is_cancelled_before_it_walks_changes_no_album_and_no_artist() {
+    let scanned = Scanned::new();
+    let albums = scanned.env.albums();
+    let artists = scanned.env.artists();
+    for rel_path in &STANDARD[6..8] {
+        fs::remove_file(scanned.path(rel_path)).unwrap();
+    }
+    fs::remove_file(below(
+        scanned.root(),
+        "Aurora Field/Glass Harbour/cover.jpg",
+    ))
+    .unwrap();
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let summary = scanner::scan(
+        &scanned.env.db,
+        &[scanned.root().to_path_buf()],
+        &cancel,
+        false,
+        ScanOptions::default(),
+    )
+    .unwrap();
+
+    assert_eq!(summary.errors, [CANCELLED]);
+    assert_eq!((summary.albums, summary.artists), (4, 3));
+    assert_eq!(scanned.env.albums(), albums);
+    assert_eq!(scanned.env.artists(), artists);
 }
