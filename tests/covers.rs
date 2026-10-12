@@ -216,6 +216,15 @@ async fn an_album_cover_without_a_size_is_the_cover_file_or_the_embedded_picture
     assert_eq!(cover.content_type, "image/png");
     assert_eq!(cover.mtime, mtime(&first_track));
 
+    // The sources are the ones that the scan stored.
+    let stored = scanned.cover_source("Glass Harbour").await;
+    assert_eq!(stored.map(PathBuf::from), Some(cover_file));
+    let track = scanned.track("Upstream").await;
+    assert_eq!(
+        scanned.cover_source("Slow Rivers").await,
+        Some(format!("embedded:{track}"))
+    );
+
     // A request without a size caches nothing.
     assert_eq!(scanned.cache_files(), [""; 0]);
 }
