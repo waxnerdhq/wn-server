@@ -1490,8 +1490,8 @@ enum Cover {
 }
 
 /// The start of the `cover_source` of an embedded picture. The ID of the
-/// track follows it.
-const EMBEDDED: &str = "embedded:";
+/// track follows it. `library::covers` reads the value.
+pub(super) const EMBEDDED: &str = "embedded:";
 
 /// Returns the cover of an album from its tracks and from what the walk saw
 /// (`docs/design.md` section 1.3).

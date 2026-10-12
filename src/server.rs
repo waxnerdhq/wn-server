@@ -82,6 +82,7 @@ pub async fn run_server(
         tracing::warn!("{AUTH_DISABLED_WARNING}");
     }
     let db = open_database(data_dir).await?;
+    let covers = crate::library::covers::Covers::new(data_dir.covers_cache_dir(), db.clone());
 
     let addr = bind_addr(&config);
     let bind_error = |source| ServerError::Bind { addr, source };
@@ -113,7 +114,7 @@ pub async fn run_server(
 
         db,
 
-        // covers
+        covers,
 
         // transcoder
 

@@ -20,6 +20,7 @@
 
 pub mod tags;
 
+pub mod covers;
 pub mod scanner;
 
 // The controller runs the scanner for the server.

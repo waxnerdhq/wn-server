@@ -209,6 +209,35 @@ pub fn cover_inputs(conn: &Connection) -> Result<Vec<CoverInputs>> {
     Ok(inputs)
 }
 
+/// The cover that a scan stored for one album.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StoredCover {
+    /// The ID of the album, read from the row.
+    pub album_id: String,
+    /// The absolute path of an image file, or `embedded:<track id>`.
+    pub source: String,
+    /// The modification time of the image file, or of the track for an
+    /// embedded picture, in Unix seconds.
+    pub mtime: i64,
+}
+
+/// Returns the stored cover of the album `album_id`. Returns `None` when no
+/// album has the ID and when the album has no cover.
+pub fn cover(conn: &Connection, album_id: &str) -> Result<Option<StoredCover>> {
+    let mut select = conn.prepare_cached(
+        "SELECT id, cover_source, cover_mtime FROM albums
+         WHERE id = ?1 AND cover_source IS NOT NULL AND cover_mtime IS NOT NULL",
+    )?;
+    let mut rows = select.query_map([album_id], |row| {
+        Ok(StoredCover {
+            album_id: row.get(0)?,
+            source: row.get(1)?,
+            mtime: row.get(2)?,
+        })
+    })?;
+    Ok(rows.next().transpose()?)
+}
+
 /// Stores the cover of the album `album_id`: `source` is the absolute path
 /// of an image file or `embedded:<track id>`, and `mtime` is the
 /// modification time of that file or of that track in Unix seconds. `None`
@@ -1119,6 +1148,38 @@ mod tests {
         assert_eq!(set(None, None), (None, None));
         // The other album is not written.
         assert_eq!(library.inputs(&other).cover_source, None);
+    }
+
+    #[test]
+    fn cover_returns_the_stored_source_and_time_of_one_album() {
+        let library = Library::new();
+        let album = library.album("Glass Harbour");
+        let other = library.album("Paper Maps");
+        let stored = |id: &str| library.db.with_reader(|conn| cover(conn, id)).unwrap();
+
+        // An album without a cover and an ID that no album has.
+        assert_eq!(stored(&album), None);
+        assert_eq!(stored("al-00000000000000000000000000000000"), None);
+
+        library
+            .db
+            .with_writer(|conn| set_cover(conn, &album, Some("embedded:tr-7"), Some(-5)))
+            .unwrap();
+        assert_eq!(
+            stored(&album),
+            Some(StoredCover {
+                album_id: album.clone(),
+                source: "embedded:tr-7".to_owned(),
+                mtime: -5,
+            })
+        );
+        assert_eq!(stored(&other), None);
+
+        library
+            .db
+            .with_writer(|conn| set_cover(conn, &album, None, None))
+            .unwrap();
+        assert_eq!(stored(&album), None);
     }
 
     #[test]

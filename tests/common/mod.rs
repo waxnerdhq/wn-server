@@ -814,6 +814,8 @@ impl AuthDefaults {
 /// The server starts no scan by itself. [`TestServer::scan_and_wait`] and
 /// the `startScan` method scan the music folders of the config.
 pub struct TestServer {
+    /// The directory of the cover cache. Dropping the server deletes it.
+    _cache_dir: TempDir,
     router: Router,
     db: Db,
     scan: ScanController,
@@ -833,6 +835,7 @@ impl TestServer {
     /// cached cover and have no test hook, because the server has no data
     /// directory.
     pub async fn with_scan(config: Config, adjust: impl FnOnce(&mut ScanSettings)) -> Self {
+        let cache_dir = tempfile::tempdir().expect("create the cover cache directory");
         let db = Db::open_memory().expect("open a memory database");
         db.write(|conn| users::insert_owner(conn, OWNER, OWNER_PASSWORD))
             .await
@@ -859,7 +862,7 @@ impl TestServer {
 
             db: db.clone(),
 
-            // covers
+            covers: wn_server::library::covers::Covers::new(cache_dir.path(), db.clone()),
 
             // transcoder
 
@@ -870,6 +873,7 @@ impl TestServer {
             started_at: Instant::now(),
         };
         Self {
+            _cache_dir: cache_dir,
             router: api::build_router(state),
             db,
             scan,
