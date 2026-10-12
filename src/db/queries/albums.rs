@@ -209,6 +209,38 @@ pub fn cover_inputs(conn: &Connection) -> Result<Vec<CoverInputs>> {
     Ok(inputs)
 }
 
+/// The album and the locator of one track that has a file.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlbumTrack {
+    pub album_id: String,
+    pub folder_id: i64,
+    /// The path below the folder, components joined with `/`.
+    pub rel_path: String,
+}
+
+/// Returns the album and the locator of every track that has a file, in the
+/// order of the locators. A track without a file is in no directory and is
+/// left out.
+///
+/// The scanner reads from the result which directories hold the tracks of
+/// an album, and which albums have tracks below a directory.
+pub fn tracks_with_file(conn: &Connection) -> Result<Vec<AlbumTrack>> {
+    let mut select = conn.prepare_cached(&format!(
+        "SELECT album_id, folder_id, rel_path FROM tracks WHERE {HAS_FILE_SQL}
+         ORDER BY folder_id, rel_path"
+    ))?;
+    let tracks = select
+        .query_map([], |row| {
+            Ok(AlbumTrack {
+                album_id: row.get(0)?,
+                folder_id: row.get(1)?,
+                rel_path: row.get(2)?,
+            })
+        })?
+        .collect::<rusqlite::Result<_>>()?;
+    Ok(tracks)
+}
+
 /// Stores the cover of the album `album_id`: `source` is the absolute path
 /// of an image file or `embedded:<track id>`, and `mtime` is the
 /// modification time of that file or of that track in Unix seconds. `None`
@@ -1088,6 +1120,35 @@ mod tests {
         assert_eq!(listed, albums);
         let empty = library.album("Paper Maps");
         assert_eq!(library.inputs(&empty).first_track, None);
+    }
+
+    #[test]
+    fn tracks_with_file_name_the_album_and_the_locator_of_each_track_that_has_a_file() {
+        let library = Library::new();
+        let first = library.album("Glass Harbour");
+        let second = library.album("Paper Maps");
+        library.add(&first, &song("Album/CD2/01.flac"));
+        library.add(&second, &song("Album/Bonus/01.flac"));
+        library.add(&first, &song("Album/CD1/01.flac"));
+        let detached = library.add(&first, &song("Album/CD1/02.flac"));
+        // A track without a file is in no directory.
+        library.detach(&detached);
+        // An album without a track is in no directory either.
+        library.album("Slow Rivers");
+
+        let track = |album_id: &str, rel_path: &str| AlbumTrack {
+            album_id: album_id.to_owned(),
+            folder_id: library.folder_id,
+            rel_path: rel_path.to_owned(),
+        };
+        assert_eq!(
+            library.db.with_reader(tracks_with_file).unwrap(),
+            [
+                track(&second, "Album/Bonus/01.flac"),
+                track(&first, "Album/CD1/01.flac"),
+                track(&first, "Album/CD2/01.flac"),
+            ]
+        );
     }
 
     #[test]

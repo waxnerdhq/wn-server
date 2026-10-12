@@ -516,6 +516,65 @@ async fn a_cover_file_that_becomes_a_symbolic_link_after_the_scan_is_not_read() 
 
 #[cfg(unix)] // Creating a symbolic link on Windows needs a privilege.
 #[tokio::test]
+async fn a_link_in_the_place_of_the_cover_file_of_a_parent_directory_is_not_read() {
+    use std::os::unix::fs::symlink;
+
+    // An image outside the music folder.
+    let outside = tempfile::tempdir().expect("create a directory");
+    let image = outside.path().join("elsewhere.jpg");
+    write_image(&image, 8, 8);
+
+    // Each disc of "Long Play" has a directory of its own, and the cover
+    // file is in their parent directory. The tracks hold a picture.
+    let library = LibraryBuilder::new()
+        .track("Aurora Field", "Long Play", "Side A", 1, "flac")
+        .disc(1)
+        .picture()
+        .track("Aurora Field", "Long Play", "Side C", 1, "flac")
+        .disc(2)
+        .picture()
+        .build();
+    let album_dir = library.root.path().join("Aurora Field").join("Long Play");
+    for (name, disc) in [("01 Side A.flac", "CD1"), ("01 Side C.flac", "CD2")] {
+        fs::create_dir(album_dir.join(disc)).expect("create the disc directory");
+        fs::rename(album_dir.join(name), album_dir.join(disc).join(name)).expect("move the track");
+    }
+    let cover_file = album_dir.join("cover.jpg");
+    write_image(&cover_file, 16, 8);
+    let scanned = Scanned::of(library).await;
+
+    // The scan stored the file of the parent directory, and the service
+    // reads it.
+    let album = scanned.album("Long Play").await;
+    let stored = cover_file.to_str().expect("a Unicode path").to_owned();
+    assert_eq!(scanned.cover_source("Long Play").await, Some(stored));
+    let cover = scanned.get(&album, None).await.expect("a cover");
+    assert_eq!(cover.bytes, fs::read(&cover_file).expect("read the cover"));
+
+    // The file becomes a link to the image outside the folder. The stored
+    // source still names the path. No scan has run since.
+    fs::remove_file(&cover_file).expect("remove the cover file");
+    symlink(&image, &cover_file).expect("create the link");
+    assert!(scanned.cover_source("Long Play").await.is_some());
+    for size in [None, Some(4)] {
+        assert_eq!(scanned.get(&album, size).await, None);
+    }
+    assert_eq!(scanned.cache_files(), [""; 0]);
+
+    // The next scan stores no link. The cover is the embedded picture of
+    // the first track.
+    scanned.scan().await;
+    let track = scanned.track("Side A").await;
+    assert_eq!(
+        scanned.cover_source("Long Play").await,
+        Some(format!("embedded:{track}"))
+    );
+    let cover = scanned.get(&album, None).await.expect("a cover");
+    assert_eq!(cover.bytes, &PICTURE_PNG[..]);
+}
+
+#[cfg(unix)] // Creating a symbolic link on Windows needs a privilege.
+#[tokio::test]
 async fn an_audio_file_that_is_a_symbolic_link_gives_its_embedded_picture() {
     use std::os::unix::fs::symlink;
 
