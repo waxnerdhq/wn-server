@@ -7,6 +7,12 @@
 //! unit tests of this module pin them. The functions that build the record use
 //! no network. [`Advertiser`] is the only part of the module that does.
 //!
+//! The server advertises under a host name of its own, which [`host_name`]
+//! builds from the instance ID. Nothing in this module reads the host name of
+//! the machine, and the server publishes no record for it. The responder of
+//! the operating system owns that name. A second responder that publishes
+//! records for it makes the operating system rename the machine.
+//!
 //! The `mdns-sd` calls used here are `ServiceDaemon::new`,
 //! `disable_interface`, `monitor`, `register`, `unregister`, `shutdown`,
 //! `ServiceInfo::new` and `enable_addr_auto`. The crate documents support for
@@ -27,11 +33,19 @@ use mdns_sd::{
 };
 use thiserror::Error;
 
-use crate::config::{Config, LABEL_MAX_BYTES, host_label};
+use crate::config::{Config, LABEL_MAX_BYTES};
 
 /// The DNS-SD service type that the server registers and the mobile app
 /// browses.
 pub const SERVICE_TYPE: &str = "_waxnerd._tcp.local.";
+
+/// The start of the label of the server's mDNS host name. The first
+/// [`HOST_ID_DIGITS`] hex digits of the instance ID follow it.
+const HOST_LABEL_PREFIX: &str = "wn-server-";
+
+/// The number of hex digits of the instance ID in the server's mDNS host
+/// name.
+const HOST_ID_DIGITS: usize = 8;
 
 /// The time the reporting thread waits for the first announcement. The daemon
 /// probes for its names for 750 ms to one second before it announces them
@@ -59,6 +73,12 @@ pub enum DiscoveryError {
         .0.display()
     )]
     InstanceId(PathBuf),
+    /// The text given as the instance ID is not a UUID in the form that `init`
+    /// writes, so no host name is built from it.
+    #[error(
+        "the instance ID is not a UUID in lower-case hex groups of 8, 4, 4, 4 and 12 characters"
+    )]
+    NotAnInstanceId,
     /// A name does not fit in one DNS label.
     #[error("{what} is {bytes} bytes long; a DNS-SD name holds 1 to {LABEL_MAX_BYTES} bytes")]
     Label { what: &'static str, bytes: usize },
@@ -152,6 +172,23 @@ pub fn addresses(bind: IpAddr) -> Vec<IpAddr> {
     }
 }
 
+/// Returns the mDNS host name of the server whose instance ID is
+/// `instance_id`: `wn-server-<hex>.local.`, where `<hex>` is the first 8 hex
+/// digits of the ID. The name is the SRV target of the registration and the
+/// name of the A and AAAA records that the server publishes.
+///
+/// The function reads `instance_id` and nothing else, so the result is never
+/// taken from the host name of the machine. An `instance_id` that is not a
+/// UUID in the form that `init` writes is an error. Every name that the
+/// function returns is therefore `wn-server-`, 8 lower-case hex digits and
+/// `.local.`: one label of 18 bytes in the local domain.
+pub fn host_name(instance_id: &str) -> Result<String, DiscoveryError> {
+    match instance_id.get(..HOST_ID_DIGITS) {
+        Some(digits) if is_uuid(instance_id) => Ok(format!("{HOST_LABEL_PREFIX}{digits}.local.")),
+        _ => Err(DiscoveryError::NotAnInstanceId),
+    }
+}
+
 /// Checks that `label` fits in one DNS label. `what` names the value in the
 /// error. `mdns-sd` accepts a longer name at registration and then leaves
 /// every record that holds it out of its packets, so the check runs before
@@ -159,8 +196,7 @@ pub fn addresses(bind: IpAddr) -> Vec<IpAddr> {
 ///
 /// `Config::load` rejects a `server.name` that is not 1 to 63 bytes long, so
 /// `run` does not get here with one. The check of the name stays for a
-/// `Config` that was not loaded from a file. The host label is checked here
-/// only.
+/// `Config` that was not loaded from a file.
 fn check_label(what: &'static str, label: &str) -> Result<(), DiscoveryError> {
     if label.is_empty() || label.len() > LABEL_MAX_BYTES {
         return Err(DiscoveryError::Label {
@@ -172,27 +208,30 @@ fn check_label(what: &'static str, label: &str) -> Result<(), DiscoveryError> {
 }
 
 /// Builds the registration of the server: the service type
-/// [`SERVICE_TYPE`], the instance name `server.name`, the host name
-/// `<first label of system_host_name>.local.`, the port `server.port`, the
-/// TXT record `txt` and the addresses that [`addresses`] returns for
+/// [`SERVICE_TYPE`], the instance name `server.name`, the host name that
+/// [`host_name`] returns for `instance_id`, the port `server.port`, the TXT
+/// record `txt` and the addresses that [`addresses`] returns for
 /// `server.bind`. The function uses no network.
+///
+/// The function takes no host name of the machine. The host name of the
+/// registration comes from `instance_id` alone, so neither `server.name` nor
+/// `server.bind` changes it.
 ///
 /// A registration without an address lets the daemon choose the addresses.
 /// A registration with an address keeps that address.
 fn service_info(
     config: &Config,
-    system_host_name: &str,
+    instance_id: &str,
     txt: &[(String, String)],
 ) -> Result<ServiceInfo, DiscoveryError> {
     let name = config.server.name.as_str();
-    let host = host_label(system_host_name);
     check_label("server.name", name)?;
-    check_label("the host name", host)?;
+    let host = host_name(instance_id)?;
     let addresses = addresses(config.server.bind);
     let info = ServiceInfo::new(
         SERVICE_TYPE,
         name,
-        &format!("{host}.local."),
+        &host,
         addresses.as_slice(),
         config.server.port,
         txt,
@@ -219,18 +258,22 @@ pub struct Advertiser {
 
 impl Advertiser {
     /// Starts the mDNS daemon and registers the server with the TXT record
-    /// `txt`. The daemon runs on its own thread, disables the interface kinds
-    /// that [`interface_kinds`] returns for `server.bind`, probes for the
-    /// names and then announces the instance.
+    /// `txt` under the host name that [`host_name`] returns for
+    /// `instance_id`. The daemon runs on its own thread, disables the
+    /// interface kinds that [`interface_kinds`] returns for `server.bind`,
+    /// probes for the names and then announces the instance.
     ///
     /// An error means that no daemon is left running. The daemon opens its
     /// multicast sockets on its own thread and reports a socket that it
     /// cannot open in its debug log only. A second thread therefore waits for
     /// the first announcement and logs it, or logs one warning when the
     /// daemon announces nothing within ten seconds.
-    pub fn start(config: &Config, txt: &[(String, String)]) -> Result<Self, DiscoveryError> {
-        let system_host_name = gethostname::gethostname();
-        let info = service_info(config, &system_host_name.to_string_lossy(), txt)?;
+    pub fn start(
+        config: &Config,
+        instance_id: &str,
+        txt: &[(String, String)],
+    ) -> Result<Self, DiscoveryError> {
+        let info = service_info(config, instance_id, txt)?;
         let fullname = info.get_fullname().to_owned();
         // An error after this statement drops `advertiser`, which shuts the
         // daemon down.
@@ -394,7 +437,8 @@ fn is_uuid(text: &str) -> bool {
 }
 
 /// Advertises the server when `discovery.mdns` is on. The TXT `id` is the
-/// instance ID in the file at `instance_id_path`.
+/// instance ID in the file at `instance_id_path`, and the host name of the
+/// registration is built from that ID.
 ///
 /// Returns `None` when `discovery.mdns` is off, and then starts no daemon.
 /// Returns `None` and logs one warning when the advertisement cannot start,
@@ -403,7 +447,7 @@ pub fn advertise(config: &Config, instance_id_path: &Path) -> Option<Advertiser>
     start_if_enabled(config, || {
         let instance_id = read_instance_id(instance_id_path)?;
         let txt = TxtRecord::build(config, crate::VERSION, &instance_id);
-        Advertiser::start(config, &txt)
+        Advertiser::start(config, &instance_id, &txt)
     })
 }
 
@@ -571,6 +615,131 @@ mod tests {
         }
     }
 
+    /// A second instance ID. Its first group differs from the first group of
+    /// [`INSTANCE_ID`].
+    const OTHER_INSTANCE_ID: &str = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d";
+
+    /// The texts that are not an instance ID. Some have the form of a host
+    /// name of a machine.
+    const NOT_INSTANCE_IDS: [&str; 12] = [
+        "",
+        "1a2b3c4d",
+        "kept",
+        "studio",
+        "studio.local",
+        "studio.local.",
+        "studio.example.com",
+        "Adnans-MacBook-Pro.local",
+        // Upper case.
+        "1A2B3C4D-5E6F-4A7B-8C9D-0E1F2A3B4C5D",
+        // No hyphens.
+        "1a2b3c4d5e6f4a7b8c9d0e1f2a3b4c5d",
+        // A dot in the first group.
+        "1a2b.c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+        // A character of 2 bytes in the first group, which is 8 bytes long.
+        "1a2b3cé-5e6f-4a7b-8c9d-0e1f2a3b4c5d",
+    ];
+
+    #[test]
+    fn host_name_is_wn_server_and_the_first_8_hex_digits_of_the_instance_id() {
+        for (instance_id, name) in [
+            (OTHER_INSTANCE_ID, "wn-server-1a2b3c4d.local."),
+            (INSTANCE_ID, "wn-server-01234567.local."),
+            (
+                "ffffffff-0000-4000-8000-000000000000",
+                "wn-server-ffffffff.local.",
+            ),
+            (
+                "00000000-ffff-4fff-bfff-ffffffffffff",
+                "wn-server-00000000.local.",
+            ),
+        ] {
+            assert_eq!(host_name(instance_id).expect("a host name"), name);
+        }
+    }
+
+    #[test]
+    fn host_name_is_one_label_in_the_local_domain() {
+        let name = host_name(OTHER_INSTANCE_ID).expect("a host name");
+        let labels: Vec<&str> = name.split('.').collect();
+        // The text after the last dot is empty, because the name ends with
+        // the dot of the root.
+        assert_eq!(labels, ["wn-server-1a2b3c4d", "local", ""]);
+        assert_eq!(labels[0].len(), 18);
+        check_label("the host label", labels[0]).expect("one DNS label");
+    }
+
+    #[test]
+    fn host_name_of_a_text_that_is_not_an_instance_id_is_an_error() {
+        for text in NOT_INSTANCE_IDS {
+            let error = host_name(text).expect_err("not an instance ID");
+            assert!(
+                matches!(error, DiscoveryError::NotAnInstanceId),
+                "{text:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_srv_target_is_the_host_name_of_the_server_for_every_bind_address() {
+        // A wildcard bind, a LAN address and a loopback address, each in
+        // IPv4 and IPv6.
+        for bind in [
+            "0.0.0.0",
+            "::",
+            "192.168.1.5",
+            "fd00::5",
+            "127.0.0.1",
+            "::1",
+        ] {
+            let mut config = config_named("studio");
+            config.server.bind = address(bind);
+            let txt = TxtRecord::build(&config, "1.2.3", OTHER_INSTANCE_ID);
+            let info = service_info(&config, OTHER_INSTANCE_ID, &txt).expect("a registration");
+            assert_eq!(info.get_hostname(), "wn-server-1a2b3c4d.local.", "{bind}");
+        }
+    }
+
+    #[test]
+    fn the_srv_target_takes_nothing_from_the_config() {
+        // Each name has the form of a host name of a machine.
+        for name in ["studio", "studio.local", "Adnans-MacBook-Pro", "wn-server"] {
+            let mut config = config_named(name);
+            config.server.port = 4321;
+            config.server.log_level = "wn_server=trace".to_owned();
+            config.library.folders = vec![PathBuf::from("/home/adnan/Music")];
+            let txt = TxtRecord::build(&config, "1.2.3", OTHER_INSTANCE_ID);
+            let info = service_info(&config, OTHER_INSTANCE_ID, &txt).expect("a registration");
+            assert_eq!(info.get_hostname(), "wn-server-1a2b3c4d.local.", "{name}");
+        }
+    }
+
+    #[test]
+    fn the_srv_target_follows_the_instance_id() {
+        let config = config_named("studio");
+        for (instance_id, target) in [
+            (INSTANCE_ID, "wn-server-01234567.local."),
+            (OTHER_INSTANCE_ID, "wn-server-1a2b3c4d.local."),
+        ] {
+            let txt = TxtRecord::build(&config, "1.2.3", instance_id);
+            let info = service_info(&config, instance_id, &txt).expect("a registration");
+            assert_eq!(info.get_hostname(), target);
+        }
+    }
+
+    #[test]
+    fn service_info_rejects_a_text_that_is_not_an_instance_id() {
+        let config = config_named("studio");
+        let txt = TxtRecord::build(&config, "1.2.3", INSTANCE_ID);
+        for text in NOT_INSTANCE_IDS {
+            let error = service_info(&config, text, &txt).expect_err("not an instance ID");
+            assert!(
+                matches!(error, DiscoveryError::NotAnInstanceId),
+                "{text:?}: {error}"
+            );
+        }
+    }
+
     #[test]
     fn a_label_holds_1_to_63_bytes() {
         check_label("server.name", "a").expect("1 byte");
@@ -597,10 +766,10 @@ mod tests {
         config.server.port = 4321;
         let txt = TxtRecord::build(&config, "1.2.3", INSTANCE_ID);
 
-        let info = service_info(&config, "host.example.com", &txt).expect("a registration");
+        let info = service_info(&config, INSTANCE_ID, &txt).expect("a registration");
         assert_eq!(info.get_type(), "_waxnerd._tcp.local.");
         assert_eq!(info.get_fullname(), "studio._waxnerd._tcp.local.");
-        assert_eq!(info.get_hostname(), "host.local.");
+        assert_eq!(info.get_hostname(), "wn-server-01234567.local.");
         assert_eq!(info.get_port(), 4321);
 
         let properties: Vec<(&str, &str)> = info
@@ -616,7 +785,7 @@ mod tests {
         let mut config = config_named("studio");
         config.server.bind = address(bind);
         let txt = TxtRecord::build(&config, "1.2.3", INSTANCE_ID);
-        service_info(&config, "studio", &txt).expect("a registration")
+        service_info(&config, INSTANCE_ID, &txt).expect("a registration")
     }
 
     #[test]
@@ -652,17 +821,19 @@ mod tests {
     fn service_info_keeps_a_dot_in_the_instance_name_in_one_label() {
         let config = config_named("studio.local");
         let txt = TxtRecord::build(&config, "1.2.3", INSTANCE_ID);
-        let info = service_info(&config, "studio.local", &txt).expect("a registration");
+        let info = service_info(&config, INSTANCE_ID, &txt).expect("a registration");
         // `mdns-sd` writes a dot inside a label as `\.`.
         assert_eq!(info.get_fullname(), r"studio\.local._waxnerd._tcp.local.");
-        assert_eq!(info.get_hostname(), "studio.local.");
+        // The instance name has the form of a host name and is not the
+        // target.
+        assert_eq!(info.get_hostname(), "wn-server-01234567.local.");
     }
 
     #[test]
     fn service_info_takes_the_longest_instance_name() {
         let config = config_named(&"n".repeat(63));
         let txt = TxtRecord::build(&config, "1.2.3", INSTANCE_ID);
-        service_info(&config, "studio", &txt).expect("a registration");
+        service_info(&config, INSTANCE_ID, &txt).expect("a registration");
     }
 
     #[test]
@@ -670,7 +841,7 @@ mod tests {
         for name in [String::new(), "n".repeat(64)] {
             let config = config_named(&name);
             let txt = TxtRecord::build(&config, "1.2.3", INSTANCE_ID);
-            let error = service_info(&config, "studio", &txt).expect_err("not one label");
+            let error = service_info(&config, INSTANCE_ID, &txt).expect_err("not one label");
             assert!(
                 matches!(
                     error,
@@ -682,14 +853,6 @@ mod tests {
                 "{error}"
             );
         }
-
-        let config = config_named("studio");
-        let txt = TxtRecord::build(&config, "1.2.3", INSTANCE_ID);
-        let error = service_info(&config, &"h".repeat(64), &txt).expect_err("not one label");
-        assert_eq!(
-            error.to_string(),
-            "the host name is 64 bytes long; a DNS-SD name holds 1 to 63 bytes"
-        );
     }
 
     #[test]
@@ -831,8 +994,14 @@ mod tests {
         let events = vec![
             DaemonEvent::IpAdd("192.168.1.5".parse().expect("an address")),
             DaemonEvent::Respond("en0".to_owned()),
-            DaemonEvent::Announce(announced.to_owned(), "studio.local.:en0".to_owned()),
-            DaemonEvent::Announce(announced.to_owned(), "studio.local.:lo0".to_owned()),
+            DaemonEvent::Announce(
+                announced.to_owned(),
+                "wn-server-01234567.local.:en0".to_owned(),
+            ),
+            DaemonEvent::Announce(
+                announced.to_owned(),
+                "wn-server-01234567.local.:lo0".to_owned(),
+            ),
         ];
         assert_eq!(
             outcome_of(events, RecvTimeoutError::Timeout),

@@ -204,11 +204,16 @@ fn init_writes_a_config_that_loads() {
     let mut expected = Config::default();
     expected.library.folders = vec![music.path().to_path_buf()];
     assert_eq!(config, expected);
-    // The name is the first label of the host name of this machine, or
-    // `wn-server`.
-    let name = &config.server.name;
-    assert!((1..=63).contains(&name.len()), "{name}");
-    assert!(!name.contains('.'), "{name}");
+    // `init` writes the fixed default name, which does not depend on the
+    // machine.
+    assert_eq!(config.server.name, "wn-server");
+    let written = fs::read_to_string(&config_path).expect("read config.toml");
+    assert!(
+        written
+            .lines()
+            .any(|line| line.starts_with("name = \"wn-server\" ")),
+        "{written}"
+    );
 }
 
 #[test]

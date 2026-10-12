@@ -27,13 +27,13 @@ const BITRATE_KBPS: RangeInclusive<u32> = 32..=320;
 const COMMENT_COLUMN: usize = 32;
 
 /// The longest DNS label, in bytes. `server.name` is one label, because it is
-/// the DNS-SD instance name, and so is the host name without `.local.`.
+/// the DNS-SD instance name.
 pub(crate) const LABEL_MAX_BYTES: usize = 63;
 
-/// The label that stands in for an empty first label of the system host
-/// name. It is also the default `server.name` of a machine whose host name is
-/// not valid Unicode.
-const DEFAULT_HOST_LABEL: &str = "wn-server";
+/// The `server.name` of a config that does not set the key. The name is the
+/// same on every machine. No default is taken from the host name of the
+/// machine.
+pub const DEFAULT_NAME: &str = "wn-server";
 
 /// A config or data directory that cannot be used.
 #[derive(Debug, Error)]
@@ -159,7 +159,7 @@ impl Default for Server {
         Self {
             bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             port: DEFAULT_PORT,
-            name: default_name(gethostname::gethostname().to_str()),
+            name: DEFAULT_NAME.to_owned(),
             log_level: "info".to_owned(),
         }
     }
@@ -423,30 +423,6 @@ fn path_value(path: &Path) -> Result<String, ConfigError> {
     }
 }
 
-/// Returns the first label of the system host name `system_name`. The mDNS
-/// host name of the machine is that label followed by `.local.`.
-///
-/// The system host name is one label (`studio`), a name in the local domain
-/// (`studio.local`) or a fully qualified name (`studio.example.com`),
-/// depending on the OS and its setup. An empty first label becomes
-/// `wn-server`.
-pub(crate) fn host_label(system_name: &str) -> &str {
-    match system_name.split('.').next() {
-        Some(label) if !label.is_empty() => label,
-        _ => DEFAULT_HOST_LABEL,
-    }
-}
-
-/// Returns the default `server.name` of a machine whose system host name is
-/// `system_name`: the first label of that name, cut to 63 bytes at a
-/// character boundary. `None` is a host name that is not valid Unicode. It
-/// gives `wn-server`, as an empty first label does. The result is 1 to 63
-/// bytes long, so it passes [`Config::validate`].
-fn default_name(system_name: Option<&str>) -> String {
-    let label = host_label(system_name.unwrap_or_default());
-    label[..label.floor_char_boundary(LABEL_MAX_BYTES)].to_owned()
-}
-
 /// Makes `path` absolute without resolving symlinks. On Windows the result has
 /// no `\\?\` prefix.
 pub(crate) fn absolute(path: &Path) -> Result<PathBuf, ConfigError> {
@@ -590,13 +566,7 @@ mod tests {
         let config = Config::default();
         assert_eq!(config.server.bind.to_string(), "0.0.0.0");
         assert_eq!(config.server.port, 4200);
-        assert_eq!(
-            config.server.name,
-            default_name(gethostname::gethostname().to_str())
-        );
-        assert!(!config.server.name.is_empty());
-        assert!(config.server.name.len() <= 63, "{}", config.server.name);
-        assert!(!config.server.name.contains('.'), "{}", config.server.name);
+        assert_eq!(config.server.name, "wn-server");
         assert_eq!(config.server.log_level, "info");
         assert!(!config.auth.disabled_unsafe);
         assert!(config.library.folders.is_empty());
@@ -612,89 +582,57 @@ mod tests {
     }
 
     #[test]
-    fn host_label_is_the_first_label_of_the_system_host_name() {
-        for (system_name, label) in [
-            ("studio", "studio"),
-            ("studio.local", "studio"),
-            ("studio.example.com", "studio"),
-            ("Adnans-MacBook-Pro.local", "Adnans-MacBook-Pro"),
-            ("", "wn-server"),
-            (".local", "wn-server"),
-        ] {
-            assert_eq!(host_label(system_name), label, "{system_name:?}");
-        }
+    fn the_default_name_is_wn_server() {
+        assert_eq!(DEFAULT_NAME, "wn-server");
+        assert_eq!(Server::default().name, "wn-server");
+        assert_eq!(Config::default().server.name, "wn-server");
     }
 
     #[test]
-    fn default_name_is_the_first_label_of_the_host_name() {
-        for (system_name, name) in [
-            ("studio", "studio"),
-            ("studio.local", "studio"),
-            ("studio.example.com", "studio"),
-            ("Adnans-MacBook-Pro.local", "Adnans-MacBook-Pro"),
-            ("Büro.local", "Büro"),
-        ] {
-            assert_eq!(default_name(Some(system_name)), name, "{system_name:?}");
-        }
-    }
-
-    #[test]
-    fn default_name_of_an_empty_or_non_unicode_host_name_is_wn_server() {
-        // `None` is a host name that is not valid Unicode.
-        for system_name in [Some(""), Some("."), Some(".local"), None] {
-            assert_eq!(default_name(system_name), "wn-server", "{system_name:?}");
-        }
-    }
-
-    #[test]
-    fn default_name_is_cut_to_63_bytes() {
-        for bytes in [63, 64, 255] {
-            let system_name = "h".repeat(bytes);
-            assert_eq!(default_name(Some(&system_name)), "h".repeat(63), "{bytes}");
-        }
-        // The first label is cut, and the labels after it do not count.
-        let long_first_label = format!("{}.example.com", "h".repeat(70));
-        assert_eq!(default_name(Some(&long_first_label)), "h".repeat(63));
-        let long_second_label = format!("studio.{}.example.com", "d".repeat(70));
-        assert_eq!(default_name(Some(&long_second_label)), "studio");
-    }
-
-    #[test]
-    fn default_name_is_cut_at_a_character_boundary() {
-        // `é` is 2 bytes, `音` is 3 bytes and U+1D11E is 4 bytes.
-        for (system_name, name) in [
-            // Byte 63 is a boundary: 21 characters of 3 bytes are kept.
-            ("音".repeat(22), "音".repeat(21)),
-            // Byte 63 is inside a character, which is left out: 61, 62, 62
-            // and 60 bytes are kept.
-            (
-                format!("a{}", "音".repeat(21)),
-                format!("a{}", "音".repeat(20)),
-            ),
-            (
-                format!("ab{}", "音".repeat(21)),
-                format!("ab{}", "音".repeat(20)),
-            ),
-            ("é".repeat(32), "é".repeat(31)),
-            ("\u{1d11e}".repeat(16), "\u{1d11e}".repeat(15)),
-        ] {
-            assert!(name.len() <= 63, "{name}");
-            assert_eq!(default_name(Some(&system_name)), name, "{system_name}");
-        }
-    }
-
-    #[test]
-    fn a_template_with_the_default_name_of_a_long_host_name_loads() {
+    fn a_config_without_the_name_key_has_the_default_name() {
         let music = tempfile::tempdir().expect("temp dir");
-        for system_name in [
-            "h".repeat(255),
-            format!("a{}", "音".repeat(84)),
-            format!("{}.example.com", "\u{1d11e}".repeat(16)),
+        let folders = format!("[library]\nfolders = ['{}']\n", music.path().display());
+        for text in [
+            folders.clone(),
+            format!("[server]\nport = 4321\n\n{folders}"),
         ] {
-            let mut config = valid_config(music.path());
-            config.server.name = default_name(Some(&system_name));
-            let (_dir, path) = config_file(&config.render(true).expect("render"));
-            assert_eq!(Config::load(&path).expect("load"), config, "{system_name}");
+            let (_dir, path) = config_file(&text);
+            let config = Config::load(&path).expect("load");
+            assert_eq!(config.server.name, "wn-server", "{text}");
+        }
+    }
+
+    #[test]
+    fn the_template_that_init_writes_has_the_default_name() {
+        let music = tempfile::tempdir().expect("temp dir");
+        let text = Config::template(&[music.path().to_path_buf()], DEFAULT_PORT).expect("template");
+        assert!(
+            text.lines()
+                .any(|line| line.starts_with("name = \"wn-server\" ")),
+            "{text}"
+        );
+        let (_dir, path) = config_file(&text);
+        assert_eq!(Config::load(&path).expect("load").server.name, "wn-server");
+    }
+
+    #[test]
+    fn a_name_in_the_config_file_is_kept_as_written() {
+        let music = tempfile::tempdir().expect("temp dir");
+        // A name that is also the host name of a machine is kept like any
+        // other name.
+        for name in [
+            "studio",
+            "Adnans-MacBook-Pro",
+            "wn-server",
+            "Büro",
+            "living room",
+        ] {
+            let (_dir, path) = config_file(&format!(
+                "[server]\nname = \"{name}\"\n\n[library]\nfolders = ['{}']\n",
+                music.path().display()
+            ));
+            let config = Config::load(&path).expect("load");
+            assert_eq!(config.server.name, name);
         }
     }
 
