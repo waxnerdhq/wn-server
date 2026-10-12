@@ -2103,8 +2103,8 @@ const TRACK_LOOKUPS: usize = 500;
 /// Removes the stale resized covers from the cover cache `cache_dir`: the
 /// files of the albums `album_ids`, and the files of every track that has no
 /// row in `db`. A file of the cache is named
-/// `<cover ID>-<size>-<cover mtime>.jpg`, and a cover ID is the ID of an
-/// album or of a track (`docs/design.md` sections 3.3 and 3.5).
+/// `<cover ID>-<size>-<cover mtime>-<version>.jpg`, and a cover ID is the ID
+/// of an album or of a track (`docs/design.md` sections 3.3 and 3.5).
 ///
 /// The files of a track are removed when no row has the ID of the track, so
 /// the function needs no list of the tracks that this scan deleted. It also
@@ -2216,7 +2216,9 @@ fn remove_cached_cover(path: &Path) {
 
 /// Returns the cover ID at the start of the name of a cached cover: the
 /// prefix, the hyphen and the hex characters of
-/// `<prefix>-<hex>-<size>-<cover mtime>.jpg`.
+/// `<prefix>-<hex>-<size>-<cover mtime>-<version>.jpg`. The parts after the
+/// ID are not read, so the name of a file that another version of the cover
+/// service wrote, which has no version, starts with its cover ID as well.
 fn cached_cover_id(name: &str) -> Option<&str> {
     let (prefix, rest) = name.split_once('-')?;
     let (hex, _) = rest.split_once('-')?;

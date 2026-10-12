@@ -12,10 +12,11 @@
 //! a file path. An ID that [`ids::parse`] rejects has no cover. An accepted
 //! ID selects a row, and the service opens the paths that the scanner stored
 //! for that row. The name of a cached file is built from the ID that the row
-//! holds, the step of the size ([`SIZE_STEPS`]), and the modification time
-//! that the row holds. An ID in the form of [`ids::parse`], a step and a
-//! time hold no path separator, so the name is one component of a path and
-//! the file is in the cache directory.
+//! holds, the step of the size ([`SIZE_STEPS`]), the modification time that
+//! the row holds, and [`CACHE_VERSION`]. An ID in the form of
+//! [`ids::parse`], a step, a time and a version hold no path separator, so
+//! the name is one component of a path and the file is in the cache
+//! directory.
 //!
 //! # Sizes
 //!
@@ -23,6 +24,17 @@
 //! cache is read, so a cover has at most six files in the cache for one
 //! modification time. `docs/design.md` section 3.11 states the size of these
 //! files.
+//!
+//! # Orientation
+//!
+//! A JPEG can declare an orientation in its Exif metadata: the turn and the
+//! mirroring that a viewer applies before it shows the image. A resized
+//! cover of such a JPEG has the orientation applied to its pixels and holds
+//! no metadata, so a client shows it as a viewer shows the source. A cover
+//! without a size is the bytes of the source with their metadata, and the
+//! client applies the orientation. A JPEG whose orientation is missing or
+//! cannot be read is resized as it is stored. The orientation of a PNG is
+//! not read.
 //!
 //! # Files from the music folders
 //!
@@ -74,7 +86,8 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use bytes::Bytes;
 use image::codecs::jpeg::JpegEncoder;
-use image::{DynamicImage, ImageError, ImageFormat, ImageReader, Limits};
+use image::metadata::Orientation;
+use image::{DynamicImage, ImageDecoder, ImageError, ImageFormat, ImageReader, Limits};
 use rusqlite::Connection;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, watch};
 
@@ -97,6 +110,17 @@ pub const MAX_SIZE: u32 = 2000;
 /// [`MAX_SIZE`]. The cache holds one file of a cover for each step that a
 /// client asked for, so six at most.
 pub const SIZE_STEPS: [u32; 6] = [80, 160, 320, 640, 1280, MAX_SIZE];
+
+/// The version of the resized covers. It is the last part of the name of a
+/// cache file ([`cache_name`]) and of the entity tag of a resized cover, so
+/// the service reads the cache files of this version and of no other.
+///
+/// The number is raised by a change that makes other bytes from the same
+/// image at the same step. A cover that an older version of the server made
+/// is then neither read from the cache nor confirmed to a client that holds
+/// it. A cover of version 2 has the orientation of its JPEG applied
+/// ([`resize`]). A cache file without a version in its name has not.
+pub const CACHE_VERSION: u32 = 2;
 
 /// The largest source image that the service reads, in bytes. A larger image
 /// has no cover, resized or not, because the service holds a cover in
@@ -351,12 +375,15 @@ impl Covers {
     /// [`MAX_SIZE`] pixels when `size` is larger. The result can therefore
     /// be larger than `size`, and two sizes of one step give the same bytes.
     /// An image whose sides are within the step keeps its size: no image is
-    /// enlarged. The resized cover is read from the cache directory, and
-    /// made and stored there when the cache does not hold it. Requests that
-    /// ask for the same resized cover while it is being made share one
-    /// result, and the cover is made once. A cover whose image is being
-    /// decoded is finished and cached also when every request for it has
-    /// ended. A cover that still waits for its turn is dropped then.
+    /// enlarged. The orientation that the Exif metadata of a JPEG declares
+    /// is applied to the pixels of the resized cover, and the image as its
+    /// source stores it keeps its bytes and its metadata. The resized cover
+    /// is read from the cache directory, and made and stored there when the
+    /// cache does not hold it. Requests that ask for the same resized cover
+    /// while it is being made share one result, and the cover is made once.
+    /// A cover whose image is being decoded is finished and cached also when
+    /// every request for it has ended. A cover that still waits for its turn
+    /// is dropped then.
     ///
     /// Returns `None` in these cases:
     ///
@@ -676,9 +703,11 @@ pub fn served_size(size: Option<u32>) -> Option<u32> {
 }
 
 /// Returns the name of the cache file of a resized cover:
-/// `<cover ID>-<size>-<mtime>.jpg` (`docs/design.md` section 3.5). The
-/// caller passes the ID and the modification time that a row holds and a
-/// size that [`served_size`] returned.
+/// `<cover ID>-<size>-<mtime>-<version>.jpg` (`docs/design.md` section
+/// 3.5). The caller passes the ID and the modification time that a row holds
+/// and a size that [`served_size`] returned. The version is
+/// [`CACHE_VERSION`], so a file that another version of the server wrote has
+/// another name and is not read.
 ///
 /// Returns `None` when `cover_id` has not the form of an ID
 /// ([`ids::parse`]). A name is therefore built from two letters, hex
@@ -688,7 +717,7 @@ pub fn served_size(size: Option<u32>) -> Option<u32> {
 /// this function.
 fn cache_name(cover_id: &str, size: u32, mtime: i64) -> Option<String> {
     ids::parse(cover_id)?;
-    Some(format!("{cover_id}-{size}-{mtime}.jpg"))
+    Some(format!("{cover_id}-{size}-{mtime}-{CACHE_VERSION}.jpg"))
 }
 
 /// Returns what the cover ID `id` of the kind `kind` resolves to, or `None`
@@ -977,7 +1006,9 @@ fn decode_limits() -> Limits {
 }
 
 /// Decodes the image in `bytes`, which is a JPEG, a PNG or a lossy WebP in
-/// the simple file form. The format is detected from the content.
+/// the simple file form. The format is detected from the content. Returns
+/// the pixels as the image stores them, and the orientation that the image
+/// declares for them, which is not applied.
 ///
 /// The decoder reads the width and the height from the header of the image.
 /// It returns an error before it allocates the pixels when a side is over
@@ -988,16 +1019,42 @@ fn decode_limits() -> Limits {
 /// which holds an alpha channel, an animation or metadata, is refused. The
 /// decoder builds tables and planes for these forms whose size the limits
 /// do not bound.
-fn decode(bytes: &[u8], limits: Limits) -> Result<DynamicImage, ImageRefusal> {
+///
+/// The orientation is the one of the Exif metadata of a JPEG
+/// ([`ImageDecoder::orientation`]). It is [`Orientation::NoTransforms`] for
+/// a JPEG without Exif metadata, for metadata without an orientation, for a
+/// value that is none of the eight orientations, and for metadata that is
+/// cut short or that cannot be read. It is the same for a PNG, whose
+/// orientation is not read, and for a WebP, which holds no metadata in the
+/// simple file form.
+///
+/// To read the orientation, the JPEG decoder parses the header of the image
+/// once more and copies the metadata segments as every parse of the header
+/// does (`docs/design.md` section 3.11). The copies are freed before the
+/// pixels are allocated. The Exif segment holds 64 KiB at most, and the
+/// orientation is read from it without an allocation: the reader takes the
+/// 12 bytes of each entry of the first image directory in turn, and it stops
+/// at the orientation or at the end of the segment.
+fn decode(bytes: &[u8], mut limits: Limits) -> Result<(DynamicImage, Orientation), ImageRefusal> {
     let mut reader = guessed(bytes)?;
-    match reader.format() {
-        Some(ImageFormat::Jpeg | ImageFormat::Png) => {}
-        Some(ImageFormat::WebP) if is_simple_lossy_webp(bytes) => {}
+    let jpeg = match reader.format() {
+        Some(ImageFormat::Jpeg) => true,
+        Some(ImageFormat::Png) => false,
+        Some(ImageFormat::WebP) if is_simple_lossy_webp(bytes) => false,
         Some(ImageFormat::WebP) => return Err(ImageRefusal::WebpForm),
         _ => return Err(ImageRefusal::Format),
+    };
+    reader.limits(limits.clone());
+    if !jpeg {
+        return Ok((reader.decode()?, Orientation::NoTransforms));
     }
-    reader.limits(limits);
-    Ok(reader.decode()?)
+    let mut decoder = reader.into_decoder()?;
+    // `ImageReader::decode` compares the bytes of the pixels with
+    // `max_alloc` before it allocates them. `into_decoder` checks the sides
+    // only, so the comparison is made here.
+    limits.reserve(decoder.total_bytes())?;
+    let orientation = decoder.orientation().unwrap_or(Orientation::NoTransforms);
+    Ok((DynamicImage::from_decoder(decoder)?, orientation))
 }
 
 /// Returns whether `bytes`, which start as a WebP file, are in the simple
@@ -1013,8 +1070,15 @@ fn is_simple_lossy_webp(bytes: &[u8]) -> bool {
 /// is scaled down to `size` in its proportions, and its shorter side is at
 /// least one pixel. An image whose sides are within `size` keeps its size.
 /// An image with an alpha channel loses the channel, because JPEG has none.
+///
+/// The orientation that a JPEG declares ([`decode`]) is applied to the
+/// pixels: the result is turned and mirrored as a viewer shows the source,
+/// and it holds no metadata. An orientation with a quarter turn exchanges
+/// the width and the height. `size` bounds the longer side, which no
+/// orientation changes, so the result has the size that the turned image
+/// has when it is scaled to `size`.
 fn resize(bytes: Vec<u8>, size: u32, limits: Limits) -> Result<Vec<u8>, ImageRefusal> {
-    let image = decode(&bytes, limits)?;
+    let (image, orientation) = decode(&bytes, limits)?;
     // Each buffer is freed when the next one is made, so the source, the
     // pixels and the resized pixels are not all in memory at one time.
     drop(bytes);
@@ -1026,10 +1090,25 @@ fn resize(bytes: Vec<u8>, size: u32, limits: Limits) -> Result<Vec<u8>, ImageRef
         // `thumbnail` enlarges a smaller image to the size.
         image
     };
-    let pixels = image.into_rgb8();
+    let pixels = oriented(image.into_rgb8(), orientation);
     let mut jpeg = Vec::new();
     JpegEncoder::new_with_quality(&mut jpeg, JPEG_QUALITY).encode_image(&pixels)?;
     Ok(jpeg)
+}
+
+/// Returns `pixels` turned and mirrored as `orientation` says
+/// ([`DynamicImage::apply_orientation`]).
+///
+/// A half turn and a mirroring change the pixels in place. A quarter turn
+/// writes them to a second buffer of the same size. [`resize`] passes the
+/// pixels after it scaled them down and made them 8-bit RGB, so the two
+/// buffers hold three bytes for each pixel of a cover, and not the bytes of
+/// the decoded source.
+fn oriented(pixels: image::RgbImage, orientation: Orientation) -> image::RgbImage {
+    let mut image = DynamicImage::ImageRgb8(pixels);
+    image.apply_orientation(orientation);
+    // The image is 8-bit RGB, so this conversion moves the pixels.
+    image.into_rgb8()
 }
 
 /// Writes `bytes` to the file `name` in the directory `cache_dir`, which is
@@ -1345,6 +1424,143 @@ mod tests {
         bytes
     }
 
+    /// The colours of the four quarters of [`quartered`], in the order top
+    /// left, top right, bottom left and bottom right, with the letters that
+    /// [`corners`] names them by.
+    const QUARTERS: [(char, Rgb<u8>); 4] = [
+        ('a', Rgb([230, 30, 30])),
+        ('b', Rgb([30, 200, 30])),
+        ('c', Rgb([30, 30, 230])),
+        ('d', Rgb([230, 230, 30])),
+    ];
+
+    /// The Exif tag of the orientation.
+    const ORIENTATION_TAG: u16 = 0x0112;
+
+    /// The Exif format of a 16-bit number, which is the format of the
+    /// orientation.
+    const SHORT: u16 = 3;
+
+    /// The corners of an image that is stored as `abcd` (see [`corners`])
+    /// when a viewer applies each Exif orientation, and whether the
+    /// orientation exchanges the width and the height. The Exif standard
+    /// names an orientation by the sides of the shown image at which the
+    /// first row and the first column of the stored image are: 1 top and
+    /// left, 2 top and right, 3 bottom and right, 4 bottom and left, 5 left
+    /// and top, 6 right and top, 7 right and bottom, 8 left and bottom.
+    const SHOWN: [(u16, &str, bool); 8] = [
+        (1, "abcd", false),
+        (2, "badc", false),
+        (3, "dcba", false),
+        (4, "cdab", false),
+        (5, "acbd", true),
+        (6, "cadb", true),
+        (7, "dbca", true),
+        (8, "bdac", true),
+    ];
+
+    /// Returns an image of `width` × `height` pixels in four quarters, each
+    /// of one of the colours of [`QUARTERS`]. No turn and no mirroring of
+    /// the image gives the same image.
+    fn quartered(width: u32, height: u32) -> image::RgbImage {
+        image::RgbImage::from_fn(width, height, |x, y| {
+            let quarter = usize::from(y >= height / 2) * 2 + usize::from(x >= width / 2);
+            QUARTERS[quarter].1
+        })
+    }
+
+    /// Returns the letters of the quarters of [`quartered`] that the corners
+    /// of the image `jpeg` show, in the order top left, top right, bottom
+    /// left and bottom right. The image as [`quartered`] returns it is
+    /// `abcd`.
+    fn corners(jpeg: &[u8]) -> String {
+        let image = image::load_from_memory(jpeg)
+            .expect("decode the JPEG")
+            .into_rgb8();
+        let (right, bottom) = (image.width() - 1, image.height() - 1);
+        [(0, 0), (right, 0), (0, bottom), (right, bottom)]
+            .into_iter()
+            .map(|(x, y)| {
+                let pixel = image.get_pixel(x, y);
+                // The encoder changes a channel by a few steps.
+                let near = |colour: &Rgb<u8>| (0..3).all(|c| pixel[c].abs_diff(colour[c]) <= 24);
+                let quarter = QUARTERS.iter().find(|(_, colour)| near(colour));
+                quarter.unwrap_or_else(|| panic!("{pixel:?} at {x}, {y}")).0
+            })
+            .collect()
+    }
+
+    /// Returns the Exif data of an image whose first directory holds one
+    /// entry with these values: the byte order, the offset of the directory,
+    /// the number of its entries, the 12 bytes of the entry, and the offset
+    /// of the next directory, which is 0. The data is 26 bytes long, and the
+    /// entry ends at byte 22.
+    fn exif_entry(big_endian: bool, tag: u16, format: u16, count: u32, value: u16) -> Vec<u8> {
+        let short = |n: u16| {
+            if big_endian {
+                n.to_be_bytes()
+            } else {
+                n.to_le_bytes()
+            }
+        };
+        let long = |n: u32| {
+            if big_endian {
+                n.to_be_bytes()
+            } else {
+                n.to_le_bytes()
+            }
+        };
+        let mut data = if big_endian { b"MM" } else { b"II" }.to_vec();
+        data.extend(short(42));
+        data.extend(long(8));
+        data.extend(short(1));
+        data.extend(short(tag));
+        data.extend(short(format));
+        data.extend(long(count));
+        // A value of two bytes is at the start of the four bytes of the
+        // value field.
+        data.extend(short(value));
+        data.extend([0, 0]);
+        data.extend(long(0));
+        data
+    }
+
+    /// Returns the Exif data that declares `orientation`, in the byte order
+    /// of Intel.
+    fn exif_orientation(orientation: u16) -> Vec<u8> {
+        exif_entry(false, ORIENTATION_TAG, SHORT, 1, orientation)
+    }
+
+    /// Returns the file `jpeg` with `exif` as its Exif data: an APP1 segment
+    /// after the start marker of the file, which holds its length, `Exif`,
+    /// two zero bytes and `exif`.
+    fn with_exif(jpeg: &[u8], exif: &[u8]) -> Vec<u8> {
+        assert_eq!(jpeg[..2], [0xff, 0xd8], "the start marker of a JPEG");
+        let length = u16::try_from(2 + 6 + exif.len()).expect("a segment of at most 64 KiB");
+        let mut bytes = vec![0xff, 0xd8, 0xff, 0xe1];
+        bytes.extend(length.to_be_bytes());
+        bytes.extend(b"Exif\0\0");
+        bytes.extend(exif);
+        bytes.extend(&jpeg[2..]);
+        bytes
+    }
+
+    /// Returns [`quartered`] of `width` × `height` pixels as a JPEG that
+    /// declares `orientation`.
+    fn oriented_jpeg(width: u32, height: u32, orientation: u16) -> Vec<u8> {
+        with_exif(
+            &encoded(quartered(width, height), ImageFormat::Jpeg),
+            &exif_orientation(orientation),
+        )
+    }
+
+    /// Resizes `bytes` to `size` and returns the width and the height of the
+    /// result and its [`corners`].
+    fn resized(bytes: Vec<u8>, size: u32) -> ((u32, u32), String) {
+        let jpeg = resize(bytes, size, decode_limits()).expect("resize the image");
+        (jpeg_dimensions(&jpeg), corners(&jpeg))
+    }
+
     /// A lossy WebP image of 8 × 4 pixels in the simple file form. The
     /// `image` crate writes lossless WebP only, so the bytes are those that
     /// `cwebp -q 20` wrote for a gradient.
@@ -1485,16 +1701,17 @@ mod tests {
     }
 
     #[test]
-    fn the_name_of_a_cache_file_holds_the_id_the_size_and_the_time() {
+    fn the_name_of_a_cache_file_holds_the_id_the_size_the_time_and_the_version() {
+        assert_eq!(CACHE_VERSION, 2);
         let id = "al-0123456789abcdef0123456789abcdef";
         assert_eq!(
             cache_name(id, 320, 1_700_000_000).as_deref(),
-            Some("al-0123456789abcdef0123456789abcdef-320-1700000000.jpg")
+            Some("al-0123456789abcdef0123456789abcdef-320-1700000000-2.jpg")
         );
         // A file from before 1970 has a negative time.
         assert_eq!(
             cache_name(id, 80, -5).as_deref(),
-            Some("al-0123456789abcdef0123456789abcdef-80--5.jpg")
+            Some("al-0123456789abcdef0123456789abcdef-80--5-2.jpg")
         );
     }
 
@@ -1673,11 +1890,229 @@ mod tests {
     }
 
     #[test]
+    fn a_jpeg_with_each_of_the_eight_orientations_is_resized_as_a_viewer_shows_it() {
+        // The first image is within the size and keeps its pixels. The
+        // second one is scaled down. Each is stored wider than high.
+        let images = [
+            ((48, 32), (48, 32), (32, 48)),
+            ((240, 160), (80, 53), (53, 80)),
+        ];
+        for ((width, height), as_stored, turned) in images {
+            let plain = encoded(quartered(width, height), ImageFormat::Jpeg);
+            for (orientation, shown, quarter_turn) in SHOWN {
+                let dimensions = if quarter_turn { turned } else { as_stored };
+                // The metadata in the byte order of Intel and of Motorola.
+                for big_endian in [false, true] {
+                    let exif = exif_entry(big_endian, ORIENTATION_TAG, SHORT, 1, orientation);
+                    let jpeg = resize(with_exif(&plain, &exif), 80, decode_limits())
+                        .expect("resize the image");
+                    let case = format!("{width} × {height}, {orientation}, {big_endian}");
+                    assert_eq!(jpeg_dimensions(&jpeg), dimensions, "{case}");
+                    assert_eq!(corners(&jpeg), shown, "{case}");
+                    // The result holds no metadata, so no viewer turns it
+                    // again.
+                    let mut decoder = image::codecs::jpeg::JpegDecoder::new(Cursor::new(&jpeg))
+                        .expect("the header of the JPEG");
+                    assert_eq!(decoder.exif_metadata().expect("the header"), None, "{case}");
+                }
+            }
+        }
+
+        // A file with two Exif segments has the orientation of the last
+        // one. `with_exif` puts its segment in front of the other one.
+        let plain = encoded(quartered(48, 32), ImageFormat::Jpeg);
+        let half_turn_first = with_exif(
+            &with_exif(&plain, &exif_orientation(6)),
+            &exif_orientation(3),
+        );
+        assert_eq!(resized(half_turn_first, 80), ((32, 48), "cadb".to_owned()));
+    }
+
+    #[test]
+    fn a_jpeg_without_a_readable_orientation_is_resized_as_it_is_stored() {
+        let plain = encoded(quartered(48, 32), ImageFormat::Jpeg);
+        let as_stored = ((48, 32), "abcd".to_owned());
+        assert_eq!(resized(plain.clone(), 80), as_stored, "no metadata");
+
+        // The metadata that the cases below change declares a quarter turn.
+        let valid = exif_orientation(6);
+        assert_eq!(valid.len(), 26);
+        let turned = ((32, 48), "cadb".to_owned());
+        assert_eq!(resized(with_exif(&plain, &valid), 80), turned);
+        let changed = |at: usize, bytes: &[u8]| {
+            let mut data = valid.clone();
+            data[at..at + bytes.len()].copy_from_slice(bytes);
+            data
+        };
+        let other_tag = exif_entry(false, 0x0100, SHORT, 1, 6);
+        let mut cases: Vec<(String, Vec<u8>)> = vec![
+            ("no data".to_owned(), Vec::new()),
+            ("an entry of another tag".to_owned(), other_tag.clone()),
+            (
+                "a 32-bit number".to_owned(),
+                exif_entry(false, ORIENTATION_TAG, 4, 1, 6),
+            ),
+            (
+                "a byte".to_owned(),
+                exif_entry(false, ORIENTATION_TAG, 1, 1, 6),
+            ),
+            (
+                "two values".to_owned(),
+                exif_entry(false, ORIENTATION_TAG, SHORT, 2, 6),
+            ),
+            (
+                "no value".to_owned(),
+                exif_entry(false, ORIENTATION_TAG, SHORT, 0, 6),
+            ),
+            ("no byte order".to_owned(), changed(0, b"XX")),
+            ("the other byte order".to_owned(), changed(0, b"MM")),
+            ("no TIFF number".to_owned(), changed(2, &[43, 0])),
+            (
+                "a directory far after the data".to_owned(),
+                changed(4, &u32::MAX.to_le_bytes()),
+            ),
+            (
+                "a directory at the end of the data".to_owned(),
+                changed(4, &26u32.to_le_bytes()),
+            ),
+            (
+                "a directory at the start of the data".to_owned(),
+                changed(4, &0u32.to_le_bytes()),
+            ),
+            (
+                "a directory without entries".to_owned(),
+                changed(8, &[0, 0]),
+            ),
+        ];
+        // A value that is none of the eight orientations. 262 and 1536 hold
+        // the byte 6.
+        for value in [0, 9, 255, 256, 262, 1536, u16::MAX] {
+            cases.push((format!("the value {value}"), exif_orientation(value)));
+        }
+        // Data that ends before the end of the entry, which is at byte 22.
+        for length in 0..22 {
+            cases.push((format!("{length} bytes"), valid[..length].to_vec()));
+        }
+        // A directory that declares 65535 entries and holds one, which is
+        // not the orientation.
+        let mut one_of_many = other_tag;
+        one_of_many[8..10].fill(0xff);
+        cases.push(("65535 entries in 26 bytes".to_owned(), one_of_many));
+        // The largest Exif segment, which holds 65527 bytes of data: a
+        // directory that declares 65535 entries, and zero bytes.
+        let mut largest = valid[..8].to_vec();
+        largest.extend([0xff, 0xff]);
+        largest.resize(65527, 0);
+        cases.push(("65535 entries in the largest segment".to_owned(), largest));
+
+        let start = Instant::now();
+        for (case, exif) in cases {
+            assert_eq!(resized(with_exif(&plain, &exif), 80), as_stored, "{case}");
+        }
+        assert!(start.elapsed() < Duration::from_secs(1));
+
+        // A segment that declares fewer bytes than it holds. The length
+        // counts its own two bytes and the six bytes of `Exif` and the
+        // zeros. The decoder takes the bytes that the length covers as the
+        // Exif data and passes over the rest: 10 bytes of data end before
+        // the entry does, and 22 bytes hold the entry.
+        let whole = with_exif(&plain, &valid);
+        let length_of = |length: u16| {
+            let mut bytes = whole.clone();
+            bytes[4..6].copy_from_slice(&length.to_be_bytes());
+            bytes
+        };
+        assert_eq!(resized(length_of(2 + 6 + 10), 80), as_stored);
+        assert_eq!(resized(length_of(2 + 6 + 22), 80), turned);
+
+        // A file that ends inside its Exif segment, and a segment whose
+        // length is less than the two bytes of the length or more than the
+        // file holds, is a damaged file. It is not decoded, as a file with
+        // another damaged header is not.
+        let damaged = [
+            whole[..12].to_vec(),
+            whole[..20].to_vec(),
+            length_of(0),
+            length_of(1),
+            length_of(u16::MAX),
+        ];
+        for bytes in damaged {
+            let refusal = resize(bytes.clone(), 80, decode_limits()).expect_err("a damaged file");
+            assert!(matches!(refusal, ImageRefusal::Image(_)), "{refusal}");
+            assert!(verify(&bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn a_jpeg_with_an_orientation_is_decoded_within_the_limits() {
+        let exif = exif_orientation(6);
+        // The limit on the memory counts the bytes of the pixels: four RGB
+        // pixels are 12 bytes.
+        let small = with_exif(&jpeg(2, 2), &exif);
+        let with_memory = |bytes: u64| {
+            let mut limits = decode_limits();
+            limits.max_alloc = Some(bytes);
+            limits
+        };
+        assert_over_a_limit(&decode(&small, with_memory(11)).expect_err("over the limit"));
+        let (image, orientation) = decode(&small, with_memory(12)).expect("at the limit");
+        assert_eq!((image.width(), image.height()), (2, 2));
+        assert_eq!(orientation, Orientation::Rotate90);
+
+        // The image that declares the largest size is refused before its
+        // pixels are allocated, by the limit on the sides and by the limit
+        // on the memory alone.
+        let bomb = with_exif(&jpeg_that_declares_the_largest_size(), &exif);
+        let start = Instant::now();
+        assert_over_a_limit(&decode(&bomb, decode_limits()).expect_err("over a limit"));
+        assert_over_a_limit(&decode(&bomb, header_limits()).expect_err("over the limit"));
+        assert!(start.elapsed() < Duration::from_secs(1));
+
+        // The limit on a side is one on the image as it is stored. A
+        // quarter turn brings no side within it.
+        let wide = with_exif(&jpeg(MAX_SOURCE_SIDE + 1, 1), &exif);
+        assert_over_a_limit(&decode(&wide, decode_limits()).expect_err("over a limit"));
+
+        // An image at the limit of a side is decoded, scaled down and
+        // turned.
+        let widest = with_exif(&jpeg(MAX_SOURCE_SIDE, 8), &exif);
+        let cover = resize(widest, MAX_SIZE, decode_limits()).expect("resize the image");
+        assert_eq!(jpeg_dimensions(&cover), (4, MAX_SIZE));
+    }
+
+    #[test]
+    fn the_orientation_of_a_png_is_not_applied() {
+        use image::ImageEncoder;
+        use image::codecs::png::{PngDecoder, PngEncoder};
+
+        let pixels = quartered(48, 32);
+        let mut png = Vec::new();
+        let mut encoder = PngEncoder::new(&mut png);
+        encoder
+            .set_exif_metadata(exif_orientation(6))
+            .expect("a PNG holds Exif data");
+        encoder
+            .write_image(pixels.as_raw(), 48, 32, image::ExtendedColorType::Rgb8)
+            .expect("encode the image");
+        // The file declares a quarter turn.
+        let mut decoder = PngDecoder::new(Cursor::new(&png)).expect("the header of the PNG");
+        assert_eq!(
+            decoder.orientation().expect("the metadata"),
+            Orientation::Rotate90
+        );
+
+        let (_, orientation) = decode(&png, decode_limits()).expect("decode the image");
+        assert_eq!(orientation, Orientation::NoTransforms);
+        assert_eq!(resized(png, 80), ((48, 32), "abcd".to_owned()));
+    }
+
+    #[test]
     fn a_lossy_webp_in_the_simple_form_is_decoded() {
         assert_eq!(&LOSSY_WEBP[12..16], b"VP8 ");
         assert!(is_simple_lossy_webp(&LOSSY_WEBP));
-        let image = decode(&LOSSY_WEBP, decode_limits()).expect("decode the image");
+        let (image, orientation) = decode(&LOSSY_WEBP, decode_limits()).expect("decode the image");
         assert_eq!((image.width(), image.height()), (8, 4));
+        assert_eq!(orientation, Orientation::NoTransforms);
     }
 
     #[test]
@@ -1761,7 +2196,7 @@ mod tests {
         over(&png(1, MAX_SOURCE_SIDE + 1));
         over(&jpeg(MAX_SOURCE_SIDE + 1, 1));
 
-        let widest = decode(&png(MAX_SOURCE_SIDE, 1), decode_limits()).expect("at the limit");
+        let (widest, _) = decode(&png(MAX_SOURCE_SIDE, 1), decode_limits()).expect("at the limit");
         assert_eq!((widest.width(), widest.height()), (MAX_SOURCE_SIDE, 1));
     }
 
@@ -1847,6 +2282,33 @@ mod tests {
         // Nothing was decoded and nothing was cached.
         assert_eq!(library.covers.decodes(), 0);
         assert!(!library.cache_dir().exists());
+    }
+
+    #[tokio::test]
+    async fn a_cover_without_a_size_keeps_the_bytes_and_the_orientation_of_its_source() {
+        let library = Library::new().await;
+        let source = oriented_jpeg(48, 32, 6);
+        let (id, _) = library
+            .album_with_cover("Glass Harbour", "cover.jpg", &source)
+            .await;
+
+        // The bytes are those of the file, with the Exif segment after the
+        // start marker. The image is neither decoded nor turned.
+        for size in [None, Some(0)] {
+            let cover = library.get(&id, size).await.expect("the stored image");
+            assert_eq!(cover.bytes, source, "{size:?}");
+            assert_eq!(cover.content_type, "image/jpeg");
+            assert_eq!(cover.bytes[2..4], [0xff, 0xe1]);
+        }
+        assert_eq!(library.covers.decodes(), 0);
+        assert!(!library.cache_dir().exists());
+
+        // A resized cover of the same source is turned, and the source is
+        // served as before.
+        let resized = library.get(&id, Some(80)).await.expect("a resized cover");
+        assert_eq!(jpeg_dimensions(&resized.bytes), (32, 48));
+        let cover = library.get(&id, None).await.expect("the stored image");
+        assert_eq!(cover.bytes, source);
     }
 
     #[tokio::test]
@@ -2143,7 +2605,7 @@ mod tests {
         assert_eq!(library.covers.decodes(), 1);
 
         // The cache holds the cover under its name and no other file.
-        let name = format!("{id}-80-{MTIME}.jpg");
+        let name = format!("{id}-80-{MTIME}-2.jpg");
         assert_eq!(library.cache_files(), [name.as_str()]);
         let cached = fs::read(library.cache_dir().join(&name)).expect("read the cache file");
         assert_eq!(cover.bytes, cached);
@@ -2170,7 +2632,7 @@ mod tests {
         // 290, 300 and 310 are sizes of the step 320.
         let cover = library.get(&id, Some(290)).await.expect("a resized cover");
         assert_eq!(jpeg_dimensions(&cover.bytes), (320, 240));
-        let name = format!("{id}-320-{MTIME}.jpg");
+        let name = format!("{id}-320-{MTIME}-2.jpg");
         assert_eq!(library.cache_files(), [name.as_str()]);
         for size in [300, 310, 161, 320] {
             assert_eq!(library.get(&id, Some(size)).await.as_ref(), Some(&cover));
@@ -2188,9 +2650,9 @@ mod tests {
         assert_eq!(
             library.cache_files(),
             [
-                format!("{id}-160-{MTIME}.jpg"),
+                format!("{id}-160-{MTIME}-2.jpg"),
                 name,
-                format!("{id}-640-{MTIME}.jpg")
+                format!("{id}-640-{MTIME}-2.jpg")
             ]
         );
     }
@@ -2275,8 +2737,8 @@ mod tests {
         assert_eq!(
             library.cache_files(),
             [
-                format!("{id}-2000-{MTIME}.jpg"),
-                format!("{id}-80-{MTIME}.jpg")
+                format!("{id}-2000-{MTIME}-2.jpg"),
+                format!("{id}-80-{MTIME}-2.jpg")
             ]
         );
     }
@@ -2288,7 +2750,7 @@ mod tests {
             .album_with_cover("Glass Harbour", "cover.png", &png(4, 2))
             .await;
         fs::create_dir_all(library.cache_dir()).expect("create the cache directory");
-        let name = format!("{id}-80-{MTIME}.jpg");
+        let name = format!("{id}-80-{MTIME}-2.jpg");
         fs::write(library.cache_dir().join(name), b"cached earlier").expect("write the file");
 
         // Every size of the step is served from the file.
@@ -2308,6 +2770,70 @@ mod tests {
         fs::write(library.cache_dir().join(name), b"cached earlier").expect("write the file");
         let cover = library.get(&id, Some(300)).await.expect("a cover");
         assert_eq!(jpeg_dimensions(&cover.bytes), (4, 2));
+        assert_eq!(library.covers.decodes(), 1);
+    }
+
+    #[tokio::test]
+    async fn the_step_bounds_the_longer_side_of_a_turned_cover() {
+        let library = Library::new().await;
+        // Each image is stored 120 pixels wide and 240 pixels high, and a
+        // viewer shows it 240 pixels wide and 120 pixels high.
+        let albums = [("Glass Harbour", 6, "cadb"), ("Paper Maps", 8, "bdac")];
+        // The size, its step, and the size of the cover. The image is
+        // scaled down to the steps below 240 pixels and keeps its size at
+        // the steps above.
+        let sizes = [
+            (64, 80, (80, 40)),
+            (160, 160, (160, 80)),
+            (200, 320, (240, 120)),
+            (5000, 2000, (240, 120)),
+        ];
+        for (title, orientation, shown) in albums {
+            let source = oriented_jpeg(120, 240, orientation);
+            let (id, _) = library.album_with_cover(title, "cover.jpg", &source).await;
+            for (size, step, dimensions) in sizes {
+                let cover = library.get(&id, Some(size)).await.expect("a resized cover");
+                assert_eq!(jpeg_dimensions(&cover.bytes), dimensions, "{title} {size}");
+                assert_eq!(corners(&cover.bytes), shown, "{title} {size}");
+                let cached = library.cache_dir().join(library.cache_name(&id, step));
+                assert_eq!(
+                    cover.bytes,
+                    fs::read(&cached).expect("read the cache file"),
+                    "{title} {size}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cover_that_was_cached_without_its_orientation_is_not_served() {
+        let library = Library::new().await;
+        let (id, _) = library
+            .album_with_cover("Glass Harbour", "cover.jpg", &oriented_jpeg(48, 32, 6))
+            .await;
+        // The file that a version of the server wrote that did not apply
+        // the orientation: its name has no version, and its image is not
+        // turned.
+        let plain = encoded(quartered(48, 32), ImageFormat::Jpeg);
+        let unturned = resize(plain, 80, decode_limits()).expect("resize the image");
+        assert_eq!(jpeg_dimensions(&unturned), (48, 32));
+        let old_name = format!("{id}-80-{MTIME}.jpg");
+        fs::create_dir_all(library.cache_dir()).expect("create the cache directory");
+        fs::write(library.cache_dir().join(&old_name), &unturned).expect("write the file");
+
+        // The cover is made from the source and is turned.
+        let cover = library.get(&id, Some(80)).await.expect("a resized cover");
+        assert!(cover.bytes != unturned, "the cover is the old file");
+        assert_eq!(jpeg_dimensions(&cover.bytes), (32, 48));
+        assert_eq!(corners(&cover.bytes), "cadb");
+        assert_eq!(library.covers.decodes(), 1);
+
+        // It is cached under the name of this version, and the next request
+        // reads that file. The old file stays until a scan removes the
+        // files of the album.
+        let name = format!("{id}-80-{MTIME}-2.jpg");
+        assert_eq!(library.cache_files(), [name, old_name]);
+        assert_eq!(library.get(&id, Some(64)).await, Some(cover));
         assert_eq!(library.covers.decodes(), 1);
     }
 
@@ -2333,8 +2859,8 @@ mod tests {
         assert_eq!(
             library.cache_files(),
             [
-                format!("{id}-80-{MTIME}.jpg"),
-                format!("{id}-80-{}.jpg", MTIME + 60)
+                format!("{id}-80-{MTIME}-2.jpg"),
+                format!("{id}-80-{}-2.jpg", MTIME + 60)
             ]
         );
     }
@@ -2348,7 +2874,7 @@ mod tests {
 
         let cover = library.get(&id, Some(5000)).await.expect("a resized cover");
         assert_eq!(jpeg_dimensions(&cover.bytes), (2000, 1));
-        let name = format!("{id}-2000-{MTIME}.jpg");
+        let name = format!("{id}-2000-{MTIME}-2.jpg");
         assert_eq!(library.cache_files(), [name.as_str()]);
 
         // Every size over the maximum is the same cover and the same file.
@@ -2367,7 +2893,7 @@ mod tests {
             let cover = library.get(&small, Some(size)).await.expect("a cover");
             assert_eq!(jpeg_dimensions(&cover.bytes), (300, 150), "{size}");
         }
-        let mut names = vec![name, format!("{small}-2000-{MTIME}.jpg")];
+        let mut names = vec![name, format!("{small}-2000-{MTIME}-2.jpg")];
         names.sort();
         assert_eq!(library.cache_files(), names);
     }

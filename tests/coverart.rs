@@ -200,9 +200,13 @@ async fn conditional(server: &TestServer, params: &[(&str, &str)], value: &str) 
 
 /// The entity tag of the cover `id` at `size` whose source has the
 /// modification time `mtime`, with its quotes. `size` is 0 for the image as
-/// it is stored, and otherwise the step that a size is served at.
+/// it is stored, and otherwise the step that a size is served at. The tag of
+/// a resized cover ends with the version of the resized covers, which is 2.
 fn etag(id: &str, size: u32, mtime: i64) -> String {
-    format!("\"{id}-{size}-{mtime}\"")
+    match size {
+        0 => format!("\"{id}-0-{mtime}\""),
+        step => format!("\"{id}-{step}-{mtime}-2\""),
+    }
 }
 
 /// Returns the path of the file `name` in the directory of the album `album`
@@ -218,6 +222,26 @@ fn write_image(path: &Path, width: u32, height: u32, shade: u8) {
     RgbImage::from_fn(width, height, |x, y| Rgb([x as u8, y as u8, shade]))
         .save(path)
         .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+}
+
+/// Returns the JPEG file `jpeg` with Exif metadata that declares
+/// `orientation`, a value from 1 to 8. The metadata is an APP1 segment after
+/// the start marker of the file. It holds `Exif`, two zero bytes and the
+/// Exif data: the byte order of Intel, the offset of the first directory,
+/// and that directory with one entry, which has the tag 0x0112, the format
+/// of a 16-bit number, one value and the orientation.
+fn with_orientation(jpeg: &[u8], orientation: u8) -> Vec<u8> {
+    assert_eq!(jpeg[..2], [0xff, 0xd8], "the start marker of a JPEG");
+    let mut exif = b"Exif\0\0II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
+    exif.extend([orientation, 0, 0, 0]);
+    // The offset of the next directory: there is none.
+    exif.extend([0; 4]);
+    let length = u16::try_from(exif.len() + 2).expect("a short segment");
+    let mut bytes = vec![0xff, 0xd8, 0xff, 0xe1];
+    bytes.extend(length.to_be_bytes());
+    bytes.extend(exif);
+    bytes.extend(&jpeg[2..]);
+    bytes
 }
 
 /// Returns the modification time of the file at `path` in Unix seconds.
@@ -345,6 +369,74 @@ async fn album_with_a_cover_file_returns_the_file_and_a_jpeg_of_at_most_the_step
     let larger = cover(&server, &[("id", id), ("size", "500")]).await;
     larger.assert_cover("image/jpeg", &etag(id, 640, time), "size=500");
     assert_eq!(jpeg_dimensions(&larger.body), (128, 64));
+}
+
+#[tokio::test]
+async fn sized_cover_of_a_jpeg_with_an_orientation_is_turned_and_the_stored_image_is_not() {
+    // The cover file is stored 128 pixels wide and 64 pixels high. Its
+    // metadata declares the orientation 6: a viewer turns the image by a
+    // quarter clockwise and shows it 64 pixels wide and 128 pixels high.
+    let library = LibraryBuilder::new()
+        .track("Aurora Field", "Glass Harbour", "Low Tide", 1, "flac")
+        .build();
+    let cover_file = file(&library, "Aurora Field", "Glass Harbour", "cover.jpg");
+    write_image(&cover_file, 128, 64, 128);
+    let plain = fs::read(&cover_file).expect("read the cover file");
+    let stored = with_orientation(&plain, 6);
+    fs::write(&cover_file, &stored).expect("write the cover file");
+    let server = TestServer::scanned(library).await;
+    let album = server.catalogue().await.album("Glass Harbour").id.clone();
+    let (id, time) = (album.as_str(), mtime(&cover_file));
+
+    // Without a size the body is the file with its metadata, byte for byte.
+    for params in [vec![("id", id)], vec![("id", id), ("size", "0")]] {
+        let original = cover(&server, &params).await;
+        original.assert_cover("image/jpeg", &etag(id, 0, time), "the stored image");
+        assert_eq!(original.body, stored);
+    }
+
+    // With a size the image is turned and then has the step of the size.
+    let params = [("id", id), ("size", "64")];
+    let resized = cover(&server, &params).await;
+    resized.assert_cover("image/jpeg", &etag(id, 80, time), "size=64");
+    assert_eq!(jpeg_dimensions(&resized.body), (40, 80));
+
+    // A cover within the step keeps its pixels. `write_image` makes the red
+    // value rise from left to right and the green value from top to bottom.
+    // After the turn the red value rises from top to bottom, and the green
+    // value falls from left to right.
+    let larger = cover(&server, &[("id", id), ("size", "500")]).await;
+    larger.assert_cover("image/jpeg", &etag(id, 640, time), "size=500");
+    assert_eq!(jpeg_dimensions(&larger.body), (64, 128));
+    let pixels = image::load_from_memory(&larger.body)
+        .expect("decode the JPEG")
+        .into_rgb8();
+    let (top_left, top_right) = (pixels.get_pixel(0, 0), pixels.get_pixel(63, 0));
+    let bottom_left = pixels.get_pixel(0, 127);
+    assert!(
+        bottom_left[0] > top_left[0] + 64,
+        "{bottom_left:?} {top_left:?}"
+    );
+    assert!(
+        top_left[1] > top_right[1] + 32,
+        "{top_left:?} {top_right:?}"
+    );
+
+    // The entity tag of a resized cover ends with the version of the resized
+    // covers. The tag that the server gave for this cover before it applied
+    // the orientation had no version: a client that holds that cover gets
+    // the turned one, and not HTTP 304.
+    assert_eq!(resized.etag(), format!("\"{id}-80-{time}-2\""));
+    let before = format!("\"{id}-80-{time}\"");
+    let answer = conditional(&server, &params, &before).await;
+    answer.assert_cover(
+        "image/jpeg",
+        &etag(id, 80, time),
+        "the tag without a version",
+    );
+    assert_eq!(answer.body, resized.body);
+    let answer = conditional(&server, &params, resized.etag()).await;
+    answer.assert_not_modified(&etag(id, 80, time), "the tag of the cover");
 }
 
 #[tokio::test]
