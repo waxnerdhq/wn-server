@@ -40,8 +40,8 @@ const NOT_SUPPORTED: [&str; 23] = [
     "getTranscodeStream",
 ];
 
-fn server() -> TestServer {
-    TestServer::bare(Config::default())
+async fn server() -> TestServer {
+    TestServer::bare(Config::default()).await
 }
 
 /// The JSON body that has `status` and then `rest`. `rest` is the text that
@@ -84,7 +84,7 @@ fn error_0(message: &str) -> Value {
 
 #[tokio::test]
 async fn ping_json_is_the_documented_envelope() {
-    let response = server().get_raw("ping", &[("f", "json")]).await;
+    let response = server().await.get_raw("ping", &[("f", "json")]).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(content_type(&response), "application/json");
     assert_eq!(body_string(response).await, json_document("ok", ""));
@@ -92,7 +92,7 @@ async fn ping_json_is_the_documented_envelope() {
 
 #[tokio::test]
 async fn ping_view_is_the_xml_envelope_with_xmlns() {
-    let response = server().get_raw("ping.view", &[]).await;
+    let response = server().await.get_raw("ping.view", &[]).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(content_type(&response), "application/xml");
     let body = body_string(response).await;
@@ -105,7 +105,7 @@ async fn ping_view_is_the_xml_envelope_with_xmlns() {
 
 #[tokio::test]
 async fn method_answers_with_and_without_the_view_suffix_in_both_formats() {
-    let server = server();
+    let server = server().await;
     for method in ["ping", "ping.view"] {
         assert_eq!(
             server.get_xml(method, &[]).await,
@@ -128,7 +128,7 @@ async fn method_answers_with_and_without_the_view_suffix_in_both_formats() {
 
 #[tokio::test]
 async fn get_license_returns_a_valid_license() {
-    let server = server();
+    let server = server().await;
     let response = server.get_json("getLicense", &[]).await;
     assert_eq!(response["status"], "ok");
     assert_eq!(response["license"], json!({ "valid": true }));
@@ -150,7 +150,7 @@ async fn get_open_subsonic_extensions_returns_the_entries_of_extensions() {
             .collect(),
     );
 
-    let server = server();
+    let server = server().await;
     let response = server.get_json("getOpenSubsonicExtensions", &[]).await;
     assert_eq!(response["status"], "ok");
     assert_eq!(response["openSubsonicExtensions"], expected);
@@ -181,7 +181,7 @@ async fn get_open_subsonic_extensions_returns_the_entries_of_extensions() {
 
 #[tokio::test]
 async fn unknown_method_is_error_0_unknown_endpoint() {
-    let server = server();
+    let server = server().await;
     let response = server.get_json("nope", &[]).await;
     assert_eq!(response["status"], "failed");
     assert_eq!(response["error"], error_0("unknown endpoint"));
@@ -200,13 +200,13 @@ async fn unknown_method_is_error_0_unknown_endpoint() {
 
 #[tokio::test]
 async fn method_names_are_case_sensitive() {
-    let response = server().get_json("Ping", &[]).await;
+    let response = server().await.get_json("Ping", &[]).await;
     assert_eq!(response["error"], error_0("unknown endpoint"));
 }
 
 #[tokio::test]
 async fn listed_method_without_a_handler_is_error_0_not_supported() {
-    let server = server();
+    let server = server().await;
     let response = server.get_json("getPodcasts", &[]).await;
     assert_eq!(response["status"], "failed");
     assert_eq!(response["error"], error_0("not supported"));
@@ -219,7 +219,7 @@ async fn listed_method_without_a_handler_is_error_0_not_supported() {
 
 #[tokio::test]
 async fn deferred_methods_are_not_supported() {
-    let server = server();
+    let server = server().await;
     for method in NOT_SUPPORTED {
         let response = server.get_json(method, &[]).await;
         assert_eq!(response["status"], "failed", "{method}");
@@ -229,7 +229,7 @@ async fn deferred_methods_are_not_supported() {
 
 #[tokio::test]
 async fn every_listed_method_is_routed() {
-    let server = server();
+    let server = server().await;
     for (method, _) in METHODS {
         for name in [(*method).to_owned(), format!("{method}.view")] {
             // A routed method answers `ok`, or it fails for a reason of its
@@ -248,7 +248,7 @@ async fn every_listed_method_is_routed() {
 
 #[tokio::test]
 async fn system_methods_answer_ok() {
-    let server = server();
+    let server = server().await;
     for method in ["ping", "getLicense", "getOpenSubsonicExtensions"] {
         let response = server.get_json(method, &[]).await;
         assert_eq!(response["status"], "ok", "{method}");
@@ -257,7 +257,7 @@ async fn system_methods_answer_ok() {
 
 #[tokio::test]
 async fn path_outside_rest_is_http_404() {
-    let server = server();
+    let server = server().await;
     for path in [
         "/",
         "/?f=json",
@@ -276,7 +276,7 @@ async fn path_outside_rest_is_http_404() {
 
 #[tokio::test]
 async fn jsonp_format_is_error_0_in_xml() {
-    let server = server();
+    let server = server().await;
     let response = server
         .get_raw("ping", &[("f", "jsonp"), ("callback", "show")])
         .await;
@@ -296,7 +296,7 @@ async fn jsonp_format_is_error_0_in_xml() {
 
 #[tokio::test]
 async fn api_error_is_http_200() {
-    let server = server();
+    let server = server().await;
     for (method, params) in [
         ("nope", &[("f", "json")][..]),
         ("tokenInfo", &[]),
@@ -309,7 +309,7 @@ async fn api_error_is_http_200() {
 
 #[tokio::test]
 async fn post_with_a_form_body_selects_json() {
-    let response = server().post_form("ping", &[("f", "json")]).await;
+    let response = server().await.post_form("ping", &[("f", "json")]).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(content_type(&response), "application/json");
     assert_eq!(body_string(response).await, json_document("ok", ""));
@@ -317,7 +317,7 @@ async fn post_with_a_form_body_selects_json() {
 
 #[tokio::test]
 async fn post_without_a_format_answers_in_xml() {
-    let server = server();
+    let server = server().await;
     let response = server.post_form("ping.view", &[("c", "app")]).await;
     assert_eq!(content_type(&response), "application/xml");
     assert_eq!(body_string(response).await, xml_document("ok", "/>"));
@@ -334,7 +334,7 @@ async fn query_string_of_a_post_comes_before_the_form_body() {
         .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
         .body(Body::from("f=xml"))
         .expect("a request");
-    let response = server().request(request).await;
+    let response = server().await.request(request).await;
     assert_eq!(content_type(&response), "application/json");
 }
 
@@ -344,14 +344,14 @@ async fn post_body_that_is_not_a_form_is_not_read() {
         .header(header::CONTENT_TYPE, "text/plain")
         .body(Body::from("f=json"))
         .expect("a request");
-    let response = server().request(request).await;
+    let response = server().await.request(request).await;
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(content_type(&response), "application/xml");
 }
 
 #[tokio::test]
 async fn other_http_methods_are_http_405() {
-    let server = server();
+    let server = server().await;
     for method in ["PUT", "DELETE", "PATCH"] {
         let request = Request::builder()
             .method(method)
@@ -392,7 +392,10 @@ async fn request_log_names_method_client_user_and_status_without_the_query_strin
         ("s", "get-secret-salt"),
         ("apiKey", "get-secret-key"),
     ]);
-    let response = server().get_path(&format!("/rest/ping.view?{query}")).await;
+    let response = server()
+        .await
+        .get_path(&format!("/rest/ping.view?{query}"))
+        .await;
     assert_eq!(response.status(), StatusCode::OK);
 
     let line = finished_line("log-get-client");
@@ -408,6 +411,7 @@ async fn request_log_names_method_client_user_and_status_without_the_query_strin
 async fn request_log_names_client_and_user_of_a_form_body_without_the_body() {
     let log = captured_log();
     let response = server()
+        .await
         .post_form(
             "getLicense",
             &[
@@ -442,6 +446,7 @@ async fn request_log_cuts_method_client_and_user_to_64_characters() {
     let client = format!("log-cut-client-{}", "c".repeat(100));
     let user = format!("log-cut-user-{}", "u".repeat(100));
     let response = server()
+        .await
         .get_raw(
             &method,
             &[("c", client.as_str()), ("u", user.as_str()), ("f", "json")],
@@ -463,6 +468,7 @@ async fn request_log_cuts_method_client_and_user_to_64_characters() {
 async fn request_log_of_a_path_outside_rest_has_the_status_and_no_method() {
     let log = captured_log();
     let response = server()
+        .await
         .get_path("/log-outside-rest?p=outside-secret")
         .await;
     assert_eq!(response.status(), StatusCode::NOT_FOUND);
