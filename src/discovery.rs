@@ -27,18 +27,11 @@ use mdns_sd::{
 };
 use thiserror::Error;
 
-use crate::config::Config;
+use crate::config::{Config, LABEL_MAX_BYTES, host_label};
 
 /// The DNS-SD service type that the server registers and the mobile app
 /// browses.
 pub const SERVICE_TYPE: &str = "_waxnerd._tcp.local.";
-
-/// The longest DNS label, in bytes. The instance name is one label, and so is
-/// the host name without `.local.`.
-const LABEL_MAX_BYTES: usize = 63;
-
-/// The host label of a machine whose system host name is empty.
-const DEFAULT_HOST_LABEL: &str = "wn-server";
 
 /// The time the reporting thread waits for the first announcement. The daemon
 /// probes for its names for 750 ms to one second before it announces them
@@ -159,24 +152,15 @@ pub fn addresses(bind: IpAddr) -> Vec<IpAddr> {
     }
 }
 
-/// Returns the first label of the system host name `system_name`. The mDNS
-/// host name of the machine is that label followed by `.local.`.
-///
-/// The system host name is one label (`studio`), a name in the local domain
-/// (`studio.local`) or a fully qualified name (`studio.example.com`),
-/// depending on the OS and its setup. An empty first label becomes
-/// `wn-server`.
-fn host_label(system_name: &str) -> &str {
-    match system_name.split('.').next() {
-        Some(label) if !label.is_empty() => label,
-        _ => DEFAULT_HOST_LABEL,
-    }
-}
-
 /// Checks that `label` fits in one DNS label. `what` names the value in the
 /// error. `mdns-sd` accepts a longer name at registration and then leaves
 /// every record that holds it out of its packets, so the check runs before
 /// the registration.
+///
+/// `Config::load` rejects a `server.name` that is not 1 to 63 bytes long, so
+/// `run` does not get here with one. The check of the name stays for a
+/// `Config` that was not loaded from a file. The host label is checked here
+/// only.
 fn check_label(what: &'static str, label: &str) -> Result<(), DiscoveryError> {
     if label.is_empty() || label.len() > LABEL_MAX_BYTES {
         return Err(DiscoveryError::Label {
@@ -584,20 +568,6 @@ mod tests {
     fn a_loopback_bind_address_is_the_only_address() {
         for bind in ["127.0.0.1", "::1"] {
             assert_eq!(addresses(address(bind)), [address(bind)], "{bind}");
-        }
-    }
-
-    #[test]
-    fn host_label_is_the_first_label_of_the_system_host_name() {
-        for (system_name, label) in [
-            ("studio", "studio"),
-            ("studio.local", "studio"),
-            ("studio.example.com", "studio"),
-            ("Adnans-MacBook-Pro.local", "Adnans-MacBook-Pro"),
-            ("", "wn-server"),
-            (".local", "wn-server"),
-        ] {
-            assert_eq!(host_label(system_name), label, "{system_name:?}");
         }
     }
 

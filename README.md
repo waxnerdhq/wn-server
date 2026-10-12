@@ -79,7 +79,7 @@ The password is stored in plain text in `library.db`. Subsonic token authenticat
 |---|---|---|
 | `server.bind` | `"0.0.0.0"` | IP address the server listens on |
 | `server.port` | `4200` | TCP port; not 0 |
-| `server.name` | the host name | instance name shown by discovery |
+| `server.name` | the first label of the host name | instance name shown by discovery; 1 to 63 bytes |
 | `server.log_level` | `"info"` | log filter; `RUST_LOG` overrides it when set |
 | `auth.disabled_unsafe` | `false` | `true` turns authentication off; unsafe, see [Authentication](#authentication) |
 | `library.folders` | `[]` | music folders; at least one, and each is an existing directory |
@@ -92,6 +92,10 @@ The password is stored in plain text in `library.db`. Subsonic token authenticat
 | `discovery.mdns` | `true` | advertise the server over mDNS |
 
 The file is checked when a command loads it. An error names the key or the folder path.
+
+The default `server.name` is the first label of the system host name: `studio` when the host name is `studio.example.com`. It is cut to 63 bytes, and it is `wn-server` when that label is empty or the host name is not valid Unicode. `init` writes it to `config.toml`.
+
+`server.name` holds 1 to 63 bytes of UTF-8. A character outside ASCII takes 2 to 4 bytes. A command that loads the file fails when the name is empty or longer, and the error names `server.name` and the length of the name. Set `name` in the `[server]` table to a name within the limit, or remove the key to get the default. `wn-server config path` prints the path of the file.
 
 A folder path is written as a TOML literal string, in single quotes, so that a backslash in a Windows path is kept as written:
 
@@ -178,7 +182,7 @@ Every device on the network can read the record. It holds no password and no acc
 
 `id` identifies the server to clients. It stays the same across restarts and renames. `run` writes a new `instance.id` when the file is missing and `library.db` exists, and logs one warning. Clients then see a new server.
 
-The server runs without the advertisement when the advertisement cannot start, and logs one warning that names the cause: `instance.id` cannot be read or does not hold a UUID, `server.name` is empty or longer than 63 bytes, or nothing was announced within 10 seconds. `RUST_LOG=info,mdns_sd=debug` shows the messages of the mDNS responder.
+The server runs without the advertisement when the advertisement cannot start, and logs one warning that names the cause: `instance.id` cannot be read or does not hold a UUID, the first label of the system host name is longer than 63 bytes, or nothing was announced within 10 seconds. `RUST_LOG=info,mdns_sd=debug` shows the messages of the mDNS responder.
 
 Ctrl-C withdraws the advertisement. On macOS, `dns-sd -B _waxnerd._tcp` lists the servers on the network.
 

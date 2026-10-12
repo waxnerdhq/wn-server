@@ -26,6 +26,15 @@ const BITRATE_KBPS: RangeInclusive<u32> = 32..=320;
 /// The column at which a comment starts in the file `init` writes.
 const COMMENT_COLUMN: usize = 32;
 
+/// The longest DNS label, in bytes. `server.name` is one label, because it is
+/// the DNS-SD instance name, and so is the host name without `.local.`.
+pub(crate) const LABEL_MAX_BYTES: usize = 63;
+
+/// The label that stands in for an empty first label of the system host
+/// name. It is also the default `server.name` of a machine whose host name is
+/// not valid Unicode.
+const DEFAULT_HOST_LABEL: &str = "wn-server";
+
 /// A config or data directory that cannot be used.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -89,7 +98,7 @@ pub struct Server {
     pub bind: IpAddr,
     /// The TCP port of the HTTP listener.
     pub port: u16,
-    /// The instance name that discovery shows.
+    /// The instance name that discovery shows: 1 to 63 bytes.
     pub name: String,
     /// The log filter. `RUST_LOG` overrides it when set.
     pub log_level: String,
@@ -150,7 +159,7 @@ impl Default for Server {
         Self {
             bind: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             port: DEFAULT_PORT,
-            name: host_name(),
+            name: default_name(gethostname::gethostname().to_str()),
             log_level: "info".to_owned(),
         }
     }
@@ -209,9 +218,10 @@ impl Config {
     }
 
     /// Checks the rules a usable config meets: at least one folder, each
-    /// folder is an existing directory, the port is not 0, at least one
-    /// transcode may run, and both bitrates are within 32 to 320 kbps. The
-    /// error names the key or the folder path of the first rule that fails.
+    /// folder is an existing directory, the port is not 0, the name is 1 to
+    /// 63 bytes long, at least one transcode may run, and both bitrates are
+    /// within 32 to 320 kbps. The error names the key or the folder path of
+    /// the first rule that fails.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.library.folders.is_empty() {
             return Err(ConfigError::NoFolders);
@@ -223,6 +233,17 @@ impl Config {
             return Err(ConfigError::Invalid {
                 key: "server.port",
                 reason: "must not be 0".to_owned(),
+            });
+        }
+        let name_bytes = self.server.name.len();
+        if name_bytes == 0 || name_bytes > LABEL_MAX_BYTES {
+            return Err(ConfigError::Invalid {
+                key: "server.name",
+                reason: format!(
+                    "the name is {name_bytes} bytes long; set `name` in the `[server]` table \
+                     of config.toml to a name of 1 to {LABEL_MAX_BYTES} bytes \
+                     (`wn-server config path` prints the path of the file)"
+                ),
             });
         }
         if self.transcoding.max_concurrent == 0 {
@@ -402,14 +423,28 @@ fn path_value(path: &Path) -> Result<String, ConfigError> {
     }
 }
 
-/// The host name, which is the default instance name.
-fn host_name() -> String {
-    let name = gethostname::gethostname().to_string_lossy().into_owned();
-    if name.is_empty() {
-        "wn-server".to_owned()
-    } else {
-        name
+/// Returns the first label of the system host name `system_name`. The mDNS
+/// host name of the machine is that label followed by `.local.`.
+///
+/// The system host name is one label (`studio`), a name in the local domain
+/// (`studio.local`) or a fully qualified name (`studio.example.com`),
+/// depending on the OS and its setup. An empty first label becomes
+/// `wn-server`.
+pub(crate) fn host_label(system_name: &str) -> &str {
+    match system_name.split('.').next() {
+        Some(label) if !label.is_empty() => label,
+        _ => DEFAULT_HOST_LABEL,
     }
+}
+
+/// Returns the default `server.name` of a machine whose system host name is
+/// `system_name`: the first label of that name, cut to 63 bytes at a
+/// character boundary. `None` is a host name that is not valid Unicode. It
+/// gives `wn-server`, as an empty first label does. The result is 1 to 63
+/// bytes long, so it passes [`Config::validate`].
+fn default_name(system_name: Option<&str>) -> String {
+    let label = host_label(system_name.unwrap_or_default());
+    label[..label.floor_char_boundary(LABEL_MAX_BYTES)].to_owned()
 }
 
 /// Makes `path` absolute without resolving symlinks. On Windows the result has
@@ -557,9 +592,11 @@ mod tests {
         assert_eq!(config.server.port, 4200);
         assert_eq!(
             config.server.name,
-            gethostname::gethostname().to_string_lossy()
+            default_name(gethostname::gethostname().to_str())
         );
         assert!(!config.server.name.is_empty());
+        assert!(config.server.name.len() <= 63, "{}", config.server.name);
+        assert!(!config.server.name.contains('.'), "{}", config.server.name);
         assert_eq!(config.server.log_level, "info");
         assert!(!config.auth.disabled_unsafe);
         assert!(config.library.folders.is_empty());
@@ -572,6 +609,93 @@ mod tests {
         assert_eq!(config.transcoding.mp3_bitrate_kbps, 320);
         assert_eq!(config.transcoding.permit_wait_ms, 5000);
         assert!(config.discovery.mdns);
+    }
+
+    #[test]
+    fn host_label_is_the_first_label_of_the_system_host_name() {
+        for (system_name, label) in [
+            ("studio", "studio"),
+            ("studio.local", "studio"),
+            ("studio.example.com", "studio"),
+            ("Adnans-MacBook-Pro.local", "Adnans-MacBook-Pro"),
+            ("", "wn-server"),
+            (".local", "wn-server"),
+        ] {
+            assert_eq!(host_label(system_name), label, "{system_name:?}");
+        }
+    }
+
+    #[test]
+    fn default_name_is_the_first_label_of_the_host_name() {
+        for (system_name, name) in [
+            ("studio", "studio"),
+            ("studio.local", "studio"),
+            ("studio.example.com", "studio"),
+            ("Adnans-MacBook-Pro.local", "Adnans-MacBook-Pro"),
+            ("Büro.local", "Büro"),
+        ] {
+            assert_eq!(default_name(Some(system_name)), name, "{system_name:?}");
+        }
+    }
+
+    #[test]
+    fn default_name_of_an_empty_or_non_unicode_host_name_is_wn_server() {
+        // `None` is a host name that is not valid Unicode.
+        for system_name in [Some(""), Some("."), Some(".local"), None] {
+            assert_eq!(default_name(system_name), "wn-server", "{system_name:?}");
+        }
+    }
+
+    #[test]
+    fn default_name_is_cut_to_63_bytes() {
+        for bytes in [63, 64, 255] {
+            let system_name = "h".repeat(bytes);
+            assert_eq!(default_name(Some(&system_name)), "h".repeat(63), "{bytes}");
+        }
+        // The first label is cut, and the labels after it do not count.
+        let long_first_label = format!("{}.example.com", "h".repeat(70));
+        assert_eq!(default_name(Some(&long_first_label)), "h".repeat(63));
+        let long_second_label = format!("studio.{}.example.com", "d".repeat(70));
+        assert_eq!(default_name(Some(&long_second_label)), "studio");
+    }
+
+    #[test]
+    fn default_name_is_cut_at_a_character_boundary() {
+        // `é` is 2 bytes, `音` is 3 bytes and U+1D11E is 4 bytes.
+        for (system_name, name) in [
+            // Byte 63 is a boundary: 21 characters of 3 bytes are kept.
+            ("音".repeat(22), "音".repeat(21)),
+            // Byte 63 is inside a character, which is left out: 61, 62, 62
+            // and 60 bytes are kept.
+            (
+                format!("a{}", "音".repeat(21)),
+                format!("a{}", "音".repeat(20)),
+            ),
+            (
+                format!("ab{}", "音".repeat(21)),
+                format!("ab{}", "音".repeat(20)),
+            ),
+            ("é".repeat(32), "é".repeat(31)),
+            ("\u{1d11e}".repeat(16), "\u{1d11e}".repeat(15)),
+        ] {
+            assert!(name.len() <= 63, "{name}");
+            assert_eq!(default_name(Some(&system_name)), name, "{system_name}");
+        }
+    }
+
+    #[test]
+    fn a_template_with_the_default_name_of_a_long_host_name_loads() {
+        let music = tempfile::tempdir().expect("temp dir");
+        for system_name in [
+            "h".repeat(255),
+            format!("a{}", "音".repeat(84)),
+            format!("{}.example.com", "\u{1d11e}".repeat(16)),
+        ] {
+            let mut config = valid_config(music.path());
+            config.server.name = default_name(Some(&system_name));
+            let (_dir, path) = config_file(&config.render(true).expect("render"));
+            assert_eq!(Config::load(&path).expect("load"), config, "{system_name}");
+        }
     }
 
     #[test]
@@ -874,6 +998,21 @@ mdns = true
     }
 
     #[test]
+    fn validate_limits_the_server_name_to_1_to_63_bytes() {
+        let music = tempfile::tempdir().expect("temp dir");
+        let mut config = valid_config(music.path());
+        // 22 characters of 3 bytes are 66 bytes.
+        for name in [String::new(), "n".repeat(64), "音".repeat(22)] {
+            config.server.name = name;
+            assert_eq!(invalid_key(&config), "server.name");
+        }
+        for name in ["n".to_owned(), "n".repeat(63), "音".repeat(21)] {
+            config.server.name = name;
+            config.validate().expect("a name of 1 to 63 bytes is valid");
+        }
+    }
+
+    #[test]
     fn validate_rejects_zero_concurrent_transcodes() {
         let music = tempfile::tempdir().expect("temp dir");
         let mut config = valid_config(music.path());
@@ -920,6 +1059,26 @@ mdns = true
         ));
         let error = Config::load(&path).expect_err("port 0");
         assert_eq!(error.to_string(), "server.port: must not be 0");
+    }
+
+    #[test]
+    fn load_reports_a_server_name_that_is_not_1_to_63_bytes_long() {
+        let music = tempfile::tempdir().expect("temp dir");
+        for (name, bytes) in [(String::new(), 0), ("n".repeat(64), 64)] {
+            let (_dir, path) = config_file(&format!(
+                "[server]\nname = \"{name}\"\n\n[library]\nfolders = ['{}']\n",
+                music.path().display()
+            ));
+            let error = Config::load(&path).expect_err("a name outside 1 to 63 bytes");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "server.name: the name is {bytes} bytes long; set `name` in the `[server]` \
+                     table of config.toml to a name of 1 to 63 bytes (`wn-server config path` \
+                     prints the path of the file)"
+                )
+            );
+        }
     }
 
     #[test]

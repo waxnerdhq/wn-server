@@ -204,6 +204,11 @@ fn init_writes_a_config_that_loads() {
     let mut expected = Config::default();
     expected.library.folders = vec![music.path().to_path_buf()];
     assert_eq!(config, expected);
+    // The name is the first label of the host name of this machine, or
+    // `wn-server`.
+    let name = &config.server.name;
+    assert!((1..=63).contains(&name.len()), "{name}");
+    assert!(!name.contains('.'), "{name}");
 }
 
 #[test]
@@ -1316,6 +1321,39 @@ fn config_show_rejects_port_zero() {
         "{}",
         stderr(&output)
     );
+}
+
+#[test]
+fn a_server_name_that_is_not_1_to_63_bytes_long_fails_the_commands_that_load_the_config() {
+    let music = temp_dir();
+    for (name, bytes) in [(String::new(), 0), ("n".repeat(64), 64)] {
+        let dir = temp_dir();
+        fs::write(
+            dir.path().join("config.toml"),
+            format!(
+                "[server]\nname = \"{name}\"\n\n[library]\nfolders = ['{}']\n",
+                music.path().display()
+            ),
+        )
+        .expect("write config");
+
+        // `run` fails when it loads the config, before it opens the database
+        // or a socket.
+        for command in [&["config", "show"][..], &["run"]] {
+            let output = run(binary().args(command).arg("--data-dir").arg(dir.path()));
+            assert_eq!(output.status.code(), Some(1), "{command:?}");
+            assert!(stdout(&output).is_empty(), "{command:?}");
+            assert_eq!(
+                stderr(&output),
+                format!(
+                    "wn-server: server.name: the name is {bytes} bytes long; set `name` in the \
+                     `[server]` table of config.toml to a name of 1 to 63 bytes (`wn-server \
+                     config path` prints the path of the file)\n"
+                ),
+                "{command:?}"
+            );
+        }
+    }
 }
 
 #[test]
