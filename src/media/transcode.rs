@@ -1884,7 +1884,6 @@ mod tests {
         assert!(waited.is_some(), "the process was not waited for");
     }
 
-    /// The directory of the committed audio fixtures.
     #[tokio::test]
     async fn transcoder_without_a_program_is_unavailable_and_starts_no_process() {
         // The program is the test binary, which runs. A transcoder that
@@ -1913,6 +1912,7 @@ mod tests {
         }
     }
 
+    /// The directory of the committed audio fixtures.
     fn fixtures() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
