@@ -2058,7 +2058,9 @@ mod links {
         let before = scanned.env.index();
 
         // While a directory with an ordinary name cannot be listed, the scan
-        // deletes no row: the files may be in that directory.
+        // deletes no row: the files may be in that directory. A process
+        // that runs as root lists the directory, so this part checks nothing
+        // for it.
         let audio = scanned.path(LOW_TIDE);
         if let Some(private) = Unlistable::new(scanned.path("Private"), &audio) {
             let summary = scanned.rescan();
@@ -2079,8 +2081,11 @@ mod links {
                 );
             }
             drop(private);
-            fs::remove_dir_all(scanned.path("Private")).unwrap();
         }
+        // The directory and the file in it are there in both cases, also
+        // for a process that lists the directory. They go before the next
+        // scan, which would give the file a row.
+        fs::remove_dir_all(scanned.path("Private")).unwrap();
 
         // The scan that reads everything deletes the three rows with what
         // is attached to them, and the album and the artist that have no
