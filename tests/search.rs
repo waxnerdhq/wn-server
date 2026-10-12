@@ -9,17 +9,17 @@ use std::path::PathBuf;
 use axum::http::StatusCode;
 use rusqlite::params;
 use serde_json::{Value, json};
-use wn_server::VERSION;
 use wn_server::api::{self, model, xml};
 use wn_server::config::Config;
 use wn_server::db::queries::tracks::{self, TrackContent};
 use wn_server::db::queries::{albums, artists, folders};
-use wn_server::db::{self, Db};
+use wn_server::db::{self};
 use wn_server::library::tags::TrackMeta;
 
 use common::{
-    Catalogue, LibraryBuilder, OWNER, StandardServer, TestServer, body_string, content_type,
-    subsonic_response,
+    Catalogue, LibraryBuilder, OWNER, StandardServer, TestServer, body_string, child_names,
+    content_type, error, first_element, json_ok, remove_file, schema_names, subsonic_response,
+    to_json, xml_failed, xml_ok,
 };
 
 /// The two methods that search the library, each with the key of its answer.
@@ -59,55 +59,12 @@ const QUERY_TOO_LONG: &str = "parameter query must be at most 1024 characters";
 /// The message of the error for a query of too many terms.
 const TOO_MANY_TERMS: &str = "parameter query must have at most 32 terms";
 
-/// The `error` object with `code` and `message`.
-fn error(code: u32, message: &str) -> Value {
-    json!({ "code": code, "message": message })
-}
-
 /// The error 0 for a count or an offset that is not a number from 0 to
 /// 4294967295.
 fn not_a_number(name: &str) -> Value {
     error(
         0,
         &format!("parameter {name} must be an integer from 0 to 4294967295"),
-    )
-}
-
-/// The XML body with the status `status` whose root element holds `rest`.
-fn xml_envelope(status: &str, rest: &str) -> String {
-    format!(
-        concat!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>"#,
-            r#"<subsonic-response xmlns="http://subsonic.org/restapi" status="{}""#,
-            r#" version="1.16.1" type="wn-server" serverVersion="{}" openSubsonic="true">"#,
-            "{}</subsonic-response>"
-        ),
-        status, VERSION, rest
-    )
-}
-
-/// The XML body of a successful response whose root element holds `rest`.
-fn xml_document(rest: &str) -> String {
-    xml_envelope("ok", rest)
-}
-
-/// The XML body of the error with `code` and `message`.
-fn xml_error(code: u32, message: &str) -> String {
-    xml_envelope(
-        "failed",
-        &format!(r#"<error code="{code}" message="{message}"/>"#),
-    )
-}
-
-/// The JSON body of a successful response whose response object holds `rest`
-/// after the fields of the envelope.
-fn json_document(rest: &str) -> String {
-    format!(
-        concat!(
-            r#"{{"subsonic-response":{{"status":"ok","version":"1.16.1","type":"wn-server","#,
-            r#""serverVersion":"{}","openSubsonic":true,{}}}}}"#
-        ),
-        VERSION, rest
     )
 }
 
@@ -121,41 +78,6 @@ fn element_content<'a>(xml: &'a str, name: &str) -> &'a str {
         .split_once(&format!("</{name}>"))
         .unwrap_or_else(|| panic!("no </{name}> in {xml}"));
     content
-}
-
-/// The names of the child elements of the element `parent` of the XML
-/// document `xml`, in the order of the document. Every child element must be
-/// an empty element, as an item of a list of a search result is.
-fn child_names<'a>(xml: &'a str, parent: &str) -> Vec<&'a str> {
-    element_content(xml, parent)
-        .split('<')
-        .skip(1)
-        .map(|element| {
-            assert!(element.ends_with("/>"), "<{element} has content: {xml}");
-            element
-                .split([' ', '/'])
-                .next()
-                .expect("a split has a first part")
-        })
-        .collect()
-}
-
-/// The names of `artists` elements `artist`, `albums` elements `album` and
-/// `songs` elements `song`, in the order of the Subsonic schema.
-fn schema_names(artists: usize, albums: usize, songs: usize) -> Vec<&'static str> {
-    [("artist", artists), ("album", albums), ("song", songs)]
-        .into_iter()
-        .flat_map(|(name, count)| std::iter::repeat_n(name, count))
-        .collect()
-}
-
-/// The position of the first element `name` in the XML document `xml`.
-fn first_element(xml: &str, name: &str) -> Option<usize> {
-    xml.find(&format!("<{name} "))
-}
-
-fn to_json(model: impl serde::Serialize) -> Value {
-    serde_json::to_value(model).expect("the model serialises")
 }
 
 /// The values of `field` of the items of `list`, in the order of the list.
@@ -350,25 +272,6 @@ async fn server_with(
         .await
         .expect("store the library");
     server
-}
-
-/// Gives the track `id` its placeholder path, as the scanner does for a
-/// track that it keeps without a file.
-async fn remove_file(db: &Db, id: &str) {
-    let id = id.to_owned();
-    db.write(move |conn| {
-        let track = tracks::get_track(conn, &id)?.expect("the track exists");
-        tracks::relink_track(
-            conn,
-            &id,
-            track.folder_id,
-            &tracks::placeholder_path(&id),
-            track.mtime,
-            track.size,
-        )
-    })
-    .await
-    .expect("give the track a placeholder path");
 }
 
 #[tokio::test]
@@ -958,7 +861,7 @@ async fn hostile_query_is_text_and_changes_nothing() {
             // XML as well: the body is a well-formed empty result.
             assert_eq!(
                 server.get_xml(method, &[("query", query)]).await,
-                xml_document(&format!("<{key}/>")),
+                xml_ok(&format!("<{key}/>")),
                 "{method} {query:?}"
             );
         }
@@ -1427,7 +1330,7 @@ async fn query_of_more_than_32_terms_is_error_0() {
             assert!(response.get(key).is_none(), "{method}");
             assert_eq!(
                 server.get_xml(method, &[("query", &query)]).await,
-                xml_error(0, TOO_MANY_TERMS),
+                xml_failed(0, TOO_MANY_TERMS),
                 "{method}"
             );
         }
@@ -1450,7 +1353,7 @@ async fn query_is_required_and_may_be_empty() {
         }
         assert_eq!(
             server.get_xml(method, &[]).await,
-            xml_error(10, "required parameter is missing: query"),
+            xml_failed(10, "required parameter is missing: query"),
             "{method}"
         );
 
@@ -1631,9 +1534,9 @@ async fn track_without_a_file_is_listed_without_a_path_and_is_in_no_folder() {
     let folder = server.folder_id.to_string();
     // The two tracks of "Slow Rivers" and one of the two tracks of "Summer
     // Sampler" lose their files.
-    remove_file(server.db(), &server.track.upstream).await;
-    remove_file(server.db(), &server.track.delta).await;
-    remove_file(server.db(), &server.track.open_road).await;
+    remove_file(&server, &server.track.upstream).await;
+    remove_file(&server, &server.track.delta).await;
+    remove_file(&server, &server.track.open_road).await;
 
     for (method, key) in METHODS {
         // Every row is a match as before.
@@ -1817,7 +1720,7 @@ async fn search3_in_xml_has_the_elements_of_the_subsonic_schema() {
         .await;
     assert_eq!(
         xml,
-        xml_document(&format!("<searchResult3>{artist}</searchResult3>"))
+        xml_ok(&format!("<searchResult3>{artist}</searchResult3>"))
     );
 
     let catalogue = server.catalogue().await;
@@ -1838,7 +1741,7 @@ async fn search3_in_xml_has_the_elements_of_the_subsonic_schema() {
         .await;
     assert_eq!(
         xml,
-        xml_document(&format!("<searchResult3>{album}</searchResult3>"))
+        xml_ok(&format!("<searchResult3>{album}</searchResult3>"))
     );
 
     let created = model::iso8601(catalogue.song("Legend").track.created_at);
@@ -1875,7 +1778,7 @@ async fn search3_in_xml_has_the_elements_of_the_subsonic_schema() {
         .await;
     assert_eq!(
         xml,
-        xml_document(&format!("<searchResult3>{song}</searchResult3>"))
+        xml_ok(&format!("<searchResult3>{song}</searchResult3>"))
     );
 
     // The three lists in one document, in the order of the Subsonic schema:
@@ -1896,7 +1799,7 @@ async fn search3_in_xml_has_the_elements_of_the_subsonic_schema() {
         .await;
     assert_eq!(
         xml,
-        xml_document(&format!(
+        xml_ok(&format!(
             "<searchResult3>{artist}{album}{song}</searchResult3>"
         ))
     );
@@ -1904,7 +1807,7 @@ async fn search3_in_xml_has_the_elements_of_the_subsonic_schema() {
     // Every match of `aurora`: one `artist`, then two `album`, then seven
     // `song` elements inside `searchResult3`.
     let xml = server.get_xml("search3", &[("query", "aurora")]).await;
-    let start = xml_document("<searchResult3>");
+    let start = xml_ok("<searchResult3>");
     let start = start.trim_end_matches("</subsonic-response>");
     assert!(xml.starts_with(start), "{xml}");
     assert!(
@@ -1920,7 +1823,7 @@ async fn search3_in_xml_has_the_elements_of_the_subsonic_schema() {
     // No match: an empty element.
     assert_eq!(
         server.get_xml("search3", &[("query", "zzz")]).await,
-        xml_document("<searchResult3/>")
+        xml_ok("<searchResult3/>")
     );
 }
 
@@ -1938,7 +1841,7 @@ async fn search2_in_xml_has_the_elements_of_the_subsonic_schema() {
         .await;
     assert_eq!(
         xml,
-        xml_document(&format!("<searchResult2>{artist}</searchResult2>"))
+        xml_ok(&format!("<searchResult2>{artist}</searchResult2>"))
     );
 
     let catalogue = server.catalogue().await;
@@ -1962,7 +1865,7 @@ async fn search2_in_xml_has_the_elements_of_the_subsonic_schema() {
         .await;
     assert_eq!(
         xml,
-        xml_document(&format!("<searchResult2>{album}</searchResult2>"))
+        xml_ok(&format!("<searchResult2>{album}</searchResult2>"))
     );
 
     // A song is the same element as in `search3`.
@@ -2000,13 +1903,13 @@ async fn search2_in_xml_has_the_elements_of_the_subsonic_schema() {
         .await;
     assert_eq!(
         xml,
-        xml_document(&format!(
+        xml_ok(&format!(
             "<searchResult2>{artist}{album}{song}</searchResult2>"
         ))
     );
     assert_eq!(
         server.get_xml("search2", &[("query", "zzz")]).await,
-        xml_document("<searchResult2/>")
+        xml_ok("<searchResult2/>")
     );
 }
 
@@ -2098,7 +2001,7 @@ async fn json_documents_keep_the_byte_order_of_their_keys() {
         // No match: the whole document as text.
         assert_eq!(
             body(method, "zzz").await,
-            json_document(&format!(r#""{key}":{{"album":[],"artist":[],"song":[]}}"#)),
+            json_ok(&format!(r#""{key}":{{"album":[],"artist":[],"song":[]}}"#)),
             "{method}"
         );
 
@@ -2110,11 +2013,7 @@ async fn json_documents_keep_the_byte_order_of_their_keys() {
             whole_result2(&catalogue)
         };
         let text = body(method, "").await;
-        assert_eq!(
-            text,
-            json_document(&format!(r#""{key}":{whole}"#)),
-            "{method}"
-        );
+        assert_eq!(text, json_ok(&format!(r#""{key}":{whole}"#)), "{method}");
         let list = |name: &str| text.find(&format!(r#""{name}":["#));
         let (album, artist, song) = (list("album"), list("artist"), list("song"));
         assert!(album.is_some(), "{method}: {text}");
@@ -2178,7 +2077,7 @@ async fn search_is_deprecated_and_answers_error_0() {
         }
         assert_eq!(
             server.get_xml(name, &[("any", "glass")]).await,
-            xml_error(0, "deprecated; use search3"),
+            xml_failed(0, "deprecated; use search3"),
             "{name}"
         );
         let response = server

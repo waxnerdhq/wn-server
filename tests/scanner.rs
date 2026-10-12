@@ -22,11 +22,15 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
 use common::{
-    ATTACHED, LibraryBuilder, TestLibrary, attached_rows, dump_of, forbid_writes, without_scans,
+    ATTACHED, LibraryBuilder, TestLibrary, attached_rows, dump_of, forbid_writes, mtime,
+    set_modified, wav, without_scans,
 };
+// File modes exist on Unix only, and so does the helper that sets them.
+#[cfg(unix)]
+use common::set_mode;
 use lofty::config::WriteOptions;
 use lofty::file::TaggedFileExt;
 use lofty::tag::{ItemKey, TagExt};
@@ -214,33 +218,18 @@ fn seen(seen: u64) -> ScanSummary {
     ScanSummary { seen, ..standard() }
 }
 
-/// Returns the modification time of a file in Unix seconds.
-fn mtime(path: &Path) -> i64 {
-    let modified = fs::metadata(path).unwrap().modified().unwrap();
-    i64::try_from(modified.duration_since(UNIX_EPOCH).unwrap().as_secs()).unwrap()
-}
-
-fn set_mtime(path: &Path, time: SystemTime) {
-    let file = fs::File::options()
-        .write(true)
-        .open(path)
-        .unwrap_or_else(|error| panic!("open {}: {error}", path.display()));
-    file.set_modified(time)
-        .unwrap_or_else(|error| panic!("set the time of {}: {error}", path.display()));
-}
-
 /// Moves the modification time of a file `seconds` into the future, so that
 /// the scanner sees a change.
 fn shift_mtime(path: &Path, seconds: u64) {
     let modified = fs::metadata(path).unwrap().modified().unwrap();
-    set_mtime(path, modified + Duration::from_secs(seconds));
+    set_modified(path, modified + Duration::from_secs(seconds));
 }
 
 /// Copies a file with its modification time, as `cp -p` does.
 fn copy_with_mtime(from: &Path, to: &Path) {
     fs::create_dir_all(to.parent().unwrap()).unwrap();
     fs::copy(from, to).unwrap_or_else(|error| panic!("copy to {}: {error}", to.display()));
-    set_mtime(to, fs::metadata(from).unwrap().modified().unwrap());
+    set_modified(to, fs::metadata(from).unwrap().modified().unwrap());
 }
 
 /// Moves a file and creates the directory it moves to.
@@ -1027,34 +1016,6 @@ fn a_retag_and_a_move_in_one_interval_make_a_new_track() {
     assert_ne!(scanned.id_at(to), id);
 }
 
-/// Returns a WAV file with `data_len` bytes of samples: mono, 8 kHz, 16-bit
-/// PCM. The samples are a fixed sequence in which no 64 KiB window repeats.
-fn wav(data_len: u32) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend(b"RIFF");
-    bytes.extend((36 + data_len).to_le_bytes());
-    bytes.extend(b"WAVEfmt ");
-    bytes.extend(16u32.to_le_bytes());
-    bytes.extend(1u16.to_le_bytes()); // PCM
-    bytes.extend(1u16.to_le_bytes()); // channels
-    bytes.extend(8000u32.to_le_bytes()); // sample rate
-    bytes.extend(16000u32.to_le_bytes()); // bytes per second
-    bytes.extend(2u16.to_le_bytes()); // bytes per frame
-    bytes.extend(16u16.to_le_bytes()); // bits per sample
-    bytes.extend(b"data");
-    bytes.extend(data_len.to_le_bytes());
-    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
-    let end = bytes.len() + data_len as usize;
-    while bytes.len() < end {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        bytes.extend(state.to_le_bytes());
-    }
-    bytes.truncate(end);
-    bytes
-}
-
 #[test]
 fn a_file_larger_than_128_kib_is_identified_by_its_first_and_last_64_kib() {
     const WINDOW: usize = 64 * 1024;
@@ -1084,7 +1045,7 @@ fn a_file_larger_than_128_kib_is_identified_by_its_first_and_last_64_kib() {
     // the file is the same track with other content.
     bytes[WINDOW + 1000] ^= 0xff;
     fs::write(root.join(from), &bytes).unwrap();
-    set_mtime(
+    set_modified(
         &root.join(from),
         UNIX_EPOCH + Duration::from_secs(u64::try_from(track.mtime).unwrap() + 5),
     );
@@ -2406,15 +2367,6 @@ mod links {
     }
 }
 
-/// Sets the permission bits of a file.
-#[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-        .unwrap_or_else(|error| panic!("set the mode of {}: {error}", path.display()));
-}
-
 /// Takes the read permission from a file. Returns whether the process can
 /// still open it, which is the case for a process that runs as root. A test
 /// of an unreadable file then has nothing to check.
@@ -3260,7 +3212,7 @@ fn retag(path: &Path, changes: &[(ItemKey, Option<&str>)]) {
     }
     tag.save_to_path(path, WriteOptions::default())
         .unwrap_or_else(|error| panic!("write the tag of {}: {error}", path.display()));
-    set_mtime(path, before + Duration::from_secs(5));
+    set_modified(path, before + Duration::from_secs(5));
 }
 
 /// Gives the item `id` what a user attaches to an album or an artist: a
@@ -4970,7 +4922,7 @@ fn replacing_the_cover_file_changes_the_cover_time_and_removes_the_resized_cover
     // The cover file is replaced by a newer file. No track changes.
     let cover = below(scanned.root(), "Aurora Field/Glass Harbour/cover.jpg");
     fs::write(&cover, b"another image").unwrap();
-    set_mtime(
+    set_modified(
         &cover,
         UNIX_EPOCH + Duration::from_secs(u64::try_from(old_mtime).unwrap() + 10),
     );
@@ -5028,7 +4980,7 @@ fn a_cover_file_that_is_removed_or_added_changes_the_cover_and_removes_the_resiz
     // so the name of a resized cover would stay the same.
     let folder_png = below(scanned.root(), "Marlow Quartet/Slow Rivers/Folder.PNG");
     fs::write(&folder_png, b"image").unwrap();
-    set_mtime(
+    set_modified(
         &folder_png,
         UNIX_EPOCH + Duration::from_secs(u64::try_from(embedded.cover_mtime.unwrap()).unwrap()),
     );
@@ -5103,7 +5055,7 @@ fn an_album_that_gets_a_cover_loses_the_resized_covers_that_an_earlier_scan_left
     // Another image with the modification time of the old one is the cover
     // file. Its resized cover has the name of the file in the cache.
     fs::write(&cover, b"another image").unwrap();
-    set_mtime(
+    set_modified(
         &cover,
         UNIX_EPOCH + Duration::from_secs(u64::try_from(old_mtime).unwrap()),
     );
@@ -5529,7 +5481,7 @@ fn a_cover_file_of_the_parent_directory_that_is_replaced_or_removed_changes_the_
 
     // The file is replaced by a newer file. No track changes.
     fs::write(&cover, b"another image").unwrap();
-    set_mtime(
+    set_modified(
         &cover,
         UNIX_EPOCH + Duration::from_secs(u64::try_from(old_mtime).unwrap() + 10),
     );

@@ -10,14 +10,14 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode, header};
 use rusqlite::params;
 use serde_json::{Value, json};
-use wn_server::VERSION;
 use wn_server::config::Config;
 use wn_server::db::queries::folders;
 use wn_server::ids::{self, Kind};
 
 use common::{
-    LibraryBuilder, OWNER, OWNER_PASSWORD, TestLibrary, TestServer, body_string, content_type,
-    form_request, token, urlencode,
+    LibraryBuilder, OWNER, OWNER_PASSWORD, TestLibrary, TestServer, body_string,
+    config_without_auth, content_type, form_request, json_document, server, token, urlencode,
+    xml_document,
 };
 
 /// Parameters of a request: names and values.
@@ -187,43 +187,6 @@ fn request(transport: Transport, name: &str, params: Pairs<'_>) -> Request<Body>
         Transport::PostForm => return form_request(&path, params),
     };
     request.expect("a request")
-}
-
-/// The JSON body that has `status` and then `rest`. `rest` is the text that
-/// follows the envelope fields inside the response object.
-fn json_document(status: &str, rest: &str) -> String {
-    format!(
-        concat!(
-            r#"{{"subsonic-response":{{"status":"{}","version":"1.16.1","type":"wn-server","#,
-            r#""serverVersion":"{}","openSubsonic":true{}}}}}"#
-        ),
-        status, VERSION, rest
-    )
-}
-
-/// The XML body that has `status` and then `rest`. `rest` is the text that
-/// follows the last attribute of the root element.
-fn xml_document(status: &str, rest: &str) -> String {
-    format!(
-        concat!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>"#,
-            r#"<subsonic-response xmlns="http://subsonic.org/restapi" status="{}""#,
-            r#" version="1.16.1" type="wn-server" serverVersion="{}" openSubsonic="true"{}"#
-        ),
-        status, VERSION, rest
-    )
-}
-
-/// A server that authenticates.
-async fn server() -> TestServer {
-    TestServer::bare(Config::default()).await
-}
-
-/// The config with `auth.disabled_unsafe = true`.
-fn config_without_auth() -> Config {
-    let mut config = Config::default();
-    config.auth.disabled_unsafe = true;
-    config
 }
 
 /// The methods of `docs/design.md` section 4 whose status is one of

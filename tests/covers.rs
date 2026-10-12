@@ -13,9 +13,12 @@ mod common;
 use std::fs;
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, UNIX_EPOCH};
 
-use common::{LibraryBuilder, PICTURE_PNG, TestLibrary, captured_log};
+use common::{
+    LibraryBuilder, PICTURE_PNG, TestLibrary, captured_log, file, mtime, set_modified,
+    with_orientation,
+};
 use image::{ImageFormat, Rgb, RgbImage};
 use lofty::config::WriteOptions;
 use lofty::file::TaggedFileExt;
@@ -134,38 +137,12 @@ impl Scanned {
     }
 }
 
-/// Returns the path of the file `name` in the directory of the album `album`
-/// of `artist` in `library`.
-fn file(library: &TestLibrary, artist: &str, album: &str, name: &str) -> PathBuf {
-    library.root.path().join(artist).join(album).join(name)
-}
-
 /// Writes an image of `width` × `height` pixels to `path`. The extension of
 /// the path selects the encoding.
 fn write_image(path: &Path, width: u32, height: u32) {
     RgbImage::from_fn(width, height, |x, y| Rgb([x as u8, y as u8, 128]))
         .save(path)
         .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
-}
-
-/// Returns the JPEG file `jpeg` with Exif metadata that declares
-/// `orientation`, a value from 1 to 8. The metadata is an APP1 segment after
-/// the start marker of the file. It holds `Exif`, two zero bytes and the
-/// Exif data: the byte order of Intel, the offset of the first directory,
-/// and that directory with one entry, which has the tag 0x0112, the format
-/// of a 16-bit number, one value and the orientation.
-fn with_orientation(jpeg: &[u8], orientation: u8) -> Vec<u8> {
-    assert_eq!(jpeg[..2], [0xff, 0xd8], "the start marker of a JPEG");
-    let mut exif = b"Exif\0\0II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
-    exif.extend([orientation, 0, 0, 0]);
-    // The offset of the next directory: there is none.
-    exif.extend([0; 4]);
-    let length = u16::try_from(exif.len() + 2).expect("a short segment");
-    let mut bytes = vec![0xff, 0xd8, 0xff, 0xe1];
-    bytes.extend(length.to_be_bytes());
-    bytes.extend(exif);
-    bytes.extend(&jpeg[2..]);
-    bytes
 }
 
 /// Adds a front cover with the content `bytes` to the tag of the audio file
@@ -184,27 +161,6 @@ fn embed_picture(path: &Path, bytes: &[u8], mime: MimeType) {
     );
     tag.save_to_path(path, WriteOptions::default())
         .unwrap_or_else(|error| panic!("write the tag of {}: {error}", path.display()));
-}
-
-/// Returns the modification time of the file at `path` in Unix seconds.
-fn mtime(path: &Path) -> i64 {
-    let modified = fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .unwrap_or_else(|error| panic!("read the time of {}: {error}", path.display()));
-    let seconds = modified
-        .duration_since(UNIX_EPOCH)
-        .expect("a time after 1970")
-        .as_secs();
-    i64::try_from(seconds).expect("a time that fits")
-}
-
-/// Sets the modification time of the file at `path`.
-fn set_mtime(path: &Path, time: SystemTime) {
-    fs::File::options()
-        .write(true)
-        .open(path)
-        .and_then(|file| file.set_modified(time))
-        .unwrap_or_else(|error| panic!("set the time of {}: {error}", path.display()));
 }
 
 /// Checks that `cover` is a JPEG and returns its width and height.
@@ -281,7 +237,7 @@ async fn a_sized_cover_is_a_jpeg_of_at_most_its_step_and_the_second_request_read
 
         // A request that made the cover again would write a new file with
         // the present time. Another size of the step reads the same file.
-        set_mtime(&cached, long_ago);
+        set_modified(&cached, long_ago);
         assert_eq!(scanned.get(&id, Some(64)).await.as_ref(), Some(&cover));
         assert_eq!(scanned.get(&id, Some(80)).await, Some(cover));
         assert_eq!(mtime(&cached), 1_000_000_000);
@@ -481,7 +437,7 @@ async fn a_scan_removes_the_cached_cover_of_a_cover_file_that_changed() {
     // The new image is 256 × 128 pixels, and its file is one minute newer.
     write_image(&cover_file, 256, 128);
     let new_time = old_time + 60;
-    set_mtime(
+    set_modified(
         &cover_file,
         UNIX_EPOCH + Duration::from_secs(new_time.unsigned_abs()),
     );

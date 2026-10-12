@@ -8,23 +8,18 @@
 mod common;
 
 use std::fs;
-use std::path::Path;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use lofty::config::WriteOptions;
-use lofty::file::TaggedFileExt;
-use lofty::tag::{ItemKey, TagExt};
+use lofty::tag::ItemKey;
 use rusqlite::params;
 use serde_json::{Value, json};
-use wn_server::VERSION;
 use wn_server::api::model;
 use wn_server::db::queries::annotations::{self, Annotation};
-use wn_server::db::queries::browse::{self, Album, Artist, Song};
-use wn_server::db::queries::{tracks, users};
 
 use common::{
-    API_VERSION, CLIENT, LibraryBuilder, OWNER, OWNER_PASSWORD, StandardServer, TestServer,
-    body_string, content_type, form_request, subsonic_response,
+    API_VERSION, CLIENT, LibraryBuilder, OWNER, OWNER_PASSWORD, StandardServer, TestServer, album,
+    artist, body_string, child_names, content_type, error, first_element, form_request, get_album,
+    get_song, is_time_between, json_ok, owner_id, remove_file, retag, rows, schema_names, song,
+    subsonic_response, to_json, unix_now, xml_document,
 };
 
 /// 2023-11-14T22:13:20Z, the time that the tests store where a document is
@@ -51,144 +46,11 @@ const RATING_RANGE: &str = "parameter rating must be an integer from 0 to 5";
 /// The message of the error for a rating that is no integer.
 const RATING_INTEGER: &str = "parameter rating must be an integer";
 
-fn unix_now() -> i64 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("the clock is after 1970");
-    i64::try_from(now.as_secs()).expect("the time fits")
-}
-
-fn to_json(model: impl serde::Serialize) -> Value {
-    serde_json::to_value(model).expect("the model serialises")
-}
-
-/// The `error` object with `code` and `message`.
-fn error(code: u32, message: &str) -> Value {
-    json!({ "code": code, "message": message })
-}
-
-/// The XML body that has `status` and then `rest`. `rest` is the text that
-/// follows the last attribute of the root element.
-fn xml_document(status: &str, rest: &str) -> String {
-    format!(
-        concat!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>"#,
-            r#"<subsonic-response xmlns="http://subsonic.org/restapi" status="{}""#,
-            r#" version="1.16.1" type="wn-server" serverVersion="{}" openSubsonic="true"{}"#
-        ),
-        status, VERSION, rest
-    )
-}
-
-/// The JSON body of a successful response whose response object holds `rest`
-/// after the fields of the envelope.
-fn json_document(rest: &str) -> String {
-    format!(
-        concat!(
-            r#"{{"subsonic-response":{{"status":"ok","version":"1.16.1","type":"wn-server","#,
-            r#""serverVersion":"{}","openSubsonic":true,{}}}}}"#
-        ),
-        VERSION, rest
-    )
-}
-
 /// The JSON body of `method` without a parameter of its own, as text.
 async fn json_body(server: &TestServer, method: &str) -> String {
     let response = server.get_raw(method, &[("f", "json")]).await;
     assert_eq!(content_type(&response), "application/json", "{method}");
     body_string(response).await
-}
-
-/// The names of the child elements of the element `parent` of the XML
-/// document `xml`, in the order of the document. The start tag of `parent`
-/// has no attribute. Every child element must be an empty element, as an
-/// item of a list of starred items is.
-fn child_names<'a>(xml: &'a str, parent: &str) -> Vec<&'a str> {
-    let (_, rest) = xml
-        .split_once(&format!("<{parent}>"))
-        .unwrap_or_else(|| panic!("no <{parent}> in {xml}"));
-    let (content, _) = rest
-        .split_once(&format!("</{parent}>"))
-        .unwrap_or_else(|| panic!("no </{parent}> in {xml}"));
-    content
-        .split('<')
-        .skip(1)
-        .map(|element| {
-            assert!(element.ends_with("/>"), "<{element} has content: {xml}");
-            element
-                .split([' ', '/'])
-                .next()
-                .expect("a split has a first part")
-        })
-        .collect()
-}
-
-/// The names of `artists` elements `artist`, `albums` elements `album` and
-/// `songs` elements `song`, in the order of the Subsonic schema.
-fn schema_names(artists: usize, albums: usize, songs: usize) -> Vec<&'static str> {
-    [("artist", artists), ("album", albums), ("song", songs)]
-        .into_iter()
-        .flat_map(|(name, count)| std::iter::repeat_n(name, count))
-        .collect()
-}
-
-/// The position of the first element `name` in the XML document `xml`.
-fn first_element(xml: &str, name: &str) -> Option<usize> {
-    xml.find(&format!("<{name} "))
-}
-
-/// The ID of the owner account of the server.
-async fn owner_id(server: &TestServer) -> i64 {
-    server
-        .db()
-        .read(|conn| users::get_by_name(conn, OWNER))
-        .await
-        .expect("read the owner")
-        .expect("the server has an owner")
-        .user
-        .id
-}
-
-/// One row of the `annotations` table: `user_id`, `item_id`, `item_type`,
-/// `starred_at`, `rating`, `play_count` and `last_played_at`.
-type Row = (
-    i64,
-    String,
-    String,
-    Option<i64>,
-    Option<u8>,
-    i64,
-    Option<i64>,
-);
-
-/// Every row of the `annotations` table, in the order of the users and then
-/// of the item IDs.
-async fn rows(server: &TestServer) -> Vec<Row> {
-    server
-        .db()
-        .read(|conn| {
-            let mut select = conn.prepare(
-                "SELECT user_id, item_id, item_type, starred_at, rating, play_count,
-                   last_played_at
-                 FROM annotations ORDER BY user_id, item_id",
-            )?;
-            let rows = select
-                .query_map([], |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                        row.get(6)?,
-                    ))
-                })?
-                .collect::<rusqlite::Result<_>>()?;
-            Ok(rows)
-        })
-        .await
-        .expect("read the annotations")
 }
 
 /// The annotation of the owner for the item `id`. The default annotation
@@ -283,21 +145,6 @@ async fn starred(server: &TestServer, params: &[(&str, &str)]) -> Value {
     response["starred"].take()
 }
 
-/// The `song` object of `getSong` for the track `id`.
-async fn get_song(server: &TestServer, id: &str) -> Value {
-    let mut response = server.get_json("getSong", &[("id", id)]).await;
-    assert_eq!(response["status"], "ok", "{response}");
-    response["song"].take()
-}
-
-/// The `album` object of `getAlbum` for the album `id`, with its `song`
-/// list.
-async fn get_album(server: &TestServer, id: &str) -> Value {
-    let mut response = server.get_json("getAlbum", &[("id", id)]).await;
-    assert_eq!(response["status"], "ok", "{response}");
-    response["album"].take()
-}
-
 /// The value of `id` of each element of the list `list`.
 fn ids(list: &Value) -> Vec<&str> {
     list.as_array()
@@ -311,83 +158,6 @@ fn ids(list: &Value) -> Vec<&str> {
 /// starred item.
 fn no_stars() -> Value {
     json!({ "artist": [], "album": [], "song": [] })
-}
-
-async fn song(server: &TestServer, id: &str) -> Song {
-    let id = id.to_owned();
-    server
-        .db()
-        .read(move |conn| browse::track(conn, &id))
-        .await
-        .expect("read the track")
-        .expect("the track exists")
-}
-
-async fn album(server: &TestServer, id: &str) -> Album {
-    let id = id.to_owned();
-    server
-        .db()
-        .read(move |conn| browse::album(conn, &id))
-        .await
-        .expect("read the album")
-        .expect("the album exists")
-}
-
-async fn artist(server: &TestServer, id: &str) -> Artist {
-    let id = id.to_owned();
-    server
-        .db()
-        .read(move |conn| browse::artist(conn, &id))
-        .await
-        .expect("read the artist")
-        .expect("the artist exists")
-}
-
-/// Whether `text` is the ISO 8601 form of a time from `from` to `to`, both
-/// in Unix seconds, as the models write a time.
-fn is_time_between(text: &Value, from: i64, to: i64) -> bool {
-    (from..=to).any(|time| *text == model::iso8601(time))
-}
-
-/// Gives the track `id` its placeholder path, as the scanner does for a
-/// track that it keeps without a file.
-async fn remove_file(server: &TestServer, id: &str) {
-    let id = id.to_owned();
-    server
-        .db()
-        .write(move |conn| {
-            let track = tracks::get_track(conn, &id)?.expect("the track exists");
-            let placeholder = tracks::placeholder_path(&id);
-            tracks::relink_track(
-                conn,
-                &id,
-                track.folder_id,
-                &placeholder,
-                track.mtime,
-                track.size,
-            )
-        })
-        .await
-        .expect("give the track a placeholder path");
-}
-
-/// Sets the tag `key` of an audio file to `text`. The file gets a later
-/// modification time than it had, so that the scanner sees the change.
-fn retag(path: &Path, key: ItemKey, text: &str) {
-    let before = fs::metadata(path).unwrap().modified().unwrap();
-    let mut file = lofty::read_from_path(path)
-        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
-    let tag = file
-        .primary_tag_mut()
-        .unwrap_or_else(|| panic!("{} has no primary tag", path.display()));
-    tag.insert_text(key, text.to_owned());
-    tag.save_to_path(path, WriteOptions::default())
-        .unwrap_or_else(|error| panic!("write the tag of {}: {error}", path.display()));
-    fs::File::options()
-        .write(true)
-        .open(path)
-        .and_then(|file| file.set_modified(before + Duration::from_secs(5)))
-        .unwrap_or_else(|error| panic!("set the time of {}: {error}", path.display()));
 }
 
 #[tokio::test]
@@ -828,7 +598,7 @@ async fn json_documents_keep_the_byte_order_of_their_keys() {
     for (method, key) in [("getStarred2", "starred2"), ("getStarred", "starred")] {
         assert_eq!(
             json_body(&server, method).await,
-            json_document(&format!(r#""{key}":{{"album":[],"artist":[],"song":[]}}"#)),
+            json_ok(&format!(r#""{key}":{{"album":[],"artist":[],"song":[]}}"#)),
             "{method}"
         );
     }
@@ -860,11 +630,7 @@ async fn json_documents_keep_the_byte_order_of_their_keys() {
         ("getStarred", "starred", starred),
     ] {
         let text = json_body(&server, method).await;
-        assert_eq!(
-            text,
-            json_document(&format!(r#""{key}":{expected}"#)),
-            "{method}"
-        );
+        assert_eq!(text, json_ok(&format!(r#""{key}":{expected}"#)), "{method}");
         let list = |name: &str| text.find(&format!(r#""{name}":["#));
         let (album, artist, song) = (list("album"), list("artist"), list("song"));
         assert!(album.is_some(), "{method}: {text}");

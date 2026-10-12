@@ -9,7 +9,6 @@ use std::fs;
 use std::io::Write;
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tempfile::TempDir;
 use wn_server::auth::verify_password;
@@ -22,7 +21,7 @@ use wn_server::db::queries::tracks::{self, IndexEntry};
 use wn_server::db::queries::users::{self, UserRow};
 use wn_server::library::scan_controller::ScanLock;
 
-use common::{LibraryBuilder, TestLibrary};
+use common::{LibraryBuilder, TestLibrary, unix_now};
 
 /// The line `init` and `user set-password` print after they store a password.
 const NOTICE: &str =
@@ -183,13 +182,6 @@ fn assert_generated_shape(password: &str) {
                     && !matches!(character, 'i' | 'l' | 'o'))
         );
     }
-}
-
-fn unix_now() -> i64 {
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("the clock is after 1970");
-    i64::try_from(elapsed.as_secs()).expect("seconds fit")
 }
 
 #[test]

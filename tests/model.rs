@@ -11,20 +11,19 @@ mod common;
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
 use common::{
-    LibraryBuilder, OWNER, ScannedServer, StandardServer, TestServer, body_bytes, body_string,
-    get_request,
+    LibraryBuilder, OWNER, ScannedServer, StandardServer, TestServer, album, artist, body_bytes,
+    body_string, get_request, owner_id, remove_file, song, to_json, unix_now,
 };
 use rusqlite::params;
-use serde_json::{Value, json};
+use serde_json::json;
 use wn_server::api::envelope::{Format, SubsonicResponse};
 use wn_server::api::model;
 use wn_server::db::queries::annotations::{self, Annotation};
-use wn_server::db::queries::browse::{self, Album, Artist, Genre, Song};
-use wn_server::db::queries::{tracks, users};
+use wn_server::db::queries::browse::{self, Genre, Song};
 use wn_server::ids::{self, Kind};
 
 /// The relative paths of the tracks of the standard library, in the order
@@ -35,43 +34,6 @@ const UPSTREAM: &str = "Marlow Quartet/Slow Rivers/01 Upstream.m4a";
 const OPEN_ROAD: &str = "Tessa Lund/Summer Sampler/01 Open Road.ogg";
 const LAST_TRAIN: &str = "Aurora Field/Summer Sampler/02 Last Train.opus";
 
-fn unix_now() -> i64 {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("the clock is after 1970");
-    i64::try_from(now.as_secs()).expect("the time fits")
-}
-
-async fn song(server: &ScannedServer, id: &str) -> Song {
-    let id = id.to_owned();
-    server
-        .db()
-        .read(move |conn| browse::track(conn, &id))
-        .await
-        .expect("read the track")
-        .expect("the track exists")
-}
-
-async fn album(server: &ScannedServer, id: &str) -> Album {
-    let id = id.to_owned();
-    server
-        .db()
-        .read(move |conn| browse::album(conn, &id))
-        .await
-        .expect("read the album")
-        .expect("the album exists")
-}
-
-async fn artist(server: &ScannedServer, id: &str) -> Artist {
-    let id = id.to_owned();
-    server
-        .db()
-        .read(move |conn| browse::artist(conn, &id))
-        .await
-        .expect("read the artist")
-        .expect("the artist exists")
-}
-
 async fn songs_of(server: &ScannedServer, album_id: &str) -> Vec<Song> {
     let album_id = album_id.to_owned();
     server
@@ -79,18 +41,6 @@ async fn songs_of(server: &ScannedServer, album_id: &str) -> Vec<Song> {
         .read(move |conn| browse::tracks_of_album(conn, &album_id))
         .await
         .expect("read the tracks")
-}
-
-/// The ID of the owner account of the server.
-async fn owner_id(server: &TestServer) -> i64 {
-    server
-        .db()
-        .read(|conn| users::get_by_name(conn, OWNER))
-        .await
-        .expect("read the owner")
-        .expect("the server has an owner")
-        .user
-        .id
 }
 
 /// The annotations of the owner for `ids`.
@@ -106,10 +56,6 @@ async fn annotations_of(server: &TestServer, ids: &[&str]) -> HashMap<String, An
 
 fn titles(songs: &[Song]) -> Vec<&str> {
     songs.iter().map(|song| song.track.title.as_str()).collect()
-}
-
-fn to_json(model: impl serde::Serialize) -> Value {
-    serde_json::to_value(model).expect("the model serialises")
 }
 
 #[tokio::test]
@@ -903,28 +849,6 @@ async fn get_many_is_empty_on_a_new_database_and_returns_an_inserted_annotation(
         (child.starred, child.user_rating, child.play_count),
         (None, None, 0)
     );
-}
-
-/// Gives the track `id` its placeholder path, as the scanner does for a
-/// track that it keeps without a file.
-async fn remove_file(server: &ScannedServer, id: &str) {
-    let id = id.to_owned();
-    server
-        .db()
-        .write(move |conn| {
-            let track = tracks::get_track(conn, &id)?.expect("the track exists");
-            let placeholder = tracks::placeholder_path(&id);
-            tracks::relink_track(
-                conn,
-                &id,
-                track.folder_id,
-                &placeholder,
-                track.mtime,
-                track.size,
-            )
-        })
-        .await
-        .unwrap();
 }
 
 #[tokio::test]

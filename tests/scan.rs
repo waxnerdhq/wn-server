@@ -17,11 +17,10 @@ use std::time::Duration;
 use serde_json::{Value, json};
 use tokio::sync::mpsc::{UnboundedReceiver, unbounded_channel};
 use wn_server::config::Config;
-use wn_server::db::queries::scans::{self, Scan};
 use wn_server::db::queries::tracks;
 use wn_server::library::scan_controller::{ScanHooks, ScanLock};
 
-use common::{LibraryBuilder, TestServer, body_string, subsonic_response};
+use common::{LibraryBuilder, TestServer, body_string, error_0, scan_rows, subsonic_response};
 
 /// The protocol version that the requests without the auth defaults send.
 const V: (&str, &str) = ("v", "1.16.1");
@@ -90,11 +89,6 @@ async fn gated_server(root: &Path) -> (TestServer, Gate) {
     (server, gate)
 }
 
-/// The rows of the `scans` table of `server`, in the order of the starts.
-async fn scan_rows(server: &TestServer) -> Vec<Scan> {
-    server.db().read(scans::list).await.expect("read the scans")
-}
-
 async fn track_count(server: &TestServer) -> u64 {
     server
         .db()
@@ -106,11 +100,6 @@ async fn track_count(server: &TestServer) -> u64 {
 /// The `scanStatus` object without `lastScan`.
 fn scan_status(scanning: bool, count: u64) -> Value {
     json!({ "scanning": scanning, "count": count })
-}
-
-/// The `error` object with code 0 and `message`.
-fn error_0(message: &str) -> Value {
-    json!({ "code": 0, "message": message })
 }
 
 /// The Unix time of `text`, which is `YYYY-MM-DDTHH:MM:SSZ`. The test fails

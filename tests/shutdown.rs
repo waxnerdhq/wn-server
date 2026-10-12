@@ -68,6 +68,9 @@ use common::{
     API_VERSION, CLIENT, LibraryBuilder, OWNER, OWNER_PASSWORD, captured_log, fixtures_dir,
     subsonic_response, token, urlencode,
 };
+// File modes exist on Unix only, and so does the helper that sets them.
+#[cfg(unix)]
+use common::set_mode;
 
 /// The longest time a test waits for an event of its server. Each of these
 /// waits ends with its event, milliseconds after the cause of the event, so
@@ -1088,15 +1091,6 @@ impl Drop for Unplugged {
             Self::Unlistable(folder) => set_mode(folder, 0o755),
         }
     }
-}
-
-/// Sets the permission bits of a directory.
-#[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-        .unwrap_or_else(|error| panic!("set the mode of {}: {error}", path.display()));
 }
 
 /// Loads the config file at `path` as `run` does, and gives the server the

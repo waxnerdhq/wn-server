@@ -23,19 +23,19 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use axum::http::StatusCode;
 use rusqlite::params;
 use serde_json::{Value, json};
-use wn_server::VERSION;
 use wn_server::api::model;
 use wn_server::config::Config;
 use wn_server::db::queries::browse::Album;
-use wn_server::db::queries::scans::{self, Scan, ScanCounts};
+use wn_server::db::queries::scans::{self, ScanCounts};
 use wn_server::db::queries::tracks::{self, TrackContent};
-use wn_server::db::queries::{albums, artists, folders, users};
+use wn_server::db::queries::{albums, artists, folders};
 use wn_server::ids::{self, Kind};
 use wn_server::library::tags::TrackMeta;
 
 use common::{
-    LibraryBuilder, PICTURE_PNG, StandardServer, TestLibrary, TestServer, body_bytes, body_string,
-    content_type, subsonic_response,
+    LibraryBuilder, PICTURE_PNG, StandardServer, TestServer, body_bytes, body_string, column,
+    content_type, failed, index_names, ok, owner_id, remove_file, scan_rows, subsonic_response,
+    two_folder_server, xml_failed, xml_ok,
 };
 
 /// The value of `ignoredArticles`.
@@ -49,58 +49,6 @@ const UNKNOWN_ARTIST: &str = "ar-ffffffffffffffffffffffffffffffff";
 
 /// An album ID that no row has.
 const UNKNOWN_ALBUM: &str = "al-ffffffffffffffffffffffffffffffff";
-
-/// The `subsonic-response` object of a success that carries `value` under
-/// `key`.
-fn ok(key: &str, value: Value) -> Value {
-    let mut response = json!({
-        "status": "ok",
-        "version": "1.16.1",
-        "type": "wn-server",
-        "serverVersion": VERSION,
-        "openSubsonic": true,
-    });
-    response[key] = value;
-    response
-}
-
-/// The `subsonic-response` object of the error `code` with `message`.
-fn failed(code: u32, message: &str) -> Value {
-    json!({
-        "status": "failed",
-        "version": "1.16.1",
-        "type": "wn-server",
-        "serverVersion": VERSION,
-        "openSubsonic": true,
-        "error": { "code": code, "message": message },
-    })
-}
-
-/// The XML body that has `status` and then `content` in the root element.
-fn xml_document(status: &str, content: &str) -> String {
-    format!(
-        concat!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>"#,
-            r#"<subsonic-response xmlns="http://subsonic.org/restapi" status="{}""#,
-            r#" version="1.16.1" type="wn-server" serverVersion="{}" openSubsonic="true">"#,
-            "{}</subsonic-response>"
-        ),
-        status, VERSION, content
-    )
-}
-
-/// The XML body of a success whose root element holds `content`.
-fn xml_ok(content: &str) -> String {
-    xml_document("ok", content)
-}
-
-/// The XML body of the error `code` with `message`.
-fn xml_failed(code: u32, message: &str) -> String {
-    xml_document(
-        "failed",
-        &format!(r#"<error code="{code}" message="{message}"/>"#),
-    )
-}
 
 /// The attributes that the XML body holds for the JSON object `element`:
 /// each field with a scalar value, in the byte order of the names. The
@@ -139,31 +87,6 @@ async fn last_modified(server: &TestServer) -> i64 {
         .unwrap_or_else(|| panic!("lastModified is no integer: {indexes}"))
 }
 
-/// The rows of the `scans` table in the order of the scans.
-async fn scan_rows(server: &TestServer) -> Vec<Scan> {
-    server.db().read(scans::list).await.expect("read the scans")
-}
-
-/// The names of the indexes of an `indexes` or `artists` element, each with
-/// the names of its artists.
-fn index_names(element: &Value) -> Vec<(String, Vec<String>)> {
-    let text = |value: &Value| value.as_str().expect("a string").to_owned();
-    element["index"]
-        .as_array()
-        .unwrap_or_else(|| panic!("no index list: {element}"))
-        .iter()
-        .map(|index| {
-            let names = index["artist"]
-                .as_array()
-                .expect("an artist list")
-                .iter()
-                .map(|artist| text(&artist["name"]))
-                .collect();
-            (text(&index["name"]), names)
-        })
-        .collect()
-}
-
 /// The values of `field` of the artists of an `indexes` or `artists`
 /// element, in the order of the document.
 fn artist_column(element: &Value, field: &str) -> Vec<String> {
@@ -173,15 +96,6 @@ fn artist_column(element: &Value, field: &str) -> Vec<String> {
         .iter()
         .flat_map(|index| index["artist"].as_array().expect("an artist list"))
         .map(|artist| artist[field].as_str().expect("a string").to_owned())
-        .collect()
-}
-
-/// The values of `field` of the items of the list `list`.
-fn column<'a>(list: &'a Value, field: &str) -> Vec<&'a Value> {
-    list.as_array()
-        .unwrap_or_else(|| panic!("no list: {list}"))
-        .iter()
-        .map(|item| &item[field])
         .collect()
 }
 
@@ -224,40 +138,6 @@ fn album_dir_json(album: &Album) -> Value {
         child["coverArt"] = json!(album.id);
     }
     child
-}
-
-/// The ID of the owner account of `server`.
-async fn owner_id(server: &TestServer) -> i64 {
-    server
-        .db()
-        .read(users::get_owner)
-        .await
-        .expect("read the owner")
-        .expect("the server has an owner")
-        .user
-        .id
-}
-
-/// Gives the track `id` its placeholder path, as the scanner does for a
-/// track that it keeps without a file.
-async fn remove_file(server: &TestServer, id: &str) {
-    let id = id.to_owned();
-    server
-        .db()
-        .write(move |conn| {
-            let track = tracks::get_track(conn, &id)?.expect("the track exists");
-            let placeholder = tracks::placeholder_path(&id);
-            tracks::relink_track(
-                conn,
-                &id,
-                track.folder_id,
-                &placeholder,
-                track.mtime,
-                track.size,
-            )
-        })
-        .await
-        .expect("give the track a placeholder path");
 }
 
 /// The time of the clock in Unix milliseconds.
@@ -398,30 +278,6 @@ async fn get_indexes_of_a_server_without_a_library_has_no_index_and_the_time_0()
             "{since}"
         );
     }
-}
-
-/// A server with two music folders, scanned, and the libraries that are the
-/// folders. The first folder holds "Aurora Field" and one album of "Shared
-/// Artist". The second holds "Marlow Quartet" and another album of "Shared
-/// Artist".
-async fn two_folder_server() -> (TestServer, TestLibrary, TestLibrary) {
-    let first = LibraryBuilder::new()
-        .track("Aurora Field", "Glass Harbour", "Low Tide", 1, "flac")
-        .track("Shared Artist", "First", "One", 1, "mp3")
-        .build();
-    let second = LibraryBuilder::new()
-        .track("Marlow Quartet", "Slow Rivers", "Upstream", 1, "m4a")
-        .track("Shared Artist", "Second", "Two", 1, "ogg")
-        .build();
-    let mut config = Config::default();
-    config.library.folders = vec![
-        first.root.path().to_path_buf(),
-        second.root.path().to_path_buf(),
-    ];
-    config.library.scan_poll_ms = 10;
-    let server = TestServer::bare(config).await;
-    server.scan_and_wait().await;
-    (server, first, second)
 }
 
 #[tokio::test]

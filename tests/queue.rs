@@ -10,21 +10,19 @@
 mod common;
 
 use std::fs;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::http::{Request, header};
 use rusqlite::{OptionalExtension, params};
 use serde_json::{Value, json};
-use wn_server::VERSION;
 use wn_server::api::model;
 use wn_server::config::Config;
 use wn_server::db::queries::play_queue::MAX_ENTRIES;
-use wn_server::db::queries::tracks;
 
 use common::{
-    API_VERSION, CLIENT, OWNER, OWNER_PASSWORD, ScannedServer, TestServer, body_string,
-    content_type, subsonic_response,
+    API_VERSION, CLIENT, OWNER, OWNER_PASSWORD, ScannedServer, TestServer, as_user, body_string,
+    content_type, entry_xml, failed, get_song, guest, ok, ok_empty, post_body, remove_file,
+    subsonic_response, unix_now, xml_failed, xml_ok, xml_ok_empty,
 };
 
 /// The message of error 70.
@@ -44,74 +42,6 @@ const UNKNOWN_TRACK: &str = "tr-ffffffffffffffffffffffffffffffff";
 
 /// 2023-03-14T17:51:22Z.
 const CHANGED_AT: i64 = 1_678_816_282;
-
-/// The `subsonic-response` object of a success without a payload.
-fn ok_empty() -> Value {
-    json!({
-        "status": "ok",
-        "version": "1.16.1",
-        "type": "wn-server",
-        "serverVersion": VERSION,
-        "openSubsonic": true,
-    })
-}
-
-/// The `subsonic-response` object of a success that carries `value` under
-/// `key`.
-fn ok(key: &str, value: Value) -> Value {
-    let mut response = ok_empty();
-    response[key] = value;
-    response
-}
-
-/// The `subsonic-response` object of the error `code` with `message`.
-fn failed(code: u32, message: &str) -> Value {
-    json!({
-        "status": "failed",
-        "version": "1.16.1",
-        "type": "wn-server",
-        "serverVersion": VERSION,
-        "openSubsonic": true,
-        "error": { "code": code, "message": message },
-    })
-}
-
-/// The XML body that has `status` and then `rest`. `rest` is the text that
-/// follows the last attribute of the root element.
-fn xml_document(status: &str, rest: &str) -> String {
-    format!(
-        concat!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>"#,
-            r#"<subsonic-response xmlns="http://subsonic.org/restapi" status="{}""#,
-            r#" version="1.16.1" type="wn-server" serverVersion="{}" openSubsonic="true"{}"#
-        ),
-        status, VERSION, rest
-    )
-}
-
-/// The XML body of a success whose root element holds `content`.
-fn xml_ok(content: &str) -> String {
-    xml_document("ok", &format!(">{content}</subsonic-response>"))
-}
-
-/// The XML body of a success without a payload.
-fn xml_ok_empty() -> String {
-    xml_document("ok", "/>")
-}
-
-/// The XML body of the error `code` with `message`.
-fn xml_failed(code: u32, message: &str) -> String {
-    let error = format!(r#"<error code="{code}" message="{message}"/>"#);
-    xml_document("failed", &format!(">{error}</subsonic-response>"))
-}
-
-/// The time now in whole Unix seconds.
-fn unix_now() -> i64 {
-    let elapsed = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .expect("the clock is after 1970");
-    i64::try_from(elapsed.as_secs()).expect("the time fits")
-}
 
 /// The parameters of a `savePlayQueue` request with `songs` as its `id`
 /// values, `current` and `extra`.
@@ -247,24 +177,6 @@ async fn set_changed(server: &TestServer) {
     assert_eq!(changed, 1);
 }
 
-/// The `song` element that `getSong` returns for `id`.
-async fn song(server: &TestServer, id: &str) -> Value {
-    let mut response = server.get_json("getSong", &[("id", id)]).await;
-    assert_eq!(response["status"], "ok", "{response}");
-    response["song"].take()
-}
-
-/// The element of the song `id` in XML under the name `entry`: the `song`
-/// element of `getSong` with the other name.
-async fn entry_xml(server: &TestServer, id: &str) -> String {
-    let body = server.get_xml("getSong", &[("id", id)]).await;
-    let start = body.find("<song ").expect("a song element");
-    let end = body
-        .rfind("</subsonic-response>")
-        .expect("the end of the root element");
-    body[start..end].replacen("<song ", "<entry ", 1)
-}
-
 /// The absolute path of the file of the track `id`.
 async fn file_of(server: &ScannedServer, id: &str) -> std::path::PathBuf {
     let catalogue = server.catalogue().await;
@@ -285,28 +197,6 @@ async fn delete_song(server: &ScannedServer, id: &str) {
     );
 }
 
-/// Gives the track `id` its placeholder path, as the scanner does for a
-/// track that it keeps without a file.
-async fn remove_file(server: &TestServer, id: &str) {
-    let id = id.to_owned();
-    server
-        .db()
-        .write(move |conn| {
-            let track = tracks::get_track(conn, &id)?.expect("the track exists");
-            let placeholder = tracks::placeholder_path(&id);
-            tracks::relink_track(
-                conn,
-                &id,
-                track.folder_id,
-                &placeholder,
-                track.mtime,
-                track.size,
-            )
-        })
-        .await
-        .expect("give the track a placeholder path");
-}
-
 /// Inserts a second account with the name `name` and the password
 /// `password`. The server has no method that does so.
 async fn add_user(server: &TestServer, name: &'static str, password: &'static str) {
@@ -322,35 +212,6 @@ async fn add_user(server: &TestServer, name: &'static str, password: &'static st
         })
         .await
         .expect("insert the user");
-}
-
-/// `request` with the parameters that authenticate the user `name` with the
-/// password `password`.
-fn as_user<'a>(
-    name: &'a str,
-    password: &'a str,
-    request: &[(&'a str, &'a str)],
-) -> Vec<(&'a str, &'a str)> {
-    let mut merged = request.to_vec();
-    merged.extend([
-        ("u", name),
-        ("p", password),
-        ("v", API_VERSION),
-        ("c", CLIENT),
-    ]);
-    merged
-}
-
-/// Sends `POST /rest/<method>` with `body` as the form body and returns the
-/// `subsonic-response` object. `body` holds every parameter of the request.
-async fn post_body(server: &TestServer, method: &str, body: String) -> Value {
-    let request = Request::post(format!("/rest/{method}"))
-        .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
-        .body(Body::from(body))
-        .expect("a request");
-    let response = server.request(request).await;
-    assert_eq!(content_type(&response), "application/json", "{method}");
-    subsonic_response(&body_string(response).await)
 }
 
 #[tokio::test]
@@ -387,9 +248,9 @@ async fn save_three_songs_then_get_returns_them_in_order_with_current_and_positi
         "changed": model::iso8601(changed_at),
         "changedBy": CLIENT,
         "entry": [
-            song(&server, songs[0]).await,
-            song(&server, songs[1]).await,
-            song(&server, songs[2]).await,
+            get_song(&server, songs[0]).await,
+            get_song(&server, songs[1]).await,
+            get_song(&server, songs[2]).await,
         ],
     });
     assert_eq!(
@@ -586,7 +447,7 @@ async fn save_with_ids_and_without_current_is_read_with_the_first_song_as_curren
         "username": OWNER,
         "changed": changed,
         "changedBy": "Supersonic",
-        "entry": [song(&server, a).await, song(&server, b).await],
+        "entry": [get_song(&server, a).await, get_song(&server, b).await],
     });
     assert_eq!(
         server.get_json("getPlayQueue", &[]).await,
@@ -685,7 +546,7 @@ async fn a_save_with_current_replaces_a_queue_that_was_saved_without_current() {
         "username": OWNER,
         "changed": changed,
         "changedBy": CLIENT,
-        "entry": [song(&server, b).await, song(&server, c).await],
+        "entry": [get_song(&server, b).await, get_song(&server, c).await],
     });
     assert_eq!(
         server.get_json("getPlayQueue", &[]).await,
@@ -859,11 +720,11 @@ async fn a_queue_holds_a_song_as_often_as_the_request_names_it() {
     assert_eq!(queue["current"], a);
     assert_eq!(queue["position"], 250);
     // The three entries of one song are the same element.
-    assert_eq!(queue["entry"][1], song(&server, a).await);
+    assert_eq!(queue["entry"][1], get_song(&server, a).await);
     assert_eq!(queue["entry"][3], queue["entry"][1]);
     assert_eq!(queue["entry"][4], queue["entry"][1]);
-    assert_eq!(queue["entry"][0], song(&server, b).await);
-    assert_eq!(queue["entry"][2], song(&server, c).await);
+    assert_eq!(queue["entry"][0], get_song(&server, b).await);
+    assert_eq!(queue["entry"][2], get_song(&server, c).await);
     let body = server.get_xml("getPlayQueue", &[]).await;
     assert_eq!(body.matches("<entry ").count(), 5);
 }
@@ -1107,7 +968,7 @@ async fn the_songs_of_the_queue_carry_what_the_user_attached_to_them() {
         assert_eq!(entry["userRating"], 4);
         assert_eq!(entry["playCount"], 7);
         assert_eq!(entry["played"], "2023-03-14T17:51:22Z");
-        assert_eq!(*entry, song(&server, a).await);
+        assert_eq!(*entry, get_song(&server, a).await);
     }
     let other = &queue["entry"][1];
     assert_eq!(other.get("starred"), None);
@@ -1121,10 +982,6 @@ async fn each_user_has_a_queue_of_its_own() {
     let b = server.track.breakwater.as_str();
     let c = server.track.night_ferry.as_str();
     add_user(&server, "guest", "secret").await;
-    /// `request` as a request of the guest.
-    fn guest<'a>(request: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
-        as_user("guest", "secret", request)
-    }
     /// The `playQueue` element that the guest reads.
     async fn queue_of_guest(server: &TestServer) -> Value {
         let mut response = server.get_json_noauth("getPlayQueue", &guest(&[])).await;
@@ -1190,10 +1047,6 @@ async fn a_save_without_current_of_one_user_leaves_the_queue_of_another_user() {
     let b = server.track.breakwater.as_str();
     let c = server.track.night_ferry.as_str();
     add_user(&server, "guest", "secret").await;
-    /// `request` as a request of the guest.
-    fn guest<'a>(request: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
-        as_user("guest", "secret", request)
-    }
     /// The answer of `getPlayQueue` to the guest.
     async fn document_of_guest(server: &TestServer) -> Value {
         server.get_json_noauth("getPlayQueue", &guest(&[])).await
@@ -1280,7 +1133,7 @@ async fn the_queue_keeps_its_songs_through_a_rescan_and_a_moved_file() {
     assert_eq!(queue["position"], 4000);
     assert_eq!(queue["entry"][1]["path"], new);
     assert_eq!(queue["entry"][3]["path"], new);
-    assert_eq!(queue["entry"][1], song(&server, a).await);
+    assert_eq!(queue["entry"][1], get_song(&server, a).await);
     // The scan is no change of the queue.
     assert_eq!(queue["changed"], "2023-03-14T17:51:22Z");
     assert_eq!(queue["changedBy"], CLIENT);
@@ -1314,7 +1167,7 @@ async fn a_track_without_a_file_stays_in_the_queue_and_is_listed() {
         let entry = &queue["entry"][place];
         assert_eq!(entry["title"], "Upstream");
         assert_eq!(entry.get("path"), None);
-        assert_eq!(*entry, song(&server, a).await);
+        assert_eq!(*entry, get_song(&server, a).await);
     }
     assert_eq!(queue["entry"][1], with_file["entry"][1]);
     let body = server.get_xml("getPlayQueue", &[]).await;
@@ -1348,7 +1201,7 @@ async fn a_track_that_a_scan_deletes_leaves_the_queue_and_the_order_stays() {
     assert_eq!(entry_ids(&queue), [d, a, c]);
     assert_eq!(queue["current"], a);
     assert_eq!(queue["position"], 9000);
-    assert_eq!(queue["entry"][1], song(&server, a).await);
+    assert_eq!(queue["entry"][1], get_song(&server, a).await);
     // The scan is no change of the queue.
     assert_eq!(queue["changed"], "2023-03-14T17:51:22Z");
     assert_eq!(queue["changedBy"], CLIENT);
@@ -1479,9 +1332,9 @@ async fn a_scan_tells_a_queue_saved_without_current_from_one_whose_current_song_
         "changed": "2023-03-14T17:51:22Z",
         "changedBy": CLIENT,
         "entry": [
-            song(&server, a).await,
-            song(&server, b).await,
-            song(&server, d).await,
+            get_song(&server, a).await,
+            get_song(&server, b).await,
+            get_song(&server, d).await,
         ],
     });
     assert_eq!(
