@@ -35,6 +35,74 @@ pub(crate) const LABEL_MAX_BYTES: usize = 63;
 /// machine.
 pub const DEFAULT_NAME: &str = "wn-server";
 
+/// A key of `config.toml` and its default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Key {
+    /// The table and the key, joined with a dot: `server.port`.
+    pub name: &'static str,
+    /// The default as `config.toml` holds it: `4200`, `"info"`, `[]`.
+    pub default: &'static str,
+}
+
+/// Every key of `config.toml` with its default, in the order of the file
+/// that `init` writes. `tests/readme.rs` checks that `README.md` documents
+/// each key with this default. A unit test checks the list against the
+/// default [`Config`].
+pub const KEYS: &[Key] = &[
+    Key {
+        name: "server.bind",
+        default: r#""0.0.0.0""#,
+    },
+    Key {
+        name: "server.port",
+        default: "4200",
+    },
+    Key {
+        name: "server.name",
+        default: r#""wn-server""#,
+    },
+    Key {
+        name: "server.log_level",
+        default: r#""info""#,
+    },
+    Key {
+        name: "auth.disabled_unsafe",
+        default: "false",
+    },
+    Key {
+        name: "library.folders",
+        default: "[]",
+    },
+    Key {
+        name: "library.scan_on_start",
+        default: "true",
+    },
+    Key {
+        name: "library.rescan_interval_minutes",
+        default: "0",
+    },
+    Key {
+        name: "transcoding.ffmpeg",
+        default: r#""ffmpeg""#,
+    },
+    Key {
+        name: "transcoding.max_concurrent",
+        default: "2",
+    },
+    Key {
+        name: "transcoding.opus_bitrate_kbps",
+        default: "192",
+    },
+    Key {
+        name: "transcoding.mp3_bitrate_kbps",
+        default: "320",
+    },
+    Key {
+        name: "discovery.mdns",
+        default: "true",
+    },
+];
+
 /// A config or data directory that cannot be used.
 #[derive(Debug, Error)]
 pub enum ConfigError {
@@ -905,6 +973,29 @@ mdns = true
         );
         let (_dir, path) = config_file(&text);
         assert_eq!(Config::load(&path).expect("load"), config);
+    }
+
+    #[test]
+    fn keys_are_the_keys_and_the_defaults_of_the_default_config() {
+        // `to_toml` writes every key of `Config`
+        // (`to_toml_round_trips_every_key`), so the lines of the default
+        // config are every key with its default.
+        let text = Config::default().to_toml().expect("to_toml");
+        let mut table = "";
+        let mut rendered = Vec::new();
+        for line in text.lines().filter(|line| !line.is_empty()) {
+            if let Some(name) = line.strip_prefix('[').and_then(|l| l.strip_suffix(']')) {
+                table = name;
+            } else {
+                let (key, default) = line.split_once(" = ").expect("a `key = value` line");
+                rendered.push((format!("{table}.{key}"), default.to_owned()));
+            }
+        }
+        let listed: Vec<(String, String)> = KEYS
+            .iter()
+            .map(|key| (key.name.to_owned(), key.default.to_owned()))
+            .collect();
+        assert_eq!(listed, rendered);
     }
 
     #[test]
