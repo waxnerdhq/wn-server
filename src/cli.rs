@@ -293,6 +293,7 @@ fn execute(cli: &Cli, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<()
             let config = Config::load(&data_dir.config_path())?;
             // The scanner logs the files it leaves for the next scan.
             init_tracing(&config.server.log_level)?;
+            config.library.warn_unavailable_folders();
             scan(&data_dir, &config, args, out)
         }
         Command::Run => {
@@ -330,6 +331,10 @@ fn execute(cli: &Cli, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<()
 /// foreground on the database of `data_dir`. A missing `instance.id` is
 /// written first. The server is advertised over mDNS while it runs, when
 /// `discovery.mdns` is on.
+///
+/// A music folder of the config that does not exist or cannot be read does
+/// not fail the load. `run_server` logs it once and serves the other
+/// folders.
 ///
 /// A stop signal ([`forward_stop_signals`]) stops the server in the order of
 /// `docs/design.md` section 3.13, and the command then succeeds. A second
@@ -588,6 +593,11 @@ impl OtherStopSignals {
 /// stale files of the cover cache of the data directory. After the scan the
 /// command checkpoints the write-ahead log, as `init` does. The command
 /// fails when the scan recorded an error, after it has printed the summary.
+///
+/// A music folder of `config` that does not exist or cannot be read does not
+/// keep the scan from starting. The caller has logged it once. The scan
+/// reads the other folders, deletes no track and records an error that
+/// names the folder, so the command fails after the summary.
 fn scan(
     data_dir: &DataDir,
     config: &Config,
@@ -689,8 +699,10 @@ fn init_tracing(log_level: &str) -> Result<(), CliError> {
 ///
 /// `config.toml` is the template with the folders and the port of `args`.
 /// Each folder must be an existing directory and is written as an absolute
-/// path. The password comes from the source that [`password_source`] picks. A
-/// generated password is printed once.
+/// path. `init` refuses a folder that does not exist, although `run` and
+/// `scan` start with one: a path that is typed here and does not exist is
+/// most likely a typing mistake. The password comes from the source that
+/// [`password_source`] picks. A generated password is printed once.
 ///
 /// A data directory that has `config.toml` and no owner account keeps
 /// `config.toml` and gets what is missing: the database when there is none,

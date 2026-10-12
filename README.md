@@ -81,7 +81,7 @@ The password is stored in plain text in `library.db`. Subsonic token authenticat
 | `server.name` | `"wn-server"` | instance name shown by discovery; 1 to 63 bytes |
 | `server.log_level` | `"info"` | log filter; `RUST_LOG` overrides it when set |
 | `auth.disabled_unsafe` | `false` | `true` turns authentication off; unsafe, see [Authentication](#authentication) |
-| `library.folders` | `[]` | music folders; at least one, and each is an existing directory |
+| `library.folders` | `[]` | music folders; at least one, and each is the absolute path of a directory |
 | `library.scan_on_start` | `true` | scan the folders when the server starts |
 | `library.rescan_interval_minutes` | `0` | minutes between periodic scans; 0 disables them |
 | `transcoding.ffmpeg` | `"ffmpeg"` | ffmpeg program name or path |
@@ -90,7 +90,7 @@ The password is stored in plain text in `library.db`. Subsonic token authenticat
 | `transcoding.mp3_bitrate_kbps` | `320` | MP3 bitrate when the client names none; 32 to 320 |
 | `discovery.mdns` | `true` | advertise the server over mDNS |
 
-The file is checked when a command loads it. An error names the key or the folder path.
+The file is checked when a command loads it. An error names the key.
 
 The default `server.name` is `wn-server` on every machine. `init` writes it to `config.toml`. Edit `name` in the `[server]` table to give the server another name, for example when two servers run on one network. A name that the file holds is kept as written. The server takes no name from the host name of the machine.
 
@@ -103,7 +103,9 @@ A folder path is written as a TOML literal string, in single quotes, so that a b
 folders = ['C:\Music', 'D:\More Music']
 ```
 
-A relative folder path resolves against the working directory of the command.
+A folder path is absolute. A command that loads the file fails when `library.folders` is empty, when a path is relative, or when a path names a file, and the error names `library.folders`.
+
+A folder that does not exist or cannot be read is not an error of the file. The drive of the folder may be unplugged, or its network share may be down. `run` and `scan` start without it (see [Running](#running) and [Scanning](#scanning)). `init` is stricter: it refuses a `--folder` that does not exist.
 
 ## Running
 
@@ -116,6 +118,8 @@ wn-server run
 `run` opens `library.db` and needs the owner account in it. `run` creates neither and fails at startup when one is missing. `wn-server init` then creates what is missing and keeps `config.toml` (see [Owner account](#owner-account)).
 
 `run` stores the music folders of `config.toml` in the database before it answers the first request, and then scans them in the background (see [Scanning](#scanning)). The server answers requests while it scans.
+
+`run` starts when a music folder does not exist or cannot be read, for example while a drive is unplugged. It logs one warning at startup that names the folder, and serves the music of the other folders. The folder stays in the list of `getMusicFolders`. Its tracks stay in the library with their stars, ratings and playlist entries; their files cannot be read until the folder is back. The server does not watch for the folder. The next scan after the folder is back reads it (see [Scanning](#scanning) for what starts a scan).
 
 Ctrl-C stops the server. So does SIGTERM on Linux and macOS, which `kill`, systemd, launchd and `docker stop` send. On Windows Ctrl-Break, closing the console window and shutting the system down stop it as well. The server stops in this order:
 
@@ -161,7 +165,9 @@ artists: 3
 errors: 0
 ```
 
-`seen` is the number of supported audio files. `added`, `changed`, `moved` and `removed` count tracks. `albums` and `artists` are the numbers in the library after the scan. Each error of the scan follows as a line `error: <message>` that names the folder, the path or the file. The command exits with status 0, or with status 1 when the scan recorded an error. Warnings about files that the scan leaves for the next scan go to stderr with the log. A music folder of `config.toml` that does not exist is an error of the config: the command names the folder and exits with status 1 before it scans.
+`seen` is the number of supported audio files. `added`, `changed`, `moved` and `removed` count tracks. `albums` and `artists` are the numbers in the library after the scan. Each error of the scan follows as a line `error: <message>` that names the folder, the path or the file. The command exits with status 0, or with status 1 when the scan recorded an error. Warnings about files that the scan leaves for the next scan go to stderr with the log.
+
+A scan with a music folder that does not exist or cannot be read reads the other folders and records an error that names the folder. `wn-server scan` logs the folder when it starts, prints that error after the summary and exits with status 1. Such a scan deletes no track, in any folder: it keeps the tracks of the unavailable folder, and it also keeps a track of another folder whose file is gone, because that file may have moved to the folder that it could not read. It stores new, changed and moved files of the folders it read. When the folder is back, the next scan finds its tracks under the same IDs, and removes the tracks whose files are gone. To remove the tracks of a folder for good, take the folder out of `library.folders`: a scan that reads every remaining folder in full, and finds music in each, then removes them.
 
 ## Authentication
 

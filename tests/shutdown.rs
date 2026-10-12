@@ -1,5 +1,6 @@
 //! The stop of a running server over a real connection (`docs/design.md`
-//! section 3.13).
+//! section 3.13), and the start of a server whose music folder is
+//! unavailable (section 3.10).
 //!
 //! The tests of this file are the only ones of the suite that open a socket.
 //! Each one runs `run_server` on `127.0.0.1` with port 0, so the system
@@ -17,10 +18,11 @@
 
 mod common;
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::io;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -29,6 +31,7 @@ use axum::body::Body;
 use axum::routing::get;
 use futures_util::StreamExt;
 use futures_util::stream;
+use serde_json::Value;
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -45,7 +48,10 @@ use wn_server::library::scan_controller::ScanHooks;
 use wn_server::library::scanner::CANCELLED;
 use wn_server::server::{ServerError, ServerOptions, StopStep, run_server};
 
-use common::{OWNER, OWNER_PASSWORD, captured_log, fixtures_dir};
+use common::{
+    API_VERSION, CLIENT, LibraryBuilder, OWNER, OWNER_PASSWORD, captured_log, fixtures_dir,
+    subsonic_response, token, urlencode,
+};
 
 /// The longest time a test waits for an event of its server. Each of these
 /// waits ends with its event, milliseconds after the cause of the event, so
@@ -85,10 +91,18 @@ struct Running {
     task: JoinHandle<Result<(), ServerError>>,
     data_dir: DataDir,
     /// The data directory. Dropping the value deletes it.
-    _dir: TempDir,
+    dir: TempDir,
 }
 
 impl Running {
+    /// Asks the server to stop and waits for its end in order. Returns the
+    /// data directory, on which the test runs its next server.
+    async fn stopped(mut self) -> TempDir {
+        self.cancel.cancel();
+        self.ended().await.expect("the server stops in order");
+        self.dir
+    }
+
     /// Waits for `run_server` to return and returns its result.
     async fn ended(&mut self) -> Result<(), ServerError> {
         tokio::time::timeout(LIMIT, &mut self.task)
@@ -132,7 +146,12 @@ fn config() -> Config {
 /// Creates a data directory whose database holds the owner account, and
 /// runs `run_server` on it with `config`, `cancel` and `options`. Returns
 /// when the listener is bound.
-async fn start(config: Config, cancel: CancellationToken, mut options: ServerOptions) -> Running {
+async fn start(config: Config, cancel: CancellationToken, options: ServerOptions) -> Running {
+    start_in(new_data_dir().await, config, cancel, options).await
+}
+
+/// Creates a data directory whose database holds the owner account.
+async fn new_data_dir() -> TempDir {
     let dir = tempfile::tempdir().expect("a temporary directory");
     let data_dir = DataDir::resolve(Some(dir.path())).expect("a data directory");
     let db = Db::open(data_dir.db_path()).expect("create the database");
@@ -142,6 +161,19 @@ async fn start(config: Config, cancel: CancellationToken, mut options: ServerOpt
         .expect("a new database has no owner");
     // The server opens the database itself.
     drop(db);
+    dir
+}
+
+/// Runs `run_server` on the data directory `dir` with `config`, `cancel` and
+/// `options`. The database of the directory holds the owner account. Returns
+/// when the listener is bound.
+async fn start_in(
+    dir: TempDir,
+    config: Config,
+    cancel: CancellationToken,
+    mut options: ServerOptions,
+) -> Running {
+    let data_dir = DataDir::resolve(Some(dir.path())).expect("a data directory");
 
     let (listening, bound) = oneshot::channel();
     options.listening = Some(listening);
@@ -158,7 +190,7 @@ async fn start(config: Config, cancel: CancellationToken, mut options: ServerOpt
         cancel,
         task,
         data_dir,
-        _dir: dir,
+        dir,
     }
 }
 
@@ -174,16 +206,51 @@ async fn start_with_routes(routes: Router<AppState>) -> Running {
 
 /// Opens a connection to `addr` and sends a GET request for `path`.
 async fn send_get(addr: SocketAddr, path: &str) -> TcpStream {
+    send(
+        addr,
+        &format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n"),
+    )
+    .await
+}
+
+/// Opens a connection to `addr` and sends `request`.
+async fn send(addr: SocketAddr, request: &str) -> TcpStream {
     let mut stream = tokio::time::timeout(LIMIT, TcpStream::connect(addr))
         .await
         .expect("the connection opens in time")
         .expect("the server accepts the connection");
-    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\n\r\n");
     stream
         .write_all(request.as_bytes())
         .await
         .expect("send the request");
     stream
+}
+
+/// Calls the API method `method` of the server at `addr` as the owner, with
+/// `params` and `f=json`, on a connection of its own that the server closes
+/// after the response. Checks that the response is HTTP 200 and returns the
+/// value of `subsonic-response`.
+async fn api(addr: SocketAddr, method: &str, params: &[(&str, &str)]) -> Value {
+    let salt = "c0ffee";
+    let token = token(OWNER_PASSWORD, salt);
+    let mut query = params.to_vec();
+    query.extend([
+        ("u", OWNER),
+        ("t", token.as_str()),
+        ("s", salt),
+        ("v", API_VERSION),
+        ("c", CLIENT),
+        ("f", "json"),
+    ]);
+    let path = format!("/rest/{method}?{}", urlencode(&query));
+    let request = format!("GET {path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let mut stream = send(addr, &request).await;
+    let response = read_to_end(&mut stream).await;
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .unwrap_or_else(|| panic!("{method}: the response has no body: {response}"));
+    assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "{method}: {head}");
+    subsonic_response(body)
 }
 
 /// Reads from `stream` until `received` holds `until`.
@@ -515,6 +582,24 @@ fn read_scans(path: &Path) -> Vec<Scan> {
     scans::list(&connection).expect("read the scans")
 }
 
+/// Waits until the database at `path` holds `count` scans and the last of
+/// them has ended, and returns the row of that scan. A scan of a library of
+/// a few files ends milliseconds after the server started it.
+async fn scan_ended(path: &Path, count: usize) -> Scan {
+    let ended = async {
+        loop {
+            let mut rows = read_scans(path);
+            if rows.len() == count && rows[count - 1].finished_at.is_some() {
+                return rows.swap_remove(count - 1);
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    };
+    tokio::time::timeout(LIMIT, ended)
+        .await
+        .unwrap_or_else(|_| panic!("scan {count} ends"))
+}
+
 #[tokio::test]
 async fn token_cancelled_during_a_scan_ends_the_scan_as_cancelled_and_closes_the_database() {
     let _one = one_server().await;
@@ -672,6 +757,284 @@ async fn startup_log_names_version_data_directory_address_folders_and_auth() {
         server.cancel.cancel();
         server.ended().await.expect("the server stops in order");
     }
+}
+
+/// How a music folder becomes unavailable in [`unavailable_folder_cycle`].
+enum Outage {
+    /// The path of the folder does not exist, which is the state of a volume
+    /// that is unplugged.
+    Missing,
+    /// The folder exists and cannot be listed. File modes exist on Unix
+    /// only.
+    #[cfg(unix)]
+    Unlistable,
+}
+
+/// A music folder that a test made unavailable. Dropping the value makes the
+/// folder available again, so the directory of the library can be deleted
+/// when a test fails.
+enum Unplugged {
+    /// The folder at the first path was moved to the second path.
+    Moved(PathBuf, PathBuf),
+    /// The folder lost its permissions.
+    #[cfg(unix)]
+    Unlistable(PathBuf),
+}
+
+impl Unplugged {
+    /// Makes `folder` unavailable in the way of `outage`. A folder that is
+    /// moved goes into the directory `parking`. Returns `None` when the
+    /// process can list a folder without permissions, which is the case for
+    /// a process that runs as root: such a test has nothing to check.
+    fn new(outage: Outage, folder: &Path, parking: &Path) -> Option<Self> {
+        match outage {
+            Outage::Missing => {
+                let parked = parking.join("unplugged");
+                fs::rename(folder, &parked).expect("move the folder away");
+                Some(Self::Moved(folder.to_path_buf(), parked))
+            }
+            #[cfg(unix)]
+            Outage::Unlistable => {
+                set_mode(folder, 0o000);
+                let unplugged = Self::Unlistable(folder.to_path_buf());
+                if fs::read_dir(folder).is_ok() {
+                    eprintln!("not checked: the process lists a directory that has no permission");
+                    return None;
+                }
+                Some(unplugged)
+            }
+        }
+    }
+}
+
+impl Drop for Unplugged {
+    fn drop(&mut self) {
+        match self {
+            // A folder that cannot be moved back stays in the parking
+            // directory, which is deleted with it.
+            Self::Moved(folder, parked) => drop(fs::rename(parked, folder)),
+            #[cfg(unix)]
+            Self::Unlistable(folder) => set_mode(folder, 0o755),
+        }
+    }
+}
+
+/// Sets the permission bits of a directory.
+#[cfg(unix)]
+fn set_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .unwrap_or_else(|error| panic!("set the mode of {}: {error}", path.display()));
+}
+
+/// Loads the config file at `path` as `run` does, and gives the server the
+/// address and the grace of the servers of this file. The file cannot name
+/// port 0.
+fn load_config(path: &Path) -> Config {
+    let mut loaded = Config::load(path).expect("the config loads");
+    let test = config();
+    loaded.server.bind = test.server.bind;
+    loaded.server.port = test.server.port;
+    loaded.server.shutdown_grace_ms = test.server.shutdown_grace_ms;
+    loaded
+}
+
+/// The ID of every track that `search3` lists for the server at `addr`, by
+/// the title of the track.
+async fn song_ids(addr: SocketAddr) -> BTreeMap<String, String> {
+    let response = api(addr, "search3", &[("query", ""), ("songCount", "100")]).await;
+    assert_eq!(response["status"], "ok", "{response}");
+    let songs = response["searchResult3"]["song"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default();
+    let text = |song: &Value, key: &str| {
+        let value = song[key].as_str();
+        value.unwrap_or_else(|| panic!("{key}: {song}")).to_owned()
+    };
+    let ids: BTreeMap<String, String> = songs
+        .iter()
+        .map(|song| (text(song, "title"), text(song, "id")))
+        .collect();
+    assert_eq!(ids.len(), songs.len(), "two tracks have one title");
+    ids
+}
+
+/// The IDs of the items of `list`, which is a list of songs or of playlist
+/// entries, in the order of the list.
+fn ids_of(list: &Value) -> Vec<&str> {
+    let items = list.as_array().map(Vec::as_slice).unwrap_or_default();
+    items
+        .iter()
+        .filter_map(|item| item["id"].as_str())
+        .collect()
+}
+
+/// Runs a server three times on one data directory whose config names two
+/// music folders: with both folders, with the second folder unavailable in
+/// the way of `outage`, and with the folder back. Each run is `run_server`
+/// with the config that `Config::load` reads from the file, as `run` starts
+/// it, and each run scans at startup.
+async fn unavailable_folder_cycle(outage: Outage) {
+    let _one = one_server().await;
+    let log = captured_log();
+    // One folder is on the disk of the machine. The other one is on a volume
+    // that can be unplugged.
+    let home = LibraryBuilder::new()
+        .track("Aurora Field", "Glass Harbour", "Low Tide", 1, "flac")
+        .track("Aurora Field", "Glass Harbour", "Breakwater", 2, "flac")
+        .track("Aurora Field", "Glass Harbour", "Night Ferry", 3, "flac")
+        .build();
+    let volume = LibraryBuilder::new()
+        .track("Marlow Quartet", "Slow Rivers", "Upstream", 1, "m4a")
+        .track("Marlow Quartet", "Slow Rivers", "Delta", 2, "m4a")
+        .track("Tessa Lund", "Field Notes", "Marsh", 1, "ogg")
+        .build();
+    let (home_path, volume_path) = (home.root.path(), volume.root.path());
+    let parking = tempfile::tempdir().expect("a temporary directory");
+
+    let dir = new_data_dir().await;
+    let config_path = dir.path().join("config.toml");
+    let folders = format!(
+        "[library]\nfolders = ['{}', '{}']\n",
+        home_path.display(),
+        volume_path.display()
+    );
+    fs::write(&config_path, folders).expect("write the config");
+    let run = |dir| {
+        let config = load_config(&config_path);
+        start_in(
+            dir,
+            config,
+            CancellationToken::new(),
+            ServerOptions::default(),
+        )
+    };
+
+    // Both folders are there. The scan at startup stores the six tracks.
+    let server = run(dir).await;
+    let db_path = server.data_dir.db_path();
+    let first = scan_ended(&db_path, 1).await;
+    assert_eq!((first.counts.added, first.error), (6, None));
+    let ids = song_ids(server.addr).await;
+    let titles: Vec<&str> = ids.keys().map(String::as_str).collect();
+    assert_eq!(
+        titles,
+        [
+            "Breakwater",
+            "Delta",
+            "Low Tide",
+            "Marsh",
+            "Night Ferry",
+            "Upstream"
+        ]
+    );
+    // The owner stars a track of the volume and puts it into a playlist,
+    // followed by a track of the other folder.
+    let (delta, low_tide) = (ids["Delta"].as_str(), ids["Low Tide"].as_str());
+    let starred = api(server.addr, "star", &[("id", delta)]).await;
+    assert_eq!(starred["status"], "ok", "{starred}");
+    let request = [("name", "Mix"), ("songId", delta), ("songId", low_tide)];
+    let created = api(server.addr, "createPlaylist", &request).await;
+    assert_eq!(created["status"], "ok", "{created}");
+    let playlist = created["playlist"]["id"].as_str().expect("a playlist ID");
+    let dir = server.stopped().await;
+
+    // The volume goes away while the server is down, and a file of the
+    // other folder is deleted.
+    let Some(unplugged) = Unplugged::new(outage, volume_path, parking.path()) else {
+        return;
+    };
+    fs::remove_file(&home.files[2]).expect("remove the file of Night Ferry");
+
+    // The config loads and the server starts. It logs the folder once.
+    let unavailable = format!("music folder {} is unavailable: ", volume_path.display());
+    assert_eq!(log.lines_with(&unavailable), Vec::<String>::new());
+    let server = run(dir).await;
+    let lines = log.lines_with(&unavailable);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains(" WARN "), "{}", lines[0]);
+
+    // The scan at startup read the folder that is there. It deleted no
+    // track: not one of the volume, and not the one whose file is deleted,
+    // because that file may be on the volume now. Its error names the
+    // folder and counts the track that it kept.
+    let second = scan_ended(&db_path, 2).await;
+    assert_eq!((second.counts.seen, second.counts.removed), (2, 0));
+    let error = second.error.as_deref().expect("the scan has an error");
+    let unread = format!("({}) cannot be read: ", volume_path.display());
+    assert!(error.contains(&unread), "{error}");
+    assert!(error.contains("; no track was deleted; "), "{error}");
+    assert!(
+        error.ends_with(
+            "1 track whose file is gone was kept, because a path or a file could not be read"
+        ),
+        "{error}"
+    );
+
+    // The server lists both folders and serves the tracks of the one that
+    // is there.
+    let addr = server.addr;
+    let listed = api(addr, "getMusicFolders", &[]).await;
+    let listed = listed["musicFolders"]["musicFolder"].as_array();
+    assert_eq!(listed.map(Vec::len), Some(2), "{listed:?}");
+    for title in ["Low Tide", "Breakwater"] {
+        let song = api(addr, "getSong", &[("id", ids[title].as_str())]).await;
+        assert_eq!(song["status"], "ok", "{song}");
+        assert_eq!(song["song"]["title"], title);
+    }
+    // Every track has its row and its ID, and what the owner attached to
+    // the track of the volume is there.
+    assert_eq!(song_ids(addr).await, ids);
+    let starred = api(addr, "getStarred2", &[]).await;
+    assert_eq!(ids_of(&starred["starred2"]["song"]), [delta]);
+    let mix = api(addr, "getPlaylist", &[("id", playlist)]).await;
+    assert_eq!(ids_of(&mix["playlist"]["entry"]), [delta, low_tide]);
+    // A scan that recorded errors is no error of `getScanStatus`.
+    let status = api(addr, "getScanStatus", &[]).await;
+    assert_eq!(status["status"], "ok", "{status}");
+    assert!(status["scanStatus"]["lastScan"].is_string(), "{status}");
+
+    // No request added a line about the folder.
+    assert_eq!(log.lines_with(&unavailable).len(), 1);
+    let dir = server.stopped().await;
+
+    // The volume is back. The scan at the next startup finds its files at
+    // the paths of their rows, so every track of it keeps its ID. The scan
+    // read every folder, so it deletes the track whose file is gone.
+    drop(unplugged);
+    let server = run(dir).await;
+    let third = scan_ended(&db_path, 3).await;
+    assert_eq!(third.error, None);
+    let counts = &third.counts;
+    assert_eq!(
+        (counts.seen, counts.added, counts.moved, counts.removed),
+        (5, 0, 0, 1)
+    );
+    let addr = server.addr;
+    let mut kept = ids.clone();
+    kept.remove("Night Ferry");
+    assert_eq!(song_ids(addr).await, kept);
+    let starred = api(addr, "getStarred2", &[]).await;
+    assert_eq!(ids_of(&starred["starred2"]["song"]), [delta]);
+    let mix = api(addr, "getPlaylist", &[("id", playlist)]).await;
+    assert_eq!(ids_of(&mix["playlist"]["entry"]), [delta, low_tide]);
+    // The folder is available, so this run logged nothing about it.
+    assert_eq!(log.lines_with(&unavailable).len(), 1);
+    server.stopped().await;
+}
+
+#[tokio::test]
+async fn server_starts_without_a_music_folder_that_does_not_exist_and_keeps_its_tracks() {
+    unavailable_folder_cycle(Outage::Missing).await;
+}
+
+// File modes exist on Unix only.
+#[cfg(unix)]
+#[tokio::test]
+async fn server_starts_without_a_music_folder_that_cannot_be_listed_and_keeps_its_tracks() {
+    unavailable_folder_cycle(Outage::Unlistable).await;
 }
 
 #[tokio::test]

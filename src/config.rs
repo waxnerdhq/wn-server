@@ -3,7 +3,7 @@
 
 use std::env;
 use std::ffi::OsStr;
-use std::fmt::Display;
+use std::fmt::{self, Display};
 use std::fs;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
@@ -55,13 +55,15 @@ pub enum ConfigError {
     /// `library.folders` is empty.
     #[error("library.folders: at least one music folder is required")]
     NoFolders,
-    /// A music folder does not exist.
+    /// A music folder that `init` was given does not exist.
     #[error("music folder {} does not exist", .0.display())]
     FolderMissing(PathBuf),
-    /// A music folder path names something that is not a directory.
+    /// A music folder that `init` was given names something that is not a
+    /// directory.
     #[error("music folder {} is not a directory", .0.display())]
     FolderNotDirectory(PathBuf),
-    /// A music folder exists and its metadata cannot be read.
+    /// A music folder that `init` was given exists and its metadata cannot
+    /// be read.
     #[error("cannot read music folder {}: {source}", path.display())]
     FolderUnreadable { path: PathBuf, source: io::Error },
     /// A music folder path cannot be written to a TOML file.
@@ -120,7 +122,9 @@ pub struct Auth {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Library {
-    /// The music folders. `Config::load` makes each path absolute.
+    /// The music folders, as absolute paths. A folder need not exist:
+    /// [`Library::unavailable_folders`] returns the ones that cannot be read
+    /// now.
     pub folders: Vec<PathBuf>,
     /// Whether `run` starts a scan at startup.
     pub scan_on_start: bool,
@@ -201,7 +205,12 @@ impl Default for Discovery {
 
 impl Config {
     /// Reads the config file at `path`. Absent keys get their defaults, the
-    /// folder paths are made absolute, and the result is validated.
+    /// result is validated, and the folder paths are cleaned.
+    ///
+    /// A music folder that does not exist or cannot be read is no error
+    /// here: the volume of the folder may be unplugged, or its network share
+    /// may be down. `run` and `scan` start without it
+    /// ([`Library::unavailable_folders`]).
     pub fn load(path: &Path) -> Result<Self, ConfigError> {
         let text = fs::read_to_string(path).map_err(|source| {
             if source.kind() == io::ErrorKind::NotFound {
@@ -217,22 +226,25 @@ impl Config {
             path: path.to_path_buf(),
             source: Box::new(source),
         })?;
-        config.make_folders_absolute()?;
         config.validate()?;
+        config.clean_folders()?;
         Ok(config)
     }
 
     /// Checks the rules a usable config meets: at least one folder, each
-    /// folder is an existing directory, the port is not 0, the name is 1 to
-    /// 63 bytes long, at least one transcode may run, and both bitrates are
-    /// within 32 to 320 kbps. The error names the key or the folder path of
+    /// folder is an absolute path that does not name a file, the port is not
+    /// 0, the name is 1 to 63 bytes long, at least one transcode may run, and
+    /// both bitrates are within 32 to 320 kbps. The error names the key of
     /// the first rule that fails.
+    ///
+    /// A folder that does not exist, and a folder whose state cannot be
+    /// read, pass. Such a folder is unavailable now and may be back later.
     pub fn validate(&self) -> Result<(), ConfigError> {
         if self.library.folders.is_empty() {
             return Err(ConfigError::NoFolders);
         }
         for folder in &self.library.folders {
-            check_folder(folder)?;
+            check_folder_value(folder)?;
         }
         if self.server.port == 0 {
             return Err(ConfigError::Invalid {
@@ -292,9 +304,12 @@ impl Config {
         toml::from_str(text)
     }
 
-    /// Replaces each folder path with its absolute form. A relative path is
-    /// resolved against the working directory. Symlinks are not resolved.
-    fn make_folders_absolute(&mut self) -> Result<(), ConfigError> {
+    /// Replaces each folder path with the form that [`absolute`] gives it.
+    /// The paths are absolute already ([`Config::validate`]), so nothing is
+    /// resolved against the working directory. The call removes `.`
+    /// components and repeated separators, and on Windows it writes every
+    /// separator as `\`. Symlinks are not resolved.
+    fn clean_folders(&mut self) -> Result<(), ConfigError> {
         for folder in &mut self.library.folders {
             *folder = absolute(folder)?;
         }
@@ -437,7 +452,9 @@ pub(crate) fn absolute(path: &Path) -> Result<PathBuf, ConfigError> {
     })
 }
 
-/// Checks that the music folder `path` exists and is a directory.
+/// Checks that the music folder `path` exists and is a directory. `init`
+/// checks each `--folder` with it, because a path that is typed on the
+/// command line and does not exist is most likely a typing mistake.
 pub(crate) fn check_folder(path: &Path) -> Result<(), ConfigError> {
     match fs::metadata(path) {
         Ok(metadata) if metadata.is_dir() => Ok(()),
@@ -449,6 +466,98 @@ pub(crate) fn check_folder(path: &Path) -> Result<(), ConfigError> {
             path: path.to_path_buf(),
             source,
         }),
+    }
+}
+
+/// Checks one value of `library.folders` when the config is loaded. The
+/// value is malformed, and the error names the key, in two cases:
+///
+/// - The path is not absolute, or it is empty. A relative path names
+///   another directory for each working directory, and the `folders` row of
+///   a music folder is found by its path.
+/// - The path names something that exists and is not a directory.
+///
+/// A path that does not exist and a path whose state cannot be read pass.
+/// Both are the state of a folder whose volume is unplugged or whose network
+/// share is down, and neither says that the value is wrong.
+fn check_folder_value(path: &Path) -> Result<(), ConfigError> {
+    let reason = if path.as_os_str().is_empty() {
+        "a music folder is an empty path".to_owned()
+    } else if !path.is_absolute() {
+        format!(
+            "the music folder {} is not an absolute path",
+            path.display()
+        )
+    } else if fs::metadata(path).is_ok_and(|metadata| !metadata.is_dir()) {
+        format!("the music folder {} is not a directory", path.display())
+    } else {
+        // A directory, a path that does not exist, or a path whose state
+        // cannot be read.
+        return Ok(());
+    };
+    Err(ConfigError::Invalid {
+        key: "library.folders",
+        reason,
+    })
+}
+
+/// A music folder of the config that cannot be read now.
+#[derive(Debug)]
+pub struct UnavailableFolder {
+    /// The path of the folder, as the config holds it.
+    pub path: PathBuf,
+    /// The error of the operating system for the folder: it does not exist,
+    /// it cannot be listed, or it is not a directory.
+    pub cause: io::Error,
+}
+
+impl Display for UnavailableFolder {
+    /// Writes the path of the folder and the error of the operating system.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "music folder {} is unavailable: {}",
+            self.path.display(),
+            self.cause
+        )
+    }
+}
+
+impl Library {
+    /// Returns the music folders that cannot be read now, in the order of
+    /// the config: a folder that does not exist, and a folder that cannot be
+    /// listed. The scanner treats each of them as an unread root
+    /// (`docs/design.md` section 3.10). A path that the config names twice
+    /// is returned once.
+    ///
+    /// The call opens each folder as the walk of the scanner does. It reads
+    /// no entry.
+    pub fn unavailable_folders(&self) -> Vec<UnavailableFolder> {
+        let mut unavailable: Vec<UnavailableFolder> = Vec::new();
+        for folder in &self.folders {
+            if unavailable.iter().any(|known| known.path == *folder) {
+                continue;
+            }
+            if let Err(cause) = fs::read_dir(folder) {
+                unavailable.push(UnavailableFolder {
+                    path: folder.clone(),
+                    cause,
+                });
+            }
+        }
+        unavailable
+    }
+
+    /// Logs one warning for each music folder that cannot be read now, with
+    /// its path and the error of the operating system. `run` and `scan` call
+    /// it once, when they start.
+    pub(crate) fn warn_unavailable_folders(&self) {
+        for folder in self.unavailable_folders() {
+            tracing::warn!(
+                "{folder}. Its tracks stay in the library, and no scan deletes a track while \
+                 the folder cannot be read"
+            );
+        }
     }
 }
 
@@ -787,15 +896,17 @@ mdns = true
         assert_eq!(config.library.folders, folders);
     }
 
-    // Windows: `C:\Music` is already absolute there, so the path that `load`
-    // stores is the path the file names.
+    // Windows: `C:\Music` is absolute there, so it passes the check of a
+    // folder value whether or not the directory exists, and the path that
+    // `load` stores is the path the file names.
     #[cfg(windows)]
     #[test]
     fn windows_folder_survives_the_round_trip() {
         let folders = vec![PathBuf::from(r"C:\Music")];
         let text = Config::template(&folders, DEFAULT_PORT).expect("template");
         let mut config = Config::parse(&text).expect("parse");
-        config.make_folders_absolute().expect("absolute");
+        check_folder_value(&folders[0]).expect("an absolute path");
+        config.clean_folders().expect("clean");
         assert_eq!(config.library.folders, folders);
     }
 
@@ -849,13 +960,42 @@ mdns = true
     }
 
     #[test]
-    fn load_makes_a_relative_folder_absolute() {
+    fn load_rejects_a_folder_that_is_not_an_absolute_path() {
         // Tests run with the package root as working directory, where `src`
-        // exists.
-        let (_dir, path) = config_file("[library]\nfolders = ['src']\n");
+        // exists. A relative path is malformed whether or not it names a
+        // directory there.
+        for folder in ["src", "absent", "./src", "../music"] {
+            let (_dir, path) = config_file(&format!("[library]\nfolders = ['{folder}']\n"));
+            let error = Config::load(&path).expect_err("a relative folder");
+            assert_eq!(
+                error.to_string(),
+                format!("library.folders: the music folder {folder} is not an absolute path")
+            );
+        }
+        let (_dir, path) = config_file("[library]\nfolders = ['']\n");
+        let error = Config::load(&path).expect_err("an empty folder");
+        assert_eq!(
+            error.to_string(),
+            "library.folders: a music folder is an empty path"
+        );
+    }
+
+    #[test]
+    fn load_cleans_an_absolute_folder_and_keeps_it_absolute() {
+        let music = tempfile::tempdir().expect("temp dir");
+        let spelled = music.path().join(".").join("albums");
+        let (_dir, path) =
+            config_file(&format!("[library]\nfolders = ['{}']\n", spelled.display()));
         let config = Config::load(&path).expect("load");
-        let expected = env::current_dir().expect("working directory").join("src");
-        assert_eq!(config.library.folders, vec![expected]);
+        // The `.` component is gone. The folder does not exist, which is no
+        // error.
+        let folder = &config.library.folders[0];
+        assert_eq!(
+            folder.as_os_str(),
+            music.path().join("albums").as_os_str(),
+            "{}",
+            folder.display()
+        );
     }
 
     #[test]
@@ -911,37 +1051,163 @@ mdns = true
     }
 
     #[test]
-    fn validate_names_a_missing_folder() {
+    fn validate_accepts_a_folder_that_does_not_exist() {
         let dir = tempfile::tempdir().expect("temp dir");
         let missing = dir.path().join("absent");
-        let error = valid_config(&missing)
+        // The path of a volume that is not mounted, alone and next to a
+        // folder that exists.
+        valid_config(&missing)
             .validate()
-            .expect_err("missing folder");
-        assert!(matches!(error, ConfigError::FolderMissing(_)), "{error}");
-        assert!(error.to_string().contains(&missing.display().to_string()));
+            .expect("a missing folder is unavailable, not malformed");
+        let mut config = valid_config(dir.path());
+        config.library.folders.push(missing);
+        config.validate().expect("one of two folders is missing");
     }
 
     #[test]
-    fn validate_names_a_folder_that_is_a_file() {
+    fn validate_accepts_a_folder_below_a_path_that_does_not_exist() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let below = dir.path().join("volume").join("music").join("albums");
+        valid_config(&below).validate().expect("valid");
+    }
+
+    #[test]
+    fn validate_rejects_a_folder_that_is_a_file_and_names_the_key() {
         let dir = tempfile::tempdir().expect("temp dir");
         let file = dir.path().join("song.flac");
         fs::write(&file, b"").expect("write file");
-        let error = valid_config(&file).validate().expect_err("file as folder");
-        assert!(
-            matches!(error, ConfigError::FolderNotDirectory(_)),
-            "{error}"
+        let config = valid_config(&file);
+        assert_eq!(invalid_key(&config), "library.folders");
+        assert_eq!(
+            config.validate().expect_err("file as folder").to_string(),
+            format!(
+                "library.folders: the music folder {} is not a directory",
+                file.display()
+            )
         );
-        assert!(error.to_string().contains(&file.display().to_string()));
+    }
+
+    #[test]
+    fn validate_rejects_a_relative_folder_and_names_the_key() {
+        for folder in ["music", "./music", "../music"] {
+            let config = valid_config(Path::new(folder));
+            assert_eq!(invalid_key(&config), "library.folders", "{folder:?}");
+            assert_eq!(
+                config.validate().expect_err("relative folder").to_string(),
+                format!("library.folders: the music folder {folder} is not an absolute path")
+            );
+        }
+        assert_eq!(invalid_key(&valid_config(Path::new(""))), "library.folders");
+    }
+
+    // Windows: a path with a root and without a drive, and a path with a
+    // drive and without a root, name another directory for each working
+    // directory, so neither is absolute there.
+    #[cfg(windows)]
+    #[test]
+    fn validate_rejects_a_windows_folder_without_a_drive_or_without_a_root() {
+        for folder in [r"\Music", r"C:Music"] {
+            assert_eq!(
+                invalid_key(&valid_config(Path::new(folder))),
+                "library.folders",
+                "{folder}"
+            );
+        }
     }
 
     #[test]
     fn validate_checks_every_folder() {
         let music = tempfile::tempdir().expect("temp dir");
-        let missing = music.path().join("absent");
+        let file = music.path().join("song.flac");
+        fs::write(&file, b"").expect("write file");
         let mut config = valid_config(music.path());
-        config.library.folders.push(missing.clone());
-        let error = config.validate().expect_err("second folder is missing");
-        assert!(error.to_string().contains(&missing.display().to_string()));
+        config.library.folders.push(music.path().join("absent"));
+        config.library.folders.push(file.clone());
+        let error = config.validate().expect_err("the third folder is a file");
+        assert!(error.to_string().contains(&file.display().to_string()));
+
+        config.library.folders[2] = PathBuf::from("relative");
+        assert_eq!(invalid_key(&config), "library.folders");
+    }
+
+    #[test]
+    fn unavailable_folders_are_the_folders_that_cannot_be_read_in_config_order() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let (rock, jazz) = (dir.path().join("rock"), dir.path().join("jazz"));
+        let (first, second) = (dir.path().join("first"), dir.path().join("second"));
+        fs::create_dir(&rock).expect("create a folder");
+        fs::create_dir(&jazz).expect("create a folder");
+
+        // The first folder is named twice.
+        let mut config = valid_config(&rock);
+        config.library.folders = vec![first.clone(), rock, second.clone(), jazz, first.clone()];
+        config.validate().expect("valid");
+        let unavailable = config.library.unavailable_folders();
+        let paths: Vec<&Path> = unavailable
+            .iter()
+            .map(|folder| folder.path.as_path())
+            .collect();
+        assert_eq!(paths, [first.as_path(), second.as_path()]);
+        for folder in &unavailable {
+            assert_eq!(folder.cause.kind(), io::ErrorKind::NotFound, "{folder}");
+            assert_eq!(
+                folder.to_string(),
+                format!(
+                    "music folder {} is unavailable: {}",
+                    folder.path.display(),
+                    folder.cause
+                )
+            );
+        }
+
+        // Every folder is back.
+        fs::create_dir(&first).expect("create a folder");
+        fs::create_dir(&second).expect("create a folder");
+        assert!(config.library.unavailable_folders().is_empty());
+    }
+
+    #[test]
+    fn a_folder_that_became_a_file_after_the_load_is_unavailable() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let folder = dir.path().join("music");
+        let config = valid_config(&folder);
+        config.validate().expect("valid");
+        fs::write(&folder, b"").expect("write file");
+        let unavailable = config.library.unavailable_folders();
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0].path, folder);
+    }
+
+    // File modes exist on Unix only.
+    #[cfg(unix)]
+    #[test]
+    fn a_folder_that_cannot_be_listed_passes_validation_and_is_unavailable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let folder = dir.path().join("music");
+        fs::create_dir(&folder).expect("create a folder");
+        let set_mode = |mode| {
+            fs::set_permissions(&folder, fs::Permissions::from_mode(mode)).expect("set the mode");
+        };
+        set_mode(0o000);
+        let config = valid_config(&folder);
+        let validated = config.validate();
+        let unavailable = config.library.unavailable_folders();
+        // The directory gets its mode back before the assertions, so that
+        // the temp directory can be removed when one fails.
+        set_mode(0o755);
+
+        validated.expect("a folder without the read permission is not malformed");
+        if unavailable.is_empty() {
+            // A process that runs as root lists the directory.
+            eprintln!("not checked: the process lists a directory that has no read permission");
+            return;
+        }
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0].path, folder);
+        assert_eq!(unavailable[0].cause.kind(), io::ErrorKind::PermissionDenied);
+        assert!(config.library.unavailable_folders().is_empty());
     }
 
     #[test]
@@ -1037,14 +1303,50 @@ mdns = true
     }
 
     #[test]
-    fn load_names_a_missing_folder() {
+    fn load_accepts_a_folder_that_does_not_exist() {
         let dir = tempfile::tempdir().expect("temp dir");
         let missing = dir.path().join("absent");
-        let (_dir, path) =
-            config_file(&format!("[library]\nfolders = ['{}']\n", missing.display()));
-        let error = Config::load(&path).expect_err("missing folder");
-        assert!(matches!(error, ConfigError::FolderMissing(_)), "{error}");
-        assert!(error.to_string().contains(&missing.display().to_string()));
+        let (_dir, path) = config_file(&format!(
+            "[library]\nfolders = ['{}', '{}']\n",
+            dir.path().display(),
+            missing.display()
+        ));
+        let config = Config::load(&path).expect("a missing folder does not fail the load");
+        assert_eq!(
+            config.library.folders,
+            [dir.path().to_path_buf(), missing.clone()]
+        );
+        let unavailable = config.library.unavailable_folders();
+        assert_eq!(unavailable.len(), 1);
+        assert_eq!(unavailable[0].path, missing);
+    }
+
+    #[test]
+    fn load_rejects_an_empty_folder_list_and_a_folder_that_is_a_file() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let file = dir.path().join("song.flac");
+        fs::write(&file, b"").expect("write file");
+        for (text, message) in [
+            (
+                "[library]\nfolders = []\n".to_owned(),
+                "library.folders: at least one music folder is required".to_owned(),
+            ),
+            (
+                "[server]\nport = 4321\n".to_owned(),
+                "library.folders: at least one music folder is required".to_owned(),
+            ),
+            (
+                format!("[library]\nfolders = ['{}']\n", file.display()),
+                format!(
+                    "library.folders: the music folder {} is not a directory",
+                    file.display()
+                ),
+            ),
+        ] {
+            let (_dir, path) = config_file(&text);
+            let error = Config::load(&path).expect_err("a malformed folder list");
+            assert_eq!(error.to_string(), message, "{text}");
+        }
     }
 
     #[test]
