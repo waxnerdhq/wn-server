@@ -8,7 +8,7 @@
 mod common;
 
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use axum::body::Body;
@@ -1128,7 +1128,7 @@ async fn large_file_is_read_in_chunks_as_the_client_takes_them() {
 /// an entry is the state of the open file. On macOS it is not, and opening
 /// the entry duplicates the descriptor, whose state is then read.
 #[cfg(unix)]
-fn open_descriptors(path: &Path) -> usize {
+fn open_descriptors(path: &std::path::Path) -> usize {
     use std::os::unix::fs::MetadataExt;
 
     let file = fs::metadata(path).expect("the state of the file");
