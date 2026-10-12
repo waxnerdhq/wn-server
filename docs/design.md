@@ -636,7 +636,7 @@ Amperfy calls `ping, getOpenSubsonicExtensions, getMusicFolders, getIndexes, get
 | getVideos, getVideoInfo | deferred: `not supported` |
 | getArtistInfo, getArtistInfo2, getAlbumInfo, getAlbumInfo2, getSimilarSongs, getSimilarSongs2, getTopSongs | empty result stubs |
 | getAlbumList, getAlbumList2, getRandomSongs, getSongsByGenre | required |
-| getNowPlaying | empty result stub |
+| getNowPlaying | empty list stub |
 | getStarred, getStarred2 | required |
 | search | deprecated: error 0 |
 | search2, search3 | required, empty query supported |
@@ -665,8 +665,7 @@ User methods (`api/users.rs`): the server has one account, so `getUser` and `get
 
 - `download` returns error 50 with the message `download is disabled on this server`. The response is the error envelope and never holds a byte of a file.
 - An empty result is an object without fields under the key of the method: `getArtistInfo` → `artistInfo`, `getArtistInfo2` → `artistInfo2`, `getAlbumInfo` and `getAlbumInfo2` → `albumInfo`, `getSimilarSongs` → `similarSongs`, `getSimilarSongs2` → `similarSongs2`, `getTopSongs` → `topSongs`.
-- `getNowPlaying` returns `nowPlaying` with the empty list `entry`, because the OpenSubsonic API marks `entry` as required.
-- An empty list is an object whose one field is an empty list, which is `[]` in JSON and absent in XML: `getShares` → `shares` with `share`, `getPodcasts` → `podcasts` with `channel`, `getNewestPodcasts` → `newestPodcasts` with `episode`, `getInternetRadioStations` → `internetRadioStations` with `internetRadioStation`, `getBookmarks` → `bookmarks` with `bookmark`.
+- An empty list is an object whose one field is an empty list, which is `[]` in JSON and absent in XML: `getNowPlaying` → `nowPlaying` with `entry`, `getShares` → `shares` with `share`, `getPodcasts` → `podcasts` with `channel`, `getNewestPodcasts` → `newestPodcasts` with `episode`, `getInternetRadioStations` → `internetRadioStations` with `internetRadioStation`, `getBookmarks` → `bookmarks` with `bookmark`. The OpenSubsonic API marks `entry` as required and the other lists as optional.
 - `getAvatar` returns error 70.
 - `createUser`, `updateUser`, `deleteUser` and `changePassword` return error 50 with the message `user management is not available on this server`. The `wn-server user` commands manage the account.
 

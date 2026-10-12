@@ -93,7 +93,7 @@ const STUBS: [(&str, Answer); 19] = [
 /// The statuses that the table in `docs/design.md` section 4 gives a stub.
 const STUB_STATUSES: [&str; 6] = [
     "empty result stubs",
-    "empty result stub",
+    "empty list stub",
     "empty list stubs",
     "disabled: error 50",
     "error 70",
