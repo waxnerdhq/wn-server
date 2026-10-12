@@ -6,7 +6,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 
-use common::{LibraryBuilder, PICTURE_PNG, STANDARD_LYRICS, TestLibrary};
+use common::{LibraryBuilder, PICTURE_PNG, TestLibrary};
 use image::ImageFormat;
 use lofty::file::TaggedFileExt;
 use lofty::picture::MimeType;
@@ -51,14 +51,6 @@ fn read_tag(path: &Path) -> Tag {
     file.primary_tag()
         .unwrap_or_else(|| panic!("{} has no primary tag", path.display()))
         .clone()
-}
-
-/// Returns the lyrics of a tag. lofty reports the lyrics of an M4A file under
-/// `ItemKey::Lyrics` and those of the other formats under
-/// `ItemKey::UnsyncLyrics`.
-fn lyrics(tag: &Tag) -> Option<&str> {
-    tag.get_string(ItemKey::UnsyncLyrics)
-        .or_else(|| tag.get_string(ItemKey::Lyrics))
 }
 
 /// Returns the components of the path of track `index` below the library root.
@@ -180,7 +172,6 @@ fn builder_round_trips_tags_in_every_format() {
         ] {
             assert_eq!(plain.get_string(key), None, "{ext} {key:?}");
         }
-        assert_eq!(lyrics(&plain), None, "{ext}");
         assert_eq!(plain.picture_count(), 0, "{ext}");
     }
 }
@@ -202,20 +193,6 @@ fn builder_embeds_the_picture_in_every_format() {
         let picture = &tag.pictures()[0];
         assert_eq!(picture.data(), PICTURE_PNG, "{ext}");
         assert_eq!(picture.mime_type(), Some(&MimeType::Png), "{ext}");
-    }
-}
-
-#[test]
-fn builder_writes_the_lyrics_in_every_format() {
-    let text = "First line\nSecond line";
-    for ext in EXTENSIONS {
-        let library = LibraryBuilder::new()
-            .track("Artist", "Album", "Title", 1, ext)
-            .lyrics(text)
-            .build();
-        let tag = read_tag(&library.files[0]);
-
-        assert_eq!(lyrics(&tag), Some(text), "{ext}");
     }
 }
 
@@ -296,15 +273,6 @@ fn standard_library_reads_back_as_the_catalogue() {
     assert_eq!(
         titles_where(&tags, |tag| tag.picture_count() > 0),
         ["Upstream", "Delta"]
-    );
-    // One track with lyrics.
-    assert_eq!(
-        titles_where(&tags, |tag| lyrics(tag).is_some()),
-        ["Open Road"]
-    );
-    assert_eq!(
-        titles_where(&tags, |tag| lyrics(tag) == Some(STANDARD_LYRICS)),
-        ["Open Road"]
     );
 
     // One album with `cover.jpg`. It is the only file that is not a track.

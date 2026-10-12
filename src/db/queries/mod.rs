@@ -25,7 +25,7 @@
 //! authentication use. `browse` reads the library for the API: it holds the
 //! rows that the response models are built from and the functions that read
 //! them by ID. The module of a group of API methods (`lists`, `search`,
-//! `playlists`, `play_queue`, `lyrics`) selects IDs with its own SQL and
+//! `playlists`, `play_queue`) selects IDs with its own SQL and
 //! reads the rows through `browse`, so it adds no function to another
 //! module. `indexes` is the module of the folder methods. They read their
 //! rows through `browse`, and the module holds what `browse` does not have:
@@ -49,8 +49,6 @@ pub mod search;
 pub mod playlists;
 
 pub mod play_queue;
-
-// lyrics
 
 pub mod users;
 

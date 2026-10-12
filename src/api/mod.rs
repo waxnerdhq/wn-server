@@ -50,7 +50,7 @@ pub mod playlists;
 
 pub mod queue;
 
-// lyrics
+pub mod lyrics;
 
 pub mod users;
 
@@ -306,9 +306,9 @@ pub const METHODS: &[(&str, Handler)] = &[
 
     ("getCoverArt", handler!(covers::get_cover_art)),
 
-    ("getLyrics", not_implemented),
+    ("getLyrics", handler!(lyrics::get_lyrics)),
 
-    ("getLyricsBySongId", not_implemented),
+    ("getLyricsBySongId", handler!(lyrics::get_lyrics_by_song_id)),
 
     ("getAvatar", handler!(stubs::get_avatar)),
 
@@ -403,8 +403,6 @@ pub const EXTENSIONS: &[(&str, &[u32])] = &[
     ("formPost", &[1]),
 
     // transcodeOffset
-
-    // songLyrics
 ];
 
 /// Builds the router of the server: one route for `/rest/{method}` that

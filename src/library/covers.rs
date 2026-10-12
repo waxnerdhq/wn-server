@@ -1091,7 +1091,6 @@ mod tests {
                 bit_depth: None,
                 channels: None,
                 has_picture,
-                has_lyrics: false,
                 suffix: "flac".to_owned(),
                 content_type: "audio/flac".to_owned(),
                 lossless: true,

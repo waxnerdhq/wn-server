@@ -6,7 +6,7 @@ mod common;
 use std::fs;
 use std::path::Path;
 
-use common::{LibraryBuilder, PICTURE_PNG, STANDARD_LYRICS};
+use common::{LibraryBuilder, PICTURE_PNG};
 use lofty::config::WriteOptions;
 use lofty::file::TaggedFileExt;
 use lofty::tag::{ItemKey, Tag, TagExt};
@@ -35,9 +35,6 @@ const FORMATS: [Format; 5] = [
     Format { ext: "opus", content_type: "audio/ogg", lossless: false, duration_ms: 500, bitrate_kbps: 28, sample_rate: 24000, bit_depth: None },
 ];
 
-/// A lyrics file with LRC time stamps.
-const LRC: &str = "[00:01.00]First line\n[00:02.50]Second line\n";
-
 /// Reads the metadata of the audio file at `path`.
 fn read(path: &Path) -> TrackMeta {
     tags::read(path).unwrap_or_else(|error| panic!("{error}"))
@@ -62,7 +59,6 @@ fn plain(format: &Format, title: &str, track_no: u32) -> TrackMeta {
         bit_depth: format.bit_depth,
         channels: Some(1),
         has_picture: false,
-        has_lyrics: false,
         suffix: format.ext.to_owned(),
         content_type: format.content_type.to_owned(),
         lossless: format.lossless,
@@ -101,7 +97,6 @@ fn read_returns_every_field_in_each_format() {
             .disc(2)
             .album_artist("Album Artist")
             .picture()
-            .lyrics("First line\nSecond line")
             .track("Artist", "Album", "Plain", 12, format.ext)
             .build();
 
@@ -113,7 +108,6 @@ fn read_returns_every_field_in_each_format() {
                 year: Some(2004),
                 genre: Some("Rock".to_owned()),
                 has_picture: true,
-                has_lyrics: true,
                 ..plain(format, "Full", 7)
             },
             "{}",
@@ -241,48 +235,6 @@ fn has_picture_agrees_with_read_front_picture() {
             "{}",
             format.ext
         );
-    }
-}
-
-#[test]
-fn lyrics_tag_sets_has_lyrics() {
-    let text = "First line\nSecond line";
-    for format in &FORMATS {
-        let library = LibraryBuilder::new()
-            .track("Artist", "Album", "With", 1, format.ext)
-            .lyrics(text)
-            .track("Artist", "Album", "Without", 2, format.ext)
-            .build();
-
-        assert!(read(&library.files[0]).has_lyrics, "{}", format.ext);
-        assert_eq!(
-            tags::read_lyrics(&library.files[0]).as_deref(),
-            Some(text),
-            "{}",
-            format.ext
-        );
-        assert!(!read(&library.files[1]).has_lyrics, "{}", format.ext);
-        assert_eq!(tags::read_lyrics(&library.files[1]), None, "{}", format.ext);
-    }
-}
-
-#[test]
-fn sidecar_lrc_sets_has_lyrics() {
-    for format in &FORMATS {
-        let library = LibraryBuilder::new()
-            .track("Artist", "Album", "Sidecar", 1, format.ext)
-            .track("Artist", "Album", "Both", 2, format.ext)
-            .lyrics("Tag line")
-            .track("Artist", "Album", "Neither", 3, format.ext)
-            .build();
-        for path in &library.files[..2] {
-            fs::write(path.with_extension("lrc"), LRC).expect("write the lyrics file");
-        }
-
-        assert!(read(&library.files[0]).has_lyrics, "{}", format.ext);
-        assert!(read(&library.files[1]).has_lyrics, "{}", format.ext);
-        // The lyrics file of another track does not count.
-        assert!(!read(&library.files[2]).has_lyrics, "{}", format.ext);
     }
 }
 
@@ -435,14 +387,9 @@ fn standard_library_reads_back_as_the_catalogue() {
             .collect()
     };
     assert_eq!(titles_where(|meta| meta.has_picture), ["Upstream", "Delta"]);
-    assert_eq!(titles_where(|meta| meta.has_lyrics), ["Open Road"]);
     assert_eq!(
         titles_where(|meta| meta.lossless),
         ["Low Tide", "Breakwater", "Night Ferry"]
-    );
-    assert_eq!(
-        tags::read_lyrics(&library.files[8]).as_deref(),
-        Some(STANDARD_LYRICS)
     );
     // The cover file of "Glass Harbour" is not an embedded picture.
     assert_eq!(tags::read_front_picture(&library.files[0]), None);

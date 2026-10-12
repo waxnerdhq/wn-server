@@ -42,9 +42,6 @@ pub const PICTURE_PNG: [u8; 75] = [
     0x00, 0x00, 0x00, 0x49, 0x45, 0x4e, 0x44, 0xae, 0x42, 0x60, 0x82,
 ];
 
-/// The lyrics of the track "Open Road" in [`LibraryBuilder::standard`].
-pub const STANDARD_LYRICS: &str = "The road is open\nThe morning is clear";
-
 /// Returns the directory of the committed audio fixtures,
 /// `tests/fixtures/audio`.
 pub fn fixtures_dir() -> PathBuf {
@@ -67,7 +64,6 @@ struct TrackSpec {
     album_artist: Option<String>,
     compilation: bool,
     picture: bool,
-    lyrics: Option<String>,
 }
 
 /// One cover image file of a library that is being built.
@@ -117,8 +113,8 @@ impl LibraryBuilder {
     /// - Marlow Quartet, "Slow Rivers" (2015, Jazz): 2 M4A tracks with an
     ///   album-artist tag and an embedded picture.
     /// - "Summer Sampler" (2020, Pop): a compilation of one Ogg Vorbis track
-    ///   by Tessa Lund, which has lyrics, and one Opus track by Aurora Field.
-    ///   Both tracks have the compilation flag and no album-artist tag.
+    ///   by Tessa Lund and one Opus track by Aurora Field. Both tracks have
+    ///   the compilation flag and no album-artist tag.
     ///
     /// The tags name three track artists. By the album identity rule in
     /// `docs/design.md` §1.3 the album artists are Aurora Field, Marlow
@@ -164,7 +160,6 @@ impl LibraryBuilder {
             .year(2020)
             .genre("Pop")
             .compilation()
-            .lyrics(STANDARD_LYRICS)
             .track("Aurora Field", "Summer Sampler", "Last Train", 2, "opus")
             .year(2020)
             .genre("Pop")
@@ -173,8 +168,8 @@ impl LibraryBuilder {
 
     /// Adds a track. `ext` selects the fixture and is one of `flac`, `mp3`,
     /// `m4a`, `ogg` and `opus`. The methods `year`, `genre`, `disc`,
-    /// `album_artist`, `compilation`, `picture` and `lyrics` change the track
-    /// that was added last.
+    /// `album_artist`, `compilation` and `picture` change the track that was
+    /// added last.
     pub fn track(
         mut self,
         artist: &str,
@@ -195,7 +190,6 @@ impl LibraryBuilder {
             album_artist: None,
             compilation: false,
             picture: false,
-            lyrics: None,
         });
         self
     }
@@ -235,16 +229,6 @@ impl LibraryBuilder {
     /// back with the type `Other`.
     pub fn picture(mut self) -> Self {
         self.last().picture = true;
-        self
-    }
-
-    /// Sets the unsynchronised lyrics of the last track. The text is stored
-    /// in a `USLT` frame in MP3, in the `©lyr` atom in M4A and in an
-    /// `UNSYNCEDLYRICS` comment in FLAC, Ogg Vorbis and Opus. lofty reads it
-    /// back under `ItemKey::UnsyncLyrics`, and under `ItemKey::Lyrics` from
-    /// M4A.
-    pub fn lyrics(mut self, text: &str) -> Self {
-        self.last().lyrics = Some(text.to_owned());
         self
     }
 
@@ -335,9 +319,6 @@ fn write_tags(path: &Path, track: &TrackSpec) {
     }
     if track.compilation {
         set(ItemKey::FlagCompilation, "1".to_owned());
-    }
-    if let Some(lyrics) = &track.lyrics {
-        set(ItemKey::UnsyncLyrics, lyrics.clone());
     }
     if track.picture {
         tag.push_picture(
@@ -543,7 +524,7 @@ mod scanned {
         pub upstream: String,
         /// "Slow Rivers", track 2, M4A.
         pub delta: String,
-        /// "Summer Sampler", track 1, Ogg Vorbis, by Tessa Lund, with lyrics.
+        /// "Summer Sampler", track 1, Ogg Vorbis, by Tessa Lund.
         pub open_road: String,
         /// "Summer Sampler", track 2, Opus, by Aurora Field.
         pub last_train: String,
