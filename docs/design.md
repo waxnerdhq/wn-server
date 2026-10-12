@@ -88,6 +88,34 @@ Portability rules in code:
 - `.gitattributes`: `* text=auto eol=lf`, `tests/fixtures/audio/* binary`.
 - Checks run through `cargo xtask check` on every OS; `xtask` invokes the cargo named by `env!("CARGO")` so the toolchain that runs it runs the checks. `scripts/check.sh` is a one-line wrapper for Unix and CI.
 
+### 2.1 Release builds
+
+A release is a tag `v<version>` on a commit of `main`, where `<version>` is the version in `Cargo.toml`. The push of the tag runs `.woodpecker/release.yaml`. The pipeline builds the binary for five targets in the Linux container, packs one archive for each target and publishes the archives as the GitHub release of the tag.
+
+The version has one source, `Cargo.toml`. The pipeline reads it there and stops before the first build when the tag is not `v` followed by it. The archive names carry it, and `wn-server --version` prints it (`VERSION` is `CARGO_PKG_VERSION`). A release of a new version therefore needs the version change in `Cargo.toml` and `Cargo.lock` on `main` before the tag.
+
+| Target | Built with | Archive |
+|---|---|---|
+| `x86_64-unknown-linux-gnu` | `cargo zigbuild`, target suffix `.2.28` | `wn-server-<version>-x86_64-unknown-linux-gnu.tar.gz` |
+| `aarch64-unknown-linux-gnu` | `cargo zigbuild`, target suffix `.2.28` | `wn-server-<version>-aarch64-unknown-linux-gnu.tar.gz` |
+| `x86_64-pc-windows-gnu` | `cargo build` with the MinGW-w64 compiler of the `gcc-mingw-w64-x86-64` package | `wn-server-<version>-x86_64-pc-windows-gnu.zip` |
+| `aarch64-apple-darwin` | `cargo zigbuild` | `wn-server-<version>-aarch64-apple-darwin.tar.gz` |
+| `x86_64-apple-darwin` | `cargo zigbuild` | `wn-server-<version>-x86_64-apple-darwin.tar.gz` |
+
+- Every build is `--release --locked --bin wn-server` with the release profile of `Cargo.toml`. SQLite is compiled into each binary (`rusqlite` `bundled`).
+- `cargo-zigbuild` runs zig as the C compiler and the linker of a target. The Linux binaries link glibc dynamically, and the suffix `.2.28` makes glibc 2.28 the oldest version that they run with.
+- `cargo-zigbuild` supports Linux and macOS targets only, so the Windows binary is built with MinGW-w64. No binary is built for the MSVC target.
+- The container has no Apple SDK. zig and `cargo-zigbuild` carry the definitions of the macOS system libraries that a Rust binary links against. An Apple framework is not among them, and no dependency of wn-server links one. A dependency that links one makes the two macOS builds fail, and the pipeline with them.
+- An archive holds one directory that has the name of the archive without the extension. The directory holds the binary (`wn-server`, or `wn-server.exe` for Windows), `LICENSE` and `README.md`.
+- The binaries are not signed. The pipeline does no code signing and no notarisation, and it builds no installer and no package for a package manager.
+- The versions of `cargo-zigbuild`, of zig (the `ziglang` package) and of the release plugin are pinned in the pipeline file.
+
+The pipeline has three steps. `build` installs the tools, compares the tag with the version, builds the five targets and writes the archives. `verify` prints the name, the size and the SHA-256 of each archive, unpacks the Linux x86_64 archive in a `debian:bookworm` container and runs `wn-server --version` there; the step fails when the output is not `wn-server <version>`. `publish` runs `woodpeckerci/plugin-release`, which creates the release of the tag with the tag as its title and uploads the archives. A failed step ends the pipeline, so nothing is published unless every target was built and the Linux x86_64 binary ran. When the pipeline runs again for a tag that has a release, the plugin keeps the release and replaces its archives.
+
+`publish` authenticates with the Woodpecker secret `github_token`, a GitHub token that can create a release in the repository. The secret is limited to tag events and to the plugin image, so a pipeline of a pull request and a step with commands cannot read it.
+
+The pipeline runs one of the five binaries, the Linux x86_64 one. The other four are built and not run.
+
 ## 3. Architecture
 
 ### 3.1 Crate layout

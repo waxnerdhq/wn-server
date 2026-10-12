@@ -1,0 +1,165 @@
+# Builds the release archives of a version and publishes them as a GitHub
+# release. Runs when a tag that starts with `v` is pushed.
+#
+# The tag is `v` followed by the version in Cargo.toml, for example `v0.1.0`.
+# The pipeline stops before the first build when the two differ. The version
+# in the archive names, the tag and the output of `wn-server --version` are
+# therefore the same.
+#
+# A release has one archive for each target:
+#
+# - wn-server-<version>-x86_64-unknown-linux-gnu.tar.gz
+# - wn-server-<version>-aarch64-unknown-linux-gnu.tar.gz
+# - wn-server-<version>-x86_64-pc-windows-gnu.zip
+# - wn-server-<version>-aarch64-apple-darwin.tar.gz
+# - wn-server-<version>-x86_64-apple-darwin.tar.gz
+#
+# An archive holds one directory that has the name of the archive without the
+# extension. The directory holds the binary, LICENSE and README.md. The
+# binaries are built with the release profile of Cargo.toml and are not
+# signed.
+#
+# Woodpecker replaces every expression that starts with a dollar sign and an
+# opening brace in this file before it reads the YAML, in the comments too. The
+# commands below therefore name shell variables without braces.
+when:
+  - event: tag
+    ref: refs/tags/v*
+  # TEMPORARY (WAX-867). This entry runs the build and verify steps on the pull
+  # request that adds this file, as the proof that every target builds. The
+  # publish step does not run on it. The last commit before the merge removes
+  # this entry and every other part marked TEMPORARY.
+  - event: pull_request
+
+steps:
+  # One step builds every target, because packages installed in one step are
+  # gone in the next. The image tag matches the toolchain in
+  # rust-toolchain.toml.
+  #
+  # Nothing is cached between runs. A run is five release builds from an empty
+  # target directory.
+  - name: build
+    image: rust:1.98.1-bookworm
+    commands:
+      # file prints the format of each binary into the log. The MinGW-w64 C
+      # compiler compiles the bundled SQLite for the Windows target and links
+      # the Windows binary. pip installs the two build tools of the next
+      # command. zip writes the Windows archive.
+      - apt-get update
+      - apt-get install -y --no-install-recommends file gcc-mingw-w64-x86-64 python3-pip zip
+      # cargo-zigbuild runs zig as the C compiler and the linker of the Linux
+      # and macOS targets. ziglang is zig as a Python package. Both versions
+      # are pinned. 0.16.0 is the zig version that cargo-zigbuild 0.23.4 is
+      # tested with. Debian's pip installs into the system Python only with
+      # the flag. The container is discarded after the step.
+      - python3 -m pip install --break-system-packages cargo-zigbuild==0.23.4 ziglang==0.16.0
+      # Adds the components that rust-toolchain.toml names and the image does
+      # not have, so that rustup installs nothing during a build.
+      - rustup toolchain install
+      # Adds the Rust standard library of each target.
+      - rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-pc-windows-gnu aarch64-apple-darwin x86_64-apple-darwin
+      # Reads the version of the package from Cargo.toml. The verify step
+      # reads it from the file that this command writes.
+      - |
+        VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("Cargo.toml", "rb"))["package"]["version"])')
+        mkdir -p target/stage dist
+        echo "$VERSION" > target/stage/VERSION
+        echo "version $VERSION, tag $CI_COMMIT_TAG"
+      # Stops when the tag is not the version in Cargo.toml.
+      #
+      # TEMPORARY (WAX-867). The comparison with the event name skips the check
+      # on a pull request, which has no tag. The last commit before the merge
+      # removes that comparison.
+      - |
+        if [ "$CI_PIPELINE_EVENT" = tag ] && [ "$CI_COMMIT_TAG" != "v$VERSION" ]; then
+          echo "The tag is not v$VERSION, the version in Cargo.toml."
+          exit 1
+        fi
+      # package <target> <binary> <format> copies the binary of a target,
+      # LICENSE and README.md into one directory, prints the format of the
+      # binary and writes the archive of the directory into dist/. The format
+      # is tar.gz or zip. Each command runs only when the one before it
+      # succeeded, so a target without a binary gets no archive.
+      - |
+        package() {
+          name="wn-server-$VERSION-$1"
+          mkdir "target/stage/$name" &&
+            cp "target/$1/release/$2" LICENSE README.md "target/stage/$name/" &&
+            file "target/stage/$name/$2" &&
+            if [ "$3" = zip ]; then
+              (cd target/stage && zip -q -r "../../dist/$name.zip" "$name")
+            else
+              (cd target/stage && tar -czf "../../dist/$name.tar.gz" "$name")
+            fi
+        }
+      # TEMPORARY (WAX-867). From here on a failed command does not stop the
+      # step, so that one proof run shows the result of every target. The last
+      # command of the step fails when an archive is missing. The last commit
+      # before the merge removes both commands.
+      - set +e
+      # Linux. The suffix of the target is the oldest glibc that the binary
+      # runs with. cargo writes the binary into the directory of the target
+      # without the suffix.
+      - cargo zigbuild --release --locked --bin wn-server --target x86_64-unknown-linux-gnu.2.28
+      - package x86_64-unknown-linux-gnu wn-server tar.gz
+      - cargo zigbuild --release --locked --bin wn-server --target aarch64-unknown-linux-gnu.2.28
+      - package aarch64-unknown-linux-gnu wn-server tar.gz
+      # Windows. cargo-zigbuild supports Linux and macOS targets only, so
+      # MinGW-w64 compiles and links this target. Nothing is built for the MSVC
+      # target.
+      - cargo build --release --locked --bin wn-server --target x86_64-pc-windows-gnu
+      - package x86_64-pc-windows-gnu wn-server.exe zip
+      # macOS. The container has no Apple SDK. zig links against the system
+      # library definitions that it carries, which is enough because no
+      # dependency of wn-server links an Apple framework. These two builds run
+      # last: when one of them fails, the log above it holds the result of the
+      # Linux and Windows targets.
+      - cargo zigbuild --release --locked --bin wn-server --target aarch64-apple-darwin
+      - package aarch64-apple-darwin wn-server tar.gz
+      - cargo zigbuild --release --locked --bin wn-server --target x86_64-apple-darwin
+      - package x86_64-apple-darwin wn-server tar.gz
+      # TEMPORARY (WAX-867). See `set +e` above.
+      - test "$(ls dist | wc -l)" -eq 5
+    backend_options:
+      kubernetes:
+        # The step sets requests only. Limits come from the namespace.
+        resources:
+          requests:
+            cpu: "2"
+            memory: 3Gi
+
+  # Prints the name, the size and the SHA-256 of each archive into the log.
+  # Then unpacks the Linux x86_64 archive in a Debian container that has no
+  # build tool and runs the binary. The step fails when the binary does not
+  # start or prints another version than the one in Cargo.toml, and nothing is
+  # published then.
+  - name: verify
+    image: debian:bookworm
+    commands:
+      - VERSION=$(cat target/stage/VERSION)
+      - ls -l dist
+      - sha256sum dist/*
+      - tar -xzf "dist/wn-server-$VERSION-x86_64-unknown-linux-gnu.tar.gz" -C /tmp
+      - /tmp/wn-server-$VERSION-x86_64-unknown-linux-gnu/wn-server --version
+      - test "$(/tmp/wn-server-$VERSION-x86_64-unknown-linux-gnu/wn-server --version)" = "wn-server $VERSION"
+
+  # Creates the GitHub release of the tag and uploads the archives to it. The
+  # title of the release is the tag. When the release exists already, the
+  # plugin keeps it and replaces the archives that have the same names. The
+  # plugin version is pinned.
+  #
+  # `github_token` is a secret of this repository in Woodpecker. It holds a
+  # GitHub token that can create a release in this repository. The step needs
+  # the secret for the tag event and for this plugin image, and for nothing
+  # else.
+  - name: publish
+    image: woodpeckerci/plugin-release:0.3.2
+    settings:
+      api_key:
+        from_secret: github_token
+      files:
+        - dist/*.tar.gz
+        - dist/*.zip
+    # The plugin fails on every event that is not a tag.
+    when:
+      - event: tag
