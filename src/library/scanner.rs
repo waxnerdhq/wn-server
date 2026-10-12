@@ -118,8 +118,9 @@ pub struct ScanSummary {
     /// One message for each problem that kept the scan from finishing its
     /// work: a folder, a path or a file that cannot be read, the number of
     /// tracks that were kept for that reason, a folder that had tracks and
-    /// has no supported file, a removed folder whose tracks were kept, and a
-    /// track that is kept without a file. A cancelled scan has
+    /// has no supported file, a removed folder whose tracks were kept, a
+    /// track that is kept without a file, and a file over the tag bound,
+    /// which kept no track from being deleted. A cancelled scan has
     /// [`CANCELLED`] as its last message.
     pub errors: Vec<String>,
 }
@@ -1450,12 +1451,33 @@ impl Scanner<'_> {
         }
     }
 
-    /// Reads the tags of `file`. Logs a warning and returns `None` when the
-    /// tags cannot be read.
+    /// Reads the tags of `file`. Returns `None` when the tags cannot be read:
+    /// with a warning for a file that the tag reader cannot parse, and with
+    /// an error of the scan for a file over the tag bound
+    /// ([`tags::MAX_TAG_BYTES`]).
+    ///
+    /// Neither file holds a deletion back. The walk read the state of the
+    /// file and the scan read its fingerprint, so the scan knows which file
+    /// it is. It is no path and no file that may hold the file of a row
+    /// ([`Unread`]).
     fn read_tags(&mut self, file: &FoundFile) -> Option<TrackMeta> {
         self.summary.tags_read += 1;
         match (self.reader.tags)(&self.path_of(file)) {
             Ok(meta) => Some(meta),
+            Err(TagError::TooLarge(_)) => {
+                // A file over the bound stays out of the library until its
+                // tags are smaller, so the owner is told in the errors of
+                // every scan that reads it.
+                let folder = self.folder_of(file).map(describe).unwrap_or_default();
+                self.problem(format!(
+                    "\"{}\" in music folder {folder} is refused: reading its tags takes more \
+                     than {} MiB of the file; it gets no track, and a track that it has stays \
+                     as it is",
+                    file.rel_path,
+                    tags::MAX_TAG_BYTES / (1024 * 1024)
+                ));
+                None
+            }
             Err(error) => {
                 tracing::warn!(%error, "the file is left for the next scan");
                 None

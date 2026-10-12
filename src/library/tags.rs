@@ -8,8 +8,17 @@
 //!
 //! Fields come from the tag of the format's primary type, or from the first
 //! tag when the file has none.
+//!
+//! A tag read takes at most [`MAX_TAG_BYTES`] of a file (`docs/design.md`
+//! section 3.10, "The tag bound"). A file whose headers declare a larger tag
+//! is refused before lofty reads it, and lofty reads every other file through
+//! a reader that stops at the bound. The module `bound` holds both parts.
+
+mod bound;
 
 use std::error::Error;
+use std::fs::File;
+use std::io::{self, BufReader, Read, Seek};
 use std::path::{Path, PathBuf};
 
 use lofty::config::ParseOptions;
@@ -19,6 +28,9 @@ use lofty::mp4::{Mp4Codec, Mp4File};
 use lofty::picture::{MimeType, Picture, PictureType};
 use lofty::probe::Probe;
 use lofty::tag::{ItemKey, Tag};
+
+use bound::Capped;
+pub use bound::MAX_TAG_BYTES;
 
 /// The supported formats: the extension in lower case and the content type.
 const FORMATS: [(&str, &str); 9] = [
@@ -118,6 +130,15 @@ pub enum TagError {
         path: PathBuf,
         source: FileParseError,
     },
+    /// The file is over the tag bound: its headers declare a tag of more
+    /// than [`MAX_TAG_BYTES`], or reading its tags takes more bytes of the
+    /// file than that. The tags were not read.
+    #[error(
+        "{} is refused: reading its tags takes more than {} MiB of the file",
+        .0.display(),
+        MAX_TAG_BYTES / (1024 * 1024)
+    )]
+    TooLarge(PathBuf),
 }
 
 /// Returns whether the extension of `path` is one of
@@ -131,14 +152,17 @@ pub fn is_supported(path: &Path) -> bool {
 /// # Errors
 ///
 /// Returns [`TagError::UnsupportedExtension`] for a path that
-/// [`is_supported`] rejects, and [`TagError::Read`] for a file that cannot be
-/// opened or parsed.
+/// [`is_supported`] rejects, [`TagError::TooLarge`] for a file over the tag
+/// bound, and [`TagError::Read`] for a file that cannot be opened or parsed.
 pub fn read(path: &Path) -> Result<TrackMeta, TagError> {
     let (suffix, content_type) =
         format_of(path).ok_or_else(|| TagError::UnsupportedExtension(path.to_owned()))?;
-    let parsed = parse(path, ParseOptions::new()).map_err(|source| TagError::Read {
-        path: path.to_owned(),
-        source,
+    let parsed = parse(path, ParseOptions::new()).map_err(|error| match error {
+        ParseError::TooLarge => TagError::TooLarge(path.to_owned()),
+        ParseError::Read(source) => TagError::Read {
+            path: path.to_owned(),
+            source,
+        },
     })?;
     let tag = main_tag(&parsed.file);
     let properties = parsed.file.properties();
@@ -191,7 +215,8 @@ pub fn read(path: &Path) -> Result<TrackMeta, TagError> {
 /// or GIF. Otherwise it is detected from the first bytes of the picture, and
 /// it is `application/octet-stream` when they are not a known image format.
 ///
-/// Returns `None` when the file has no picture or cannot be read.
+/// Returns `None` when the file has no picture, cannot be read or is over the
+/// tag bound. The tag of a file over the bound is not read.
 pub fn read_front_picture(path: &Path) -> Option<(Vec<u8>, String)> {
     format_of(path)?;
     let parsed = parse(path, ParseOptions::new().read_properties(false)).ok()?;
@@ -216,20 +241,93 @@ fn format_of(path: &Path) -> Option<(&'static str, &'static str)> {
         .find(|(supported, _)| supported.eq_ignore_ascii_case(extension))
 }
 
-/// Opens the file at `path` and parses it with `options`.
-fn parse(path: &Path, options: ParseOptions) -> Result<Parsed, FileParseError> {
-    let probe = Probe::open(path)?.options(options).guess_file_type()?;
+/// Why a file was not parsed.
+#[derive(Debug)]
+enum ParseError {
+    /// The file is over the tag bound.
+    TooLarge,
+    /// The file cannot be opened, or lofty cannot parse it.
+    Read(FileParseError),
+}
+
+impl From<FileParseError> for ParseError {
+    fn from(error: FileParseError) -> Self {
+        Self::Read(error)
+    }
+}
+
+impl From<io::Error> for ParseError {
+    fn from(error: io::Error) -> Self {
+        Self::Read(error.into())
+    }
+}
+
+/// Opens the file at `path` and parses it with `options`, within the tag
+/// bound.
+fn parse(path: &Path, options: ParseOptions) -> Result<Parsed, ParseError> {
+    let file = BufReader::new(File::open(path)?);
+    parse_reader(file, FileType::from_path(path), options, MAX_TAG_BYTES)
+}
+
+/// Parses the file in `reader` with `options`. `by_extension` is the format
+/// that the extension of the file names. At most `limit` bytes of the file
+/// are read, in every step together.
+///
+/// Returns [`ParseError::TooLarge`] when the headers of the file declare a
+/// tag of more than `limit` bytes, which is found before lofty reads the
+/// file, and when a step asks the reader for a byte past `limit`.
+fn parse_reader<R: Read + Seek>(
+    reader: R,
+    by_extension: Option<FileType>,
+    options: ParseOptions,
+    limit: u64,
+) -> Result<Parsed, ParseError> {
+    let mut reader = Capped::new(reader, limit);
+    let parsed = parse_capped(&mut reader, by_extension, options, limit);
+    // lofty ends some of its loops at a read that fails and returns what it
+    // has, so the reader decides and not the result.
+    if reader.exceeded() {
+        return Err(ParseError::TooLarge);
+    }
+    parsed
+}
+
+/// The steps of [`parse_reader`]: detects the format, adds up what the
+/// headers declare, and has lofty read the file.
+fn parse_capped<R: Read + Seek>(
+    reader: &mut Capped<R>,
+    by_extension: Option<FileType>,
+    options: ParseOptions,
+    limit: u64,
+) -> Result<Parsed, ParseError> {
+    // The content decides the format. The extension decides it when the
+    // content does not.
+    let detected = Probe::new(&mut *reader)
+        .options(options)
+        .guess_file_type()?
+        .file_type();
+    let Some(file_type) = detected.or(by_extension) else {
+        // lofty returns the error of a file without a format.
+        let file = Probe::new(reader).options(options).read()?;
+        return Ok(Parsed { file, alac: false });
+    };
+
+    if bound::declared(reader, file_type, limit) > limit {
+        return Err(ParseError::TooLarge);
+    }
+    reader.rewind()?;
+
     // The properties that lofty reports for every format do not name the
     // codec. The properties of `Mp4File` do, so an MP4 file is read as one.
-    if probe.file_type() == Some(FileType::Mp4) {
-        let mut reader = probe.into_inner();
-        let file = Mp4File::read_from(&mut reader, options)?;
+    if file_type == FileType::Mp4 {
+        let file = Mp4File::read_from(reader, options)?;
         let alac = file.properties().codec() == Some(Mp4Codec::ALAC);
         Ok(Parsed {
             file: file.into(),
             alac,
         })
     } else {
+        let probe = Probe::with_file_type(reader, file_type).options(options);
         Ok(Parsed {
             file: probe.read()?,
             alac: false,
@@ -348,9 +446,12 @@ fn causes(error: &dyn Error) -> String {
 mod tests {
     use std::fs;
 
+    use std::io::Cursor;
+
     use lofty::properties::FileProperties;
     use lofty::tag::TagType;
 
+    use super::bound::testing::Counting;
     use super::*;
 
     /// The eight bytes that start every PNG file.
@@ -671,6 +772,291 @@ mod tests {
             format!("outer: reason: {}", std::fmt::Error)
         );
         assert_eq!(causes(&std::fmt::Error), std::fmt::Error.to_string());
+    }
+
+    /// Returns the bytes of the fixture `a.<ext>` with a title and a front
+    /// cover of `picture` bytes in the tag of its primary type, as lofty
+    /// writes them. `wav` and `aiff` are the files that this module builds.
+    fn tagged(ext: &str, picture: usize) -> Vec<u8> {
+        use lofty::config::WriteOptions;
+        use lofty::tag::TagExt;
+
+        let name = format!("a.{ext}");
+        let bytes = match ext {
+            "wav" => wav(),
+            "aiff" => aiff(),
+            _ => {
+                let fixture = Path::new(env!("CARGO_MANIFEST_DIR"))
+                    .join("tests/fixtures/audio")
+                    .join(&name);
+                fs::read(&fixture).unwrap_or_else(|error| panic!("{}: {error}", fixture.display()))
+            }
+        };
+        let (_dir, path) = write_file(&name, &bytes);
+        let file_type = FileType::from_ext(ext).expect("a format of lofty");
+        let mut tag = Tag::new(file_type.primary_tag_type());
+        tag.insert_text(ItemKey::TrackTitle, "Tagged".to_owned());
+        tag.push_picture(
+            Picture::unchecked(vec![0x5a; picture])
+                .pic_type(PictureType::CoverFront)
+                .mime_type(MimeType::Png)
+                .build(),
+        );
+        tag.save_to_path(&path, WriteOptions::default())
+            .unwrap_or_else(|error| panic!("{name}: {error}"));
+        fs::read(&path).expect("read the tagged file")
+    }
+
+    /// The seven containers of the supported formats.
+    const CONTAINERS: [&str; 7] = ["flac", "mp3", "m4a", "ogg", "opus", "wav", "aiff"];
+
+    /// Parses `bytes` as a file with the extension `ext` and at most `limit`
+    /// bytes read. Returns the result and the reader, which has counted.
+    fn parse_counted(
+        bytes: &[u8],
+        ext: &str,
+        limit: u64,
+    ) -> (Result<Parsed, ParseError>, Counting<Cursor<Vec<u8>>>) {
+        let mut reader = Counting::new(Cursor::new(bytes.to_vec()));
+        let parsed = parse_reader(
+            &mut reader,
+            FileType::from_ext(ext),
+            ParseOptions::new(),
+            limit,
+        );
+        (parsed, reader)
+    }
+
+    #[test]
+    fn a_tagged_file_of_each_container_is_read_within_the_bound() {
+        for ext in CONTAINERS {
+            let bytes = tagged(ext, 64 * 1024);
+            let (parsed, reader) = parse_counted(&bytes, ext, MAX_TAG_BYTES);
+            let parsed = parsed.unwrap_or_else(|error| panic!("{ext}: {error:?}"));
+            let tag = main_tag(&parsed.file);
+            assert_eq!(text(tag, ItemKey::TrackTitle), Some("Tagged"), "{ext}");
+            let picture = front_picture(tag).unwrap_or_else(|| panic!("{ext}: no picture"));
+            assert_eq!(picture.data(), vec![0x5a; 64 * 1024], "{ext}");
+            // The picture is among the bytes that were read.
+            assert!(reader.bytes > 64 * 1024, "{ext}: {}", reader.bytes);
+        }
+    }
+
+    #[test]
+    fn the_headers_of_each_container_declare_the_picture_in_its_tag() {
+        for ext in CONTAINERS {
+            let bytes = tagged(ext, 64 * 1024);
+            let file_type = FileType::from_ext(ext).expect("a format of lofty");
+            let mut reader = Counting::new(Cursor::new(&bytes));
+            let declared = bound::declared(&mut reader, file_type, u64::MAX);
+            // Vorbis comments hold a picture in Base64, which takes four
+            // bytes for three.
+            assert!(declared >= 64 * 1024, "{ext}: {declared}");
+            assert!(declared <= bytes.len() as u64, "{ext}: {declared}");
+            // The walk read headers and no byte of the picture.
+            assert!(reader.bytes < 1024, "{ext}: {} bytes read", reader.bytes);
+        }
+    }
+
+    #[test]
+    fn a_file_whose_headers_declare_more_than_the_limit_is_refused_and_its_tag_is_not_read() {
+        for ext in CONTAINERS {
+            let bytes = tagged(ext, 64 * 1024);
+            // The picture alone is four times the limit.
+            let (parsed, reader) = parse_counted(&bytes, ext, 16 * 1024);
+            assert!(matches!(parsed, Err(ParseError::TooLarge)), "{ext}");
+            // The reader was asked for the bytes that detect the format and
+            // for headers: far less than the limit and than the picture. No
+            // read had room for the picture, so lofty did not read the tag.
+            assert!(reader.bytes < 4096, "{ext}: {} bytes read", reader.bytes);
+            assert!(reader.longest < 4096, "{ext}: a read of {}", reader.longest);
+        }
+    }
+
+    #[test]
+    fn the_limit_is_exact_for_each_container() {
+        for ext in CONTAINERS {
+            let bytes = tagged(ext, 64 * 1024);
+            let file_type = FileType::from_ext(ext).expect("a format of lofty");
+            let declared = bound::declared(&mut Cursor::new(&bytes), file_type, u64::MAX);
+            // What a read of the file takes: the detection of the format,
+            // the headers and what lofty reads.
+            let (_, unlimited) = parse_counted(&bytes, ext, u64::MAX);
+            let needed = unlimited.bytes;
+
+            // A limit of one byte less refuses the file, and the reader
+            // hands out no byte past the one that shows that the file goes
+            // on.
+            let (parsed, reader) = parse_counted(&bytes, ext, needed - 1);
+            assert!(matches!(parsed, Err(ParseError::TooLarge)), "{ext}");
+            assert!(reader.bytes <= needed, "{ext}: {}", reader.bytes);
+
+            // The file is read with the smallest limit that holds what the
+            // read takes and what the headers declare. The headers of an
+            // MP4 file declare the sample tables too, which lofty does not
+            // read.
+            let (parsed, reader) = parse_counted(&bytes, ext, needed.max(declared));
+            assert!(parsed.is_ok(), "{ext}: {:?}", parsed.err());
+            assert_eq!(reader.bytes, needed, "{ext}");
+        }
+    }
+
+    #[test]
+    fn the_reader_stops_a_file_whose_headers_declare_less_than_lofty_reads() {
+        // An MP3 file that starts with 64 KiB of zero bytes. No header
+        // declares them, and lofty reads them one by one to find the tag
+        // that follows. With a limit of 16 KiB the reader ends that.
+        let mut bytes = vec![0u8; 64 * 1024];
+        bytes.extend(tagged("mp3", 1024));
+        let file_type = FileType::Mpeg;
+        assert!(bound::declared(&mut Cursor::new(&bytes), file_type, u64::MAX) <= 128);
+
+        let (parsed, reader) = parse_counted(&bytes, "mp3", 16 * 1024);
+        assert!(matches!(parsed, Err(ParseError::TooLarge)));
+        // One byte past the limit shows that the file goes on.
+        assert!(reader.bytes <= 16 * 1024 + 1, "{} bytes read", reader.bytes);
+
+        // The same file is read when the limit has room for the zero bytes.
+        let (parsed, _) = parse_counted(&bytes, "mp3", 128 * 1024);
+        let parsed = parsed.expect("within the limit");
+        assert_eq!(
+            text(main_tag(&parsed.file), ItemKey::TrackTitle),
+            Some("Tagged")
+        );
+    }
+
+    /// The ten bytes of an ID3v2 header that declares a tag of 256 MiB.
+    const HUGE_ID3V2: [u8; 10] = [b'I', b'D', b'3', 4, 0, 0, 0x7f, 0x7f, 0x7f, 0x7f];
+
+    /// Returns a file of a few bytes whose headers declare a tag region over
+    /// [`MAX_TAG_BYTES`] for the container of `ext`. No byte of the region is
+    /// in the file.
+    fn declares_a_huge_tag(ext: &str) -> Vec<u8> {
+        let riff = |form: &[u8; 4], kind: &[u8; 4], chunk: &[u8; 4], size: [u8; 4]| {
+            [&form[..], &[0; 4], kind, chunk, &size].concat()
+        };
+        match ext {
+            "mp3" | "aac" => HUGE_ID3V2.to_vec(),
+            // An ID3v2 tag before the stream marker, which lofty reads.
+            "flac" => HUGE_ID3V2.to_vec(),
+            // A file type atom and the header of a `moov` atom of 2 GiB.
+            "m4a" => [
+                &16u32.to_be_bytes()[..],
+                b"ftypM4A \0\0\0\0",
+                &0x8000_0000u32.to_be_bytes(),
+                b"moov",
+            ]
+            .concat(),
+            // A page with the identification packet, and the header of a
+            // page whose 255 segments are full, so that the comment packet
+            // goes on after it. lofty detects the codec from the first bytes
+            // of the identification packet.
+            "ogg" | "opus" => {
+                let mut file = b"OggS".to_vec();
+                file.resize(26, 0);
+                file.extend([1, 30]);
+                file.extend(if ext == "ogg" {
+                    &b"\x01vorbis"[..]
+                } else {
+                    &b"OpusHead"[..]
+                });
+                file.resize(27 + 1 + 30, 0);
+                file.extend(b"OggS");
+                file.resize(file.len() + 22, 0);
+                file.push(255);
+                file.resize(file.len() + 255, 255);
+                file
+            }
+            "wav" => riff(b"RIFF", b"WAVE", b"LIST", 0x7000_0000u32.to_le_bytes()),
+            "aif" | "aiff" => riff(b"FORM", b"AIFF", b"ID3 ", 0x7000_0000u32.to_be_bytes()),
+            _ => panic!("no file for {ext}"),
+        }
+    }
+
+    #[test]
+    fn a_header_that_declares_a_tag_over_the_bound_is_refused_without_the_bytes_being_read() {
+        for ext in ["mp3", "aac", "flac", "m4a", "wav", "aif", "aiff"] {
+            let bytes = declares_a_huge_tag(ext);
+            assert!(bytes.len() < 64, "{ext}");
+            let (parsed, reader) = parse_counted(&bytes, ext, MAX_TAG_BYTES);
+            assert!(matches!(parsed, Err(ParseError::TooLarge)), "{ext}");
+            // Every byte that the reader handed out is a byte of the file,
+            // and no read asked for more than the detection of the format
+            // does. The bound is 32 MiB.
+            assert!(
+                reader.bytes <= 4 * bytes.len() as u64,
+                "{ext}: {}",
+                reader.bytes
+            );
+            assert!(
+                reader.longest <= 8192,
+                "{ext}: a read of {}",
+                reader.longest
+            );
+
+            // The same file on disk, through the functions that the scanner
+            // and the cover service call.
+            let (_dir, path) = write_file(&format!("huge.{ext}"), &bytes);
+            let error = read(&path).expect_err("over the bound");
+            assert!(
+                matches!(&error, TagError::TooLarge(refused) if *refused == path),
+                "{ext}: {error:?}"
+            );
+            assert!(error.to_string().contains("more than 32 MiB"), "{error}");
+            assert_eq!(read_front_picture(&path), None, "{ext}");
+        }
+    }
+
+    #[test]
+    fn an_ogg_comment_packet_over_the_bound_is_refused_page_by_page() {
+        // The segment table of one page declares 65 025 bytes of the comment
+        // packet. A file needs 517 such pages to pass 32 MiB. This file has
+        // the header of each page and no content, as a file that was cut
+        // would have, so the limit of the test is that of two pages.
+        for ext in ["ogg", "opus"] {
+            let mut bytes = declares_a_huge_tag(ext);
+            let page = bytes[bytes.len() - 282..].to_vec();
+            bytes.resize(bytes.len() + 255 * 255, 0);
+            bytes.extend(&page);
+            let (parsed, reader) = parse_counted(&bytes, ext, 100_000);
+            assert!(matches!(parsed, Err(ParseError::TooLarge)), "{ext}");
+            assert!(reader.bytes < 4096, "{ext}: {} bytes read", reader.bytes);
+            assert!(
+                reader.longest <= 8192,
+                "{ext}: a read of {}",
+                reader.longest
+            );
+        }
+    }
+
+    #[test]
+    fn a_file_that_is_cut_inside_its_tag_is_an_error_and_no_panic() {
+        // Each tagged file is cut at every 499th byte, which covers the
+        // headers, the tag and the picture, and is read with and without
+        // the properties, as the scanner and the cover service read it.
+        for ext in CONTAINERS {
+            let bytes = tagged(ext, 8 * 1024);
+            for cut in (0..bytes.len()).step_by(499) {
+                for options in [
+                    ParseOptions::new(),
+                    ParseOptions::new().read_properties(false),
+                ] {
+                    let reader = Cursor::new(&bytes[..cut]);
+                    let file_type = FileType::from_ext(ext);
+                    // The result differs with the place of the cut. A cut
+                    // file is never over the bound.
+                    let parsed = parse_reader(reader, file_type, options, MAX_TAG_BYTES);
+                    assert!(
+                        !matches!(parsed, Err(ParseError::TooLarge)),
+                        "{ext} cut at {cut}"
+                    );
+                }
+            }
+            // The whole file is read on disk through the public functions.
+            let (_dir, path) = write_file(&format!("cut.{ext}"), &bytes[..bytes.len() / 2]);
+            let _ = read(&path);
+            let _ = read_front_picture(&path);
+        }
     }
 
     #[test]
