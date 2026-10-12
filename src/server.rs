@@ -14,7 +14,7 @@ use axum::Router;
 use axum::serve::Listener;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::oneshot;
+use tokio::sync::{Semaphore, oneshot};
 use tokio::task::JoinHandle;
 use tokio_util::sync::{CancellationToken, WaitForCancellationFutureOwned};
 
@@ -236,10 +236,12 @@ pub async fn run_server(
     // This handle stays out of the state, so that the stop can close the
     // database when the router and its state are gone.
     let closing = db.clone();
-    // The probe runs `ffmpeg -version` once and logs whether the server can
-    // transcode. A server without ffmpeg serves original files.
+    // The probe runs `ffmpeg -version` and `ffmpeg -encoders` once and logs
+    // which formats the server can transcode to. A server without ffmpeg
+    // serves original files.
     let transcoder: Arc<dyn Transcoder> =
         Arc::new(FfmpegTranscoder::probe(&config.transcoding).await);
+    let streams = Arc::new(Semaphore::new(config.server.max_streams));
 
     // The fields follow the layout rule in the module comment of `api`.
     #[rustfmt::skip]
@@ -251,6 +253,8 @@ pub async fn run_server(
         covers,
 
         transcoder,
+
+        streams,
 
         scan: scan.clone(),
 

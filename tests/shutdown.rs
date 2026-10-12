@@ -2,7 +2,7 @@
 //! section 3.13), and the start of a server whose music folder is
 //! unavailable (section 3.10).
 //!
-//! The tests of this file and two tests of `tests/transcode.rs` are the only
+//! The tests of this file and three tests of `tests/transcode.rs` are the only
 //! ones of the suite that connect to a socket. Each one runs `run_server` on
 //! `127.0.0.1` with port 0, so the system chooses a free port, and speaks
 //! HTTP/1.1 over a `TcpStream`. No test starts the mDNS daemon: the step that

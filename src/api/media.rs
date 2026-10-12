@@ -4,6 +4,7 @@
 //! with the envelope. An error is an envelope, as for every other method.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use axum::extract::State;
 use axum::http::{HeaderMap, Method};
@@ -35,12 +36,16 @@ use crate::media::transcode::TranscodeJob;
 ///
 /// - The original file is the answer of `stream::raw`. `Range`, `If-Range`,
 ///   `If-None-Match` and `If-Modified-Since` are the request headers that
-///   it depends on. `timeOffset` is read and has no effect on it.
+///   it depends on. `timeOffset` is read and has no effect on it. The
+///   responses of the server hold at most `server.max_streams` original
+///   files open: HTTP 503 with `Retry-After: 5` answers a request that
+///   needs one more and gets no slot within `server.stream_permit_wait_ms`.
 /// - A transcode is the answer of `stream::transcoded`, with the transcoder
 ///   of the state. The stream starts at the second `timeOffset` of the
 ///   track. No request header changes it. HTTP 503 with `Retry-After: 5`
-///   answers a request for which no transcode slot is free, and error 0
-///   answers a request on a server without ffmpeg.
+///   answers a request for which no transcode slot is free. Error 0 answers
+///   a request on a server whose ffmpeg is missing or lacks the encoder of
+///   the format, and a transcode that produces no output.
 ///
 /// `estimateContentLength` is read and has no effect on either answer: the
 /// original file has its own length, and a transcode has none.
@@ -59,7 +64,19 @@ pub async fn stream(
     let (track, path) = file_of_track(&state.db, id).await?;
     let folders = &state.config.library.folders;
     match stream::decide(&track, &request, &state.config.transcoding) {
-        StreamPlan::Raw => stream::raw(&track, path, folders, &method, &headers).await,
+        StreamPlan::Raw => {
+            let wait = Duration::from_millis(state.config.server.stream_permit_wait_ms);
+            stream::raw(
+                &track,
+                path,
+                folders,
+                &method,
+                &headers,
+                &state.streams,
+                wait,
+            )
+            .await
+        }
         StreamPlan::Transcode {
             target,
             bitrate_kbps,
@@ -73,7 +90,8 @@ pub async fn stream(
                 offset_s,
             };
             let transcoder = state.transcoder.as_ref();
-            stream::transcoded(&track, job, folders, &method, transcoder).await
+            let config = &state.config.transcoding;
+            stream::transcoded(&track, job, folders, &method, transcoder, config).await
         }
     }
 }

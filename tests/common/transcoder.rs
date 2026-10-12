@@ -3,12 +3,12 @@
 
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use axum::body::Body;
 use bytes::Bytes;
 use futures_util::{Stream, StreamExt, stream};
+use tokio::sync::{mpsc, watch};
 use wn_server::media::transcode::{
     TranscodeError, TranscodeFuture, TranscodeJob, TranscodeStream, Transcoder,
 };
@@ -45,12 +45,16 @@ pub enum FakeFailure {
     Spawn,
 }
 
+/// The chunks of a stream that a test feeds ([`FakeTranscoder::feed`]).
+type Feed = mpsc::UnboundedReceiver<Vec<u8>>;
+
 /// What a test set on a [`FakeTranscoder`], and the jobs that reached it.
 struct State {
     bytes: Vec<u8>,
     failure: Option<FakeFailure>,
     stays_open: bool,
     known_length: bool,
+    feed: Option<Feed>,
     jobs: Vec<TranscodeJob>,
 }
 
@@ -62,7 +66,7 @@ struct State {
 pub struct FakeTranscoder {
     state: Mutex<State>,
     /// The number of streams that exist.
-    open: Arc<AtomicUsize>,
+    open: Arc<watch::Sender<usize>>,
 }
 
 impl Default for FakeTranscoder {
@@ -73,9 +77,10 @@ impl Default for FakeTranscoder {
                 failure: None,
                 stays_open: false,
                 known_length: false,
+                feed: None,
                 jobs: Vec::new(),
             }),
-            open: Arc::new(AtomicUsize::new(0)),
+            open: Arc::new(watch::Sender::new(0)),
         }
     }
 }
@@ -113,6 +118,17 @@ impl FakeTranscoder {
         self.state().known_length = true;
     }
 
+    /// Makes the next stream yield the chunks that the test sends to the
+    /// returned sender, each when it is sent. The stream has no output
+    /// before the first chunk is sent, as a process that has written
+    /// nothing. It ends when the sender is dropped, and it stays open as
+    /// long as the test holds the sender.
+    pub fn feed(&self) -> mpsc::UnboundedSender<Vec<u8>> {
+        let (sender, receiver) = mpsc::unbounded_channel();
+        self.state().feed = Some(receiver);
+        sender
+    }
+
     /// The jobs for which the transcoder started a stream, in their order.
     pub fn jobs(&self) -> Vec<TranscodeJob> {
         self.state().jobs.clone()
@@ -121,23 +137,34 @@ impl FakeTranscoder {
     /// The number of streams that the transcoder started and that are not
     /// dropped.
     pub fn open_streams(&self) -> usize {
-        self.open.load(Ordering::SeqCst)
+        *self.open.borrow()
+    }
+
+    /// Waits until `count` streams exist: the streams that the transcoder
+    /// started and that are not dropped. The wait ends with the start or
+    /// the drop of a stream, so a test waits for the event and polls
+    /// nothing.
+    pub async fn streams_open(&self, count: usize) {
+        let mut open = self.open.subscribe();
+        open.wait_for(|open| *open == count)
+            .await
+            .expect("the transcoder exists");
     }
 }
 
 /// Counts one open stream until it is dropped.
-struct OpenStream(Arc<AtomicUsize>);
+struct OpenStream(Arc<watch::Sender<usize>>);
 
 impl OpenStream {
-    fn new(open: &Arc<AtomicUsize>) -> Self {
-        open.fetch_add(1, Ordering::SeqCst);
+    fn new(open: &Arc<watch::Sender<usize>>) -> Self {
+        open.send_modify(|open| *open += 1);
         Self(Arc::clone(open))
     }
 }
 
 impl Drop for OpenStream {
     fn drop(&mut self) {
-        self.0.fetch_sub(1, Ordering::SeqCst);
+        self.0.send_modify(|open| *open -= 1);
     }
 }
 
@@ -163,19 +190,27 @@ impl Transcoder for FakeTranscoder {
                 });
             }
 
-            let chunks: Vec<io::Result<Bytes>> = state
-                .bytes
-                .chunks(FAKE_CHUNK)
-                .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
-                .collect();
-            let end: Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>> = if state.stays_open {
-                Box::pin(stream::pending())
+            type Chunks = Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>;
+            let chunks: Chunks = if let Some(mut feed) = state.feed.take() {
+                Box::pin(
+                    stream::poll_fn(move |cx| feed.poll_recv(cx)).map(|chunk| Ok(chunk.into())),
+                )
             } else {
-                Box::pin(stream::empty())
+                let chunks: Vec<io::Result<Bytes>> = state
+                    .bytes
+                    .chunks(FAKE_CHUNK)
+                    .map(|chunk| Ok(Bytes::copy_from_slice(chunk)))
+                    .collect();
+                let end: Chunks = if state.stays_open {
+                    Box::pin(stream::pending())
+                } else {
+                    Box::pin(stream::empty())
+                };
+                Box::pin(stream::iter(chunks).chain(end))
             };
             let open = OpenStream::new(&self.open);
             // The closure owns the counter, and the stream owns the closure.
-            let chunks = stream::iter(chunks).chain(end).map(move |chunk| {
+            let chunks = chunks.map(move |chunk| {
                 let _owned = &open;
                 chunk
             });

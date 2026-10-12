@@ -7,15 +7,18 @@
 //! it. The unit tests in `src/media/transcode.rs` cover the transcoder that
 //! runs a process.
 //!
-//! Two tests open a socket on `127.0.0.1` with a port that the system
+//! Three tests open a socket on `127.0.0.1` with a port that the system
 //! chooses, because they check what a connection does: a client that
-//! disconnects, and a server that `run_server` starts without ffmpeg.
+//! disconnects during a stream, a client that disconnects before the first
+//! output, and a server that `run_server` starts without ffmpeg.
 
 mod common;
 
 use std::fs;
+use std::future::Future;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -24,6 +27,7 @@ use axum::body::Body;
 use axum::http::header::HeaderName;
 use axum::http::{Method, Request, StatusCode, header};
 use axum::response::Response;
+use http_body_util::BodyExt;
 use rusqlite::params;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
@@ -658,6 +662,365 @@ async fn head_request_for_a_transcode_gets_the_headers_and_starts_no_transcode()
     .await;
     assert_eq!(content_type(&response), "application/xml");
     assert_eq!(header_of(&response, &header::ACCEPT_RANGES), None);
+}
+
+/// A server over a library of one FLAC track, with the config that `adjust`
+/// changes. Returns the server and the ID of the track. A test of a limit
+/// of a transcode sets the fields of the config that are no config keys.
+async fn one_track_server(adjust: impl FnOnce(&mut Config)) -> (ScannedServer, String) {
+    let library = LibraryBuilder::new()
+        .track("Aurora Field", "Glass Harbour", "Low Tide", 1, "flac")
+        .build();
+    let server = TestServer::scanned_with(library, adjust).await;
+    let id = server.catalogue().await.song("Low Tide").track.id.clone();
+    (server, id)
+}
+
+/// Polls `response`, the future of a request that selects a transcode,
+/// until the transcoder of `server` has started its stream. The request has
+/// no answer by then, because the stream has no output yet.
+async fn waits_at_the_transcoder(
+    server: &TestServer,
+    mut response: Pin<&mut impl Future<Output = Response>>,
+) {
+    let reached = async {
+        tokio::select! {
+            _ = &mut response => panic!("an answer before the first output"),
+            () = server.transcoder().streams_open(1) => {}
+        }
+    };
+    tokio::time::timeout(LIMIT, reached)
+        .await
+        .expect("the request reaches the transcoder");
+}
+
+/// The next chunk of `body`, or its error. `None` at the end of the body.
+/// The body yields within [`LIMIT`].
+async fn next_chunk(body: &mut Body) -> Option<Result<Vec<u8>, axum::Error>> {
+    let frame = tokio::time::timeout(LIMIT, body.frame())
+        .await
+        .expect("the body yields within the limit")?;
+    Some(frame.map(|frame| frame.into_data().expect("a data frame").to_vec()))
+}
+
+/// The lines of the captured log that the requests of the client `client`
+/// wrote.
+fn log_lines(client: &str) -> Vec<String> {
+    captured_log().lines_with(&format!(r#"c="{client}""#))
+}
+
+#[tokio::test]
+async fn transcode_without_output_is_error_0_and_no_empty_stream() {
+    let server = TestServer::standard().await;
+    let id = server.track.low_tide.as_str();
+    let no_output = (0, "ffmpeg produced no output".to_owned());
+
+    // The transcoder starts, and its stream ends before its first byte, as
+    // the output of an ffmpeg that fails for the file does.
+    server.transcoder().set_bytes(b"");
+    let cases: [Pairs; 3] = [
+        &[("format", "opus")],
+        &[("format", "mp3"), ("timeOffset", "30")],
+        &[("maxBitRate", "32")],
+    ];
+    for params in cases {
+        assert_eq!(
+            stream_error(&server, id, params).await,
+            no_output,
+            "{params:?}"
+        );
+    }
+    // The envelope of the error in XML, and by POST.
+    let mut params = vec![("id", id), ("format", "opus")];
+    let xml = server.get_xml("stream", &params).await;
+    assert!(
+        xml.contains(r#"<error code="0" message="ffmpeg produced no output"/>"#),
+        "{xml}"
+    );
+    params.push(("f", "json"));
+    let response = server.post_form("stream", &params).await;
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(content_type(&response), "application/json");
+    let envelope = subsonic_response(&body_string(response).await);
+    assert_eq!(envelope["error"]["message"], "ffmpeg produced no output");
+    // Each request reached the transcoder, and no stream of it is left.
+    assert_eq!(server.transcoder().jobs().len(), 5);
+    assert_eq!(server.transcoder().open_streams(), 0);
+
+    // A stream of a known length without a byte.
+    server.transcoder().known_length();
+    assert_eq!(
+        stream_error(&server, id, &[("format", "opus")]).await,
+        no_output
+    );
+
+    // A HEAD request starts no transcode, so it reports no such error.
+    let head = stream_as(&server, Method::HEAD, id, &[("format", "opus")], &[]).await;
+    assert_transcode_headers(&head, "audio/ogg", "HEAD");
+
+    // The original file is served, and a transcode with output is a stream.
+    let response = stream(&server, id, &[]).await;
+    assert_eq!(content_type(&response), "audio/flac");
+    server.transcoder().set_bytes(FAKE_TRANSCODE);
+    let response = stream(&server, id, &[("format", "opus")]).await;
+    assert_transcode_headers(&response, "audio/ogg", "a transcode with output");
+    assert_eq!(body_bytes(response).await, FAKE_TRANSCODE);
+}
+
+#[tokio::test]
+async fn transcode_without_output_within_the_limit_is_error_0_and_is_ended() {
+    const LIMIT_MS: u64 = 50;
+    let (server, id) = one_track_server(|config| {
+        config.transcoding.first_output_wait_ms = LIMIT_MS;
+    })
+    .await;
+
+    for method in [Method::GET, Method::POST] {
+        // The stream of the transcoder has no output and no end, as the
+        // output of an ffmpeg that hangs.
+        let silent = server.transcoder().feed();
+        let asked = Instant::now();
+        let params = [("format", "opus"), ("f", "json")];
+        let response =
+            tokio::time::timeout(LIMIT, stream_as(&server, method.clone(), &id, &params, &[]))
+                .await
+                .expect("the wait for the first output has a limit");
+        let waited = asked.elapsed();
+        // The limit of the config ended the wait, and not the default of
+        // 10 s. A wait does not end early.
+        assert!(waited >= Duration::from_millis(LIMIT_MS), "{waited:?}");
+        let default_ms = Config::default().transcoding.first_output_wait_ms;
+        assert!(waited < Duration::from_millis(default_ms), "{waited:?}");
+
+        assert_eq!(response.status(), StatusCode::OK, "{method}");
+        assert_eq!(content_type(&response), "application/json", "{method}");
+        assert_eq!(header_of(&response, &header::ACCEPT_RANGES), None);
+        let envelope = subsonic_response(&body_string(response).await);
+        assert_eq!(envelope["status"], "failed", "{method}");
+        assert_eq!(envelope["error"]["code"], 0, "{method}");
+        assert_eq!(
+            envelope["error"]["message"], "ffmpeg produced no output",
+            "{method}"
+        );
+        // The transcode was ended before the answer: its stream is dropped,
+        // although the transcoder had not ended it.
+        assert_eq!(server.transcoder().open_streams(), 0, "{method}");
+        assert!(silent.is_closed(), "{method}");
+    }
+    assert_eq!(server.transcoder().jobs().len(), 2);
+}
+
+#[tokio::test]
+async fn response_of_a_transcode_starts_with_the_first_output_and_is_every_byte() {
+    let server = TestServer::standard().await;
+    let id = server.track.low_tide.as_str();
+    let bytes = pattern(3 * FAKE_CHUNK + 123);
+    let chunks: Vec<&[u8]> = bytes.chunks(FAKE_CHUNK).collect();
+
+    for method in [Method::GET, Method::POST] {
+        let feed = server.transcoder().feed();
+        let params = [("format", "opus"), ("maxBitRate", "96")];
+        let response = stream_as(&server, method.clone(), id, &params, &[]);
+        tokio::pin!(response);
+        // The transcode runs and has written nothing: the request has no
+        // answer yet. The wait is a lower bound.
+        waits_at_the_transcoder(&server, response.as_mut()).await;
+        let early = tokio::time::timeout(Duration::from_millis(50), &mut response).await;
+        assert!(
+            early.is_err(),
+            "{method}: an answer before the first output"
+        );
+
+        // The first output is the start of the response.
+        feed.send(chunks[0].to_vec()).expect("the stream exists");
+        let response = tokio::time::timeout(LIMIT, &mut response)
+            .await
+            .expect("the first output starts the response");
+        assert_transcode_headers(&response, "audio/ogg", method.as_str());
+        assert_eq!(header_of(&response, &header::CONTENT_LENGTH), None);
+        assert_eq!(
+            header_of(&response, &header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some("*")
+        );
+
+        // The body is the first output and every chunk after it, and it
+        // ends when the transcoder ends its stream.
+        for chunk in &chunks[1..] {
+            feed.send(chunk.to_vec()).expect("the stream exists");
+        }
+        drop(feed);
+        let body = tokio::time::timeout(LIMIT, body_bytes(response))
+            .await
+            .expect("the body ends with its stream");
+        assert_eq!(body.len(), bytes.len(), "{method}");
+        assert!(body == bytes, "{method}");
+        tokio::time::timeout(LIMIT, server.transcoder().streams_open(0))
+            .await
+            .expect("the stream of the transcoder is dropped at its end");
+    }
+    assert_eq!(server.transcoder().jobs().len(), 2);
+}
+
+#[tokio::test]
+async fn request_that_is_dropped_before_the_first_output_leaves_no_stream_and_no_task() {
+    let server = TestServer::standard().await;
+    let id = server.track.low_tide.as_str();
+    let tasks = || {
+        tokio::runtime::Handle::current()
+            .metrics()
+            .num_alive_tasks()
+    };
+    let tasks_before = tasks();
+
+    let silent = server.transcoder().feed();
+    {
+        let response = stream(&server, id, &[("format", "opus")]);
+        tokio::pin!(response);
+        // The handler waits for the first output of the transcode.
+        waits_at_the_transcoder(&server, response.as_mut()).await;
+        // The request is dropped here, as the server drops the request of a
+        // client that disconnects, and every request in progress when the
+        // grace of a stop is over.
+    }
+    // The stream of the transcoder went with the request: no response
+    // started, and nothing of the request is left.
+    assert_eq!(server.transcoder().open_streams(), 0);
+    assert!(silent.is_closed());
+    assert_eq!(tasks(), tasks_before);
+    assert_eq!(server.transcoder().jobs().len(), 1);
+}
+
+#[tokio::test]
+async fn client_that_disconnects_before_the_first_output_ends_the_transcode() {
+    let server = Arc::new(TestServer::standard().await);
+    let silent = server.transcoder().feed();
+    let addr = listen(Arc::clone(&server)).await;
+
+    let path = format!(
+        "/rest/stream?{}",
+        query(&[("id", &server.track.low_tide), ("format", "opus")])
+    );
+    let client = send_get(addr, &path, &[]).await;
+    // The transcode runs, and the handler waits for its first output.
+    tokio::time::timeout(LIMIT, server.transcoder().streams_open(1))
+        .await
+        .expect("the request reaches the transcoder");
+
+    // The client disconnects. The server drops the request, and the request
+    // drops the stream of the transcoder.
+    drop(client);
+    tokio::time::timeout(LIMIT, server.transcoder().streams_open(0))
+        .await
+        .expect("the stream of the transcoder is dropped");
+    assert!(silent.is_closed());
+}
+
+#[tokio::test]
+async fn client_that_reads_nothing_loses_its_transcode_at_the_write_timeout() {
+    captured_log();
+    const TIMEOUT_MS: u64 = 50;
+    const CLIENT_NAME: &str = "transcode-write-timeout";
+    let (server, id) = one_track_server(|config| {
+        config.transcoding.write_timeout_ms = TIMEOUT_MS;
+    })
+    .await;
+    // A stream of three chunks that stays open, as the output of an ffmpeg
+    // that waits for its reader.
+    let bytes = pattern(3 * FAKE_CHUNK);
+    server.transcoder().set_bytes(bytes.clone());
+    server.transcoder().stay_open();
+
+    let params = [("format", "opus"), ("c", CLIENT_NAME)];
+    let response = stream(&server, &id, &params).await;
+    let began = Instant::now();
+    assert_transcode_headers(&response, "audio/ogg", "the response");
+    assert_eq!(server.transcoder().open_streams(), 1);
+
+    // The client reads nothing. The transcode ends although the response
+    // exists: the limit of 10 s is far below the default of 60 s.
+    tokio::time::timeout(LIMIT, server.transcoder().streams_open(0))
+        .await
+        .expect("the write timeout ends the transcode");
+    // A wait does not end early.
+    let waited = began.elapsed();
+    assert!(waited >= Duration::from_millis(TIMEOUT_MS), "{waited:?}");
+
+    // The client reads again: the chunk that the body held, and then an
+    // error, which ends the connection without the end of a body.
+    let mut body = response.into_body();
+    let first = next_chunk(&mut body).await.expect("a chunk");
+    assert!(first.expect("a chunk") == bytes[..FAKE_CHUNK]);
+    let cut = next_chunk(&mut body).await.expect("no end of the body");
+    assert!(cut.is_err(), "the stream is cut and has no end");
+
+    // The log has the line of the request and one line at `info` that says
+    // why the stream ended, and no line at `error`.
+    let lines = log_lines(CLIENT_NAME);
+    let with = |text: &str| lines.iter().filter(|line| line.contains(text)).count();
+    assert_eq!(lines.len(), 2, "{lines:?}");
+    assert_eq!(with("finished processing request"), 1, "{lines:?}");
+    assert_eq!(with("took no chunk"), 1, "{lines:?}");
+    assert_eq!(with(" INFO "), 1, "{lines:?}");
+    assert_eq!(with("ERROR"), 0, "{lines:?}");
+}
+
+#[tokio::test]
+async fn slow_transcoder_does_not_end_the_stream_of_a_client_that_waits() {
+    const TIMEOUT_MS: u64 = 50;
+    let (server, id) = one_track_server(|config| {
+        config.transcoding.write_timeout_ms = TIMEOUT_MS;
+    })
+    .await;
+    let feed = server.transcoder().feed();
+    feed.send(b"OggS".to_vec()).expect("the stream exists");
+    let response = stream(&server, &id, &[("format", "opus")]).await;
+    let mut body = response.into_body();
+    let mut received = Vec::new();
+    let first = next_chunk(&mut body).await.expect("a chunk");
+    received.extend_from_slice(&first.expect("a chunk"));
+
+    // The client waits for each chunk, and the transcoder takes three write
+    // timeouts for each. The time is a lower bound: a longer one tests the
+    // same.
+    for chunk in [&b"one"[..], b"two", b"three"] {
+        let waiting =
+            tokio::time::timeout(Duration::from_millis(3 * TIMEOUT_MS), body.frame()).await;
+        assert!(waiting.is_err(), "a chunk before the transcoder wrote it");
+        feed.send(chunk.to_vec()).expect("the stream is not ended");
+        let next = next_chunk(&mut body).await.expect("a chunk");
+        received.extend_from_slice(&next.expect("a chunk"));
+    }
+    assert_eq!(server.transcoder().open_streams(), 1);
+    drop(feed);
+    assert!(next_chunk(&mut body).await.is_none());
+    assert_eq!(received, b"OggSonetwothree");
+}
+
+#[tokio::test]
+async fn http_503_of_a_busy_transcoder_is_not_logged_at_error() {
+    captured_log();
+    const CLIENT_NAME: &str = "transcode-busy-log";
+    let server = TestServer::standard().await;
+    let id = server.track.low_tide.as_str();
+    server.transcoder().fail_with(Some(FakeFailure::Busy));
+
+    for method in [Method::GET, Method::POST] {
+        let params = [("format", "opus"), ("c", CLIENT_NAME)];
+        let response = stream_as(&server, method, id, &params, &[]).await;
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+    // The line of each request, at the level of a `stream` request, and the
+    // line of the handler that says why, at `info`. The trace layer adds no
+    // line at `error`, as it does for a 5xx status that is a failure.
+    let lines = log_lines(CLIENT_NAME);
+    let with = |text: &str| lines.iter().filter(|line| line.contains(text)).count();
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    assert_eq!(with("status=503"), 2, "{lines:?}");
+    assert_eq!(with(" DEBUG "), 2, "{lines:?}");
+    assert_eq!(with("every transcode slot is taken"), 2, "{lines:?}");
+    assert_eq!(with(" INFO "), 2, "{lines:?}");
+    assert_eq!(with("ERROR"), 0, "{lines:?}");
+    assert_eq!(with("response failed"), 0, "{lines:?}");
 }
 
 /// The time `seconds` Unix seconds.

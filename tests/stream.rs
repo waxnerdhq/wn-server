@@ -1,14 +1,15 @@
 //! Router tests of `stream` (`docs/design.md` sections 3.9 and 4): the
 //! original file of every format, ranges, `If-Range`, conditional requests,
-//! HEAD and POST, the parameters that select the original file, and the
-//! files that the method does not serve. `tests/transcode.rs` covers the
-//! requests that select a transcode.
+//! HEAD and POST, the parameters that select the original file, the files
+//! that the method does not serve, and the bound on the files that its
+//! responses hold open. `tests/transcode.rs` covers the requests that select
+//! a transcode.
 
 mod common;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::body::Body;
 use axum::http::header::HeaderName;
@@ -16,12 +17,13 @@ use axum::http::{Method, Request, StatusCode, header};
 use axum::response::Response;
 use http_body_util::BodyExt;
 use rusqlite::params;
+use wn_server::config::Config;
 use wn_server::db::Db;
 use wn_server::db::queries::tracks::{self, Track};
 
 use common::{
     API_VERSION, CLIENT, LibraryBuilder, OWNER, OWNER_PASSWORD, ScannedServer, TestServer,
-    body_bytes, body_string, content_type, subsonic_response, urlencode,
+    body_bytes, body_string, captured_log, content_type, subsonic_response, urlencode,
 };
 
 /// Parameters of a request, and request headers: names and values.
@@ -281,12 +283,49 @@ const WAV_DATA_LEN: u32 = 1024 * 1024;
 /// samples. Returns the server, the ID of the track and the path of the
 /// file.
 async fn wav_server() -> (ScannedServer, String, PathBuf) {
+    wav_server_with(|_| {}).await
+}
+
+/// The server of [`wav_server`] with the config that `adjust` changes.
+async fn wav_server_with(adjust: impl FnOnce(&mut Config)) -> (ScannedServer, String, PathBuf) {
     let library = LibraryBuilder::new().build();
     let path = library.root.path().join("harbour.wav");
     fs::write(&path, wav(WAV_DATA_LEN)).expect("write the WAV file");
-    let server = TestServer::scanned(library).await;
+    let server = TestServer::scanned_with(library, adjust).await;
     let id = row_at(server.db(), "harbour.wav").await.id;
     (server, id, path)
+}
+
+/// The longest time a test of the bound waits for an answer that needs no
+/// wait. The wait ends with the answer, so the limit does not delay a
+/// passing run.
+const LIMIT: Duration = Duration::from_secs(10);
+
+/// A `stream_permit_wait_ms` that no test outlasts: a request that waits for
+/// a slot under it is not answered within [`LIMIT`].
+const NO_END_MS: u64 = 3_600_000;
+
+/// The server of [`wav_server`], whose responses hold at most `max_streams`
+/// original files open, and whose requests wait `permit_wait_ms` for a
+/// slot.
+async fn bounded_wav_server(
+    max_streams: usize,
+    permit_wait_ms: u64,
+) -> (ScannedServer, String, PathBuf) {
+    wav_server_with(|config| {
+        config.server.max_streams = max_streams;
+        config.server.stream_permit_wait_ms = permit_wait_ms;
+    })
+    .await
+}
+
+/// Sends a `stream` request as [`stream_as`] does, to a server whose
+/// requests have no end when they wait for a slot. The answer comes within
+/// [`LIMIT`], or the request waited for a slot.
+async fn answered(server: &TestServer, method: Method, id: &str, headers: Pairs<'_>) -> Response {
+    tokio::time::timeout(LIMIT, stream_as(server, method, id, &[], headers))
+        .await
+        .unwrap_or_else(|_| panic!("the request with {headers:?} waits for a slot"))
 }
 
 #[tokio::test]
@@ -1253,6 +1292,341 @@ async fn response_that_the_client_drops_leaves_no_open_file_and_no_task() {
     );
     assert_eq!(open_descriptors(&path), 0);
     assert_eq!(tasks(), tasks_before);
+}
+
+#[tokio::test]
+async fn request_past_the_bound_on_open_files_is_http_503_until_a_body_is_dropped() {
+    let log = captured_log();
+    const WAIT_MS: u64 = 50;
+    let (server, id, path) = bounded_wav_server(1, WAIT_MS).await;
+    let file = fs::read(&path).unwrap();
+    // The test finds the log lines of its requests by this client name.
+    let client = [("c", "stream-past-the-bound")];
+
+    // The test holds the body of the first response, which holds the file.
+    let first = stream(&server, &id, &[], &[]).await;
+    assert_eq!(first.status(), StatusCode::OK);
+
+    for method in [Method::GET, Method::POST] {
+        let asked = Instant::now();
+        let mut all = vec![("id", id.as_str())];
+        all.extend(client);
+        let second = server
+            .request(request(method.clone(), "stream", &all, &[]))
+            .await;
+        let waited = asked.elapsed();
+        // The request waited for a slot, for the wait of the config and not
+        // for the default of 5 s. A wait does not end early.
+        assert!(waited >= Duration::from_millis(WAIT_MS), "{waited:?}");
+        let default_ms = Config::default().server.stream_permit_wait_ms;
+        assert!(waited < Duration::from_millis(default_ms), "{waited:?}");
+
+        assert_eq!(second.status(), StatusCode::SERVICE_UNAVAILABLE, "{method}");
+        assert_eq!(
+            header_of(&second, &header::RETRY_AFTER),
+            Some("5"),
+            "{method}"
+        );
+        // A browser-based client reads the status of a response of another
+        // origin only with these headers.
+        assert_eq!(
+            header_of(&second, &header::ACCESS_CONTROL_ALLOW_ORIGIN),
+            Some("*"),
+            "{method}"
+        );
+        assert_eq!(
+            header_of(&second, &header::ACCESS_CONTROL_EXPOSE_HEADERS),
+            Some(EXPOSED),
+            "{method}"
+        );
+        for name in [
+            header::CONTENT_TYPE,
+            header::ACCEPT_RANGES,
+            header::ETAG,
+            header::CONTENT_DISPOSITION,
+        ] {
+            assert_eq!(header_of(&second, &name), None, "{method} {name}");
+        }
+        assert!(body_bytes(second).await.is_empty(), "{method}");
+    }
+
+    // The answer is one that the server chose. The log has the line of each
+    // request and the line that says why, and no line at `error`.
+    let lines = log.lines_with(r#"c="stream-past-the-bound""#);
+    let with = |text: &str| lines.iter().filter(|line| line.contains(text)).count();
+    assert_eq!(with("status=503"), 2, "{lines:?}");
+    assert_eq!(with("server.max_streams"), 2, "{lines:?}");
+    assert_eq!(with("ERROR"), 0, "{lines:?}");
+
+    // After the first body is dropped, the next request gets the file.
+    drop(first);
+    let third = stream(&server, &id, &[], &[]).await;
+    assert_whole_file(third, &file, "audio/wav", "after the drop").await;
+}
+
+#[tokio::test]
+async fn answers_without_the_file_do_not_wait_for_a_slot() {
+    // The one slot is taken, and a request that waits for it has no end.
+    let (server, id, path) = bounded_wav_server(1, NO_END_MS).await;
+    let size = fs::metadata(&path).unwrap().len();
+    let held = stream(&server, &id, &[], &[]).await;
+    assert_eq!(held.status(), StatusCode::OK);
+    let tag = header_of(&held, &header::ETAG).expect("a tag").to_owned();
+    let date = header_of(&held, &header::LAST_MODIFIED)
+        .expect("a date")
+        .to_owned();
+
+    // A HEAD request, with and without a range.
+    for headers in [vec![], vec![("range", "bytes=100-199")]] {
+        let head = answered(&server, Method::HEAD, &id, &headers).await;
+        assert_eq!(head.status(), StatusCode::OK, "{headers:?}");
+        for name in [
+            header::CONTENT_TYPE,
+            header::CONTENT_LENGTH,
+            header::ACCEPT_RANGES,
+            header::CONTENT_DISPOSITION,
+            header::ETAG,
+            header::LAST_MODIFIED,
+        ] {
+            assert_eq!(
+                header_of(&head, &name),
+                header_of(&held, &name),
+                "{name} {headers:?}"
+            );
+        }
+        assert!(body_bytes(head).await.is_empty(), "{headers:?}");
+    }
+
+    // The version that the client holds: HTTP 304.
+    for headers in [
+        vec![("if-none-match", tag.as_str())],
+        vec![("if-modified-since", date.as_str())],
+        vec![("if-none-match", tag.as_str()), ("range", "bytes=100-199")],
+    ] {
+        for method in [Method::GET, Method::POST] {
+            let response = answered(&server, method, &id, &headers).await;
+            assert_eq!(response.status(), StatusCode::NOT_MODIFIED, "{headers:?}");
+            assert_eq!(
+                header_of(&response, &header::ETAG),
+                Some(tag.as_str()),
+                "{headers:?}"
+            );
+            assert!(body_bytes(response).await.is_empty(), "{headers:?}");
+        }
+    }
+
+    // A range that no byte satisfies: HTTP 416.
+    let past_the_end = format!("bytes={size}-");
+    for headers in [
+        vec![("range", past_the_end.as_str())],
+        vec![("range", "bytes=-0")],
+        vec![("range", past_the_end.as_str()), ("if-range", tag.as_str())],
+    ] {
+        for method in [Method::GET, Method::POST] {
+            let response = answered(&server, method, &id, &headers).await;
+            assert_eq!(
+                response.status(),
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "{headers:?}"
+            );
+            assert_eq!(
+                header_of(&response, &header::CONTENT_RANGE),
+                Some(format!("bytes */{size}").as_str()),
+                "{headers:?}"
+            );
+            assert_eq!(
+                header_of(&response, &header::ACCEPT_RANGES),
+                Some("bytes"),
+                "{headers:?}"
+            );
+            assert!(body_bytes(response).await.is_empty(), "{headers:?}");
+        }
+    }
+
+    // An error is no response of a file.
+    let missing = answered(&server, Method::GET, NO_TRACK, &[]).await;
+    assert_eq!(content_type(&missing), "application/xml");
+    drop(held);
+}
+
+#[tokio::test]
+async fn no_answer_of_stream_keeps_a_slot_after_its_response_is_gone() {
+    // One slot, and a request that waits for it has no end: every request
+    // for the file below gets the slot that the request before it returned.
+    let (server, id, path) = bounded_wav_server(1, NO_END_MS).await;
+    let file = fs::read(&path).unwrap();
+    let size = file.len();
+    let whole = answered(&server, Method::GET, &id, &[]).await;
+    let tag = header_of(&whole, &header::ETAG).expect("a tag").to_owned();
+    // A body that is read to its end.
+    assert_whole_file(whole, &file, "audio/wav", "the first request").await;
+
+    let past_the_end = format!("bytes={size}-");
+    let cases: [(Method, Pairs, StatusCode); 12] = [
+        // A response that is dropped unread, and a part of the file.
+        (Method::GET, &[], StatusCode::OK),
+        (
+            Method::GET,
+            &[("range", "bytes=1000-")],
+            StatusCode::PARTIAL_CONTENT,
+        ),
+        (
+            Method::POST,
+            &[("range", "bytes=-100")],
+            StatusCode::PARTIAL_CONTENT,
+        ),
+        // `If-Range` of another version: the file is opened for the whole
+        // file after the part was refused.
+        (
+            Method::GET,
+            &[("range", "bytes=1000-"), ("if-range", "\"0.00000000-0\"")],
+            StatusCode::OK,
+        ),
+        (
+            Method::GET,
+            &[("range", &past_the_end), ("if-range", "\"0.00000000-0\"")],
+            StatusCode::OK,
+        ),
+        // Several ranges and a range of another unit: the whole file.
+        (
+            Method::GET,
+            &[("range", "bytes=0-9,100-199")],
+            StatusCode::OK,
+        ),
+        (Method::GET, &[("range", "items=0-1")], StatusCode::OK),
+        // The answers without the file.
+        (Method::HEAD, &[], StatusCode::OK),
+        (
+            Method::GET,
+            &[("if-none-match", &tag)],
+            StatusCode::NOT_MODIFIED,
+        ),
+        (
+            Method::GET,
+            &[("range", &past_the_end)],
+            StatusCode::RANGE_NOT_SATISFIABLE,
+        ),
+        (
+            Method::GET,
+            &[("range", "bytes=abc")],
+            StatusCode::RANGE_NOT_SATISFIABLE,
+        ),
+        (Method::POST, &[], StatusCode::OK),
+    ];
+    for (method, headers, status) in cases {
+        let response = answered(&server, method.clone(), &id, headers).await;
+        assert_eq!(response.status(), status, "{method} {headers:?}");
+        drop(response);
+    }
+
+    // Errors, among them a file that is gone.
+    for (track, params) in [
+        (NO_TRACK, vec![]),
+        (id.as_str(), vec![("maxBitRate", "high")]),
+    ] {
+        let mut all = vec![("id", track)];
+        all.extend(params);
+        let request = request(Method::GET, "stream", &all, &[]);
+        let response = tokio::time::timeout(LIMIT, server.request(request))
+            .await
+            .expect("an error does not wait for a slot");
+        assert_eq!(content_type(&response), "application/xml");
+    }
+    let scanned = row(server.db(), &id).await.mtime;
+    fs::remove_file(&path).expect("delete the file");
+    let gone = answered(&server, Method::GET, &id, &[]).await;
+    assert_eq!(content_type(&gone), "application/xml");
+    fs::write(&path, &file).expect("write the file again");
+    set_modified(&path, unix_time(scanned));
+
+    // The slot is free: the file is served.
+    let last = answered(&server, Method::GET, &id, &[]).await;
+    assert_whole_file(last, &file, "audio/wav", "the last request").await;
+}
+
+#[tokio::test]
+async fn range_of_another_unit_is_ignored_and_a_range_in_bytes_is_answered() {
+    let server = TestServer::standard().await;
+    let id = server.track.low_tide.as_str();
+    let (_, file) = row_and_file(&server, id).await;
+    let size = file.len();
+    let first = stream(&server, id, &[], &[]).await;
+    let tag = header_of(&first, &header::ETAG).expect("a tag").to_owned();
+    drop(first);
+
+    // RFC 9110 section 14.2: a server ignores a `Range` header whose unit it
+    // does not understand. The answer is the whole file.
+    for range in ["items=0-1", "seconds=0-10", "none", "0-1"] {
+        for method in [Method::GET, Method::POST] {
+            let case = format!("{method} {range}");
+            let response = stream_as(&server, method, id, &[], &[("range", range)]).await;
+            assert_whole_file(response, &file, "audio/flac", &case).await;
+        }
+        // With `If-Range` of the file as well.
+        let headers = [("range", range), ("if-range", tag.as_str())];
+        let response = stream(&server, id, &[], &headers).await;
+        assert_whole_file(response, &file, "audio/flac", range).await;
+    }
+
+    // A range in bytes keeps its answers.
+    let response = stream(&server, id, &[], &[("range", "bytes=0-1")]).await;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(
+        header_of(&response, &header::CONTENT_RANGE),
+        Some(format!("bytes 0-1/{size}").as_str())
+    );
+    assert_eq!(header_of(&response, &header::ACCEPT_RANGES), Some("bytes"));
+    assert_eq!(body_bytes(response).await, &file[..2]);
+
+    let past_the_end = format!("bytes={size}-");
+    for range in [past_the_end.as_str(), "bytes=abc"] {
+        let response = stream(&server, id, &[], &[("range", range)]).await;
+        assert_eq!(
+            response.status(),
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "{range}"
+        );
+    }
+}
+
+// The open files of a process are listed through `/dev/fd`, which Windows
+// does not have.
+#[cfg(unix)]
+#[tokio::test]
+async fn dropped_body_closes_its_file_and_returns_its_slot() {
+    // One slot, and a request that waits for it has no end.
+    let (server, id, path) = bounded_wav_server(1, NO_END_MS).await;
+    let size = fs::metadata(&path).unwrap().len() as usize;
+    let before = open_descriptors(&path);
+    assert_eq!(before, 0);
+
+    for round in 0..3 {
+        // The request gets the slot that the body of the round before
+        // returned.
+        let response = answered(&server, Method::GET, &id, &[]).await;
+        assert_eq!(response.status(), StatusCode::OK, "round {round}");
+        let mut body = response.into_body();
+        let first = body
+            .frame()
+            .await
+            .expect("a frame")
+            .expect("a frame")
+            .into_data()
+            .expect("a data frame");
+        assert!(first.len() < size / 4, "{}", first.len());
+        assert_eq!(open_descriptors(&path), 1, "round {round}");
+
+        // The client disconnects: the server drops the body.
+        drop(body);
+        let closed = async {
+            while open_descriptors(&path) > before {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(1), closed)
+            .await
+            .expect("the file is closed within one second");
+    }
 }
 
 // A symbolic link is created with a Unix call. On Windows the call needs a

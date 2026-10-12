@@ -115,6 +115,15 @@ pub struct Server {
     /// not a config key; tests set it.
     #[serde(skip)]
     pub shutdown_grace_short_ms: u64,
+    /// The number of original files that the responses of `stream` hold
+    /// open at the same time. It is not a config key; tests set it.
+    #[serde(skip)]
+    pub max_streams: usize,
+    /// The milliseconds a `stream` request for an original file waits for
+    /// one of those files to be closed. It is not a config key; tests set
+    /// it.
+    #[serde(skip)]
+    pub stream_permit_wait_ms: u64,
 }
 
 /// The `[auth]` table.
@@ -159,6 +168,14 @@ pub struct Transcoding {
     /// config key; tests set it.
     #[serde(skip)]
     pub permit_wait_ms: u64,
+    /// The milliseconds a transcode has to produce its first output. It is
+    /// not a config key; tests set it.
+    #[serde(skip)]
+    pub first_output_wait_ms: u64,
+    /// The milliseconds a chunk of a transcoded stream waits for the client
+    /// to take the chunk before it. It is not a config key; tests set it.
+    #[serde(skip)]
+    pub write_timeout_ms: u64,
 }
 
 /// The `[discovery]` table.
@@ -178,6 +195,8 @@ impl Default for Server {
             log_level: "info".to_owned(),
             shutdown_grace_ms: 10_000,
             shutdown_grace_short_ms: 1500,
+            max_streams: 64,
+            stream_permit_wait_ms: 5000,
         }
     }
 }
@@ -201,6 +220,8 @@ impl Default for Transcoding {
             opus_bitrate_kbps: 192,
             mp3_bitrate_kbps: 320,
             permit_wait_ms: 5000,
+            first_output_wait_ms: 10_000,
+            write_timeout_ms: 60_000,
         }
     }
 }
@@ -852,6 +873,8 @@ mdns = true
                 log_level: "wn_server=debug".to_owned(),
                 shutdown_grace_ms: 10_000,
                 shutdown_grace_short_ms: 1500,
+                max_streams: 64,
+                stream_permit_wait_ms: 5000,
             },
             auth: Auth {
                 disabled_unsafe: true,
@@ -868,6 +891,8 @@ mdns = true
                 opus_bitrate_kbps: 96,
                 mp3_bitrate_kbps: 128,
                 permit_wait_ms: 5000,
+                first_output_wait_ms: 10_000,
+                write_timeout_ms: 60_000,
             },
             discovery: Discovery { mdns: false },
         };
@@ -1048,6 +1073,63 @@ mdns = true
             let error = Config::load(&path).expect_err("internal field as key");
             assert!(matches!(error, ConfigError::Parse { .. }), "{error}");
             assert!(error.to_string().contains("unknown field"), "{error}");
+        }
+    }
+
+    #[test]
+    fn limits_of_stream_have_their_defaults_and_are_no_config_keys() {
+        // The values of `docs/design.md` section 3.9.
+        let config = Config::default();
+        assert_eq!(config.server.max_streams, 64);
+        assert_eq!(config.server.stream_permit_wait_ms, 5000);
+        assert_eq!(config.transcoding.first_output_wait_ms, 10_000);
+        assert_eq!(config.transcoding.write_timeout_ms, 60_000);
+
+        // A config file gives them no other value, and a file that names
+        // one is refused.
+        let music = tempfile::tempdir().expect("temp dir");
+        let (_dir, path) = config_file(&format!(
+            "[library]\nfolders = ['{}']\n",
+            music.path().display()
+        ));
+        let loaded = Config::load(&path).expect("load");
+        assert_eq!(loaded.server.max_streams, 64);
+        assert_eq!(loaded.server.stream_permit_wait_ms, 5000);
+        assert_eq!(loaded.transcoding.first_output_wait_ms, 10_000);
+        assert_eq!(loaded.transcoding.write_timeout_ms, 60_000);
+        for text in [
+            "[server]\nmax_streams = 1\n",
+            "[server]\nstream_permit_wait_ms = 10\n",
+            "[transcoding]\nfirst_output_wait_ms = 10\n",
+            "[transcoding]\nwrite_timeout_ms = 10\n",
+        ] {
+            let (_dir, path) = config_file(text);
+            let error = Config::load(&path).expect_err("internal field as key");
+            assert!(matches!(error, ConfigError::Parse { .. }), "{error}");
+            assert!(error.to_string().contains("unknown field"), "{error}");
+        }
+    }
+
+    #[test]
+    fn limits_of_stream_are_not_rendered() {
+        // `config show` prints `to_toml`, and `init` writes `render(true)`.
+        let mut config = valid_config(Path::new("/music"));
+        config.server.max_streams = 1;
+        config.server.stream_permit_wait_ms = 50;
+        config.transcoding.first_output_wait_ms = 30;
+        config.transcoding.write_timeout_ms = 40;
+        for text in [
+            config.to_toml().expect("to_toml"),
+            config.render(true).expect("render"),
+        ] {
+            for field in [
+                "max_streams",
+                "stream_permit_wait_ms",
+                "first_output_wait_ms",
+                "write_timeout_ms",
+            ] {
+                assert!(!text.contains(field), "{field}: {text}");
+            }
         }
     }
 

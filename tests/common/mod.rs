@@ -26,6 +26,7 @@ use lofty::tag::{ItemKey, Tag, TagExt};
 use md5::{Digest, Md5};
 use serde_json::Value;
 use tempfile::TempDir;
+use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 use tower::ServiceExt;
 use transcoder::FakeTranscoder;
@@ -584,7 +585,17 @@ mod scanned {
         /// builds its library with [`LibraryBuilder`] and finds the IDs with
         /// [`ScannedServer::catalogue`].
         pub async fn scanned(library: TestLibrary) -> ScannedServer {
-            scanned_server(Arc::new(library)).await
+            scanned_server(Arc::new(library), |_| {}).await
+        }
+
+        /// As [`TestServer::scanned`], with the config that `adjust`
+        /// changes. A test of a limit of `stream` sets the fields of the
+        /// config that are no config keys.
+        pub async fn scanned_with(
+            library: TestLibrary,
+            adjust: impl FnOnce(&mut Config),
+        ) -> ScannedServer {
+            scanned_server(Arc::new(library), adjust).await
         }
 
         /// Sends `GET /rest/<method>` with `params` and the auth defaults in
@@ -647,7 +658,7 @@ mod scanned {
     }
 
     async fn standard_server(library: Arc<TestLibrary>) -> StandardServer {
-        let server = scanned_server(library).await;
+        let server = scanned_server(library, |_| {}).await;
         let catalogue = server.catalogue().await;
         let artist = |name: &str| catalogue.artist(name).id.clone();
         let album = |title: &str| catalogue.album(title).id.clone();
@@ -680,10 +691,14 @@ mod scanned {
         }
     }
 
-    async fn scanned_server(library: Arc<TestLibrary>) -> ScannedServer {
+    async fn scanned_server(
+        library: Arc<TestLibrary>,
+        adjust: impl FnOnce(&mut Config),
+    ) -> ScannedServer {
         let root = library.root.path().to_path_buf();
         let mut config = Config::default();
         config.library.folders = vec![root.clone()];
+        adjust(&mut config);
         let server = TestServer::bare(config).await;
 
         let summary = scan(server.db(), &root).await;
@@ -843,6 +858,7 @@ impl TestServer {
         let scan_poll_ms = config.library.scan_poll_ms;
         let transcoder = Arc::new(FakeTranscoder::default());
         let folders = config.library.folders.clone();
+        let streams = Arc::new(Semaphore::new(config.server.max_streams));
 
         // The fields follow the layout rule in the module comment of
         // `wn_server::api`.
@@ -855,6 +871,8 @@ impl TestServer {
             covers: wn_server::library::covers::Covers::new(cache_dir.path(), db.clone(), folders),
 
             transcoder: transcoder.clone(),
+
+            streams,
 
             scan: scan.clone(),
 
