@@ -518,12 +518,15 @@ A client browses the service type `_waxnerd._tcp` in the domain `local.`. The se
 |---|---|
 | PTR `_waxnerd._tcp.local.` | `<instance name>._waxnerd._tcp.local.` |
 | SRV | priority 0, weight 0, port `server.port`, target `<label>.local.` |
-| TXT | the eight keys of the next table |
+| TXT | the keys of the next table |
 | A and AAAA of the target | the addresses under Addresses |
 
 - The instance name is `server.name`: 1 to 63 bytes of UTF-8. When another responder on the link holds that name with other records, the daemon renames the instance by appending ` (2)`, then ` (3)` and so on. TXT `name` keeps `server.name`. A client does not identify a server by its instance name.
-- The target label is the first label of the system host name (`studio` for `studio.example.com`). The daemon appends `-2`, then `-3` and so on when another responder holds the host name with other addresses.
-- A client connects to an address of the A and AAAA records of the target, on the SRV port. The responder of the operating system, where one runs, publishes the same host name, and its records can hold addresses that the server does not listen on, such as IPv6 addresses when `server.bind` is an IPv4 address. A client tries the addresses in turn and goes on to the next one when a connection is refused.
+- The target label is the first label of the system host name (`studio` for `studio.example.com`). The daemon changes the label to `<label>-2`, then `<label>-3` and so on, when another responder answers its probe for the host name with an address record of the same type and another address. A client takes the target from the SRV record and builds it from no other value.
+- A client connects to an address of the A and AAAA records of the target, on the SRV port. The records can hold addresses that the server does not listen on: the responder of the operating system, where one runs, publishes the same host name with the addresses of the machine, such as IPv6 addresses when `server.bind` is an IPv4 address. A client therefore follows three rules.
+  1. It skips every link-local IPv6 address (`fe80::/10`). A connection to such an address needs a zone index, and the URL of this contract carries none.
+  2. It tries the other addresses one after the other, in an order of its own choice. It bounds each attempt with a timeout of its own choice.
+  3. It goes on to the next address when an attempt fails for any reason: the connection is refused, the attempt times out, the address is unreachable, or any other error occurs. The server is unreachable for the client when no address is left.
 
 #### TXT record
 
@@ -531,14 +534,14 @@ A client browses the service type `_waxnerd._tcp` in the domain `local.`. The se
 |---|---|---|
 | `txtvers` | `1`. A decimal number: the version of this table. | Ignores an instance whose `txtvers` it does not know. |
 | `api` | `opensubsonic`. | Ignores an instance with another value. |
-| `path` | `/rest`. A URL path that starts with `/` and does not end with `/`. | Builds the URL of an API method as `http://<address>:<port><path>/<method>`, for example `http://192.168.1.5:4200/rest/ping`. An IPv6 address is in brackets. |
-| `id` | The UUID in `instance.id`: 36 characters, lower-case hex digits in groups of 8, 4, 4, 4 and 12, separated by hyphens. | Stores the server under this key. Two instances with one `id` are one server. |
+| `path` | `/rest`. A URL path that starts with `/` and does not end with `/`. | Builds the URL of an API method as `http://<address>:<port><path>/<method>`, for example `http://192.168.1.5:4200/rest/ping`. The scheme is `http` because `tls` is `0`. An IPv6 address is in brackets. |
+| `id` | The UUID in `instance.id`: 36 characters, lower-case hex digits in groups of 8, 4, 4, 4 and 12, separated by hyphens. | Stores the server under this key. Two instances with one `id` are one server: the client keeps the instance whose SRV and TXT records it received last, with the port and the addresses of that instance, and drops the other. |
 | `name` | `server.name`: 1 to 63 bytes of UTF-8. | Shows it as the name of the server. |
 | `auth` | `password`, or `none` when `auth.disabled_unsafe` is set. | `password`: sends `u` with `p`, or with `t` and `s` (§3.7). `none`: sends none of them. Ignores an instance with another value. |
 | `tls` | `0`: the server speaks plain HTTP. No other value is defined. | Ignores an instance with another value. |
-| `ver` | The version of the server in the form `MAJOR.MINOR.PATCH`, for example `0.1.0`. | Shows it. A client does not derive behaviour from it. |
+| `ver` | The Cargo version of the server, unchanged: `MAJOR.MINOR.PATCH`, for example `0.1.0`, with a suffix for a pre-release, as in `0.2.0-beta.1`. | Shows the text as it is. A client does not parse it and derives no behaviour from it. |
 
-- The record holds these eight keys and nothing else, because every device on the network can read it: no credential, no account name, no folder path.
+- The record holds no other key today. Every device on the network can read the record, so no key carries a credential, an account name or a folder path.
 - `txtvers` is the first key. The order of the other keys is not part of the contract. Each key appears once. The keys are lower-case ASCII, and a client compares keys without regard to case (RFC 6763 section 6.4). The values are UTF-8; only `name` can hold characters outside ASCII.
 - A new key does not change `txtvers`, and a client ignores a key it does not know. `txtvers` increases when a key is removed or when the format or the meaning of a key changes.
 - `id` stays the same across restarts and across changes of `server.name`, the host name, the port and the addresses. It is new after `init` on a new data directory, and after `run` wrote a missing `instance.id`.
@@ -550,12 +553,13 @@ A client browses the service type `_waxnerd._tcp` in the domain `local.`. The se
 | `server.bind` | A and AAAA records |
 |---|---|
 | `0.0.0.0` | Every IPv4 address of the interfaces that are up, the loopback interface included. The daemon follows address changes. No AAAA record. |
-| `::` | Every IPv4 and IPv6 address of those interfaces. The daemon follows address changes. |
+| `::` | Every IPv4 and IPv6 address of those interfaces, link-local IPv6 addresses included. The daemon follows address changes. |
 | another IPv4 address | That address. No AAAA record. |
 | another IPv6 address | That address. No A record. |
 
 - The daemon announces an address on the interface whose subnet holds it and on no other. A client therefore receives the addresses of the link it is on. A server that binds one address is announced on the link of that address only: a server on `127.0.0.1` is visible to clients on the same machine and not on the LAN.
 - The daemon does not use point-to-point interfaces, such as VPN tunnels, or the Apple peer-to-peer interfaces `awdl` and `llw`.
+- The daemon publishes the link-local IPv6 addresses of a server that binds `::`. The responder of the operating system publishes them for the host name whatever `server.bind` is. A client skips them (Records, rule 1).
 - Windows: a listener on `::` accepts IPv6 connections only, because Windows sets `IPV6_V6ONLY` on a new socket and the listener does not clear it. The A records of a server that binds `::` on Windows therefore name addresses that the listener does not accept. Linux and macOS accept both families on that listener.
 
 #### Start, failure and stop
@@ -565,7 +569,7 @@ A client browses the service type `_waxnerd._tcp` in the domain `local.`. The se
 - The daemon probes for its names for 750 ms to one second and then announces the instance (RFC 6762 section 8.1).
 - The server runs without the advertisement when the advertisement cannot start. `run` logs one warning when `instance.id` cannot be read or is not a UUID, when `server.name` or the host label is not 1 to 63 bytes long, or when `mdns-sd` returns an error. `mdns-sd` opens its multicast sockets on the daemon thread and reports a socket it cannot open in its debug log only, so a second thread waits for the first announcement: it logs the announced name at `info`, or one warning when nothing was announced within 10 s.
 - Withdrawal: `unregister` sends a goodbye packet on every interface, the daemon repeats it after 120 ms, and `shutdown` ends the daemon thread. A client then sees the instance removed. A stop before the first announcement sends no goodbye packet, because nothing was announced. The thread that waits for the first announcement records it; a stop after the 10 s of that thread always sends the packet. A goodbye packet for an instance that was not announced would remove the records of another running server with the same instance name from the clients, for example when `run` is started twice and the second server cannot bind its port.
-- A server that ends without the goodbye packet stays in the caches of clients until its records expire: 120 s for the SRV and address records, 4500 s for the PTR and TXT records.
+- A server that ends without the goodbye packet stays in the caches of clients until its records expire. `mdns-sd` sets 120 s for the SRV and address records and 4500 s for the PTR and TXT records. These times are not part of the contract, and a client does not depend on them.
 - Windows Firewall prompts on first start for TCP 4200 and UDP 5353.
 
 ### 3.13 Logging and shutdown

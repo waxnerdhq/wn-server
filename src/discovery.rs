@@ -93,9 +93,9 @@ impl TxtRecord {
     /// | `name` | `server.name` |
     /// | `auth` | `password`, or `none` when `auth.disabled_unsafe` is set |
     /// | `tls` | `0`; the server speaks plain HTTP |
-    /// | `ver` | `version`, the version of the server, such as `0.1.0` |
+    /// | `ver` | `version` unchanged, the Cargo version of the server |
     ///
-    /// The record holds nothing else. Every device on the local network can
+    /// The record holds no other key. Every device on the local network can
     /// read it, so it carries no credential, no account name and no folder
     /// path. `docs/design.md` section 3.12 states the format of each value
     /// and what a client does with it.
@@ -512,6 +512,16 @@ mod tests {
                 ("ver", "1.2.3"),
             ]
         );
+    }
+
+    #[test]
+    fn txt_ver_is_the_version_text_unchanged() {
+        // A client shows `ver` and does not parse it, so a pre-release
+        // version and build metadata pass through as they are.
+        for version in ["0.1.0", "0.2.0-beta.1", "1.0.0-rc.2+build.5"] {
+            let record = TxtRecord::build(&config_named("studio"), version, INSTANCE_ID);
+            assert_eq!(record.last(), Some(&("ver".to_owned(), version.to_owned())));
+        }
     }
 
     #[test]

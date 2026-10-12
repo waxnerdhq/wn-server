@@ -172,7 +172,7 @@ The TXT record holds these keys, in this order:
 | `name` | `server.name` |
 | `auth` | `password`, or `none` when `auth.disabled_unsafe = true` |
 | `tls` | `0` |
-| `ver` | the version of the server in the form `MAJOR.MINOR.PATCH`, for example `0.1.0` |
+| `ver` | the Cargo version of the server, for example `0.1.0`, or `0.2.0-beta.1` for a pre-release |
 
 Every device on the network can read the record. It holds no password and no account name. Section 3.12 of [docs/design.md](docs/design.md) states what a client does with each key.
 
