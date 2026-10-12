@@ -422,6 +422,9 @@ mod scanned {
 
         /// Scans the music folder again and returns the summary of the scan.
         /// A test calls it after it changed a file of a library of its own.
+        /// The scan is a call of the scanner and not of the scan controller
+        /// of the server, so `scanning` and `count` of `getScanStatus` do
+        /// not report it.
         pub async fn rescan(&self) -> ScanSummary {
             scan(self.db(), self.root()).await
         }

@@ -11,8 +11,9 @@
 //! A change that adds a module replaces the comment line of that module and
 //! keeps the blank lines. Two changes then never touch neighbouring lines,
 //! and git merges them without a conflict. A change that needs a module the
-//! list does not name adds the name to the design and an entry with its
-//! blank line here.
+//! list does not name adds the name to the design, and an entry with its
+//! blank line above `mod int;`. That line is the last of the list and does
+//! not change, so the new entry is no neighbour of a comment line.
 //!
 //! rustfmt orders `mod` lines that follow each other without a blank line.
 //! Every entry is followed by a blank line, so rustfmt keeps this order.

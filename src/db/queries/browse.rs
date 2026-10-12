@@ -29,24 +29,14 @@ use std::path::PathBuf;
 
 use rusqlite::{Connection, OptionalExtension, Row};
 
+use super::albums::TRACK_ORDER;
 use super::int;
-use super::tracks::{self, Track};
+use super::tracks::{self, HAS_FILE_SQL, Track};
 use crate::db::Result;
 
 pub use super::folders::Folder;
 /// Returns every music folder row in ID order.
 pub use super::folders::list as folders;
-
-/// The SQL test for a track that has a file. It is the test of
-/// `tracks::has_file` (`docs/design.md` section 3.4).
-const HAS_FILE: &str = "rel_path NOT LIKE '/%'";
-
-/// The order of the tracks of one album: by disc number, where a track
-/// without one counts as disc 1, then by track number, where a track without
-/// one follows the numbered tracks, then by locator (`docs/design.md`
-/// section 1.3). The scanner picks the first track of an album in the same
-/// order (`albums::cover_inputs`).
-const TRACK_ORDER: &str = "coalesce(disc_no, 1), track_no IS NULL, track_no, folder_id, rel_path";
 
 /// The columns of [`Artist`] in the order [`artist_from_row`] reads them.
 const ARTIST_COLUMNS: &str = "id, name, sort_name, album_count";
@@ -140,7 +130,7 @@ pub fn list_artists(conn: &Connection, folder_id: Option<i64>) -> Result<Vec<Art
         "SELECT {ARTIST_COLUMNS} FROM artists
          WHERE ?1 IS NULL OR EXISTS (
            SELECT 1 FROM tracks
-           WHERE tracks.artist_id = artists.id AND tracks.folder_id = ?1 AND {HAS_FILE})
+           WHERE tracks.artist_id = artists.id AND tracks.folder_id = ?1 AND {HAS_FILE_SQL})
          ORDER BY key"
     ))?;
     let artists = select
@@ -206,8 +196,9 @@ pub fn albums_by_ids<S: AsRef<str>>(conn: &Connection, ids: &[S]) -> Result<Vec<
 
 /// Returns the tracks of the album `album_id`: by disc number, where a track
 /// without one counts as disc 1, then by track number, where a track without
-/// one follows the numbered tracks, then by path. An ID that no album has
-/// gives no track.
+/// one follows the numbered tracks, then by path. The order is
+/// `albums::TRACK_ORDER`, in which the scanner picks the first track of an
+/// album. An ID that no album has gives no track.
 ///
 /// The result holds every track row of the album, so its length is the
 /// `song_count` of the album after a scan. A track without a file is one of
@@ -304,6 +295,7 @@ pub fn file_path(conn: &Connection, track: &Track) -> Result<Option<PathBuf>> {
 ///
 /// A scan that runs has no end time and does not count. A cancelled scan has
 /// one and counts, because it keeps the changes it stored.
+/// `scans::last_finished` returns the same time as ISO 8601 text.
 pub fn last_scan_finished_at(conn: &Connection) -> Result<Option<i64>> {
     let finished_at = conn
         .prepare_cached("SELECT max(finished_at) FROM scans")?
@@ -342,14 +334,39 @@ pub(super) fn json_array<S: AsRef<str>>(ids: &[S]) -> String {
 /// Returns the rows of `rows` in the order of `ids`. `id_of` returns the ID
 /// of a row. An ID without a row adds nothing, and an ID that `ids` holds
 /// twice adds its row twice.
+///
+/// A row moves into the result at the last place at which `ids` names it,
+/// and it is cloned for each earlier place. A list that names no ID twice
+/// clones no row.
 fn in_order_of<T: Clone, S: AsRef<str>>(
     ids: &[S],
     rows: Vec<T>,
     id_of: fn(&T) -> &String,
 ) -> Vec<T> {
-    let by_id: HashMap<&str, &T> = rows.iter().map(|row| (id_of(row).as_str(), row)).collect();
+    // The last place of each ID in `ids`. A later place replaces an earlier
+    // one of the same ID.
+    let last_place: HashMap<&str, usize> = ids
+        .iter()
+        .enumerate()
+        .map(|(place, id)| (id.as_ref(), place))
+        .collect();
+    // The rows by ID. The keys are the texts of `ids`, so no ID is copied.
+    let mut by_id: HashMap<&str, T> = HashMap::with_capacity(rows.len());
+    for row in rows {
+        if let Some((id, _)) = last_place.get_key_value(id_of(&row).as_str()) {
+            by_id.insert(*id, row);
+        }
+    }
     ids.iter()
-        .filter_map(|id| by_id.get(id.as_ref()).map(|row| (*row).clone()))
+        .enumerate()
+        .filter_map(|(place, id)| {
+            let id = id.as_ref();
+            if last_place.get(id) == Some(&place) {
+                by_id.remove(id)
+            } else {
+                by_id.get(id).cloned()
+            }
+        })
         .collect()
 }
 
@@ -391,7 +408,9 @@ fn song_from_row(row: &Row<'_>) -> rusqlite::Result<Song> {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
     use std::path::Path;
+    use std::rc::Rc;
 
     use super::*;
     use crate::db::Db;
@@ -569,19 +588,57 @@ mod tests {
         ])
     }
 
-    #[test]
-    fn the_sql_test_for_a_file_agrees_with_has_file() {
-        let db = Db::open_memory().unwrap();
-        let placeholder = tracks::placeholder_path(T1);
-        for rel_path in ["a.flac", "a/b.flac", "%/a.flac", "_", placeholder.as_str()] {
-            let in_sql: bool = db
-                .with_reader(|conn| {
-                    let sql = format!("SELECT ?1 AS rel_path WHERE {HAS_FILE}");
-                    Ok(conn.prepare(&sql)?.exists([rel_path])?)
-                })
-                .unwrap();
-            assert_eq!(in_sql, tracks::has_file(rel_path), "{rel_path}");
+    /// A row that counts how often it is cloned. The clones share the count.
+    #[derive(Debug)]
+    struct Counted {
+        id: String,
+        clones: Rc<Cell<usize>>,
+    }
+
+    impl Clone for Counted {
+        fn clone(&self) -> Self {
+            self.clones.set(self.clones.get() + 1);
+            Self {
+                id: self.id.clone(),
+                clones: Rc::clone(&self.clones),
+            }
         }
+    }
+
+    /// Orders one row for each of `row_ids` by `ids` and returns the IDs of
+    /// the result and the number of clones that were made.
+    fn ordered(row_ids: &[&str], ids: &[&str]) -> (Vec<String>, usize) {
+        let clones = Rc::new(Cell::new(0));
+        let rows = row_ids
+            .iter()
+            .map(|id| Counted {
+                id: (*id).to_owned(),
+                clones: Rc::clone(&clones),
+            })
+            .collect();
+        let result = in_order_of(ids, rows, |row: &Counted| &row.id);
+        let result_ids = result.into_iter().map(|row| row.id).collect();
+        (result_ids, clones.get())
+    }
+
+    #[test]
+    fn rows_in_the_order_of_ids_are_cloned_only_for_a_repeated_id() {
+        // The rows arrive in the order of the table and not of the list.
+        let (result, clones) = ordered(&["a", "b", "c"], &["c", "x", "a", "b"]);
+        assert_eq!(result, ["c", "a", "b"]);
+        assert_eq!(clones, 0);
+
+        // `a` is named three times: two clones and the row itself.
+        let (result, clones) = ordered(&["a", "b"], &["a", "b", "a", "x", "a"]);
+        assert_eq!(result, ["a", "b", "a", "a"]);
+        assert_eq!(clones, 2);
+
+        let (result, clones) = ordered(&["a"], &[]);
+        assert_eq!(result, [] as [&str; 0]);
+        assert_eq!(clones, 0);
+        let (result, clones) = ordered(&[], &["a", "a"]);
+        assert_eq!(result, [] as [&str; 0]);
+        assert_eq!(clones, 0);
     }
 
     #[test]

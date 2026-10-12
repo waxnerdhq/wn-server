@@ -163,7 +163,7 @@ pub struct Child {
 /// that `getAlbum` returns.
 ///
 /// `id`, `name`, `songCount`, `duration` and `created` are required by the
-/// API. `userRating` is an OpenSubsonic addition.
+/// API. `userRating` and `played` are OpenSubsonic additions.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AlbumID3 {
@@ -189,6 +189,9 @@ pub struct AlbumID3 {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user_rating: Option<u8>,
     pub play_count: u64,
+    /// The time of the last play.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub played: Option<String>,
     /// The songs of the album. `None` where the album is an entry of a list.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub song: Option<Vec<Child>>,
@@ -379,7 +382,9 @@ pub fn child_dir_for_album(album: &browse::Album, annotation: Option<&Annotation
 /// user, without its songs.
 ///
 /// `songCount` and `duration` are the values that the last scan stored.
-/// `playCount` is 0 for an album without a play.
+/// `playCount` is 0 for an album without a play. `starred`, `userRating`,
+/// `playCount` and `played` are the values that [`child_dir_for_album`]
+/// reports for the same album and annotation.
 pub fn album(album: &browse::Album, annotation: Option<&Annotation>) -> AlbumID3 {
     let annotation = annotation.copied().unwrap_or_default();
     AlbumID3 {
@@ -396,6 +401,7 @@ pub fn album(album: &browse::Album, annotation: Option<&Annotation>) -> AlbumID3
         starred: annotation.starred_at.map(iso8601),
         user_rating: annotation.rating,
         play_count: annotation.play_count,
+        played: annotation.last_played_at.map(iso8601),
         song: None,
     }
 }
@@ -640,12 +646,13 @@ pub fn iso8601(unix_seconds: i64) -> String {
 }
 
 /// Returns the year, the month and the day of the day that is `days` days
-/// after 1970-01-01, in the proleptic Gregorian calendar.
+/// after 1970-01-01, in the proleptic Gregorian calendar. [`iso8601`] and
+/// the date that `wn-server user show` prints use it.
 ///
 /// The computation counts days from 1 March of year 0. A year that starts in
 /// March has its leap day at the end, so the month and the day follow from
 /// the day of the year without a table of month lengths.
-fn civil_date(days: i64) -> (i64, i64, i64) {
+pub(crate) fn civil_date(days: i64) -> (i64, i64, i64) {
     /// Days from 0000-03-01 to 1970-01-01.
     const EPOCH_DAY: i64 = 719_468;
     /// Days in the 400-year cycle of the calendar.
@@ -1041,13 +1048,15 @@ mod tests {
             concat!(
                 r#""album":{"artist":"Aurora Field","artistId":"ar-01","coverArt":"al-01","#,
                 r#""created":"2023-03-14T17:51:22Z","duration":645,"genre":"Electronic","#,
-                r#""id":"al-01","name":"Glass Harbour","playCount":8,"songCount":3,"#,
+                r#""id":"al-01","name":"Glass Harbour","playCount":8,"#,
+                r#""played":"2023-11-14T22:21:40Z","songCount":3,"#,
                 r#""starred":"2023-11-14T22:13:20Z","userRating":4,"year":2019}"#
             ),
             concat!(
                 r#"<album artist="Aurora Field" artistId="ar-01" coverArt="al-01""#,
                 r#" created="2023-03-14T17:51:22Z" duration="645" genre="Electronic""#,
-                r#" id="al-01" name="Glass Harbour" playCount="8" songCount="3""#,
+                r#" id="al-01" name="Glass Harbour" playCount="8""#,
+                r#" played="2023-11-14T22:21:40Z" songCount="3""#,
                 r#" starred="2023-11-14T22:13:20Z" userRating="4" year="2019"/>"#
             ),
         );
@@ -1110,6 +1119,29 @@ mod tests {
         // An entry of a list has no `song` field at all.
         let (json, _) = documents("album", album(&bare_album_row(), None));
         assert!(!json.contains(r#""song""#), "{json}");
+    }
+
+    #[test]
+    fn the_two_forms_of_an_album_report_the_same_annotation() {
+        let played_only = Annotation {
+            play_count: 2,
+            last_played_at: Some(86_399),
+            ..Annotation::default()
+        };
+        for annotation in [None, Some(annotation()), Some(played_only)] {
+            let entry = album(&album_row(), annotation.as_ref());
+            let directory = child_dir_for_album(&album_row(), annotation.as_ref());
+            assert_eq!(entry.starred, directory.starred, "{annotation:?}");
+            assert_eq!(entry.user_rating, directory.user_rating, "{annotation:?}");
+            assert_eq!(entry.play_count, directory.play_count, "{annotation:?}");
+            assert_eq!(entry.played, directory.played, "{annotation:?}");
+        }
+        let entry = album(&album_row(), Some(&played_only));
+        assert_eq!(entry.played.as_deref(), Some("1970-01-01T23:59:59Z"));
+        assert_eq!(
+            (entry.starred, entry.user_rating, entry.play_count),
+            (None, None, 2)
+        );
     }
 
     #[test]

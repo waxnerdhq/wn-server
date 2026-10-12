@@ -770,35 +770,12 @@ fn format_uuid_v4(mut bytes: [u8; 16]) -> String {
     )
 }
 
-/// Returns the UTC calendar date of a Unix time as `YYYY-MM-DD`.
-///
-/// The computation counts days from 1 March of year 0 in the proleptic
-/// Gregorian calendar. A year that starts in March has its leap day at the
-/// end, so the month and the day follow from the day of the year without a
-/// table of month lengths.
+/// Returns the UTC calendar date of a Unix time as `YYYY-MM-DD`. The
+/// calendar computation is the one of the times that the API reports
+/// (`api::model::civil_date`).
 fn utc_date(unix_seconds: i64) -> String {
-    /// Days from 0000-03-01 to 1970-01-01.
-    const EPOCH_DAY: i64 = 719_468;
-    /// Days in the 400-year cycle of the calendar.
-    const CYCLE_DAYS: i64 = 146_097;
-
-    let days = unix_seconds.div_euclid(86_400) + EPOCH_DAY;
-    let cycle = days.div_euclid(CYCLE_DAYS);
-    let day_of_cycle = days.rem_euclid(CYCLE_DAYS);
-    let year_of_cycle = (day_of_cycle - day_of_cycle / 1_460 + day_of_cycle / 36_524
-        - day_of_cycle / 146_096)
-        / 365;
-    let day_of_year =
-        day_of_cycle - (365 * year_of_cycle + year_of_cycle / 4 - year_of_cycle / 100);
-    // 0 is March and 11 is February.
-    let month_index = (5 * day_of_year + 2) / 153;
-    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
-    let month = if month_index < 10 {
-        month_index + 3
-    } else {
-        month_index - 9
-    };
-    let year = year_of_cycle + cycle * 400 + i64::from(month <= 2);
+    let days = unix_seconds.div_euclid(86_400);
+    let (year, month, day) = crate::api::model::civil_date(days);
     format!("{year:04}-{month:02}-{day:02}")
 }
 
