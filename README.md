@@ -136,7 +136,7 @@ Every API method needs a user, except `getOpenSubsonicExtensions`. The server ch
 
 The response does not tell an unknown user from a wrong password. A failed attempt is logged at the `info` level with the values of `u` and `c`, each cut to 64 characters, and the error code. A password, a token or a salt is never logged and is never part of an error message.
 
-`auth.disabled_unsafe = true` turns authentication off. This is unsafe: every request that has `v` and `c` then acts as the owner without a password, for anyone who can reach the port. `run` logs a warning at startup while the setting is on.
+`auth.disabled_unsafe = true` turns authentication off. This is unsafe: every request that has `v` and `c` then acts as the owner without a password, for anyone who can reach the port. That includes any web page that is open in a browser on the network: every response carries `Access-Control-Allow-Origin: *` (see [API](#api)), so the browser lets the page read the responses. Such a page can then use the server as the owner. It can read and stream the library, and it can call every method, including the methods that change state: stars, ratings, playlists and scans. `run` logs a warning at startup while the setting is on.
 
 ## API
 
@@ -146,6 +146,14 @@ The server answers OpenSubsonic requests at `/rest/<method>` and `/rest/<method>
 - An API error is an HTTP 200 response with the status `failed` and an `error` element that holds the Subsonic error code and a message.
 - The check of the user comes before the method. A request without a user gets the authentication error from every method except `getOpenSubsonicExtensions`, also from a method that the server does not serve.
 - A method of the OpenSubsonic API that the server does not serve returns error 0 with the message `not supported`. A name that is not an OpenSubsonic method returns error 0 with the message `unknown endpoint`.
+
+A client that runs in a browser calls the server from a page of another origin. The server sends the CORS headers that a browser needs for that:
+
+- Every response at `/rest/<method>` and `/rest/<method>.view` carries `Access-Control-Allow-Origin: *`. That includes an API error and an authentication error.
+- An `OPTIONS` request to these paths is answered as a preflight request. It needs no user and no parameter. The answer is HTTP 204 with `Access-Control-Allow-Methods: GET, POST, OPTIONS`, `Access-Control-Allow-Headers: Content-Type, Range` and `Access-Control-Max-Age: 86400`.
+- Every other response at these paths carries `Access-Control-Expose-Headers: Content-Range, Accept-Ranges, Content-Length`.
+- No response carries `Access-Control-Allow-Credentials`. The credentials are request parameters, and the server sets no cookie.
+- The server has no list of allowed origins. A response for any other path carries none of these headers.
 
 ## Discovery
 
