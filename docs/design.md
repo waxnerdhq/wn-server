@@ -384,7 +384,8 @@ wn-server init  [--data-dir D] [--folder PATH]... [--username NAME] [--port N] [
                 creates the data directory (0700 on Unix), config.toml, instance.id,
                 the database (0600 on Unix) and the owner account; generates the
                 password and prints it once, unless --password-stdin or
-                WN_SERVER_PASSWORD supplies one
+                WN_SERVER_PASSWORD supplies one; with a config.toml and no
+                owner account, keeps config.toml and creates what is missing
 wn-server run   [--data-dir D]                 runs the server in the foreground
 wn-server scan  [--data-dir D] [--full]        runs one scan and exits; --full re-reads every tag
 wn-server user show                            prints the owner's name, role and creation date (UTC)
@@ -397,11 +398,13 @@ wn-server --version
 
 `--data-dir` is accepted before and after the subcommand. `init` checks that each `--folder` is an existing directory and writes it as an absolute path. Without `--folder` it writes `folders = []`, and the commands that load the config fail until the owner adds a folder. `init` does not overwrite an existing `config.toml`. On Unix it creates the directories that are missing with mode 0700 and leaves the mode of an existing data directory unchanged. `--port 0` is rejected.
 
-`init` works in this order: it checks the folders, refuses an existing `config.toml`, obtains the password, creates the data directory, writes `config.toml`, writes `instance.id` when the file is missing, opens the database and inserts the owner. `--username` names the owner; the default is `owner`. The insert does nothing when an owner row exists, and `init` then fails. When a step after the config write fails, `init` removes the `config.toml` and the `instance.id` it wrote in that run, so the command can run again. An existing `instance.id` is kept.
+`init` works in this order: it checks the folders, refuses a data directory that has `config.toml` and an owner row in `library.db`, obtains the password, creates the data directory, writes `config.toml`, writes `instance.id` when the file is missing, opens the database and inserts the owner. `--username` names the owner; the default is `owner`. The insert does nothing when an owner row exists, and `init` then fails. When a step after the config write fails, `init` removes the `config.toml` and the `instance.id` it wrote in that run, so the command can run again. An existing `instance.id` is kept.
+
+A data directory that has `config.toml` and no owner row has lost its database or its owner: `library.db` is missing, or it exists without an owner row. `init` opens an existing `library.db` before it reads the password to tell this case from the refused one. It then keeps `config.toml` as it is and creates what is missing. `--folder` and `--port` do not change an existing `config.toml`, so `init` fails when either is given, before it reads the password. It skips the config write. The other steps are those of a first `init`: the password rules and `--username` are the same, a missing `instance.id` is written, a missing `library.db` is created (0600 on Unix) and the owner is inserted. The other rows of an existing database stay as they are. `init` prints `kept <config path>` and then `created <database path>` or `kept <database path>` in place of `wrote <config path>`. When a later step fails, this run removes no file: the next run keeps the `instance.id` and uses the database file that the failed run left. SQLite deletes a write-ahead log that it finds next to an empty database file, so a log that a lost database left behind does not reach the new one. Nothing of a lost database is recovered.
 
 `init` and `user set-password` print `Password for <name> (shown once): <password>` when they generated the password, and then `The password is stored in plain text in the data directory. Do not reuse it elsewhere.` Both checkpoint the write-ahead log with `Db::close` before they print, so the stored password is on disk; a checkpoint that another process blocks is not an error.
 
-`user set-password --username NAME` selects the account by name; without the option the account is the owner. The `user` commands fail when `library.db` does not exist or has no owner row, and do not create either. Only `init` creates them, and `init` refuses a data directory that has a `config.toml`, so the error states the recovery: move `config.toml` away and run `init`.
+`user set-password --username NAME` selects the account by name; without the option the account is the owner. The `user` commands fail when `library.db` does not exist or has no owner row, and do not create either. Only `init` creates them, so the error names `wn-server init`, which creates what is missing and keeps an existing `config.toml` and an existing database.
 
 A command that fails prints `wn-server: <error>` to stderr and exits with 1. A usage error exits with 2.
 

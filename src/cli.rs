@@ -35,12 +35,6 @@ pub const DEFAULT_USERNAME: &str = "owner";
 const PLAIN_TEXT_NOTICE: &str =
     "The password is stored in plain text in the data directory. Do not reuse it elsewhere.";
 
-/// The end of the error of a `user` command that finds no database or no
-/// owner account. `init` creates both and refuses a data directory that has a
-/// config file, so the text names the step that makes `init` run.
-const INIT_RECOVERY: &str = "`wn-server init` creates it. init does not overwrite config.toml, \
-     so move that file away first when it exists";
-
 /// The environment variable that holds the log filter. When it is set and not
 /// empty it replaces `server.log_level`.
 const LOG_FILTER_ENV: &str = "RUST_LOG";
@@ -85,14 +79,14 @@ pub struct InitArgs {
     #[arg(long = "folder", value_name = "PATH")]
     pub folders: Vec<PathBuf>,
 
-    /// The TCP port the server listens on
+    /// The TCP port the server listens on. Without this option the port is
+    /// 4200
     #[arg(
         long,
         value_name = "N",
-        default_value_t = config::DEFAULT_PORT,
         value_parser = clap::value_parser!(u16).range(1..)
     )]
-    pub port: u16,
+    pub port: Option<u16>,
 
     /// The name of the owner account
     #[arg(
@@ -161,13 +155,22 @@ enum CliError {
     CreateDataDir { path: PathBuf, source: io::Error },
     #[error("{} already exists; init does not overwrite it", .0.display())]
     ConfigExists(PathBuf),
+    #[error(
+        "{} exists; --folder and --port do not change it. Run init without them, or edit the file",
+        .0.display()
+    )]
+    OptionsNotApplied(PathBuf),
     #[error("cannot write {}: {source}", path.display())]
     WriteFile { path: PathBuf, source: io::Error },
     #[error("cannot write to stdout: {0}")]
     Stdout(#[from] io::Error),
     #[error(transparent)]
     Db(#[from] DbError),
-    #[error("the database {} does not exist; {INIT_RECOVERY}", .0.display())]
+    #[error(
+        "the database {} does not exist; `wn-server init` creates it and the owner account \
+         and keeps an existing config.toml",
+        .0.display()
+    )]
     NoDatabase(PathBuf),
     #[error(
         "the database {} already has an owner account; init does not replace it. \
@@ -175,7 +178,11 @@ enum CliError {
         .0.display()
     )]
     OwnerExists(PathBuf),
-    #[error("the database {} has no owner account; {INIT_RECOVERY}", .0.display())]
+    #[error(
+        "the database {} has no owner account; `wn-server init` creates the account \
+         and keeps the database and an existing config.toml",
+        .0.display()
+    )]
     NoOwner(PathBuf),
     #[error("no user is named {0}")]
     NoUser(String),
@@ -351,11 +358,18 @@ fn init_tracing(log_level: &str) -> Result<(), CliError> {
 /// path. The password comes from the source that [`password_source`] picks. A
 /// generated password is printed once.
 ///
+/// A data directory that has `config.toml` and no owner account keeps
+/// `config.toml` and gets what is missing: the database when there is none,
+/// and the owner account. The folders and the port of `args` are an error
+/// there, because they do not change a config file that exists. The rows of a
+/// database that exists stay as they are.
+///
 /// Nothing is created when a folder fails its check, when `config.toml`
-/// exists or when no password can be read. An existing `config.toml` and an
-/// existing owner account are errors and are left as they are. An existing
-/// `instance.id` is kept. When a step after the config write fails, the
-/// `config.toml` and the `instance.id` that this run wrote are removed.
+/// exists and the database has an owner account or when no password can be
+/// read. An existing owner account is an error and is left as it is. An
+/// existing `instance.id` is kept. When a step after the config write fails,
+/// the `config.toml` and the `instance.id` that this run wrote are removed. A
+/// run that keeps `config.toml` removes no file.
 fn init(
     data_dir: &DataDir,
     args: &InitArgs,
@@ -368,35 +382,54 @@ fn init(
         config::check_folder(&folder)?;
         folders.push(folder);
     }
-    let text = Config::template(&folders, args.port)?;
+    let text = Config::template(&folders, args.port.unwrap_or(config::DEFAULT_PORT))?;
 
     let config_path = data_dir.config_path();
-    // This check runs before the password is read, so a second `init` does
-    // not wait for a line on stdin. The write below refuses an existing file
-    // again.
-    if config_path.exists() {
-        return Err(CliError::ConfigExists(config_path));
+    let db_path = data_dir.db_path();
+    // A data directory with a config file and no owner account has lost its
+    // database or its owner. This run keeps the config file and the database
+    // that exist and creates what is missing.
+    let keeps_config = config_path.exists();
+    let keeps_db = db_path.exists();
+    // These checks run before the password is read, so an `init` that refuses
+    // does not wait for a line on stdin. The config write below refuses an
+    // existing file again, and the insert refuses an existing owner again.
+    if keeps_config {
+        if keeps_db && has_owner(&db_path)? {
+            return Err(CliError::ConfigExists(config_path));
+        }
+        if !args.folders.is_empty() || args.port.is_some() {
+            return Err(CliError::OptionsNotApplied(config_path));
+        }
     }
     let password = new_password(args.password_stdin, input)?;
 
-    create_data_dir(data_dir.path()).map_err(|source| CliError::CreateDataDir {
-        path: data_dir.path().to_path_buf(),
-        source,
-    })?;
-    if !write_new_file(&config_path, &text)? {
-        return Err(CliError::ConfigExists(config_path));
-    }
     // The files this run wrote. An `instance.id` from before the run is not
     // in the list.
-    let mut written = vec![config_path.clone()];
+    let mut written = Vec::new();
+    if !keeps_config {
+        create_data_dir(data_dir.path()).map_err(|source| CliError::CreateDataDir {
+            path: data_dir.path().to_path_buf(),
+            source,
+        })?;
+        if !write_new_file(&config_path, &text)? {
+            return Err(CliError::ConfigExists(config_path));
+        }
+        written.push(config_path.clone());
+    }
     let (db, owner) = match create_owner(data_dir, &args.username, &password.text, &mut written) {
         Ok(created) => created,
         Err(error) => {
-            // `init` refuses a data directory that has a config file. The
-            // files this run wrote are removed, so that `init` can run again
-            // when the cause of the error is gone.
-            for path in &written {
-                let _ = fs::remove_file(path);
+            // `init` does not apply `--folder` and `--port` to a config file
+            // that exists. A run that wrote the config file removes the files
+            // it wrote, so that `init` can run again with the same options
+            // when the cause of the error is gone. A run that kept the config
+            // file removes nothing. The next run keeps the `instance.id` and
+            // uses the database that this run left.
+            if !keeps_config {
+                for path in &written {
+                    let _ = fs::remove_file(path);
+                }
             }
             return Err(error);
         }
@@ -405,12 +438,18 @@ fn init(
     // in place, and `user set-password` sets a password that was not printed.
     close_db(db)?;
 
-    writeln!(out, "wrote {}", config_path.display())?;
-    if folders.is_empty() {
-        writeln!(
-            out,
-            "no music folder is configured; add one to library.folders in that file"
-        )?;
+    if keeps_config {
+        writeln!(out, "kept {}", config_path.display())?;
+        let action = if keeps_db { "kept" } else { "created" };
+        writeln!(out, "{action} {}", db_path.display())?;
+    } else {
+        writeln!(out, "wrote {}", config_path.display())?;
+        if folders.is_empty() {
+            writeln!(
+                out,
+                "no music folder is configured; add one to library.folders in that file"
+            )?;
+        }
     }
     print_password(out, &owner.name, &password)?;
     Ok(())
@@ -437,6 +476,14 @@ fn create_owner(
         .with_writer(|conn| users::insert_owner(conn, name, password))?
         .ok_or(CliError::OwnerExists(db_path))?;
     Ok((db, owner))
+}
+
+/// Returns whether the database at `db_path` has an owner account. The
+/// file must exist. `Db::open` applies the migrations that the database
+/// lacks.
+fn has_owner(db_path: &Path) -> Result<bool, CliError> {
+    let db = Db::open(db_path)?;
+    Ok(db.with_reader(users::get_owner)?.is_some())
 }
 
 /// Prints the name, the role and the creation date of the owner account. The
@@ -717,17 +764,17 @@ mod tests {
             panic!("expected init");
         };
         assert_eq!(args.folders, [PathBuf::from("a"), PathBuf::from("b")]);
-        assert_eq!(args.port, 4321);
+        assert_eq!(args.port, Some(4321));
     }
 
     #[test]
-    fn init_defaults_to_no_folder_port_4200_and_the_name_owner() {
+    fn init_defaults_to_no_folder_no_port_and_the_name_owner() {
         let cli = parse(&["init"]).expect("init");
         let Command::Init(args) = cli.command else {
             panic!("expected init");
         };
         assert!(args.folders.is_empty());
-        assert_eq!(args.port, 4200);
+        assert_eq!(args.port, None);
         assert_eq!(args.username, "owner");
         assert!(!args.password_stdin);
     }
