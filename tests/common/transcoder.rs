@@ -20,20 +20,6 @@ pub const FAKE_TRANSCODE: &[u8] = b"the bytes of a transcode";
 /// The size of the chunks in which a [`FakeTranscoder`] yields its bytes.
 pub const FAKE_CHUNK: usize = 4096;
 
-/// A value of `transcoding.ffmpeg` that names no program: a path in the
-/// directory of the audio fixtures, which holds no such file.
-///
-/// A test that runs `run_server` sets it. The server then probes this path
-/// and starts no program, so the test does not depend on whether the
-/// machine has ffmpeg, and the default suite starts no ffmpeg.
-pub fn no_ffmpeg() -> String {
-    super::fixtures_dir()
-        .join("no-ffmpeg")
-        .to_str()
-        .expect("a Unicode path")
-        .to_owned()
-}
-
 /// An error that a [`FakeTranscoder`] returns in place of a stream.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FakeFailure {

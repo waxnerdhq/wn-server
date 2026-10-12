@@ -44,9 +44,9 @@ use wn_server::db::queries::users;
 use wn_server::library::scanner::{self, ScanOptions};
 use wn_server::media::stream::{self as media_stream, Target};
 use wn_server::media::transcode::TranscodeJob;
-use wn_server::server::{ServerOptions, run_server};
+use wn_server::server::{FfmpegProbe, ServerOptions, run_server};
 
-use common::transcoder::{FAKE_CHUNK, FAKE_TRANSCODE, FakeFailure, FakeTranscoder, no_ffmpeg};
+use common::transcoder::{FAKE_CHUNK, FAKE_TRANSCODE, FakeFailure, FakeTranscoder};
 use common::{
     API_VERSION, CLIENT, LibraryBuilder, OWNER, OWNER_PASSWORD, ScannedServer, StandardServer,
     TestServer, body_bytes, body_string, captured_log, content_type, subsonic_response, urlencode,
@@ -1370,10 +1370,14 @@ async fn server_without_ffmpeg_starts_with_one_warning_and_serves_original_files
     config.library.scan_on_start = false;
     config.transcoding.ffmpeg = missing.to_str().expect("a Unicode path").to_owned();
 
+    // The server probes the program of its config, as the server of the
+    // `run` command does. This is the one test of the suite that asks for
+    // the probe.
     let cancel = CancellationToken::new();
     let (listening, bound) = oneshot::channel();
     let options = ServerOptions {
         listening: Some(listening),
+        probe: FfmpegProbe::Run,
         ..ServerOptions::default()
     };
     let mut task = tokio::spawn({
@@ -1493,14 +1497,14 @@ async fn stop_with_the_short_grace_ends_the_transcodes_that_wait_for_ffmpeg_and_
     config.server.shutdown_grace_short_ms = SHORT_GRACE_MS;
     config.library.folders = vec![root.clone()];
     config.library.scan_on_start = false;
-    config.transcoding.ffmpeg = no_ffmpeg();
     config.transcoding.first_output_wait_ms = NO_END_MS;
     config.transcoding.write_timeout_ms = NO_END_MS;
 
-    // `run_server` builds the transcoder that runs ffmpeg and gives a test
-    // no way to replace it. A route next to the API answers as the handler
-    // of `stream` answers a request that selects a transcode: with
-    // `media::stream::transcoded`, here with the transcoder of the test.
+    // The transcoder of the server is the one that runs ffmpeg, and this
+    // server has not probed it, so it starts no process. A route next to
+    // the API answers as the handler of `stream` answers a request that
+    // selects a transcode: with `media::stream::transcoded`, here with the
+    // transcoder of the test.
     let transcoder = Arc::new(FakeTranscoder::default());
     let routes = Router::new().route(
         "/transcode",

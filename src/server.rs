@@ -72,6 +72,27 @@ pub enum ServerError {
 /// block its thread.
 pub type StopStep = Box<dyn FnOnce() + Send>;
 
+/// Whether [`run_server`] runs ffmpeg when the server starts.
+///
+/// `run_server` starts a program in one place: the probe of
+/// `transcoding.ffmpeg`. The probe runs for [`FfmpegProbe::Run`] only, which
+/// the `run` command passes. Every other caller gets the default and a
+/// server that starts no program, whatever its config names and whatever
+/// the machine has installed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FfmpegProbe {
+    /// `run_server` runs no program. The transcoder of the server has no
+    /// target ([`FfmpegTranscoder::without_program`]): a request that needs
+    /// a transcode gets the error of a server without ffmpeg, and the
+    /// server serves original files.
+    #[default]
+    Skip,
+    /// `run_server` probes the program of `transcoding.ffmpeg`
+    /// ([`FfmpegTranscoder::probe`]): it runs the program twice and logs
+    /// what it found.
+    Run,
+}
+
 /// What the caller of [`run_server`] adds to the server. The default adds
 /// nothing.
 #[derive(Default)]
@@ -97,6 +118,10 @@ pub struct ServerOptions {
     /// the process a fixed time after the stop signal. The default is a
     /// token that nothing cancels.
     pub hurry: CancellationToken,
+    /// Whether the server probes ffmpeg when it starts. The `run` command
+    /// passes [`FfmpegProbe::Run`]. The default is [`FfmpegProbe::Skip`], so
+    /// a test that runs `run_server` starts no ffmpeg.
+    pub probe: FfmpegProbe,
 }
 
 /// The time limit of step 2 and of step 3 of the stop.
@@ -238,9 +263,12 @@ pub async fn run_server(
     let closing = db.clone();
     // The probe runs `ffmpeg -version` and `ffmpeg -encoders` once and logs
     // which formats the server can transcode to. A server without ffmpeg
-    // serves original files.
-    let transcoder: Arc<dyn Transcoder> =
-        Arc::new(FfmpegTranscoder::probe(&config.transcoding).await);
+    // serves original files, and so does a server whose caller asked for no
+    // probe.
+    let transcoder: Arc<dyn Transcoder> = Arc::new(match options.probe {
+        FfmpegProbe::Run => FfmpegTranscoder::probe(&config.transcoding).await,
+        FfmpegProbe::Skip => FfmpegTranscoder::without_program(&config.transcoding),
+    });
     let streams = Arc::new(Semaphore::new(config.server.max_streams));
 
     // The fields follow the layout rule in the module comment of `api`.
@@ -1674,6 +1702,8 @@ mod tests {
         assert!(options.scan.on_batch.is_none());
         // Nothing holds a clone of the token, so nothing cancels it.
         assert!(!options.hurry.is_cancelled());
+        // No program runs.
+        assert_eq!(options.probe, FfmpegProbe::Skip);
     }
 
     #[test]

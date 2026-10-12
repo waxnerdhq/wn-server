@@ -254,6 +254,14 @@ impl FfmpegTranscoder {
         Self::new(config, found.targets())
     }
 
+    /// The transcoder of `config` for a server that did not probe its
+    /// program. It has no target, as the transcoder of a program that does
+    /// not run has none: every job is [`TranscodeError::Unavailable`], and
+    /// the transcoder starts no process.
+    pub fn without_program(config: &Transcoding) -> Self {
+        Self::new(config, Vec::new())
+    }
+
     /// The transcoder of `config`. `targets` is the result of the probe: the
     /// targets that the program can encode.
     fn new(config: &Transcoding, targets: Vec<Target>) -> Self {
@@ -1877,6 +1885,34 @@ mod tests {
     }
 
     /// The directory of the committed audio fixtures.
+    #[tokio::test]
+    async fn transcoder_without_a_program_is_unavailable_and_starts_no_process() {
+        // The program is the test binary, which runs. A transcoder that
+        // started it would return a stream.
+        let program = std::env::current_exe().expect("the test binary");
+        let config = Transcoding {
+            ffmpeg: program.to_str().expect("a Unicode path").to_owned(),
+            max_concurrent: 1,
+            ..Transcoding::default()
+        };
+        let transcoder = FfmpegTranscoder::without_program(&config);
+        assert_eq!(transcoder.targets, []);
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("a.flac");
+        for target in TARGETS {
+            let error = transcoder
+                .spawn(job(path.to_str().unwrap(), target, 96, 0))
+                .await
+                .expect_err("no stream");
+            assert!(matches!(error, TranscodeError::Unavailable), "{error:?}");
+            assert_eq!(error.to_string(), "ffmpeg not available");
+            // No job took a permit, which a job takes before its process
+            // starts.
+            assert_eq!(transcoder.semaphore.available_permits(), 1);
+        }
+    }
+
     fn fixtures() -> PathBuf {
         Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("tests")
