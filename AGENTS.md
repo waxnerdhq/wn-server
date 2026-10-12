@@ -16,6 +16,7 @@ wn-server is a headless music server. It scans a local music collection into SQL
 - `tests/`: router-level integration tests. `tests/fixtures/audio/`: five tiny audio files. `tests/common/mod.rs`: `LibraryBuilder` and `TestServer`.
 - `examples/e2e.rs`: the end-to-end client session.
 - `xtask/`: the `cargo xtask check` command. `scripts/check.sh`: its Unix wrapper. `scripts/make-fixtures.sh`: regenerates the fixtures (maintainer tool, Unix).
+- `scripts/orchestrator/`: the scripts of the merge sequence (see Orchestration).
 - `.woodpecker/`: CI pipelines.
 
 ## Tooling
@@ -35,19 +36,29 @@ wn-server is a headless music server. It scans a local music collection into SQL
 - Branch name: `adnan/wax-nnn-short-slug`. PR title: `WAX-nnn: Sentence case summary`. The PR body contains `Fixes WAX-nnn`.
 - The issue moves to In Progress before the first code change and to In Review when the PR is pushed.
 - The loop is plan, implement, review, apply fixes. The planner writes the issue, the implementer writes the code and tests, the reviewer reads the diff and ranks findings, the implementer applies the fixes.
+- The implementer's report lists every deviation from the issue and everything in the issue or the design that the implementer found wrong. The report is part of the PR description. The reviewer rules on each item.
+- When a review has no blocking findings, the implementer applies the should-fix findings and the PR merges without a second review pass. A second pass is required when the first pass had blocking findings, or when the issue's scope changed after the review.
+- Follow-up work found in a review becomes a new WAX issue in the project, with its blocking relations set. It is not added to the PR under review unless the orchestrator amends the issue text first.
 - All checks run locally with `cargo xtask check` (or `scripts/check.sh`) before a push. Nobody states that checks pass without having run them in that session.
 - The orchestrator squash-merges when the review has no blocking findings and the checks are green (owner decision for this repo, 2026-10-11).
-- After the merge, the merger verifies that the Linear issue is closed, and closes it when the automation did not.
+- A PR merges only when the Woodpecker status on its head commit is green. That status is required in addition to the local check.
+- Linear's GitHub automation is not connected to this repository, so a merged PR does not close its issue. `scripts/orchestrator/merge-lane.sh` moves the issue to Done after the merge. The merger verifies that the issue is closed, and closes it when the script did not.
+- This repository is public. Details of the owner's CI infrastructure stay out of PRs, commit messages and anything public that an issue links to.
 - A commit message ends with the attribution line the environment provides.
 
 ## Orchestration
 
 - The main session orchestrates and does not implement.
-- For each unblocked issue the orchestrator starts an implementer in its own git worktree, then a reviewer on the PR, then has the implementer apply the blocking and should-fix findings, then squash-merges, deletes the branch, verifies the Linear issue closed, and starts the issues the merge unblocked.
+- For each unblocked issue the orchestrator starts an implementer in its own git worktree, then a reviewer on the PR, then has the implementer apply the blocking and should-fix findings, then runs the merge sequence, and starts the issues the merge unblocked.
 - The reviewer posts its findings as one comment on the PR. The implementer answers them in the PR. The orchestrator receives counts and verdicts, not the findings.
-- The reviewer runs in the implementer's worktree so that it can run the checks on the PR's code. The orchestrator removes the worktree after the merge.
+- The reviewer runs in the implementer's worktree so that it can run the checks on the PR's code.
 - A lane brief that omits the reviewer pass or the Linear state moves is defective and is corrected before the lane starts.
-- Before the squash-merge, the lane rebases its branch on `main` and reruns `cargo xtask check`, because `main` moves after every merge and parallel PRs touch shared tables such as `METHODS`.
+- The merge sequence is three scripts in `scripts/orchestrator/`. The orchestrator runs them in this order after the implementer reports its fixes. `<worktree-id>` names the lane's worktree, `.claude/worktrees/agent-<worktree-id>`.
+  1. `prep-lane.sh <worktree-id>` rebases the lane's branch on `origin/main`, formats the code, reruns `cargo xtask check`, pushes, and prints the head commit. `main` moves after every merge, and parallel PRs touch shared tables such as `METHODS`. When the branch already contains `origin/main`, the script only prints the head commit.
+  2. `ci-wait.sh <pr> <sha>` waits for the Woodpecker status on that commit.
+  3. `merge-lane.sh <pr> <WAX-id> <sha> <worktree-id>` checks that the PR's head commit is `<sha>`, that GitHub reports the merge state as clean, and that the CI status is green. It then squash-merges, removes the worktree and the lane's branches, updates `main`, and moves the Linear issue to Done.
+- The three scripts are POSIX `sh` and run on the owner's Mac only. They are orchestrator tooling, not contributor tooling, so the rule that contributor scripts are Rust holds.
+- `.gitattributes` sets `merge=union` on the module-list files, so a rebase keeps the `pub mod` lines of both sides and the format step orders them. A rebase conflict in any other file stops `prep-lane.sh` and goes back to the lane's implementer.
 - Work state lives in Linear and git. Anything the orchestrator knows that those do not show goes into a handoff note for the next orchestrator session.
 
 ## Documentation
