@@ -937,7 +937,7 @@ async fn client_that_reads_nothing_loses_its_transcode_at_the_write_timeout() {
     assert_eq!(server.transcoder().open_streams(), 1);
 
     // The client reads nothing. The transcode ends although the response
-    // exists: the limit of 10 s is far below the default of 60 s.
+    // exists: the limit of 10 s is far below the default of 10 minutes.
     tokio::time::timeout(LIMIT, server.transcoder().streams_open(0))
         .await
         .expect("the write timeout ends the transcode");

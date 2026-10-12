@@ -221,7 +221,7 @@ impl Default for Transcoding {
             mp3_bitrate_kbps: 320,
             permit_wait_ms: 5000,
             first_output_wait_ms: 10_000,
-            write_timeout_ms: 60_000,
+            write_timeout_ms: 600_000,
         }
     }
 }
@@ -892,7 +892,7 @@ mdns = true
                 mp3_bitrate_kbps: 128,
                 permit_wait_ms: 5000,
                 first_output_wait_ms: 10_000,
-                write_timeout_ms: 60_000,
+                write_timeout_ms: 600_000,
             },
             discovery: Discovery { mdns: false },
         };
@@ -1083,7 +1083,7 @@ mdns = true
         assert_eq!(config.server.max_streams, 64);
         assert_eq!(config.server.stream_permit_wait_ms, 5000);
         assert_eq!(config.transcoding.first_output_wait_ms, 10_000);
-        assert_eq!(config.transcoding.write_timeout_ms, 60_000);
+        assert_eq!(config.transcoding.write_timeout_ms, 600_000);
 
         // A config file gives them no other value, and a file that names
         // one is refused.
@@ -1096,7 +1096,7 @@ mdns = true
         assert_eq!(loaded.server.max_streams, 64);
         assert_eq!(loaded.server.stream_permit_wait_ms, 5000);
         assert_eq!(loaded.transcoding.first_output_wait_ms, 10_000);
-        assert_eq!(loaded.transcoding.write_timeout_ms, 60_000);
+        assert_eq!(loaded.transcoding.write_timeout_ms, 600_000);
         for text in [
             "[server]\nmax_streams = 1\n",
             "[server]\nstream_permit_wait_ms = 10\n",
