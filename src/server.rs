@@ -23,6 +23,7 @@ use crate::config::{Config, DataDir, Library};
 use crate::db::queries::{folders, users};
 use crate::db::{Db, DbError};
 use crate::library::scan_controller::{ScanController, ScanHooks, ScanSettings};
+use crate::media::transcode::{FfmpegTranscoder, Transcoder};
 
 /// What [`run_server`] logs at startup when `auth.disabled_unsafe` is `true`.
 const AUTH_DISABLED_WARNING: &str = "authentication is disabled (auth.disabled_unsafe = true). \
@@ -183,6 +184,10 @@ pub async fn run_server(
     // This handle stays out of the state, so that the stop can close the
     // database when the router and its state are gone.
     let closing = db.clone();
+    // The probe runs `ffmpeg -version` once and logs whether the server can
+    // transcode. A server without ffmpeg serves original files.
+    let transcoder: Arc<dyn Transcoder> =
+        Arc::new(FfmpegTranscoder::probe(&config.transcoding).await);
 
     // The fields follow the layout rule in the module comment of `api`.
     #[rustfmt::skip]
@@ -193,7 +198,7 @@ pub async fn run_server(
 
         covers,
 
-        // transcoder
+        transcoder,
 
         scan: scan.clone(),
 
