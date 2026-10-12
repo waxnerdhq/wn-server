@@ -4341,6 +4341,392 @@ fn the_cover_of_an_album_in_a_folder_that_cannot_be_read_stays() {
     assert!(cached.exists());
 }
 
+/// The key of the album of [`disc_library`] in [`TestDb::albums`], which is
+/// also the relative path of its directory.
+const LONG_PLAY: &str = "Aurora Field/Long Play";
+
+/// Moves the file `name` of the album directory `album_dir` into the
+/// directory `disc` of that directory.
+fn move_to_disc(album_dir: &Path, name: &str, disc: &str) {
+    move_file(&album_dir.join(name), &album_dir.join(disc).join(name));
+}
+
+/// Builds a library of one album, "Long Play" by Aurora Field, whose discs
+/// have directories of their own: two tracks of disc 1 in `CD1` and one
+/// track of disc 2 in `CD2`. No track holds a picture. Returns the library
+/// and the directory of the album, which is the parent directory of `CD1`
+/// and `CD2`.
+fn disc_library() -> (TestLibrary, PathBuf) {
+    let library = LibraryBuilder::new()
+        .track("Aurora Field", "Long Play", "Side A", 1, "flac")
+        .disc(1)
+        .track("Aurora Field", "Long Play", "Side B", 2, "flac")
+        .disc(1)
+        .track("Aurora Field", "Long Play", "Side C", 1, "flac")
+        .disc(2)
+        .build();
+    let album_dir = below(library.root.path(), LONG_PLAY);
+    move_to_disc(&album_dir, "01 Side A.flac", "CD1");
+    move_to_disc(&album_dir, "02 Side B.flac", "CD1");
+    move_to_disc(&album_dir, "01 Side C.flac", "CD2");
+    (library, album_dir)
+}
+
+/// Returns the stored cover of the album `key`: its source and its
+/// modification time.
+fn cover_of(env: &TestDb, key: &str) -> (Option<String>, Option<i64>) {
+    let album = env.album(key);
+    (album.cover_source, album.cover_mtime)
+}
+
+/// Returns the cover that a scan stores for the image file at `path`.
+fn file_cover(path: &Path) -> (Option<String>, Option<i64>) {
+    (Some(text(path)), Some(mtime(path)))
+}
+
+#[test]
+fn an_album_in_disc_directories_has_the_cover_file_of_their_parent_directory() {
+    let library = LibraryBuilder::new()
+        .track("Aurora Field", "Long Play", "Side A", 1, "flac")
+        .disc(1)
+        .picture()
+        .track("Aurora Field", "Long Play", "Side C", 1, "flac")
+        .disc(2)
+        .picture()
+        .build();
+    let album_dir = below(library.root.path(), LONG_PLAY);
+    move_to_disc(&album_dir, "01 Side A.flac", "CD1");
+    move_to_disc(&album_dir, "01 Side C.flac", "CD2");
+    let cover = album_dir.join("cover.jpg");
+    fs::write(&cover, b"image").unwrap();
+    let scanned = Scanned::of(library);
+
+    // The file precedes the embedded pictures of the tracks.
+    assert_eq!(scanned.env.albums().len(), 1);
+    assert_eq!(cover_of(&scanned.env, LONG_PLAY), file_cover(&cover));
+}
+
+#[test]
+fn a_cover_file_beside_the_first_track_precedes_the_one_of_the_parent_directory() {
+    let (library, album_dir) = disc_library();
+    let parent = album_dir.join("cover.jpg");
+    fs::write(&parent, b"image").unwrap();
+    // The directory of the second disc has a cover file and the directory
+    // of the first disc has none. The file of the second disc is beside no
+    // first track, so the file of the parent directory is the cover.
+    let of_second = album_dir.join("CD2").join("cover.jpg");
+    fs::write(&of_second, b"image").unwrap();
+    let scanned = Scanned::of(library);
+    assert_eq!(cover_of(&scanned.env, LONG_PLAY), file_cover(&parent));
+
+    // The directory of the first disc has a cover file and the directory
+    // of the second disc has none. The name of the file comes after `cover`
+    // in the order of the names, and the directory decides first.
+    let beside = album_dir.join("CD1").join("album.png");
+    fs::rename(&of_second, &beside).unwrap();
+    assert_eq!(scanned.rescan().seen, 3);
+    assert_eq!(cover_of(&scanned.env, LONG_PLAY), file_cover(&beside));
+
+    // No disc directory has a cover file. The cover is the file of the
+    // parent directory again.
+    fs::remove_file(&beside).unwrap();
+    assert_eq!(scanned.rescan().seen, 3);
+    assert_eq!(cover_of(&scanned.env, LONG_PLAY), file_cover(&parent));
+}
+
+#[test]
+fn a_parent_directory_that_holds_two_albums_gives_its_cover_file_to_neither() {
+    // The directory `Box` holds the two disc directories of "Long Play" and
+    // the two disc directories of "Short Play".
+    let library = LibraryBuilder::new()
+        .track("Aurora Field", "Long Play", "Side A", 1, "flac")
+        .disc(1)
+        .track("Aurora Field", "Long Play", "Side C", 1, "flac")
+        .disc(2)
+        .track("Aurora Field", "Short Play", "Front", 1, "mp3")
+        .disc(1)
+        .track("Aurora Field", "Short Play", "Back", 1, "mp3")
+        .disc(2)
+        .build();
+    let artist_dir = library.root.path().join("Aurora Field");
+    let box_dir = artist_dir.join("Box");
+    let moves = [
+        ("Long Play", "01 Side A.flac", "CD1"),
+        ("Long Play", "01 Side C.flac", "CD2"),
+        ("Short Play", "01 Front.mp3", "CD3"),
+        ("Short Play", "01 Back.mp3", "CD4"),
+    ];
+    for (album, name, disc) in moves {
+        move_file(
+            &artist_dir.join(album).join(name),
+            &box_dir.join(disc).join(name),
+        );
+    }
+    let cover = box_dir.join("cover.jpg");
+    fs::write(&cover, b"image").unwrap();
+    let scanned = Scanned::of(library);
+
+    let short_play = "Aurora Field/Short Play";
+    assert_eq!(scanned.env.albums().len(), 2);
+    assert_eq!(cover_of(&scanned.env, LONG_PLAY), (None, None));
+    assert_eq!(cover_of(&scanned.env, short_play), (None, None));
+
+    // One track of the other album is enough, in a directory below a disc
+    // directory too.
+    fs::remove_file(box_dir.join("CD4").join("01 Back.mp3")).unwrap();
+    move_file(
+        &box_dir.join("CD3").join("01 Front.mp3"),
+        &box_dir.join("CD2").join("Extras").join("01 Front.mp3"),
+    );
+    let summary = scanned.rescan();
+    assert_eq!((summary.moved, summary.removed), (1, 1));
+    assert_eq!(cover_of(&scanned.env, LONG_PLAY), (None, None));
+    assert_eq!(cover_of(&scanned.env, short_play), (None, None));
+
+    // The parent directory holds the tracks of one album when the other
+    // album is gone. The file is then the cover of that album.
+    fs::remove_file(box_dir.join("CD2").join("Extras").join("01 Front.mp3")).unwrap();
+    let summary = scanned.rescan();
+    assert_eq!((summary.removed, summary.albums), (1, 1));
+    assert_eq!(cover_of(&scanned.env, LONG_PLAY), file_cover(&cover));
+}
+
+#[test]
+fn an_album_in_one_directory_does_not_take_the_cover_file_of_its_parent_directory() {
+    // The directory of an artist with two albums and the directory of an
+    // artist with one album get an image file.
+    let library = LibraryBuilder::standard().build();
+    let root = library.root.path();
+    fs::write(below(root, "Aurora Field/folder.jpg"), b"image").unwrap();
+    fs::write(below(root, "Marlow Quartet/folder.jpg"), b"image").unwrap();
+    let scanned = Scanned::of(library);
+
+    // Every album has the cover that it has in the standard library.
+    let own = below(scanned.root(), "Aurora Field/Glass Harbour/cover.jpg");
+    assert_eq!(
+        cover_of(&scanned.env, "Aurora Field/Glass Harbour"),
+        file_cover(&own)
+    );
+    let upstream = scanned.track_at(STANDARD[6]);
+    assert_eq!(
+        cover_of(&scanned.env, "Marlow Quartet/Slow Rivers"),
+        (
+            Some(format!("embedded:{}", upstream.id)),
+            Some(upstream.mtime)
+        )
+    );
+    // The two tracks of "Summer Sampler" are in the directories of two
+    // artists, which have no common parent directory but the folder.
+    for key in ["Aurora Field/Paper Maps", "Various Artists/Summer Sampler"] {
+        assert_eq!(cover_of(&scanned.env, key), (None, None), "{key}");
+    }
+}
+
+#[test]
+fn a_cover_file_of_the_parent_directory_that_is_replaced_or_removed_changes_the_cover() {
+    let (library, album_dir) = disc_library();
+    let cover = album_dir.join("cover.jpg");
+    fs::write(&cover, b"image").unwrap();
+    // The directory of the artist, one level further up, holds an image
+    // too. It is the cover of no album.
+    fs::write(
+        below(library.root.path(), "Aurora Field/cover.jpg"),
+        b"image",
+    )
+    .unwrap();
+    let scanned = Scanned::of(library);
+    let cache = tempfile::tempdir().unwrap();
+    let album = scanned.env.album(LONG_PLAY);
+    let old_mtime = mtime(&cover);
+    assert_eq!(
+        (album.cover_source.clone(), album.cover_mtime),
+        (Some(text(&cover)), Some(old_mtime))
+    );
+    let unchanged = ScanSummary {
+        seen: 3,
+        albums: 1,
+        artists: 1,
+        ..ScanSummary::default()
+    };
+
+    // A scan that finds the cover file as it was removes no resized cover.
+    let cached = cache_cover(cache.path(), &album.id, 300, old_mtime);
+    assert_eq!(rescan_with_cache(&scanned, cache.path()), unchanged);
+    assert!(cached.exists());
+
+    // The file is replaced by a newer file. No track changes.
+    fs::write(&cover, b"another image").unwrap();
+    set_mtime(
+        &cover,
+        UNIX_EPOCH + Duration::from_secs(u64::try_from(old_mtime).unwrap() + 10),
+    );
+    assert_eq!(rescan_with_cache(&scanned, cache.path()), unchanged);
+    assert_eq!(
+        scanned.env.album(LONG_PLAY),
+        Album {
+            cover_mtime: Some(old_mtime + 10),
+            ..album.clone()
+        }
+    );
+    assert!(!cached.exists());
+
+    // The file is removed. The album has no other cover, so the scan
+    // clears the source.
+    let cached = cache_cover(cache.path(), &album.id, 300, old_mtime + 10);
+    fs::remove_file(&cover).unwrap();
+    assert_eq!(rescan_with_cache(&scanned, cache.path()), unchanged);
+    assert_eq!(
+        scanned.env.album(LONG_PLAY),
+        Album {
+            cover_source: None,
+            cover_mtime: None,
+            ..album.clone()
+        }
+    );
+    assert!(!cached.exists());
+
+    // A cover file with another name is added to the parent directory.
+    let added = album_dir.join("Front.webp");
+    fs::write(&added, b"image").unwrap();
+    assert_eq!(rescan_with_cache(&scanned, cache.path()), unchanged);
+    assert_eq!(cover_of(&scanned.env, LONG_PLAY), file_cover(&added));
+}
+
+#[test]
+fn disc_directories_in_the_music_folder_itself_have_the_cover_file_of_the_folder() {
+    // The directory of the album is the music folder, so the parent
+    // directory of the disc directories is the folder itself.
+    let (_library, album_dir) = disc_library();
+    let cover = album_dir.join("cover.jpg");
+    fs::write(&cover, b"image").unwrap();
+    let env = TestDb::new();
+    assert_eq!(env.scan(&[&album_dir]).added, 3);
+
+    assert_eq!(cover_of(&env, LONG_PLAY), file_cover(&cover));
+}
+
+#[test]
+fn a_cover_file_outside_the_music_folders_is_the_cover_of_no_album() {
+    // The cover file is in the directory of the album, and the image of
+    // the artist is one directory further up.
+    let (library, album_dir) = disc_library();
+    fs::write(album_dir.join("cover.jpg"), b"image").unwrap();
+    fs::write(
+        below(library.root.path(), "Aurora Field/cover.jpg"),
+        b"image",
+    )
+    .unwrap();
+    let (first, second) = (album_dir.join("CD1"), album_dir.join("CD2"));
+
+    // Each disc directory is a music folder. The directory of the album is
+    // the parent directory of both folders and is outside the library.
+    let env = TestDb::new();
+    assert_eq!(env.scan(&[&first, &second]).added, 3);
+    assert_eq!(cover_of(&env, LONG_PLAY), (None, None));
+
+    // One disc directory is the music folder. Its tracks are in the folder
+    // itself, which has no parent directory in the library.
+    let env = TestDb::new();
+    assert_eq!(env.scan(&[&first]).added, 2);
+    assert_eq!(cover_of(&env, LONG_PLAY), (None, None));
+
+    // The directory of the album is the music folder and holds no cover
+    // file. The image of the artist is in the parent directory of the
+    // folder.
+    fs::remove_file(album_dir.join("cover.jpg")).unwrap();
+    let env = TestDb::new();
+    assert_eq!(env.scan(&[&album_dir]).added, 3);
+    assert_eq!(cover_of(&env, LONG_PLAY), (None, None));
+}
+
+#[test]
+fn tracks_in_the_music_folder_itself_are_in_no_disc_directory() {
+    // The directory of the album is the music folder. The tracks of disc 1
+    // are in `CD1`, and the track of disc 2 is in the folder itself.
+    let (_library, album_dir) = disc_library();
+    move_file(
+        &album_dir.join("CD2").join("01 Side C.flac"),
+        &album_dir.join("01 Side C.flac"),
+    );
+    let cover = album_dir.join("cover.jpg");
+    fs::write(&cover, b"image").unwrap();
+    let env = TestDb::new();
+    assert_eq!(env.scan(&[&album_dir]).added, 3);
+
+    // The folder itself has no parent directory in the library, so it and
+    // `CD1` are not two directories of one parent directory. The cover
+    // file of the folder is beside the track of disc 2 and not beside the
+    // first track.
+    assert_eq!(cover_of(&env, LONG_PLAY), (None, None));
+
+    // With its first track in the folder itself the album has the file.
+    move_file(
+        &album_dir.join("CD1").join("01 Side A.flac"),
+        &album_dir.join("01 Side A.flac"),
+    );
+    assert_eq!(env.scan(&[&album_dir]).moved, 1);
+    assert_eq!(cover_of(&env, LONG_PLAY), file_cover(&cover));
+}
+
+#[test]
+fn disc_directories_in_two_music_folders_have_no_common_parent_directory() {
+    // Two music folders hold a directory `Long Play` each, with one disc
+    // directory of the album in each. The two disc directories have the
+    // same relative parent path and two parent directories on the disk.
+    let (library, album_dir) = disc_library();
+    let root = library.root.path();
+    let (first, second) = (root.join("first"), root.join("second"));
+    fs::create_dir_all(&first).unwrap();
+    fs::create_dir_all(second.join("Long Play")).unwrap();
+    fs::rename(album_dir.join("CD2"), second.join("Long Play").join("CD2")).unwrap();
+    fs::rename(&album_dir, first.join("Long Play")).unwrap();
+    for folder in [&first, &second] {
+        fs::write(folder.join("Long Play").join("cover.jpg"), b"image").unwrap();
+    }
+    let env = TestDb::new();
+    assert_eq!(env.scan(&[&first, &second]).added, 3);
+
+    assert_eq!(env.albums().len(), 1);
+    assert_eq!(cover_of(&env, LONG_PLAY), (None, None));
+}
+
+// A symbolic link is created with a Unix call. On Windows the call needs a
+// privilege.
+#[cfg(unix)]
+#[test]
+fn a_cover_file_of_the_parent_directory_that_is_a_symbolic_link_is_no_cover() {
+    use std::os::unix::fs::symlink;
+
+    // An image outside the music folder, and an image inside it under a
+    // name that is not the name of a cover file.
+    let outside = tempfile::tempdir().unwrap();
+    let elsewhere = outside.path().join("elsewhere.jpg");
+    fs::write(&elsewhere, b"image").unwrap();
+    let (library, album_dir) = disc_library();
+    let inside = album_dir.join("scan.jpg");
+    fs::write(&inside, b"image").unwrap();
+
+    // The link to the file outside has the first name in the order of the
+    // cover names.
+    let link = album_dir.join("cover.jpg");
+    symlink(&elsewhere, &link).unwrap();
+    let scanned = Scanned::of(library);
+    assert_eq!(cover_of(&scanned.env, LONG_PLAY), (None, None));
+
+    // A link to a file inside the folder is no cover either.
+    fs::remove_file(&link).unwrap();
+    symlink(&inside, &link).unwrap();
+    assert_eq!(scanned.rescan().seen, 3);
+    assert_eq!(cover_of(&scanned.env, LONG_PLAY), (None, None));
+
+    // A regular file with a later name in the order is the cover while the
+    // link is there.
+    let regular = album_dir.join("folder.jpg");
+    fs::write(&regular, b"image").unwrap();
+    assert_eq!(scanned.rescan().seen, 3);
+    assert_eq!(cover_of(&scanned.env, LONG_PLAY), file_cover(&regular));
+}
+
 /// Scans the one folder of `scanned` in batches of `batch_size` and cancels
 /// the scan after the first batch.
 fn rescan_and_cancel_after_the_first_batch(scanned: &Scanned, batch_size: usize) -> ScanSummary {

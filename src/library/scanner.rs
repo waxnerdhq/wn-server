@@ -39,7 +39,7 @@ use rusqlite::{Connection, TransactionBehavior};
 use tokio_util::sync::CancellationToken;
 use walkdir::WalkDir;
 
-use crate::db::queries::albums::{self, CoverInputs};
+use crate::db::queries::albums::{self, AlbumTrack, CoverInputs};
 use crate::db::queries::folders::{self, Folder};
 use crate::db::queries::scans::{self, ScanCounts};
 use crate::db::queries::tracks::{self, IndexEntry, TrackContent};
@@ -1460,8 +1460,10 @@ fn aggregate(conn: &mut Connection, seen: Option<&Seen<'_>>) -> Result<Aggregate
     artists::update_names(&tx)?;
     albums::update_names(&tx)?;
     if let Some(seen) = seen {
+        let tracks = albums::tracks_with_file(&tx)?;
+        let directories = TrackDirectories::of(&tracks);
         for inputs in albums::cover_inputs(&tx)? {
-            let Cover::Known(cover) = resolve_cover(&inputs, seen) else {
+            let Cover::Known(cover) = resolve_cover(&inputs, seen, &directories) else {
                 continue;
             };
             let source = cover.as_ref().map(|(source, _)| source.as_str());
@@ -1513,10 +1515,15 @@ pub(super) const EMBEDDED: &str = "embedded:";
 ///
 /// 1. The cover image file of that directory ([`cover_rank`]), with the
 ///    absolute path of the file as the source and its modification time.
-/// 2. The embedded picture of the first track that has a file and a picture,
+/// 2. The cover image file of the parent directory of the disc directories
+///    of the album ([`TrackDirectories::parent_of_discs`]), with the same
+///    source and time. An album has that directory when its tracks are in
+///    two or more directories of one parent directory, and no track of
+///    another album is at or below the parent directory.
+/// 3. The embedded picture of the first track that has a file and a picture,
 ///    with `embedded:<track id>` as the source and the modification time of
 ///    the track.
-/// 3. No cover.
+/// 4. No cover.
 ///
 /// A track without a file gives no directory and no picture. An album whose
 /// tracks all have no file has no cover.
@@ -1526,8 +1533,17 @@ pub(super) const EMBEDDED: &str = "embedded:";
 /// directory in a folder that is not configured, for a directory at or below
 /// a path that the walk could not read, and for the directory of a row whose
 /// file is gone and that the scan kept. The result is then
-/// [`Cover::Unknown`].
-fn resolve_cover(inputs: &CoverInputs, seen: &Seen<'_>) -> Cover {
+/// [`Cover::Unknown`]. A walk that listed a directory listed its parent
+/// directory before, so it knows the image files of both.
+///
+/// The walk records the image files inside a folder only, and the parent
+/// directory is a path inside the folder of the tracks. No file outside the
+/// configured folders is the cover of an album.
+fn resolve_cover(
+    inputs: &CoverInputs,
+    seen: &Seen<'_>,
+    directories: &TrackDirectories<'_>,
+) -> Cover {
     let Some((folder_id, rel_path)) = &inputs.first_track else {
         return Cover::Known(None);
     };
@@ -1539,7 +1555,16 @@ fn resolve_cover(inputs: &CoverInputs, seen: &Seen<'_>) -> Cover {
     if !walk.saw_directory(directory) {
         return Cover::Unknown;
     }
-    if let Some(image) = walk.covers.get(directory) {
+    let beside = walk.covers.get(directory).map(|image| (directory, image));
+    let image = beside.or_else(|| {
+        // The disc directories of an album are in one folder, which is the
+        // folder of its first track.
+        let (_, parent) = directories
+            .parent_of_discs(&inputs.album_id)
+            .filter(|(parent_folder, _)| parent_folder == folder_id)?;
+        Some((parent, walk.covers.get(parent)?))
+    });
+    if let Some((directory, image)) = image {
         let mut path = folder.path.clone();
         path.extend(directory.split('/').filter(|name| !name.is_empty()));
         path.push(&image.name);
@@ -1556,6 +1581,124 @@ fn resolve_cover(inputs: &CoverInputs, seen: &Seen<'_>) -> Cover {
             .as_ref()
             .map(|(track_id, mtime)| (format!("{EMBEDDED}{track_id}"), *mtime)),
     )
+}
+
+/// The directories that hold the track rows, by album and by folder. The
+/// scan reads from them whether the discs of an album have directories of
+/// their own ([`TrackDirectories::parent_of_discs`]).
+///
+/// A track row counts for as long as it exists, also a row that the scan
+/// kept although its file is gone. A track without a file is in no directory
+/// and is not part of the value.
+#[derive(Debug, Default)]
+struct TrackDirectories<'a> {
+    /// The directories of the tracks of each album, by album ID.
+    albums: HashMap<&'a str, Placement<'a>>,
+    /// The album of the tracks at and below a directory, by folder ID and by
+    /// the relative path of the directory. The value is `None` when the
+    /// tracks there belong to more than one album. A folder has an entry for
+    /// every directory that holds a track and for every directory above
+    /// such a directory, up to the folder itself, which is the empty path.
+    below: HashMap<i64, HashMap<&'a str, Option<&'a str>>>,
+}
+
+/// The directories that hold the tracks of one album.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Placement<'a> {
+    /// One directory.
+    One { folder_id: i64, directory: &'a str },
+    /// Two or more directories of one folder that have the same parent
+    /// directory.
+    Siblings { folder_id: i64, parent: &'a str },
+    /// Directories that have no common parent directory: they are in two
+    /// folders, at different depths or below different directories, or one
+    /// of them is the folder itself.
+    Apart,
+}
+
+impl<'a> Placement<'a> {
+    /// Adds the directory of one more track of the album.
+    fn add(&mut self, folder_id: i64, directory: &'a str) {
+        *self = match *self {
+            Self::One {
+                folder_id: known,
+                directory: only,
+            } if known == folder_id => {
+                if only == directory {
+                    return;
+                }
+                match (parent(only), parent(directory)) {
+                    (Some(first), Some(second)) if first == second => Self::Siblings {
+                        folder_id,
+                        parent: first,
+                    },
+                    _ => Self::Apart,
+                }
+            }
+            Self::Siblings {
+                folder_id: known,
+                parent: shared,
+            } if known == folder_id && parent(directory) == Some(shared) => return,
+            _ => Self::Apart,
+        };
+    }
+}
+
+impl<'a> TrackDirectories<'a> {
+    /// Returns the directories of `tracks`, the tracks that have a file.
+    fn of(tracks: &'a [AlbumTrack]) -> Self {
+        let mut directories = Self::default();
+        for track in tracks {
+            let album = track.album_id.as_str();
+            let directory = directory(&track.rel_path);
+            directories
+                .albums
+                .entry(album)
+                .and_modify(|placement| placement.add(track.folder_id, directory))
+                .or_insert(Placement::One {
+                    folder_id: track.folder_id,
+                    directory,
+                });
+            let below = directories.below.entry(track.folder_id).or_default();
+            let mut next = Some(directory);
+            while let Some(at) = next {
+                below
+                    .entry(at)
+                    .and_modify(|held| {
+                        if *held != Some(album) {
+                            *held = None;
+                        }
+                    })
+                    .or_insert(Some(album));
+                next = parent(at);
+            }
+        }
+        directories
+    }
+
+    /// Returns the parent directory of the disc directories of the album
+    /// `album_id`, as the ID of its folder and its relative path
+    /// (`docs/design.md` section 1.3).
+    ///
+    /// An album has that directory when both of these hold:
+    ///
+    /// - Its tracks are in two or more directories, and all of these
+    ///   directories have the same parent directory in one folder. An album
+    ///   in one directory has none. In a library of `<artist>/<album>`
+    ///   directories the parent directory of such an album is the directory
+    ///   of its artist, and an image there is not the cover of the album.
+    /// - No track of another album is at or below the parent directory.
+    ///
+    /// The parent directory is a directory of the folder or the folder
+    /// itself. The folder itself has no parent directory ([`parent`]), so
+    /// tracks in the folder itself are in no disc directory.
+    fn parent_of_discs(&self, album_id: &str) -> Option<(i64, &'a str)> {
+        let Some(Placement::Siblings { folder_id, parent }) = self.albums.get(album_id) else {
+            return None;
+        };
+        let held = self.below.get(folder_id)?.get(parent)?;
+        (*held == Some(album_id)).then_some((*folder_id, *parent))
+    }
 }
 
 /// The file stems of a cover image, in the order in which they are chosen.
@@ -1745,6 +1888,14 @@ fn directory(rel_path: &str) -> &str {
     rel_path
         .rsplit_once('/')
         .map_or("", |(directory, _)| directory)
+}
+
+/// Returns the parent directory of the directory `path` of a folder, as a
+/// relative path. The folder itself, which is the empty path, has none: its
+/// parent directory is outside the library, and the scan reads nothing
+/// there.
+fn parent(path: &str) -> Option<&str> {
+    (!path.is_empty()).then(|| directory(path))
 }
 
 /// Returns the directory components of a relative path.
@@ -2516,7 +2667,36 @@ mod tests {
         }
     }
 
+    /// Returns the tracks at the relative paths `rel_paths` in the folder 1
+    /// as tracks of the album `album_id`.
+    fn tracks_in(album_id: &str, rel_paths: &[&str]) -> Vec<AlbumTrack> {
+        rel_paths
+            .iter()
+            .map(|rel_path| AlbumTrack {
+                album_id: album_id.to_owned(),
+                folder_id: 1,
+                rel_path: (*rel_path).to_owned(),
+            })
+            .collect()
+    }
+
+    /// Returns the cover of an album whose one track with a file is its
+    /// first track.
     fn resolve(inputs: &CoverInputs, walk: FolderWalk) -> Cover {
+        let first_track = inputs.first_track.iter();
+        let tracks: Vec<AlbumTrack> = first_track
+            .map(|(folder_id, rel_path)| AlbumTrack {
+                album_id: inputs.album_id.clone(),
+                folder_id: *folder_id,
+                rel_path: rel_path.clone(),
+            })
+            .collect();
+        resolve_among(inputs, walk, &tracks)
+    }
+
+    /// Returns the cover of an album in a library whose tracks with a file
+    /// are `tracks`.
+    fn resolve_among(inputs: &CoverInputs, walk: FolderWalk, tracks: &[AlbumTrack]) -> Cover {
         let (folders, walks) = seen_of(walk);
         resolve_cover(
             inputs,
@@ -2524,6 +2704,7 @@ mod tests {
                 folders: &folders,
                 walks: &walks,
             },
+            &TrackDirectories::of(tracks),
         )
     }
 
@@ -2559,6 +2740,7 @@ mod tests {
 
     #[test]
     fn a_cover_image_in_another_directory_is_not_the_cover() {
+        // Every track of the album is in `cd1`.
         let inputs = inputs_of(Some("Artist/Album/cd1/01.flac"), None);
         let walk = walk_of(
             &["Artist/Album/cd1/01.flac", "Artist/Album/cd2/01.flac"],
@@ -2570,6 +2752,247 @@ mod tests {
             ],
         );
         assert_eq!(resolve(&inputs, walk), Cover::Known(None));
+    }
+
+    /// The relative paths of the tracks of an album with two disc
+    /// directories.
+    const DISCS: [&str; 3] = [
+        "Artist/Album/cd1/01.flac",
+        "Artist/Album/cd1/02.flac",
+        "Artist/Album/cd2/01.flac",
+    ];
+
+    #[test]
+    fn the_cover_image_of_the_parent_directory_is_the_cover_of_an_album_in_disc_directories() {
+        let inputs = inputs_of(Some(DISCS[0]), Some(("tr-1", 100)));
+        let tracks = tracks_in("al-1", &DISCS);
+        let walk = || {
+            walk_of(
+                &DISCS,
+                &[
+                    ("Artist/Album/Folder.PNG", 500),
+                    ("Artist/Album/cd2/cover.jpg", 2),
+                    ("Artist/cover.jpg", 3),
+                    ("cover.jpg", 4),
+                ],
+            )
+        };
+        // The image file precedes the embedded picture. The image of the
+        // second disc and the images further up are not the cover.
+        let parent = image(&["Artist", "Album", "Folder.PNG"], 500);
+        assert_eq!(resolve_among(&inputs, walk(), &tracks), parent);
+
+        // A third disc directory, and a track of another album outside the
+        // parent directory.
+        let mut more = tracks.clone();
+        more.extend(tracks_in("al-1", &["Artist/Album/cd3/01.flac"]));
+        more.extend(tracks_in("al-2", &["Artist/Other/01.flac", "loose.flac"]));
+        assert_eq!(resolve_among(&inputs, walk(), &more), parent);
+    }
+
+    #[test]
+    fn the_cover_image_beside_the_first_track_precedes_the_one_of_the_parent_directory() {
+        let inputs = inputs_of(Some(DISCS[0]), Some(("tr-1", 100)));
+        let tracks = tracks_in("al-1", &DISCS);
+        let walk = walk_of(
+            &DISCS,
+            &[
+                ("Artist/Album/cd1/album.webp", 1),
+                ("Artist/Album/cover.jpg", 500),
+            ],
+        );
+        assert_eq!(
+            resolve_among(&inputs, walk, &tracks),
+            image(&["Artist", "Album", "cd1", "album.webp"], 1)
+        );
+    }
+
+    #[test]
+    fn an_album_in_disc_directories_without_an_image_in_both_places_has_its_embedded_picture() {
+        let tracks = tracks_in("al-1", &DISCS);
+        // The image of the second disc is beside no first track.
+        let covers = [("Artist/Album/cd2/cover.jpg", 2)];
+        let pictured = inputs_of(Some(DISCS[0]), Some(("tr-7", 700)));
+        assert_eq!(
+            resolve_among(&pictured, walk_of(&DISCS, &covers), &tracks),
+            Cover::Known(Some(("embedded:tr-7".to_owned(), 700)))
+        );
+        let plain = inputs_of(Some(DISCS[0]), None);
+        assert_eq!(
+            resolve_among(&plain, walk_of(&DISCS, &covers), &tracks),
+            Cover::Known(None)
+        );
+    }
+
+    #[test]
+    fn a_parent_directory_with_tracks_of_another_album_gives_its_cover_image_to_no_album() {
+        let inputs = inputs_of(Some(DISCS[0]), None);
+        // The track of the other album is in the parent directory itself, in
+        // a directory beside the discs, and deeper below the parent
+        // directory.
+        for other in [
+            "Artist/Album/bonus.flac",
+            "Artist/Album/cd3/01.flac",
+            "Artist/Album/cd2/extra/01.flac",
+        ] {
+            let mut audio = DISCS.to_vec();
+            audio.push(other);
+            let mut tracks = tracks_in("al-1", &DISCS);
+            tracks.extend(tracks_in("al-2", &[other]));
+            let walk = walk_of(&audio, &[("Artist/Album/cover.jpg", 500)]);
+            assert_eq!(
+                resolve_among(&inputs, walk, &tracks),
+                Cover::Known(None),
+                "{other}"
+            );
+        }
+
+        // Two albums with two disc directories each, in one parent
+        // directory.
+        let second = ["Artist/Album/cd3/01.flac", "Artist/Album/cd4/01.flac"];
+        let mut audio = DISCS.to_vec();
+        audio.extend(second);
+        let mut tracks = tracks_in("al-1", &DISCS);
+        tracks.extend(tracks_in("al-2", &second));
+        let mut other = inputs_of(Some(second[0]), None);
+        other.album_id = "al-2".to_owned();
+        for inputs in [&inputs, &other] {
+            let walk = walk_of(&audio, &[("Artist/Album/cover.jpg", 500)]);
+            assert_eq!(
+                resolve_among(inputs, walk, &tracks),
+                Cover::Known(None),
+                "{}",
+                inputs.album_id
+            );
+        }
+    }
+
+    #[test]
+    fn disc_directories_in_the_folder_itself_have_the_cover_image_of_the_folder() {
+        let audio = ["CD1/01.flac", "CD2/01.flac"];
+        let inputs = inputs_of(Some(audio[0]), None);
+        let walk = walk_of(&audio, &[("cover.jpg", 500)]);
+        assert_eq!(
+            resolve_among(&inputs, walk, &tracks_in("al-1", &audio)),
+            image(&["cover.jpg"], 500)
+        );
+    }
+
+    #[test]
+    fn tracks_in_the_folder_itself_are_in_no_disc_directory() {
+        // The folder itself has no parent directory in the library. Its
+        // image is beside the tracks in the folder, and it is not the image
+        // of a parent directory of the folder and of `CD2`.
+        let audio = ["01.flac", "CD2/01.flac"];
+        let inputs = inputs_of(Some("CD2/01.flac"), None);
+        let walk = walk_of(&audio, &[("cover.jpg", 500)]);
+        assert_eq!(
+            resolve_among(&inputs, walk, &tracks_in("al-1", &audio)),
+            Cover::Known(None)
+        );
+    }
+
+    #[test]
+    fn tracks_in_two_folders_are_in_no_disc_directories_of_one_parent_directory() {
+        // The two directories have the same relative parent path in two
+        // folders, which are two directories on the disk.
+        let inputs = inputs_of(Some(DISCS[0]), None);
+        let mut tracks = tracks_in("al-1", &DISCS[..2]);
+        tracks.push(AlbumTrack {
+            album_id: "al-1".to_owned(),
+            folder_id: 2,
+            rel_path: DISCS[2].to_owned(),
+        });
+        let walk = walk_of(&DISCS[..2], &[("Artist/Album/cover.jpg", 500)]);
+        assert_eq!(resolve_among(&inputs, walk, &tracks), Cover::Known(None));
+    }
+
+    #[test]
+    fn directories_without_a_common_parent_directory_are_no_disc_directories() {
+        let cases = [
+            // At different depths.
+            ["Artist/Album/cd1/01.flac", "Artist/Album/cd2/part/01.flac"],
+            // The parent directory holds a track itself.
+            ["Artist/Album/cd1/01.flac", "Artist/Album/02.flac"],
+            // Below different directories.
+            ["Artist/Album/cd1/01.flac", "Artist/Other/cd2/01.flac"],
+        ];
+        for audio in cases {
+            let inputs = inputs_of(Some(audio[0]), None);
+            let walk = walk_of(
+                &audio,
+                &[("Artist/Album/cover.jpg", 500), ("Artist/cover.jpg", 3)],
+            );
+            assert_eq!(
+                resolve_among(&inputs, walk, &tracks_in("al-1", &audio)),
+                Cover::Known(None),
+                "{audio:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_cover_of_an_album_in_disc_directories_is_unknown_when_the_walk_did_not_see_the_first() {
+        let inputs = inputs_of(Some(DISCS[0]), None);
+        let tracks = tracks_in("al-1", &DISCS);
+        // The walk saw the parent directory and its image, and no supported
+        // file in the directory of the first track.
+        let walk = walk_of(&DISCS[2..], &[("Artist/Album/cover.jpg", 500)]);
+        assert_eq!(resolve_among(&inputs, walk, &tracks), Cover::Unknown);
+    }
+
+    #[test]
+    fn the_parent_of_a_directory_is_inside_the_folder() {
+        assert_eq!(parent("Artist/Album/cd1"), Some("Artist/Album"));
+        assert_eq!(parent("Artist"), Some(""));
+        // The folder itself.
+        assert_eq!(parent(""), None);
+    }
+
+    #[test]
+    fn the_placement_of_an_album_follows_the_directories_of_its_tracks() {
+        let one = Placement::One {
+            folder_id: 1,
+            directory: "Album/cd1",
+        };
+        let siblings = Placement::Siblings {
+            folder_id: 1,
+            parent: "Album",
+        };
+        let after = |mut placement: Placement<'static>, folder_id, directory| {
+            placement.add(folder_id, directory);
+            placement
+        };
+        assert_eq!(after(one, 1, "Album/cd1"), one);
+        assert_eq!(after(one, 1, "Album/cd2"), siblings);
+        assert_eq!(after(one, 2, "Album/cd1"), Placement::Apart);
+        assert_eq!(after(one, 2, "Album/cd2"), Placement::Apart);
+        assert_eq!(after(one, 1, "Album"), Placement::Apart);
+        assert_eq!(after(siblings, 1, "Album/cd3"), siblings);
+        assert_eq!(after(siblings, 2, "Album/cd3"), Placement::Apart);
+        assert_eq!(after(siblings, 1, "Other/cd3"), Placement::Apart);
+        assert_eq!(after(siblings, 1, "Album/cd3/part"), Placement::Apart);
+        assert_eq!(after(Placement::Apart, 1, "Album/cd1"), Placement::Apart);
+
+        // Two directories of the folder itself have the folder as their
+        // parent directory. The folder itself has none.
+        let top = Placement::One {
+            folder_id: 1,
+            directory: "cd1",
+        };
+        let in_folder = Placement::Siblings {
+            folder_id: 1,
+            parent: "",
+        };
+        assert_eq!(after(top, 1, "cd2"), in_folder);
+        assert_eq!(after(top, 1, ""), Placement::Apart);
+        assert_eq!(after(in_folder, 1, ""), Placement::Apart);
+        let root = Placement::One {
+            folder_id: 1,
+            directory: "",
+        };
+        assert_eq!(after(root, 1, ""), root);
+        assert_eq!(after(root, 1, "cd2"), Placement::Apart);
     }
 
     #[test]
@@ -2625,7 +3048,11 @@ mod tests {
             folders: &folders,
             walks: &walks,
         };
-        assert_eq!(resolve_cover(&other_folder, &seen), Cover::Unknown);
+        let directories = TrackDirectories::default();
+        assert_eq!(
+            resolve_cover(&other_folder, &seen, &directories),
+            Cover::Unknown
+        );
     }
 
     #[test]

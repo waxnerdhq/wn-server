@@ -724,6 +724,58 @@ async fn etag_changes_when_a_scan_stores_a_new_cover() {
 }
 
 #[tokio::test]
+async fn album_in_disc_directories_returns_the_cover_file_of_their_parent_directory() {
+    // Each disc of the album has a directory of its own, and the cover file
+    // is in the directory of the album, which holds both.
+    let library = LibraryBuilder::new()
+        .track("Aurora Field", "Long Play", "Side A", 1, "flac")
+        .disc(1)
+        .track("Aurora Field", "Long Play", "Side C", 1, "flac")
+        .disc(2)
+        .build();
+    let album_dir = library.root.path().join("Aurora Field").join("Long Play");
+    for (name, disc) in [("01 Side A.flac", "CD1"), ("01 Side C.flac", "CD2")] {
+        fs::create_dir(album_dir.join(disc)).expect("create the disc directory");
+        fs::rename(album_dir.join(name), album_dir.join(disc).join(name)).expect("move the track");
+    }
+    let cover_file = album_dir.join("cover.jpg");
+    write_image(&cover_file, 16, 8, 128);
+    let server = TestServer::scanned(library).await;
+    let album_id = server.catalogue().await.album("Long Play").id.clone();
+    let id = album_id.as_str();
+
+    // The album and its songs name the cover of the album.
+    let response = server.get_json("getAlbum", &[("id", id)]).await;
+    assert_eq!(cover_art(&response["album"]).as_deref(), Some(id));
+    let songs = response["album"]["song"].as_array().expect("the songs");
+    assert_eq!(songs.len(), 2);
+    for song in songs {
+        assert_eq!(cover_art(song).as_deref(), Some(id));
+    }
+
+    let time = mtime(&cover_file);
+    let original = cover(&server, &[("id", id)]).await;
+    original.assert_cover("image/jpeg", &etag(id, 0, time), "the file");
+    assert_eq!(
+        original.body,
+        fs::read(&cover_file).expect("read the cover")
+    );
+    let params = [("id", id), ("size", "8")];
+    let resized = cover(&server, &params).await;
+    resized.assert_cover("image/jpeg", &etag(id, 8, time), "the file at 8");
+    assert_eq!(jpeg_dimensions(&resized.body), (8, 4));
+
+    // Without the file the album has no cover after the next scan.
+    fs::remove_file(&cover_file).expect("remove the cover file");
+    let summary = server.rescan().await;
+    assert_eq!(summary.errors, [""; 0]);
+    let response = server.get_json("getAlbum", &[("id", id)]).await;
+    assert_eq!(cover_art(&response["album"]), None);
+    let answer = cover(&server, &[("id", id), ("f", "json")]).await;
+    answer.assert_error(70, NOT_FOUND, "the album without the file");
+}
+
+#[tokio::test]
 async fn id_without_a_cover_is_error_70_in_json_and_xml() {
     let server = TestServer::standard().await;
     let album = server.album.glass_harbour.as_str();
