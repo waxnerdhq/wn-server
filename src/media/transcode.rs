@@ -36,8 +36,18 @@
 //! - `-format_whitelist` with [`DEMUXERS`]: ffmpeg reads the input only with
 //!   the demuxer of an audio container that the scanner supports. It
 //!   refuses a file whose content is anything else, which includes every
-//!   playlist and script format. None of the listed demuxers opens another
-//!   file under the defaults of ffmpeg.
+//!   playlist and script format.
+//!
+//! The whitelists do not cover one case. An MP4 file can name a second file
+//! as the place of its audio data (a data reference), and the `mov` demuxer,
+//! which the list needs for `m4a` files, can open that file through the
+//! `file` protocol. ffmpeg does so only with the option `enable_drefs` of
+//! that demuxer. The option is off by default, and the server does not pass
+//! it, so ffmpeg skips the reference. The server relies on this default of
+//! ffmpeg. With an ffmpeg that follows the reference, a crafted MP4 file of
+//! the library makes ffmpeg read a local file that a relative path from the
+//! file reaches, and the stream goes to the client, which is the
+//! authenticated owner.
 //!
 //! # How many processes run
 //!
@@ -125,7 +135,8 @@ pub const PROTOCOLS: &str = "file";
 /// | `wav` | `wav` |
 ///
 /// ffmpeg matches an entry of the list against each name of a demuxer, so
-/// `mov` allows the demuxer of MP4 files.
+/// `mov` allows the demuxer of MP4 files. That demuxer is the one of the
+/// list that can open a second file: see the module comment.
 pub const DEMUXERS: &str = "aac,aiff,flac,mov,mp3,ogg,wav";
 
 /// One transcode: the track, the file, the format, the bitrate and the
@@ -1531,7 +1542,7 @@ mod tests {
         path
     }
 
-    /// One of the two tests that run ffmpeg. They need ffmpeg with libopus
+    /// One of the three tests that run ffmpeg. They need ffmpeg with libopus
     /// and libmp3lame on PATH, so they are not part of the default suite:
     /// `cargo test --lib -- --ignored --nocapture real_ffmpeg`.
     ///
@@ -1591,20 +1602,38 @@ mod tests {
         assert!(all_permits_back(&transcoder, 2).await);
     }
 
+    /// Runs ffmpeg with `arguments`, without its error output, and returns
+    /// what it wrote. `None` when ffmpeg cannot be run or has not ended
+    /// within ten seconds.
+    async fn ffmpeg_output(arguments: Vec<OsString>) -> Option<std::process::Output> {
+        let mut command = Command::new("ffmpeg");
+        command
+            .args(arguments)
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        let run = tokio::time::timeout(Duration::from_secs(10), command.output());
+        run.await.ok()?.ok()
+    }
+
+    /// The job of an Opus transcode of the file at `path`.
+    fn opus_job(path: &Path) -> TranscodeJob {
+        TranscodeJob {
+            track: TRACK.to_owned(),
+            path: path.to_path_buf(),
+            target: Target::Opus,
+            bitrate_kbps: 96,
+            offset_s: 0,
+        }
+    }
+
     /// Runs ffmpeg on the file at `path` with the command line of the
     /// server without the two whitelists, and describes what it did: the
     /// length of its output, or that it did not end within ten seconds. The
     /// test prints the text and asserts nothing about it: it shows what the
     /// ffmpeg of the machine does with the file by default.
     async fn without_the_whitelists(path: &Path) -> String {
-        let job = TranscodeJob {
-            track: TRACK.to_owned(),
-            path: path.to_path_buf(),
-            target: Target::Opus,
-            bitrate_kbps: 96,
-            offset_s: 0,
-        };
-        let mut arguments = arguments(&job);
+        let mut arguments = arguments(&opus_job(path));
         for option in ["-protocol_whitelist", "-format_whitelist"] {
             let at = arguments
                 .iter()
@@ -1612,16 +1641,9 @@ mod tests {
                 .expect("the option");
             arguments.drain(at..at + 2);
         }
-        let mut command = Command::new("ffmpeg");
-        command
-            .args(arguments)
-            .stdin(Stdio::null())
-            .stderr(Stdio::null())
-            .kill_on_drop(true);
-        match tokio::time::timeout(Duration::from_secs(10), command.output()).await {
-            Ok(Ok(output)) => format!("{} bytes and {}", output.stdout.len(), output.status),
-            Ok(Err(error)) => format!("an error ({error})"),
-            Err(_) => "no end within ten seconds".to_owned(),
+        match ffmpeg_output(arguments).await {
+            Some(output) => format!("{} bytes and {}", output.stdout.len(), output.status),
+            None => "no end within ten seconds".to_owned(),
         }
     }
 
@@ -1707,6 +1729,150 @@ mod tests {
         let (output, end) = real_transcode(&transcoder, &secret, Target::Opus, 0).await;
         assert!(matches!(end, ProcessEnd::Exited(status) if status.success()));
         assert!(output.starts_with(b"OggS"));
+        assert!(all_permits_back(&transcoder, 2).await);
+    }
+
+    /// The range of the first box of the kind `kind` among the boxes that
+    /// `data` holds in `within`.
+    fn mp4_box(
+        data: &[u8],
+        within: std::ops::Range<usize>,
+        kind: &[u8; 4],
+    ) -> std::ops::Range<usize> {
+        let mut at = within.start;
+        while at + 8 <= within.end {
+            let size = u32::from_be_bytes(data[at..at + 4].try_into().expect("four bytes"));
+            let size = usize::try_from(size).expect("a size");
+            assert!(size >= 8, "a box of {size} bytes");
+            if &data[at + 4..at + 8] == kind {
+                return at..at + size;
+            }
+            at += size;
+        }
+        panic!("no {} box", String::from_utf8_lossy(kind));
+    }
+
+    /// The M4A file `fixture` as a file whose audio data is in another
+    /// file: its data reference is a Macintosh alias record that names the
+    /// file `target` in the directory of the file, in the layout that the
+    /// `mov` demuxer of ffmpeg reads, and its own sample data is zeroed. The
+    /// audio of such a file can only come from the file that it names.
+    fn m4a_with_a_data_reference(fixture: &[u8], target: &str) -> Vec<u8> {
+        let mut data = fixture.to_vec();
+        let mut chain = Vec::new();
+        let mut within = 0..data.len();
+        for kind in [b"moov", b"trak", b"mdia", b"minf", b"dinf", b"dref"] {
+            let found = mp4_box(&data, within, kind);
+            within = found.start + 8..found.end;
+            chain.push(found);
+        }
+        // The sample data precedes the `moov` box, so the offsets of the
+        // samples stay as they are when that box grows.
+        let mdat = mp4_box(&data, 0..data.len(), b"mdat");
+        assert!(mdat.start < chain[0].start);
+
+        let name = target.as_bytes();
+        let mut file_name = [0u8; 63];
+        file_name[..name.len()].copy_from_slice(name);
+        let mut alias = Vec::new();
+        alias.extend(b"alis");
+        alias.extend([0; 4 + 10]); // the version and the flags, and a skipped part
+        alias.extend([0; 1 + 27]); // the name of the volume: none
+        alias.extend([0; 12]);
+        alias.push(u8::try_from(name.len()).expect("a short name"));
+        alias.extend(file_name);
+        alias.extend([0; 16]);
+        // One level up from the file and one level down to the target: a
+        // reference in the directory of the file.
+        alias.extend(1u16.to_be_bytes());
+        alias.extend(1u16.to_be_bytes());
+        alias.extend([0; 16]);
+        // The record of the type 2 is the path. The type -1 ends the records.
+        alias.extend(2u16.to_be_bytes());
+        alias.extend(
+            u16::try_from(name.len())
+                .expect("a short name")
+                .to_be_bytes(),
+        );
+        alias.extend(name);
+        alias.extend(std::iter::repeat_n(0, name.len() % 2));
+        alias.extend(0xffffu16.to_be_bytes());
+        alias.extend(0u16.to_be_bytes());
+
+        let size = |length: usize| u32::try_from(length).expect("a size").to_be_bytes();
+        let mut dref = Vec::new();
+        dref.extend(size(16 + 4 + alias.len()));
+        dref.extend(b"dref");
+        dref.extend([0; 4]);
+        dref.extend(1u32.to_be_bytes());
+        dref.extend(size(4 + alias.len()));
+        dref.extend(alias);
+
+        let old = chain[5].clone();
+        let grown = dref.len() - old.len();
+        data.splice(old, dref);
+        for parent in &chain[..5] {
+            data[parent.start..parent.start + 4].copy_from_slice(&size(parent.len() + grown));
+        }
+        data[mdat.start + 8..mdat.end].fill(0);
+        data
+    }
+
+    /// The third test that runs ffmpeg (see the first one). An MP4 file can
+    /// name a second file as the place of its audio data. The whitelists do
+    /// not refuse such a file: its demuxer and the `file` protocol are on
+    /// them. ffmpeg follows the reference only with the option
+    /// `enable_drefs` of the demuxer, which the command line of the server
+    /// does not hold. The test shows both: with the option ffmpeg reads the
+    /// audio of the other file, and under the command line of the server
+    /// its stream holds no audio.
+    #[tokio::test]
+    #[ignore = "runs ffmpeg, which the default suite does not need"]
+    async fn real_ffmpeg_does_not_follow_a_data_reference_of_an_mp4_file() {
+        let transcoder = real_transcoder().await;
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let fixture = fs::read(fixtures().join("a.m4a")).expect("read the fixture");
+        let secret = dir.path().join("secret.m4a");
+        fs::write(&secret, &fixture).expect("write the other file");
+        let crafted = dir.path().join("crafted.m4a");
+        let bytes = m4a_with_a_data_reference(&fixture, "secret.m4a");
+        fs::write(&crafted, bytes).expect("write the crafted file");
+
+        // The transcode of the other file, for the comparison.
+        let (audio, end) = real_transcode(&transcoder, &secret, Target::Opus, 0).await;
+        assert!(matches!(end, ProcessEnd::Exited(status) if status.success()));
+        assert!(audio.len() > 4000, "{}", audio.len());
+
+        // The crafted file is a reference that ffmpeg can follow: with the
+        // option that allows it, ffmpeg reads the audio of the other file.
+        let mut allowed = arguments(&opus_job(&crafted));
+        let input = allowed
+            .iter()
+            .position(|argument| argument == "-i")
+            .expect("the input option");
+        allowed.splice(input..input, ["-enable_drefs", "1"].map(OsString::from));
+        let followed = ffmpeg_output(allowed).await.expect("ffmpeg ends");
+        assert!(
+            followed.stdout.len() > audio.len() / 2,
+            "ffmpeg did not follow the reference with enable_drefs: {} bytes",
+            followed.stdout.len()
+        );
+
+        // Under the command line of the server ffmpeg skips the reference:
+        // the stream holds the header of an Ogg Opus stream and no audio.
+        let (output, end) = real_transcode(&transcoder, &crafted, Target::Opus, 0).await;
+        assert!(
+            output.len() < audio.len() / 4,
+            "the stream holds audio of the other file: {} bytes",
+            output.len()
+        );
+        println!(
+            "crafted.m4a: the other file gives {} bytes; with enable_drefs {} bytes; \
+             with the command line of the server {} bytes, {end:?}",
+            audio.len(),
+            followed.stdout.len(),
+            output.len()
+        );
         assert!(all_permits_back(&transcoder, 2).await);
     }
 }
