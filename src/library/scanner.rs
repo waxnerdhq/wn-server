@@ -1421,7 +1421,10 @@ struct Aggregated {
 ///    rows and artist rows. An album or an artist that a track refers to
 ///    keeps its row and its ID, also when the track has no file.
 /// 2. The song count, the duration, the year and the genre of every album
-///    and the album count of every artist are recomputed.
+///    and the album count of every artist are recomputed. An artist row and
+///    an album row whose name no track carries take the spelling that the
+///    most tracks carry, and an album row takes the name of its artist row
+///    (`docs/design.md` section 3.3).
 /// 3. The cover of every album whose directory the walk saw is set
 ///    ([`resolve_cover`]).
 /// 4. Every annotation of an item that no longer exists is deleted.
@@ -1441,6 +1444,9 @@ fn aggregate(conn: &mut Connection, seen: Option<&Seen<'_>>) -> Result<Aggregate
     }
     albums::recompute_aggregates(&tx)?;
     artists::recompute_aggregates(&tx)?;
+    // The artists come first: an album row takes the name of its artist row.
+    artists::update_names(&tx)?;
+    albums::update_names(&tx)?;
     if let Some(seen) = seen {
         for inputs in albums::cover_inputs(&tx)? {
             let Cover::Known(cover) = resolve_cover(&inputs, seen) else {

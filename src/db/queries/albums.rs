@@ -47,7 +47,8 @@ pub struct CoverInputs {
 /// the present time as its creation time, and the placeholder aggregates: no
 /// year, no genre, no cover, a song count of 0 and a duration of 0. An
 /// existing row keeps its values, except that `compilation = true` sets the
-/// compilation flag. The flag is never cleared here.
+/// compilation flag. The flag is never cleared here. [`update_names`] is the
+/// function that changes the spelling of a name.
 pub fn upsert_by_key(
     conn: &Connection,
     artist_id: &str,
@@ -122,6 +123,56 @@ pub fn recompute_aggregates(conn: &Connection) -> Result<()> {
              OR albums.duration_ms IS NOT agg.duration_ms
              OR albums.year IS NOT agg.year
              OR albums.genre IS NOT agg.genre)",
+    )?
+    .execute([])?;
+    Ok(())
+}
+
+/// Sets the display names of the album rows from the tracks and from the
+/// artist rows (`docs/design.md` section 3.3).
+///
+/// `name`: an album whose stored name is the album title of none of its
+/// tracks (`tracks.album_name`) gets the title that the most tracks of the
+/// album have, and the first in byte order among titles of equally many
+/// tracks. A title counts only when it has the key of the album. A track
+/// without a file counts as every other track does. An album without a track
+/// keeps its name.
+///
+/// `artist_name`: an album gets the name of its artist row. The caller sets
+/// the names of the artist rows first (`artists::update_names`).
+///
+/// The ID, the artist and the key of a row stay. A row that has its names is
+/// not written.
+pub fn update_names(conn: &Connection) -> Result<()> {
+    let uncarried: Vec<(String, String)> = conn
+        .prepare_cached(
+            "SELECT id, key FROM albums
+             WHERE NOT EXISTS (
+               SELECT 1 FROM tracks
+               WHERE tracks.album_id = albums.id AND tracks.album_name = albums.name)",
+        )?
+        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+        .collect::<rusqlite::Result<_>>()?;
+    let mut spellings = conn.prepare_cached(
+        "SELECT album_name FROM tracks WHERE album_id = ?1
+         GROUP BY album_name ORDER BY count(*) DESC, album_name",
+    )?;
+    let mut rename = conn.prepare_cached("UPDATE albums SET name = ?2 WHERE id = ?1")?;
+    for (id, key) in uncarried {
+        let carried: Vec<String> = spellings
+            .query_map([&id], |row| row.get(0))?
+            .collect::<rusqlite::Result<_>>()?;
+        let most_carried = carried
+            .into_iter()
+            .find(|title| ids::album_key(title) == key);
+        if let Some(title) = most_carried {
+            rename.execute([&id, &title])?;
+        }
+    }
+    conn.prepare_cached(
+        "UPDATE albums SET artist_name = artists.name
+         FROM artists
+         WHERE artists.id = albums.artist_id AND albums.artist_name <> artists.name",
     )?
     .execute([])?;
     Ok(())
@@ -318,6 +369,8 @@ mod tests {
     #[derive(Debug, Clone)]
     struct Song {
         rel_path: &'static str,
+        /// The album title of the track.
+        album: &'static str,
         disc_no: Option<u32>,
         track_no: Option<u32>,
         year: Option<u32>,
@@ -327,11 +380,13 @@ mod tests {
         mtime: i64,
     }
 
-    /// Returns a track at `rel_path` without numbers, year, genre and
-    /// picture, with a duration of 1000 ms and the modification time 100.
+    /// Returns a track at `rel_path` with the album title `Album`, without
+    /// numbers, year, genre and picture, with a duration of 1000 ms and the
+    /// modification time 100.
     fn song(rel_path: &'static str) -> Song {
         Song {
             rel_path,
+            album: "Album",
             disc_no: None,
             track_no: None,
             year: None,
@@ -381,7 +436,7 @@ mod tests {
                 title: song.rel_path.to_owned(),
                 artist: "Aurora Field".to_owned(),
                 album_artist: "Aurora Field".to_owned(),
-                album: "Album".to_owned(),
+                album: song.album.to_owned(),
                 track_no: song.track_no,
                 disc_no: song.disc_no,
                 year: song.year,
@@ -435,6 +490,34 @@ mod tests {
             self.db
                 .with_writer(|conn| recompute_aggregates(conn))
                 .unwrap();
+        }
+
+        /// Inserts a track of the album `album_id` for each pair of a
+        /// relative path and an album title, and returns the IDs.
+        fn add_titled(
+            &self,
+            album_id: &str,
+            tracks: &[(&'static str, &'static str)],
+        ) -> Vec<String> {
+            tracks
+                .iter()
+                .map(|&(rel_path, album)| {
+                    self.add(
+                        album_id,
+                        &Song {
+                            album,
+                            ..song(rel_path)
+                        },
+                    )
+                })
+                .collect()
+        }
+
+        /// Runs `update_names` and returns the name of the album with the
+        /// key `key`.
+        fn name_after_update(&self, key: &str) -> String {
+            self.db.with_writer(|conn| update_names(conn)).unwrap();
+            self.row(key).name
         }
 
         /// Returns the row of the album with the key `key`.
@@ -686,6 +769,160 @@ mod tests {
         let error = library
             .db
             .with_writer(|conn| recompute_aggregates(conn))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("an album row was updated"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn update_names_gives_an_album_whose_name_no_track_carries_the_most_common_title() {
+        let library = Library::new();
+        let album = library.album("glass harbour");
+        library.add_titled(
+            &album,
+            &[
+                ("a.flac", "GLASS HARBOUR"),
+                ("b.flac", "Glass Harbour"),
+                ("c.flac", "Glass Harbour"),
+            ],
+        );
+        assert_eq!(library.name_after_update("glass harbour"), "Glass Harbour");
+        // The row has its ID and its key.
+        assert_eq!(library.album("glass harbour"), album);
+        assert_eq!(library.db.with_reader(count).unwrap(), 1);
+    }
+
+    #[test]
+    fn update_names_keeps_a_name_that_one_track_carries() {
+        let library = Library::new();
+        let album = library.album("glass harbour");
+        let ids = library.add_titled(
+            &album,
+            &[
+                ("a.flac", "glass harbour"),
+                ("b.flac", "Glass Harbour"),
+                ("c.flac", "Glass Harbour"),
+            ],
+        );
+        assert_eq!(library.name_after_update("glass harbour"), "glass harbour");
+
+        // A track without a file carries its title as every other track.
+        library.detach(&ids[0]);
+        assert_eq!(library.name_after_update("glass harbour"), "glass harbour");
+
+        // The track that carried the name is gone.
+        library.delete(&ids[0]);
+        assert_eq!(library.name_after_update("glass harbour"), "Glass Harbour");
+        assert_eq!(library.album("glass harbour"), album);
+    }
+
+    #[test]
+    fn update_names_chooses_the_first_title_in_byte_order_among_equally_common_ones() {
+        let library = Library::new();
+        let album = library.album("glass harbour");
+        library.add_titled(
+            &album,
+            &[
+                ("a.flac", "Glass Harbour"),
+                ("b.flac", "glass Harbour"),
+                ("c.flac", "GLASS HARBOUR"),
+            ],
+        );
+        assert_eq!(library.name_after_update("glass harbour"), "GLASS HARBOUR");
+
+        // The row keeps the name while a track carries it, also when another
+        // title becomes the most common one.
+        library.add_titled(
+            &album,
+            &[("d.flac", "Glass Harbour"), ("e.flac", "Glass Harbour")],
+        );
+        assert_eq!(library.name_after_update("glass harbour"), "GLASS HARBOUR");
+    }
+
+    #[test]
+    fn update_names_leaves_out_a_title_with_another_key() {
+        let library = Library::new();
+        let album = library.album("glass harbour");
+        // The key of a title with space inside differs from the key of the
+        // album.
+        library.add_titled(
+            &album,
+            &[("a.flac", "Glass  Harbour"), ("b.flac", "Glass  Harbour")],
+        );
+        assert_eq!(library.name_after_update("glass harbour"), "glass harbour");
+
+        library.add_titled(&album, &[("c.flac", "Glass Harbour")]);
+        assert_eq!(library.name_after_update("glass harbour"), "Glass Harbour");
+    }
+
+    #[test]
+    fn update_names_keeps_the_name_of_an_album_without_a_track() {
+        let library = Library::new();
+        library.album("glass harbour");
+        assert_eq!(library.name_after_update("glass harbour"), "glass harbour");
+    }
+
+    #[test]
+    fn update_names_gives_an_album_the_name_of_its_artist_row() {
+        let library = Library::new();
+        let album = library.album("Glass Harbour");
+        let other_artist = artist(&library.db, "Marlow Quartet");
+        let other = library
+            .db
+            .with_writer(|conn| {
+                upsert_by_key(conn, &other_artist, "Slow Rivers", "MARLOW quartet", false)
+            })
+            .unwrap();
+        assert_eq!(library.row("glass harbour").artist_name, "Artist");
+
+        library.db.with_writer(|conn| update_names(conn)).unwrap();
+        assert_eq!(library.row("glass harbour").artist_name, "Aurora Field");
+        assert_eq!(library.row("slow rivers").artist_name, "Marlow Quartet");
+        // The rows have their IDs, and their titles are as they were.
+        assert_eq!(library.album("Glass Harbour"), album);
+        assert_eq!(
+            upsert(&library.db, &other_artist, "Slow Rivers", false),
+            other
+        );
+        assert_eq!(library.row("glass harbour").name, "Glass Harbour");
+        assert_eq!(library.row("slow rivers").name, "Slow Rivers");
+    }
+
+    #[test]
+    fn update_names_writes_no_row_that_has_its_names() {
+        let library = Library::new();
+        let carried = library.album("glass harbour");
+        library.add_titled(
+            &carried,
+            &[("a.flac", "glass harbour"), ("b.flac", "Glass Harbour")],
+        );
+        // An album whose tracks carry no title with its key, and an album
+        // without a track.
+        let uncarried = library.album("Paper Maps");
+        library.add(&uncarried, &song("c.flac"));
+        library.album("Slow Rivers");
+        library.db.with_writer(|conn| update_names(conn)).unwrap();
+
+        library
+            .db
+            .with_writer(|conn| {
+                conn.execute_batch(
+                    "CREATE TEMP TRIGGER no_update BEFORE UPDATE ON albums
+                     BEGIN SELECT RAISE(ABORT, 'an album row was updated'); END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        library.db.with_writer(|conn| update_names(conn)).unwrap();
+
+        // The trigger is in force: a name that no track carries fails the
+        // update.
+        library.add_titled(&uncarried, &[("d.flac", "PAPER MAPS")]);
+        let error = library
+            .db
+            .with_writer(|conn| update_names(conn))
             .unwrap_err();
         assert!(
             error.to_string().contains("an album row was updated"),
