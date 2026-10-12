@@ -328,6 +328,12 @@ errors: 0
 
 A scan that a database error ends prints that error and no summary, and the command exits with status 1.
 
+### What a scan reads
+
+A scan reads the content of an audio file only when the file is new or has changed. A file has changed when its size or its modification time in whole seconds differs from the stored one. Of such a file the scan reads up to 128 KiB to recognise it after a rename or a move: the first and the last 64 KiB, or the whole file when it has 128 KiB or less (see [Renamed, moved and retagged files](#renamed-moved-and-retagged-files)). It then reads the tags of the file, unless the file was renamed or moved and did not change otherwise.
+
+The first scan of a library finds every file new, so it reads up to 128 KiB and the tags of every file. It is the scan that reads the most. A later scan walks the directories and reads the content of the new and the changed files only. A full scan treats every file as changed.
+
 ### Files with large tags
 
 A scan does not read the tags of a file when that takes more than 32 MiB of the file. That is a file with a very large tag, such as several large pictures, and a damaged file whose header declares such a tag.
@@ -758,6 +764,30 @@ Five tests are marked `#[ignore]` and run on request only:
   ```
 
 [AGENTS.md](AGENTS.md) holds the rules for a change to this repository.
+
+### The end-to-end session
+
+Two examples check a running server over TCP, as a client does. `make-library` writes a library of 10 tracks and 2 cover images to a directory, which is missing or empty. `e2e` is an OpenSubsonic client. It signs in with a token, browses and searches the library, reads covers, streams a file whole and with a range, asks for transcodes to Opus and MP3, sets a star, counts a play, and saves a playlist and a play queue. It needs a server whose one music folder is the directory of `make-library`. It compares the bytes of `stream` and of `getCoverArt` with the files in that directory, so it runs on the machine of the server. The steps that transcode need ffmpeg (see [ffmpeg](#ffmpeg)).
+
+Run the commands in the source tree. `PASSWORD` is a password for this server only, and the two directories are new:
+
+```
+cargo run --example make-library -- /path/to/e2e-library
+WN_SERVER_PASSWORD=PASSWORD cargo run -- --data-dir /path/to/e2e-data init --folder /path/to/e2e-library
+cargo run -- --data-dir /path/to/e2e-data run
+```
+
+`WN_SERVER_PASSWORD=PASSWORD` in front of a command is the form of a Unix shell. In PowerShell, run `$env:WN_SERVER_PASSWORD = "PASSWORD"` before the `init` command. `--data-dir` keeps the session away from the data directory of an installed server. `init --port N` selects another port when port 4200 is in use, and the address of `e2e` then has that port. With the `config.toml` that `init` writes, the server listens on every IPv4 address of the machine and advertises itself (see [Discovery](#discovery)). To keep it on the machine, set `bind = "127.0.0.1"` in the `[server]` table and `mdns = false` in the `[discovery]` table of `/path/to/e2e-data/config.toml` before `run`.
+
+`run` stays in the foreground. In a second terminal:
+
+```
+cargo run --example e2e -- http://127.0.0.1:4200 owner PASSWORD /path/to/e2e-library
+```
+
+The four arguments are the address of the server, the name of the owner, the password and the directory of the library. Each step prints `PASS`, or `FAIL` with one line of detail, and the last line holds the number of steps, the number of failed steps and the time. The exit status is 0 when every step passed and 1 when a step failed. The session sends no request later than 60 seconds after its start.
+
+The session can run again against the same server. It removes the star and the playlist that it creates, sets a star again that it found, and ends with the play queue that it found. It adds one play to one track. Ctrl-C stops the server, and the two directories can be deleted afterwards.
 
 ## Licence
 
