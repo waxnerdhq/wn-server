@@ -18,6 +18,7 @@ use std::fs;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use axum::http::StatusCode;
 use rusqlite::params;
 use serde_json::{Value, json};
 use wn_server::VERSION;
@@ -31,8 +32,8 @@ use wn_server::ids::{self, Kind};
 use wn_server::library::tags::TrackMeta;
 
 use common::{
-    LibraryBuilder, StandardServer, TestLibrary, TestServer, body_string, content_type,
-    subsonic_response,
+    LibraryBuilder, PICTURE_PNG, StandardServer, TestLibrary, TestServer, body_bytes, body_string,
+    content_type, subsonic_response,
 };
 
 /// The value of `ignoredArticles`.
@@ -1174,6 +1175,113 @@ async fn the_tree_is_walked_from_the_indexes_to_every_song_and_back() {
         );
         assert!(artist_dir.get("parent").is_none(), "{artist_dir}");
         assert!(listed.contains(&grandparent), "{grandparent}");
+    }
+}
+
+/// The body and the content type of the answer of `getCoverArt` to `params`.
+/// The answer must be HTTP 200.
+async fn cover(server: &TestServer, params: &[(&str, &str)]) -> (Vec<u8>, String) {
+    let response = server.get_raw("getCoverArt", params).await;
+    assert_eq!(response.status(), StatusCode::OK, "{params:?}");
+    let content_type = content_type(&response);
+    (body_bytes(response).await, content_type)
+}
+
+#[tokio::test]
+async fn the_cover_art_ids_of_the_tree_are_ids_that_get_cover_art_serves() {
+    let server = TestServer::standard().await;
+    let glass_harbour = server.album.glass_harbour.as_str();
+    let slow_rivers = server.album.slow_rivers.as_str();
+
+    // An artist has no image, so no artist of the indexes has `coverArt`.
+    let indexes = indexes(&server, &[]).await;
+    for index in indexes["index"].as_array().expect("an index list") {
+        for artist in index["artist"].as_array().expect("an artist list") {
+            assert!(artist.get("coverArt").is_none(), "{artist}");
+        }
+    }
+
+    // Every album and every song of the tree, each with the ID of its own
+    // row and its `coverArt`.
+    let mut items: Vec<(String, Option<String>)> = Vec::new();
+    let mut read = |element: &Value| {
+        let text = |value: &Value| value.as_str().expect("a string").to_owned();
+        items.push((text(&element["id"]), element.get("coverArt").map(text)));
+    };
+    for artist in artist_column(&indexes, "id") {
+        let artist_dir = directory(&server, &artist).await;
+        assert!(artist_dir.get("coverArt").is_none(), "{artist_dir}");
+        for album in artist_dir["child"].as_array().expect("a child list") {
+            read(album);
+            let id = album["id"].as_str().expect("an ID");
+            let album_dir = directory(&server, id).await;
+            album_dir["child"]
+                .as_array()
+                .expect("a child list")
+                .iter()
+                .for_each(&mut read);
+        }
+    }
+    assert_eq!(items.len(), 4 + 10);
+
+    // The values are the IDs of the two albums that have a cover. "Glass
+    // Harbour" and its three songs name the one, "Slow Rivers" and its two
+    // songs the other.
+    let named = |id: &str| {
+        items
+            .iter()
+            .filter(|(_, cover_art)| cover_art.as_deref() == Some(id))
+            .count()
+    };
+    assert_eq!(named(glass_harbour), 1 + 3);
+    assert_eq!(named(slow_rivers), 1 + 2);
+    let values: BTreeSet<&str> = items
+        .iter()
+        .filter_map(|(_, cover_art)| cover_art.as_deref())
+        .collect();
+    assert_eq!(values, BTreeSet::from([glass_harbour, slow_rivers]));
+
+    // `getCoverArt` serves each value: the image as its source stores it,
+    // and a JPEG for a size.
+    let cover_file = server.path("Aurora Field/Glass Harbour/cover.jpg");
+    let sources: [(&str, Vec<u8>, &str); 2] = [
+        (
+            glass_harbour,
+            fs::read(&cover_file).expect("read the cover file"),
+            "image/jpeg",
+        ),
+        // The picture in the first track of the album.
+        (slow_rivers, PICTURE_PNG.to_vec(), "image/png"),
+    ];
+    for (id, bytes, mime) in sources {
+        for method in ["getCoverArt", "getCoverArt.view"] {
+            let response = server.get_raw(method, &[("id", id)]).await;
+            assert_eq!(response.status(), StatusCode::OK, "{method} {id}");
+            assert_eq!(content_type(&response), mime, "{method} {id}");
+            assert_eq!(body_bytes(response).await, bytes, "{method} {id}");
+        }
+        let (body, content_type) = cover(&server, &[("id", id), ("size", "32")]).await;
+        assert_eq!(content_type, "image/jpeg", "{id}");
+        let format = image::guess_format(&body).expect("an image");
+        assert_eq!(format.to_mime_type(), "image/jpeg", "{id}");
+        image::load_from_memory(&body).expect("decode the cover");
+    }
+
+    // An item without `coverArt` has no cover: `getCoverArt` answers error
+    // 70 for the ID of its row. These are the two albums without a cover
+    // and their five songs.
+    let without: Vec<&str> = items
+        .iter()
+        .filter(|(_, cover_art)| cover_art.is_none())
+        .map(|(id, _)| id.as_str())
+        .collect();
+    assert_eq!(without.len(), 2 + 5);
+    for id in without {
+        assert_eq!(
+            server.get_json("getCoverArt", &[("id", id)]).await,
+            failed(70, NOT_FOUND),
+            "{id}"
+        );
     }
 }
 

@@ -18,7 +18,8 @@
 //! IDs of every other method (`docs/design.md` section 3.3). `parent` of a
 //! song is the ID of its album, and `parent` of an album is the ID of its
 //! artist, so every `parent` is an ID that `getMusicDirectory` takes. An
-//! artist has no parent.
+//! artist has no parent. `coverArt` of an album and of a song is the cover
+//! art ID that `getCoverArt` takes, and an artist has none.
 //!
 //! # Rows and elements
 //!
