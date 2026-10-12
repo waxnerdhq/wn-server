@@ -21,6 +21,7 @@ use crate::auth;
 use crate::config::{self, Config, ConfigError, DataDir};
 use crate::db::queries::users::{self, User, UserRow};
 use crate::db::{Db, DbError};
+use crate::discovery;
 use crate::server::{self, ServerError};
 
 /// The environment variable that supplies the password to `init` and
@@ -294,8 +295,10 @@ fn execute(cli: &Cli, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<()
 }
 
 /// Loads the config, starts logging to stderr and runs the server in the
-/// foreground on the database of `data_dir`. Ctrl-C stops the server, and the
-/// command then succeeds.
+/// foreground on the database of `data_dir`. A missing `instance.id` is
+/// written first. The server is advertised over mDNS while it runs, when
+/// `discovery.mdns` is on. Ctrl-C stops the server, and the command then
+/// succeeds.
 fn serve(data_dir: &DataDir) -> Result<(), CliError> {
     let config = Config::load(&data_dir.config_path())?;
     init_tracing(&config.server.log_level)?;
@@ -303,12 +306,44 @@ fn serve(data_dir: &DataDir) -> Result<(), CliError> {
         .enable_all()
         .build()
         .map_err(CliError::ServerRuntime)?;
+    match write_missing_instance_id(data_dir) {
+        Ok(true) => tracing::warn!(
+            "{} was missing; wrote a new instance ID, so clients see a new server",
+            data_dir.instance_id_path().display()
+        ),
+        Ok(false) => {}
+        // The server runs without the file. It is the ID that discovery
+        // advertises, and discovery reports that it cannot read it.
+        Err(error) => tracing::warn!("{error}"),
+    }
+    // The advertisement lasts until this value is dropped, which is when
+    // `serve` returns, with or without an error. It starts before
+    // `run_server` binds the listener. When the bind fails, the value is
+    // dropped before the mDNS daemon has announced anything.
+    let _advertiser = discovery::advertise(&config, &data_dir.instance_id_path());
     runtime.block_on(async {
         let cancel = CancellationToken::new();
         tokio::spawn(cancel_on_ctrl_c(cancel.clone()));
         server::run_server(config, data_dir, cancel).await
     })?;
     Ok(())
+}
+
+/// Writes a new instance ID to `instance.id` when the file is missing and the
+/// database exists. Returns whether it wrote the file.
+///
+/// `init` writes the file together with the database, and it refuses a data
+/// directory that has a config file and an owner account. No other command
+/// writes the file, so `run` restores it. A data directory without a database
+/// has lost more than this file, and `init` restores that one.
+fn write_missing_instance_id(data_dir: &DataDir) -> Result<bool, CliError> {
+    if !data_dir.db_path().exists() {
+        return Ok(false);
+    }
+    write_new_file(
+        &data_dir.instance_id_path(),
+        &format!("{}\n", new_instance_id()),
+    )
 }
 
 /// Cancels `cancel` when the process receives Ctrl-C.
@@ -1027,6 +1062,55 @@ mod tests {
             assert!(groups[2].starts_with('4'), "{id}");
             assert!(matches!(&groups[3][..1], "8" | "9" | "a" | "b"), "{id}");
         }
+    }
+
+    /// The data directory `dir` with a file at the path of the database.
+    fn data_dir_with_a_database(dir: &Path) -> DataDir {
+        let data_dir = DataDir::resolve(Some(dir)).expect("a data directory");
+        fs::write(data_dir.db_path(), b"").expect("write the database file");
+        data_dir
+    }
+
+    #[test]
+    fn run_writes_a_missing_instance_id_once_when_the_database_exists() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let data_dir = data_dir_with_a_database(dir.path());
+        let path = data_dir.instance_id_path();
+
+        assert!(write_missing_instance_id(&data_dir).expect("first start"));
+        let id = discovery::read_instance_id(&path).expect("an ID that discovery accepts");
+        assert_eq!(
+            fs::read_to_string(&path).expect("read instance.id"),
+            format!("{id}\n")
+        );
+
+        // The next start finds the file. It writes nothing, so `run` logs
+        // nothing, and the ID stays.
+        assert!(!write_missing_instance_id(&data_dir).expect("second start"));
+        assert_eq!(discovery::read_instance_id(&path).expect("an ID"), id);
+    }
+
+    #[test]
+    fn run_keeps_an_existing_instance_id() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let data_dir = data_dir_with_a_database(dir.path());
+        let path = data_dir.instance_id_path();
+        fs::write(&path, "kept\n").expect("write instance.id");
+
+        assert!(!write_missing_instance_id(&data_dir).expect("start"));
+        assert_eq!(
+            fs::read_to_string(&path).expect("read instance.id"),
+            "kept\n"
+        );
+    }
+
+    #[test]
+    fn run_writes_no_instance_id_without_a_database() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let data_dir = DataDir::resolve(Some(dir.path())).expect("a data directory");
+
+        assert!(!write_missing_instance_id(&data_dir).expect("start"));
+        assert!(!data_dir.instance_id_path().exists());
     }
 
     #[test]
