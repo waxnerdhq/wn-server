@@ -508,11 +508,15 @@ Folder sync at `run` and `scan`: folders from config are upserted by path. The s
 
 ### 3.12 mDNS
 
-No DNS-SD type exists for Subsonic servers; the server registers its own and the mobile app browses for it.
+No DNS-SD type exists for Subsonic servers; the server registers its own and the mobile app browses for it. The service type and the TXT record are a contract with the app, and unit tests in `discovery` pin them.
 
-- Type `_waxnerd._tcp.local.`; instance name `server.name`; host `<hostname>.local.`; port `server.port`.
-- TXT: `txtvers=1`, `api=opensubsonic`, `path=/rest`, `id=<instance.id>`, `name=<server.name>`, `auth=password|none`, `tls=0`, `ver=<server version>`.
-- `mdns-sd` `ServiceDaemon` with `enable_addr_auto()`. When `server.bind` is an IPv4 address the daemon disables IPv6 interfaces (`disable_interface(IfKind::IPv6)`), so no AAAA record points at an address the server does not listen on; when `bind` is `::` or an IPv6 address both families are advertised. `unregister` and `shutdown` on graceful stop send a goodbye packet. Windows Firewall prompts on first start for TCP 4200 and UDP 5353.
+- Type `_waxnerd._tcp.local.`; instance name `server.name`; host `<label>.local.`, where the label is the first label of the system host name (`studio` for `studio.example.com`); port `server.port`.
+- TXT, in this order: `txtvers=1`, `api=opensubsonic`, `path=/rest`, `id=<instance.id>`, `name=<server.name>`, `auth=password|none`, `tls=0`, `ver=<server version>`. `auth` is `none` when `auth.disabled_unsafe` is set. The record holds nothing else, because every device on the network can read it.
+- `discovery::TxtRecord::build` and `discovery::interface_kinds` are pure. `discovery::Advertiser` owns the `mdns-sd` `ServiceDaemon`, which runs on its own thread. The registration uses `enable_addr_auto()`, so the daemon publishes the addresses of its interfaces and follows their changes. When `server.bind` is an IPv4 address the daemon disables IPv6 interfaces (`disable_interface(IfKind::IPv6)`), so no AAAA record points at an address the server does not listen on; when `bind` is `::` or an IPv6 address both families are advertised.
+- The `run` command starts the advertisement before `run_server` when `discovery.mdns` is on, and withdraws it when `run_server` returns. It reads `instance.id` then. The ID must be a UUID in the form `init` writes.
+- The server runs without the advertisement when the advertisement cannot start. `run` logs one warning when `instance.id` is missing or is not a UUID, when `server.name` or the host label is not 1 to 63 bytes long, or when `mdns-sd` returns an error. `mdns-sd` opens its multicast sockets on the daemon thread and reports a socket it cannot open in its debug log only, so a second thread waits for the first announcement: it logs the announced name at `info`, or one warning when nothing was announced within 10 s.
+- Withdrawal: `unregister` sends a goodbye packet on every interface, the daemon repeats it after 120 ms, and `shutdown` ends the daemon thread. A stop within the 750 ms in which the daemon probes for its names sends no goodbye packet, because nothing was announced. A goodbye packet in that case would remove the records of another running server with the same instance name from the clients, for example when `run` is started twice and the second server cannot bind its port.
+- Windows Firewall prompts on first start for TCP 4200 and UDP 5353.
 
 ### 3.13 Logging and shutdown
 

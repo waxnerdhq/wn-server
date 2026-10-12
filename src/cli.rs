@@ -21,6 +21,7 @@ use crate::auth;
 use crate::config::{self, Config, ConfigError, DataDir};
 use crate::db::queries::users::{self, User, UserRow};
 use crate::db::{Db, DbError};
+use crate::discovery;
 use crate::server::{self, ServerError};
 
 /// The environment variable that supplies the password to `init` and
@@ -294,8 +295,9 @@ fn execute(cli: &Cli, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<()
 }
 
 /// Loads the config, starts logging to stderr and runs the server in the
-/// foreground on the database of `data_dir`. Ctrl-C stops the server, and the
-/// command then succeeds.
+/// foreground on the database of `data_dir`. The server is advertised over
+/// mDNS while it runs, when `discovery.mdns` is on. Ctrl-C stops the server,
+/// and the command then succeeds.
 fn serve(data_dir: &DataDir) -> Result<(), CliError> {
     let config = Config::load(&data_dir.config_path())?;
     init_tracing(&config.server.log_level)?;
@@ -303,6 +305,11 @@ fn serve(data_dir: &DataDir) -> Result<(), CliError> {
         .enable_all()
         .build()
         .map_err(CliError::ServerRuntime)?;
+    // The advertisement lasts until this value is dropped, which is when
+    // `serve` returns, with or without an error. It starts before
+    // `run_server` binds the listener. When the bind fails, the value is
+    // dropped before the mDNS daemon has announced anything.
+    let _advertiser = discovery::advertise(&config, &data_dir.instance_id_path());
     runtime.block_on(async {
         let cancel = CancellationToken::new();
         tokio::spawn(cancel_on_ctrl_c(cancel.clone()));
