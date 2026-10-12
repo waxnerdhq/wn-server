@@ -43,7 +43,7 @@ pub mod browse;
 
 // search
 
-// playlists
+pub mod playlists;
 
 // play_queue
 

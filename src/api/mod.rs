@@ -46,7 +46,7 @@ pub mod browse;
 
 pub mod annotate;
 
-// playlists
+pub mod playlists;
 
 // queue
 
@@ -278,15 +278,15 @@ pub const METHODS: &[(&str, Handler)] = &[
 
     ("search3", not_implemented),
 
-    ("getPlaylists", not_implemented),
+    ("getPlaylists", handler!(playlists::get_playlists)),
 
-    ("getPlaylist", not_implemented),
+    ("getPlaylist", handler!(playlists::get_playlist)),
 
-    ("createPlaylist", not_implemented),
+    ("createPlaylist", handler!(playlists::create_playlist)),
 
-    ("updatePlaylist", not_implemented),
+    ("updatePlaylist", handler!(playlists::update_playlist)),
 
-    ("deletePlaylist", not_implemented),
+    ("deletePlaylist", handler!(playlists::delete_playlist)),
 
     ("stream", not_implemented),
 
