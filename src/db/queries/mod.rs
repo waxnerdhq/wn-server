@@ -48,7 +48,7 @@ pub mod search;
 
 pub mod playlists;
 
-// play_queue
+pub mod play_queue;
 
 // lyrics
 
