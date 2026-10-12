@@ -83,6 +83,6 @@ wn-server is a headless music server. It scans a local music collection into SQL
 
 - Before pushing: `cargo xtask check` passes on the developer's machine.
 - Behaviour visible over HTTP has a router-level test in `tests/`. Pure logic has unit tests next to the code.
-- Transcoding tests use `FakeTranscoder`; the three tests that run ffmpeg are `#[ignore]`. A test that runs `run_server` sets `transcoding.ffmpeg` to a path that names no program, such as `common::transcoder::no_ffmpeg()`, so that the default suite starts no ffmpeg.
+- Transcoding tests use `FakeTranscoder`; the four tests that run ffmpeg are `#[ignore]`. A test that runs `run_server` sets `transcoding.ffmpeg` to a path that names no program, such as `common::transcoder::no_ffmpeg()`, so that the default suite starts no ffmpeg.
 - A PR description states which tests were added and, for manual checks (mDNS, real clients, native Windows runs), pastes the command and its output.
 - The reviewer checks that each acceptance criterion in the issue is covered by a test or a recorded manual check, and that nothing from the issue's out-of-scope list was built.

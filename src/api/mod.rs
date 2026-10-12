@@ -76,6 +76,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use serde::Serialize;
 use tokio_util::sync::CancellationToken;
+use tower_http::classify::{
+    ClassifiedResponse, ClassifyResponse, NeverClassifyEos, ServerErrorsAsFailures,
+    ServerErrorsFailureClass, SharedClassifier,
+};
 use tower_http::trace::TraceLayer;
 use tracing::Span;
 use tracing::field::Empty;
@@ -123,6 +127,10 @@ pub struct AppState {
     /// The transcoder: it runs ffmpeg for a `stream` request that selects a
     /// transcode.
     pub transcoder: Arc<dyn crate::media::transcode::Transcoder>,
+
+    /// The slots of the original files: one permit for each file that a
+    /// response of `stream` may hold open (`server.max_streams`).
+    pub streams: Arc<tokio::sync::Semaphore>,
 
     /// The scans of the server. It runs at most one at a time.
     pub scan: ScanController,
@@ -434,9 +442,10 @@ pub fn build_router_with(state: AppState, extra: Router<AppState>) -> Router {
         .merge(extra)
         // The layer logs one line for a request, in `record_response`. The
         // lines that it logs by default at the start of a request and at the
-        // end of a body are turned off.
+        // end of a body are turned off. It logs a response that `Failures`
+        // names a failure once more, at `error`.
         .layer(
-            TraceLayer::new_for_http()
+            TraceLayer::new(SharedClassifier::new(Failures))
                 .make_span_with(request_span)
                 .on_request(())
                 .on_response(record_response)
@@ -465,6 +474,42 @@ fn request_span<B>(_request: &http::Request<B>) -> Span {
 #[derive(Clone, Copy)]
 struct LoggedAtDebug;
 
+/// Marks a response whose 5xx status is the answer that its handler chose:
+/// the HTTP 503 of `stream` for a request that got no slot. The trace layer
+/// does not log such a response as a failure of the server. The handler
+/// logs why it chose the answer.
+#[derive(Debug, Clone, Copy)]
+pub struct ChosenStatus;
+
+/// Names the responses that the trace layer logs at `error`: every response
+/// with a 5xx status, as `tower_http` names them for HTTP, without the
+/// responses that carry [`ChosenStatus`].
+#[derive(Debug, Clone, Copy)]
+struct Failures;
+
+impl ClassifyResponse for Failures {
+    type FailureClass = ServerErrorsFailureClass;
+    type ClassifyEos = NeverClassifyEos<ServerErrorsFailureClass>;
+
+    fn classify_response<B>(
+        self,
+        response: &http::Response<B>,
+    ) -> ClassifiedResponse<Self::FailureClass, Self::ClassifyEos> {
+        if response.extensions().get::<ChosenStatus>().is_some() {
+            ClassifiedResponse::Ready(Ok(()))
+        } else {
+            ServerErrorsAsFailures::new().classify_response(response)
+        }
+    }
+
+    fn classify_error<E>(self, error: &E) -> Self::FailureClass
+    where
+        E: std::fmt::Display + 'static,
+    {
+        ServerErrorsAsFailures::new().classify_error(error)
+    }
+}
+
 /// Records the HTTP status of the response in the span of the request and
 /// logs the one line of the request. The span gives the line the method
 /// name, `c`, `u` and the status. `duration_ms` is the time from the arrival
@@ -472,8 +517,10 @@ struct LoggedAtDebug;
 ///
 /// A body that is streamed after the headers adds no time to the line and no
 /// line of its own. When the client closes the connection during the body,
-/// the server drops the body and logs nothing. The trace layer logs a body
-/// that fails on the server once, at `error`.
+/// the server drops the body and logs nothing. The trace layer logs a
+/// response that [`Failures`] names a failure once, at `error`. It decides
+/// that from the status, so it logs no line for a body that ends with an
+/// error.
 ///
 /// The level is `info`, and `debug` for a response with the
 /// [`LoggedAtDebug`] mark.
@@ -1161,6 +1208,61 @@ mod tests {
                 "{name} is not a method"
             );
         }
+    }
+
+    #[test]
+    fn response_with_a_5xx_status_is_a_failure_unless_its_handler_chose_the_status() {
+        let response = |status: StatusCode, chosen: bool| {
+            let mut response = Response::new(Body::empty());
+            *response.status_mut() = status;
+            if chosen {
+                response.extensions_mut().insert(ChosenStatus);
+            }
+            response
+        };
+        // Whether the trace layer logs the response at `error`.
+        let is_failure = |response: &Response| match Failures.classify_response(response) {
+            ClassifiedResponse::Ready(class) => class.is_err(),
+            ClassifiedResponse::RequiresEos(_) => panic!("the status decides"),
+        };
+
+        // The HTTP 503 of `stream` for a request that got no slot.
+        assert!(!is_failure(&response(
+            StatusCode::SERVICE_UNAVAILABLE,
+            true
+        )));
+        // Every other 5xx status, and a 503 that no handler chose.
+        for status in [
+            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::BAD_GATEWAY,
+            StatusCode::SERVICE_UNAVAILABLE,
+            StatusCode::GATEWAY_TIMEOUT,
+        ] {
+            let plain = response(status, false);
+            assert!(is_failure(&plain), "{status}");
+            // The class is the one that `tower_http` gives the status.
+            let ClassifiedResponse::Ready(Err(class)) = Failures.classify_response(&plain) else {
+                panic!("{status}");
+            };
+            assert!(
+                matches!(class, ServerErrorsFailureClass::StatusCode(found) if found == status)
+            );
+        }
+        // A status below 500 is no failure, with and without the mark.
+        for status in [
+            StatusCode::OK,
+            StatusCode::PARTIAL_CONTENT,
+            StatusCode::NOT_FOUND,
+            StatusCode::RANGE_NOT_SATISFIABLE,
+        ] {
+            assert!(!is_failure(&response(status, false)), "{status}");
+            assert!(!is_failure(&response(status, true)), "{status}");
+        }
+        // The error of a body is a failure.
+        let class = Failures.classify_error(&"the body failed");
+        assert!(
+            matches!(class, ServerErrorsFailureClass::Error(text) if text == "the body failed")
+        );
     }
 
     #[test]

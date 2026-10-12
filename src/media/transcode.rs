@@ -49,6 +49,17 @@
 //! file reaches, and the stream goes to the client, which is the
 //! authenticated owner.
 //!
+//! # What the server can transcode to
+//!
+//! [`FfmpegTranscoder::probe`] runs the program twice when the server
+//! starts: `<ffmpeg> -version`, and `<ffmpeg> -hide_banner -encoders`, which
+//! lists the encoders of the build. A target is available when the list
+//! holds its encoder ([`encoder`]). A job for a target that is not available
+//! is [`TranscodeError::Unavailable`] and starts no process: every job when
+//! the program does not run, and the jobs of one target when the build lacks
+//! one encoder. The probe logs one warning for what is missing. No request
+//! runs the probe again.
+//!
 //! # How many processes run
 //!
 //! A semaphore has one permit for each process that may run
@@ -60,10 +71,12 @@
 //!
 //! # How the process ends
 //!
-//! The body of the response owns the process.
+//! The body of a [`TranscodeStream`] owns the process.
 //!
-//! - When the body is dropped before the output has ended, which is what a
-//!   client that disconnects causes, the process is killed.
+//! - When the body is dropped before the output has ended, the process is
+//!   killed. `stream::transcoded` drops the body when the process writes no
+//!   output within the limit, when the client disconnects, when the client
+//!   takes no chunk for the write timeout, and when the server stops.
 //! - When the output has ended, the process ends by itself. A process that
 //!   has not ended after [`EXIT_WAIT`] is killed.
 //!
@@ -95,12 +108,23 @@ use tokio_util::io::ReaderStream;
 use super::stream::Target;
 use crate::config::Transcoding;
 
-/// The longest time the probe at startup waits for `ffmpeg -version`. A
-/// program that has not answered by then counts as not available.
+/// The longest time the probe at startup waits for one run of the program:
+/// `ffmpeg -version`, and then `ffmpeg -encoders`. A program that has not
+/// answered by then counts as not available.
 const PROBE_LIMIT: Duration = Duration::from_secs(10);
 
-/// The most bytes the probe reads from the output of `ffmpeg -version`.
+/// The most bytes the probe reads from the output of one run of the
+/// program. The encoder list of ffmpeg 8.0 with 204 encoders has 12 KiB.
+///
+/// The probe reads no byte behind the limit and closes the output there. A
+/// program that writes more ends with a failure or not within the limit of
+/// the run, and counts as not available. An encoder whose line is behind
+/// the limit of a list that the program still wrote in full counts as
+/// missing.
 const PROBE_OUTPUT_LIMIT: u64 = 64 * 1024;
+
+/// The targets of a transcode, in the order in which the probe names them.
+const TARGETS: [Target; 2] = [Target::Opus, Target::Mp3];
 
 /// The longest part of the version line of ffmpeg that the log holds, in
 /// characters.
@@ -171,7 +195,8 @@ pub enum TranscodeError {
     /// within the permit wait.
     #[error("every transcode slot is taken")]
     Busy,
-    /// The server has no program that transcodes.
+    /// The server has no program that transcodes to the target of the job:
+    /// the program does not run, or it lacks the encoder of the target.
     #[error("ffmpeg not available")]
     Unavailable,
     /// The process cannot be started.
@@ -198,45 +223,45 @@ pub struct FfmpegTranscoder {
     semaphore: Arc<Semaphore>,
     /// The time a job waits for a permit.
     permit_wait: Duration,
-    /// Whether the probe at startup ran the program.
-    available: bool,
+    /// The targets that the probe at startup found the program can encode.
+    /// It is empty when the program does not run.
+    targets: Vec<Target>,
 }
 
 impl FfmpegTranscoder {
-    /// Builds the transcoder of `config` and runs `<ffmpeg> -version` once.
+    /// Builds the transcoder of `config` and probes the program of
+    /// `config.ffmpeg` once: `<ffmpeg> -version`, and then
+    /// `<ffmpeg> -hide_banner -encoders` ([`probed`]).
     ///
-    /// The result of the run is logged: the version line of the program at
-    /// `info`, or one warning that says why the program is not available. A
-    /// transcoder without the program starts no process, and every job of it
-    /// is [`TranscodeError::Unavailable`].
+    /// The result is logged: the version line of the program at `info`, and
+    /// at most one warning, which says why the program is not available or
+    /// which encoder it lacks ([`Probe::warning`]). The transcoder starts no
+    /// process for a target that the probe did not find, and a job for such
+    /// a target is [`TranscodeError::Unavailable`].
     pub async fn probe(config: &Transcoding) -> Self {
-        let mut command = Command::new(&config.ffmpeg);
-        command.arg("-version");
-        let available = match version(command, PROBE_LIMIT).await {
-            Ok(version) => {
-                tracing::info!(ffmpeg = %config.ffmpeg, %version, "ffmpeg is available");
-                true
-            }
-            Err(reason) => {
-                tracing::warn!(
-                    ffmpeg = %config.ffmpeg,
-                    "ffmpeg is not available: {reason}. The server serves original files, \
-                     and a stream request that needs a transcode gets an error. \
-                     Install ffmpeg or set transcoding.ffmpeg, and restart the server"
-                );
-                false
-            }
+        let program = |arguments: &[&str]| {
+            let mut command = Command::new(&config.ffmpeg);
+            command.args(arguments);
+            command
         };
-        Self::new(config, available)
+        let found = probed(program, PROBE_LIMIT).await;
+        if let Probe::Program { version, .. } = &found {
+            tracing::info!(ffmpeg = %config.ffmpeg, %version, "ffmpeg is available");
+        }
+        if let Some(warning) = found.warning() {
+            tracing::warn!(ffmpeg = %config.ffmpeg, "{warning}");
+        }
+        Self::new(config, found.targets())
     }
 
-    /// The transcoder of `config`. `available` is the result of the probe.
-    fn new(config: &Transcoding, available: bool) -> Self {
+    /// The transcoder of `config`. `targets` is the result of the probe: the
+    /// targets that the program can encode.
+    fn new(config: &Transcoding, targets: Vec<Target>) -> Self {
         Self {
             bin: OsString::from(&config.ffmpeg),
             semaphore: Arc::new(Semaphore::new(config.max_concurrent)),
             permit_wait: Duration::from_millis(config.permit_wait_ms),
-            available,
+            targets,
         }
     }
 
@@ -339,7 +364,7 @@ impl FfmpegTranscoder {
         job: &TranscodeJob,
         report: Report,
     ) -> Result<TranscodeStream, TranscodeError> {
-        if !self.available {
+        if !self.targets.contains(&job.target) {
             return Err(TranscodeError::Unavailable);
         }
         if !job.path.is_absolute() {
@@ -357,8 +382,10 @@ impl FfmpegTranscoder {
 impl Transcoder for FfmpegTranscoder {
     /// Starts ffmpeg for `job`.
     ///
-    /// [`TranscodeError::Unavailable`] answers every job of a transcoder
-    /// whose probe failed. [`TranscodeError::Spawn`] answers a path that is
+    /// [`TranscodeError::Unavailable`] answers a job for a target that the
+    /// probe did not find: every job of a transcoder whose program does not
+    /// run, and the jobs of one target when the program lacks one encoder.
+    /// [`TranscodeError::Spawn`] answers a path that is
     /// not absolute, before a permit is taken (see the module comment), and
     /// a process that the system does not start.
     ///
@@ -373,11 +400,29 @@ impl Transcoder for FfmpegTranscoder {
     }
 }
 
+/// The ffmpeg encoder of `target`: the value of `-c:a`, and the name of the
+/// encoder in the list of `ffmpeg -encoders`.
+fn encoder(target: Target) -> &'static str {
+    match target {
+        Target::Opus => "libopus",
+        Target::Mp3 => "libmp3lame",
+    }
+}
+
+/// The name of the format of `target` in a log line.
+fn format_name(target: Target) -> &'static str {
+    match target {
+        Target::Opus => "Opus",
+        Target::Mp3 => "MP3",
+    }
+}
+
 /// The arguments of ffmpeg for `job`, without the program.
 fn arguments(job: &TranscodeJob) -> Vec<OsString> {
-    let (codec, format) = match job.target {
-        Target::Opus => ("libopus", "ogg"),
-        Target::Mp3 => ("libmp3lame", "mp3"),
+    let codec = encoder(job.target);
+    let format = match job.target {
+        Target::Opus => "ogg",
+        Target::Mp3 => "mp3",
     };
     let mut arguments: Vec<OsString> = [
         "-nostdin",
@@ -406,14 +451,130 @@ fn arguments(job: &TranscodeJob) -> Vec<OsString> {
     arguments
 }
 
+/// What the probe at startup found.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Probe {
+    /// The program is not available: it does not run, or its list of
+    /// encoders cannot be read. The text says why.
+    NoProgram(String),
+    /// The program runs.
+    Program {
+        /// The version line of the program.
+        version: String,
+        /// The targets whose encoder the program lacks.
+        missing: Vec<Target>,
+    },
+}
+
+impl Probe {
+    /// The targets that the server can transcode to.
+    fn targets(&self) -> Vec<Target> {
+        match self {
+            Self::NoProgram(_) => Vec::new(),
+            Self::Program { missing, .. } => TARGETS
+                .into_iter()
+                .filter(|target| !missing.contains(target))
+                .collect(),
+        }
+    }
+
+    /// The one warning that the probe logs, and `None` when the program has
+    /// the encoder of every target. The text says what is missing, which
+    /// requests get an error, and what the owner does about it.
+    fn warning(&self) -> Option<String> {
+        let no_transcode = "The server serves original files, and a stream request that needs \
+                            a transcode gets an error";
+        match self {
+            Self::NoProgram(reason) => Some(format!(
+                "ffmpeg is not available: {reason}. {no_transcode}. \
+                 Install ffmpeg or set transcoding.ffmpeg, and restart the server"
+            )),
+            Self::Program { missing, .. } if missing.is_empty() => None,
+            Self::Program { missing, .. } => {
+                let encoders = missing.iter().copied().map(encoder);
+                let encoders = encoders.collect::<Vec<_>>().join(" and ");
+                let effect = match self.targets().first() {
+                    None => no_transcode.to_owned(),
+                    Some(works) => format!(
+                        "A stream request that needs a transcode to {} gets an error, \
+                         and a transcode to {} works",
+                        format_name(missing[0]),
+                        format_name(*works)
+                    ),
+                };
+                Some(format!(
+                    "ffmpeg has no encoder {encoders}. {effect}. \
+                     Install an ffmpeg with {encoders} or set transcoding.ffmpeg, \
+                     and restart the server"
+                ))
+            }
+        }
+    }
+}
+
+/// Probes a program. `program` returns the command that runs the program
+/// with the given arguments, and `limit` is the longest time one run may
+/// take.
+///
+/// The first run is `-version`. A program that cannot be started, that ends
+/// with a failure status or that has not ended after `limit` is not
+/// available, and it is not run again. The second run is
+/// `-hide_banner -encoders`, whose output lists the encoders of the build.
+/// A program whose list cannot be read is not available either.
+async fn probed(program: impl Fn(&[&str]) -> Command, limit: Duration) -> Probe {
+    let version = match version(program(&["-version"]), limit).await {
+        Ok(version) => version,
+        Err(reason) => return Probe::NoProgram(reason),
+    };
+    match output_of(program(&["-hide_banner", "-encoders"]), limit).await {
+        Ok(list) => Probe::Program {
+            version,
+            missing: TARGETS
+                .into_iter()
+                .filter(|target| !lists_encoder(&list, encoder(*target)))
+                .collect(),
+        },
+        Err(reason) => Probe::NoProgram(format!("its list of encoders cannot be read: {reason}")),
+    }
+}
+
+/// Whether `list`, the output of `ffmpeg -encoders`, names the audio encoder
+/// `name`.
+///
+/// A line of an encoder holds six flags, the name of the encoder and a
+/// description, each after white space: ` A....D libopus      libopus Opus
+/// (codec opus)`. The first flag is `A` for an audio encoder. The name must
+/// be equal: the line of the encoder `opus`, which ffmpeg has itself, does
+/// not name `libopus`.
+fn lists_encoder(list: &str, name: &str) -> bool {
+    list.lines().any(|line| {
+        let mut fields = line.split_whitespace();
+        let flags = fields.next().unwrap_or_default();
+        flags.len() == 6 && flags.starts_with('A') && fields.next() == Some(name)
+    })
+}
+
 /// Runs `command`, which is `<ffmpeg> -version`, and returns the first line
 /// of its output that is not empty, cut to [`VERSION_CHARS`] characters. The
-/// error says why the program is not available: it cannot be started, it
-/// ends with a failure status, or it has not ended after `limit`.
+/// error is the one of [`output_of`].
+async fn version(command: Command, limit: Duration) -> Result<String, String> {
+    let text = output_of(command, limit).await?;
+    let line = text
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or_default();
+    Ok(line.chars().take(VERSION_CHARS).collect())
+}
+
+/// Runs `command`, a run of the probe, and returns the first
+/// [`PROBE_OUTPUT_LIMIT`] bytes of its output as text. The error says why
+/// the program is not available: it cannot be started, it ends with a
+/// failure status, or it has not ended after `limit`.
 ///
 /// The process reads nothing from its standard input, and its error output
 /// is discarded. A process that has not ended after `limit` is killed.
-async fn version(mut command: Command, limit: Duration) -> Result<String, String> {
+async fn output_of(mut command: Command, limit: Duration) -> Result<String, String> {
     command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -433,13 +594,7 @@ async fn version(mut command: Command, limit: Duration) -> Result<String, String
     };
     match tokio::time::timeout(limit, run).await {
         Ok(Ok((status, output))) if status.success() => {
-            let text = String::from_utf8_lossy(&output);
-            let line = text
-                .lines()
-                .map(str::trim)
-                .find(|line| !line.is_empty())
-                .unwrap_or_default();
-            Ok(line.chars().take(VERSION_CHARS).collect())
+            Ok(String::from_utf8_lossy(&output).into_owned())
         }
         Ok(Ok((status, _))) => Err(format!("the program ended with {status}")),
         Ok(Err(error)) => Err(format!("the program cannot be run ({error})")),
@@ -495,14 +650,16 @@ fn failure(end: ProcessEnd) -> Option<ExitStatus> {
 
 /// The [`Report`] of the transcoder: logs the end of the process of the
 /// track `track`. A failure ([`failure`]) is one line at `warn` with the
-/// status and the ID of the track. The stream of such a process is empty or
-/// incomplete, and the response was HTTP 200 when ffmpeg failed.
+/// status and the ID of the track. A process that failed before its first
+/// output gave its request an error, and one that failed later gave it an
+/// incomplete stream after HTTP 200 (`stream::transcoded`).
 fn log_end(track: &str, end: ProcessEnd) {
     match failure(end) {
         Some(status) => tracing::warn!(
             %track,
             %status,
-            "ffmpeg ended with a failure, and the stream of the track is empty or incomplete. \
+            "ffmpeg ended with a failure. The request for the track got an error when \
+             ffmpeg had written nothing, and an incomplete stream otherwise. \
              The messages of ffmpeg are logged at the debug level"
         ),
         None => tracing::debug!(%track, ?end, "the transcode process has ended"),
@@ -658,6 +815,11 @@ mod tests {
     /// process. Without it the process ends with success.
     const EXIT_VARIABLE: &str = "WN_SERVER_TEST_EXIT";
 
+    /// The environment variable that holds a text which the child process
+    /// writes to its standard output before everything else: the output of
+    /// a program that the probe runs.
+    const PRINT_VARIABLE: &str = "WN_SERVER_TEST_PRINT";
+
     /// The ID of the track of the jobs of the tests.
     const TRACK: &str = "tr-00000000000000000000000000000001";
 
@@ -682,7 +844,8 @@ mod tests {
     /// The process that stands in for ffmpeg. The tests start the test
     /// binary again with this test as its only test and with
     /// [`SLEEP_VARIABLE`] set. The test then locks the file of
-    /// [`LOCK_VARIABLE`] when that variable is set, writes
+    /// [`LOCK_VARIABLE`] when that variable is set, writes the text of
+    /// [`PRINT_VARIABLE`] when that variable is set, writes
     /// [`CHILD_STARTED`] and sleeps for that number of seconds. A process
     /// that no test kills ends by itself after the sleep, with the status
     /// of [`EXIT_VARIABLE`] when that variable is set.
@@ -700,6 +863,9 @@ mod tests {
                 file.lock().expect("lock the file");
                 file
             });
+            if let Ok(text) = std::env::var(PRINT_VARIABLE) {
+                println!("{text}");
+            }
             println!("{CHILD_STARTED}{}", std::process::id());
             std::thread::sleep(Duration::from_secs(seconds));
             let status = std::env::var(EXIT_VARIABLE)
@@ -723,16 +889,21 @@ mod tests {
         command
     }
 
-    /// A transcoder that the probe found, with `max_concurrent` permits and
-    /// a permit wait of [`PERMIT_WAIT`]. Its program is `bin`.
+    /// A transcoder whose probe found both encoders, with `max_concurrent`
+    /// permits and a permit wait of [`PERMIT_WAIT`]. Its program is `bin`.
     fn transcoder(bin: &str, max_concurrent: usize) -> FfmpegTranscoder {
+        transcoder_for(bin, max_concurrent, &TARGETS)
+    }
+
+    /// As [`transcoder`], for a program that can encode `targets` only.
+    fn transcoder_for(bin: &str, max_concurrent: usize, targets: &[Target]) -> FfmpegTranscoder {
         let config = Transcoding {
             ffmpeg: bin.to_owned(),
             max_concurrent,
             permit_wait_ms: PERMIT_WAIT_MS,
             ..Transcoding::default()
         };
-        FfmpegTranscoder::new(&config, true)
+        FfmpegTranscoder::new(&config, targets.to_vec())
     }
 
     /// The command of a child process that ends at once with the exit
@@ -1290,7 +1461,7 @@ mod tests {
             ..Transcoding::default()
         };
         let transcoder = FfmpegTranscoder::probe(&config).await;
-        assert!(!transcoder.available);
+        assert_eq!(transcoder.targets, []);
 
         let path = dir.path().join("a.flac");
         let error = transcoder
@@ -1333,6 +1504,231 @@ mod tests {
             .expect_err("no answer");
         assert!(reason.contains("did not end within"), "{reason}");
         assert!(asked.elapsed() < LIMIT);
+    }
+
+    /// The longest time one run of the stand-in may take in a test of the
+    /// probe. It is a limit and no wait: a run takes some milliseconds.
+    const PROBE_TEST_LIMIT: Duration = Duration::from_secs(10);
+
+    /// The start of the output of `ffmpeg -hide_banner -encoders` of
+    /// ffmpeg 8.0, and its lines of four audio encoders.
+    const ENCODER_LIST_HEAD: &str = "Encoders:
+ V..... = Video
+ A..... = Audio
+ S..... = Subtitle
+ .F.... = Frame-level multithreading
+ ..S... = Slice-level multithreading
+ ...X.. = Codec is experimental
+ ....B. = Supports draw_horiz_band
+ .....D = Supports direct rendering method 1
+ ------
+ V....D a64multi             Multicolor charset for Commodore 64 (codec a64_multi)
+ V....D libx264              libx264 H.264 / AVC / MPEG-4 AVC / MPEG-4 part 10 (codec h264)
+ A....D flac                 FLAC (Free Lossless Audio Codec)
+ A..X.D opus                 Opus
+";
+
+    /// The line of the encoder libopus in that output.
+    const LIBOPUS_LINE: &str = " A....D libopus              libopus Opus (codec opus)\n";
+
+    /// The line of the encoder libmp3lame in that output.
+    const LIBMP3LAME_LINE: &str =
+        " A....D libmp3lame           libmp3lame MP3 (MPEG audio layer 3) (codec mp3)\n";
+
+    /// The command of a child process that writes `output` and ends with
+    /// success: a program that the probe runs.
+    fn program_that_writes(output: &str) -> Command {
+        let mut command = child(0);
+        command.env(PRINT_VARIABLE, output);
+        command
+    }
+
+    #[test]
+    fn encoder_list_names_an_encoder_by_its_whole_name() {
+        let both = format!("{ENCODER_LIST_HEAD}{LIBMP3LAME_LINE}{LIBOPUS_LINE}");
+        assert!(lists_encoder(&both, "libopus"));
+        assert!(lists_encoder(&both, "libmp3lame"));
+        assert!(lists_encoder(&both, "flac"));
+        // The encoder `opus` of ffmpeg itself is another encoder.
+        assert!(lists_encoder(ENCODER_LIST_HEAD, "opus"));
+        assert!(!lists_encoder(ENCODER_LIST_HEAD, "libopus"));
+        assert!(!lists_encoder(ENCODER_LIST_HEAD, "libmp3lame"));
+        let opus_only = format!("{ENCODER_LIST_HEAD}{LIBOPUS_LINE}");
+        assert!(lists_encoder(&opus_only, "libopus"));
+        assert!(!lists_encoder(&opus_only, "libmp3lame"));
+
+        // A name in a description, a video encoder with the name, a line
+        // of the legend and a line without flags name no audio encoder.
+        for list in [
+            " A....D other                wraps libopus\n",
+            " V....D libopus              a video encoder\n",
+            " A..... = libopus\n",
+            "libopus\n",
+            " libopus libopus\n",
+            "",
+        ] {
+            assert!(!lists_encoder(list, "libopus"), "{list:?}");
+        }
+        // Windows line ends.
+        assert!(lists_encoder(
+            " A....D libopus              libopus Opus (codec opus)\r\n",
+            "libopus"
+        ));
+    }
+
+    #[test]
+    fn encoder_of_a_target_is_the_codec_of_its_command_line() {
+        for (target, name) in [(Target::Opus, "libopus"), (Target::Mp3, "libmp3lame")] {
+            assert_eq!(encoder(target), name);
+            let argv = transcoder("ffmpeg", 1).argv(&job("/music/a.flac", target, 96, 0));
+            let codec = argv
+                .iter()
+                .position(|argument| argument == "-c:a")
+                .expect("the codec option");
+            assert_eq!(argv[codec + 1], name);
+        }
+        assert_eq!(TARGETS, [Target::Opus, Target::Mp3]);
+    }
+
+    #[tokio::test]
+    async fn probe_finds_the_targets_whose_encoder_the_program_lists() {
+        let both = format!("{ENCODER_LIST_HEAD}{LIBMP3LAME_LINE}{LIBOPUS_LINE}");
+        let opus_only = format!("{ENCODER_LIST_HEAD}{LIBOPUS_LINE}");
+        let mp3_only = format!("{ENCODER_LIST_HEAD}{LIBMP3LAME_LINE}");
+        for (list, missing, targets) in [
+            (both.as_str(), vec![], vec![Target::Opus, Target::Mp3]),
+            (opus_only.as_str(), vec![Target::Mp3], vec![Target::Opus]),
+            (mp3_only.as_str(), vec![Target::Opus], vec![Target::Mp3]),
+            (ENCODER_LIST_HEAD, vec![Target::Opus, Target::Mp3], vec![]),
+        ] {
+            // The program gets the arguments of the two runs, in their order.
+            let runs = std::sync::Mutex::new(Vec::new());
+            let program = |arguments: &[&str]| {
+                runs.lock().unwrap().push(arguments.join(" "));
+                program_that_writes(list)
+            };
+            let found = probed(program, PROBE_TEST_LIMIT).await;
+            assert_eq!(
+                *runs.lock().unwrap(),
+                ["-version", "-hide_banner -encoders"],
+                "{missing:?}"
+            );
+            let Probe::Program {
+                version,
+                missing: found_missing,
+            } = &found
+            else {
+                panic!("{found:?}");
+            };
+            assert!(!version.is_empty());
+            assert_eq!(*found_missing, missing);
+            assert_eq!(found.targets(), targets);
+            // One warning when an encoder is missing, and none otherwise.
+            assert_eq!(found.warning().is_some(), !missing.is_empty(), "{found:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn probe_of_a_program_whose_encoder_list_cannot_be_read_finds_no_target() {
+        // The program answers `-version` and fails for the list.
+        let program = |arguments: &[&str]| {
+            if arguments.contains(&"-encoders") {
+                failing_child(3)
+            } else {
+                child(0)
+            }
+        };
+        let found = probed(program, PROBE_TEST_LIMIT).await;
+        let Probe::NoProgram(reason) = &found else {
+            panic!("{found:?}");
+        };
+        assert!(reason.contains("list of encoders"), "{reason}");
+        assert!(reason.contains("ended with"), "{reason}");
+        assert_eq!(found.targets(), []);
+
+        // A program that does not run is not asked for its list.
+        let runs = std::sync::Mutex::new(0);
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let program = |_arguments: &[&str]| {
+            *runs.lock().unwrap() += 1;
+            Command::new(dir.path().join("no ffmpeg here"))
+        };
+        let found = probed(program, PROBE_TEST_LIMIT).await;
+        assert!(matches!(&found, Probe::NoProgram(reason) if reason.contains("cannot be run")));
+        assert_eq!(*runs.lock().unwrap(), 1);
+    }
+
+    #[test]
+    fn probe_has_one_warning_that_names_what_is_missing() {
+        let found = |missing: &[Target]| Probe::Program {
+            version: "ffmpeg version 8.0".to_owned(),
+            missing: missing.to_vec(),
+        };
+        assert_eq!(found(&[]).warning(), None);
+
+        let warning = found(&[Target::Mp3]).warning().expect("a warning");
+        assert!(warning.contains("no encoder libmp3lame"), "{warning}");
+        assert!(
+            warning.contains("transcode to MP3 gets an error"),
+            "{warning}"
+        );
+        assert!(warning.contains("transcode to Opus works"), "{warning}");
+        assert!(!warning.contains("libopus"), "{warning}");
+
+        let warning = found(&[Target::Opus]).warning().expect("a warning");
+        assert!(warning.contains("no encoder libopus"), "{warning}");
+        assert!(
+            warning.contains("transcode to Opus gets an error"),
+            "{warning}"
+        );
+        assert!(warning.contains("transcode to MP3 works"), "{warning}");
+        assert!(!warning.contains("libmp3lame"), "{warning}");
+
+        let warning = found(&[Target::Opus, Target::Mp3])
+            .warning()
+            .expect("a warning");
+        assert!(
+            warning.contains("no encoder libopus and libmp3lame"),
+            "{warning}"
+        );
+        assert!(warning.contains("serves original files"), "{warning}");
+        assert!(!warning.contains("works"), "{warning}");
+
+        let warning = Probe::NoProgram("the program cannot be run (not found)".to_owned())
+            .warning()
+            .expect("a warning");
+        assert!(
+            warning.starts_with("ffmpeg is not available: the program cannot be run (not found)."),
+            "{warning}"
+        );
+        assert!(warning.contains("serves original files"), "{warning}");
+    }
+
+    #[tokio::test]
+    async fn target_without_its_encoder_is_unavailable_and_the_other_target_starts() {
+        // The program is a path that names no program, so a job that passes
+        // the check of the target fails where the process starts.
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let missing = dir.path().join("no ffmpeg here");
+        let bin = missing.to_str().expect("a Unicode path");
+        let path = dir.path().join("a.flac");
+        let path = path.to_str().expect("a Unicode path");
+        for (has, lacks) in [(Target::Opus, Target::Mp3), (Target::Mp3, Target::Opus)] {
+            let transcoder = transcoder_for(bin, 1, &[has]);
+            let error = transcoder
+                .spawn(job(path, lacks, 96, 0))
+                .await
+                .expect_err("no stream");
+            assert!(matches!(error, TranscodeError::Unavailable), "{error:?}");
+            assert_eq!(error.to_string(), "ffmpeg not available");
+
+            let error = transcoder
+                .spawn(job(path, has, 96, 0))
+                .await
+                .expect_err("no program");
+            assert!(matches!(error, TranscodeError::Spawn(_)), "{error:?}");
+            assert_eq!(transcoder.semaphore.available_permits(), 1);
+        }
     }
 
     /// Reads `body` to its end, for [`LIMIT`] at most.
@@ -1489,12 +1885,14 @@ mod tests {
     }
 
     /// The transcoder of the default config, which runs `ffmpeg` from
-    /// `PATH`. The test fails when the probe finds no ffmpeg.
+    /// `PATH`. The test fails when the probe finds no ffmpeg, or an ffmpeg
+    /// without one of the two encoders.
     async fn real_transcoder() -> FfmpegTranscoder {
         let transcoder = FfmpegTranscoder::probe(&Transcoding::default()).await;
-        assert!(
-            transcoder.available,
-            "this test needs ffmpeg on PATH (`ffmpeg -version` did not run)"
+        assert_eq!(
+            transcoder.targets, TARGETS,
+            "this test needs ffmpeg with libopus and libmp3lame on PATH \
+             (the probe of `ffmpeg -version` and `ffmpeg -encoders` found these targets)"
         );
         transcoder
     }
@@ -1542,8 +1940,10 @@ mod tests {
         path
     }
 
-    /// One of the three tests that run ffmpeg. They need ffmpeg with libopus
-    /// and libmp3lame on PATH, so they are not part of the default suite:
+    /// One of the four tests that run ffmpeg: three of this file, and one of
+    /// `stream.rs`, which sends a file through `stream::transcoded`. They
+    /// need ffmpeg with libopus and libmp3lame on PATH, so they are not part
+    /// of the default suite:
     /// `cargo test --lib -- --ignored --nocapture real_ffmpeg`.
     ///
     /// The test transcodes a file of every audio container that the scanner
