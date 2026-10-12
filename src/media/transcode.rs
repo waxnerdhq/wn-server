@@ -302,9 +302,9 @@ fn arguments(job: &TranscodeJob) -> Vec<OsString> {
 }
 
 /// Runs `command`, which is `<ffmpeg> -version`, and returns the first line
-/// of its output that is not empty, cut to [`VERSION_CHARS`] characters. The error says why
-/// the program is not available: it cannot be started, it ends with a
-/// failure status, or it has not ended after `limit`.
+/// of its output that is not empty, cut to [`VERSION_CHARS`] characters. The
+/// error says why the program is not available: it cannot be started, it
+/// ends with a failure status, or it has not ended after `limit`.
 ///
 /// The process reads nothing from its standard input, and its error output
 /// is discarded. A process that has not ended after `limit` is killed.

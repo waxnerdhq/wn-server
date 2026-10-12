@@ -205,8 +205,9 @@ async fn set_duration(db: &Db, id: &str, duration_ms: i64) {
     .expect("set the duration");
 }
 
-/// `len` bytes in which no part of 256 bytes repeats at the same place of
-/// two chunks, so a part of the bytes is found at one offset.
+/// `len` bytes that repeat after 251 bytes. The size of a chunk of the
+/// transcoder is no multiple of 251, so two chunks start with other bytes,
+/// and a body that leaves out or repeats a chunk differs from these bytes.
 fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|index| (index % 251) as u8).collect()
 }
