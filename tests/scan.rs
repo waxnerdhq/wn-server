@@ -245,7 +245,11 @@ async fn get_scan_status_after_a_scan_has_the_count_and_the_end_time_of_the_scan
     let rows = scan_rows(&server).await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].counts.seen, 10);
-    assert_eq!(Some(unix_seconds(last_scan)), rows[0].finished_at);
+    // The row holds milliseconds, and the text names the second of them.
+    assert_eq!(
+        Some(unix_seconds(last_scan)),
+        rows[0].finished_at.map(|ms| ms / 1000)
+    );
     assert_eq!(
         status.as_object().map(serde_json::Map::len),
         Some(3),
@@ -262,6 +266,41 @@ async fn get_scan_status_after_a_scan_has_the_count_and_the_end_time_of_the_scan
     assert_eq!(response["scanStatus"]["scanning"], false);
     assert_eq!(response["scanStatus"]["count"], 10);
     assert_eq!(scan_rows(&server).await.len(), 2);
+}
+
+#[tokio::test]
+async fn last_scan_is_the_second_of_the_stored_end_time_in_utc() {
+    // The server has no music folder. Its scan changes nothing.
+    let server = TestServer::bare(config(&[])).await;
+    server.scan_and_wait().await;
+    let rows = scan_rows(&server).await;
+    assert_eq!(rows.len(), 1);
+    assert!(!rows[0].changed_library, "{rows:?}");
+
+    // The end time of the scan in Unix milliseconds, and the text of its
+    // second. A build that stored 1791680523 seconds sent the first text.
+    let cases: [(i64, &str); 5] = [
+        (1_791_680_523_000, "2026-10-11T01:02:03Z"),
+        (1_791_680_523_001, "2026-10-11T01:02:03Z"),
+        (1_791_680_523_999, "2026-10-11T01:02:03Z"),
+        (1_791_680_524_000, "2026-10-11T01:02:04Z"),
+        (951_782_400_000, "2000-02-29T00:00:00Z"),
+    ];
+    for (finished_at, text) in cases {
+        server
+            .db()
+            .write(move |conn| {
+                conn.execute("UPDATE scans SET finished_at = ?1", [finished_at])?;
+                Ok(())
+            })
+            .await
+            .expect("set the end time");
+        let response = server.get_json("getScanStatus", &[]).await;
+        assert_eq!(response["scanStatus"]["lastScan"], text, "{finished_at}");
+        let body = server.get_xml("getScanStatus", &[]).await;
+        let element = format!(r#"<scanStatus count="0" lastScan="{text}" scanning="false"/>"#);
+        assert!(body.contains(&element), "{finished_at}: {body}");
+    }
 }
 
 #[tokio::test]
@@ -357,7 +396,10 @@ async fn get_scan_status_after_a_scan_that_recorded_errors_is_idle_with_its_end_
     assert_eq!(status["scanning"], false);
     assert_eq!(status["count"], 10);
     let last_scan = status["lastScan"].as_str().expect("lastScan is a string");
-    assert_eq!(Some(unix_seconds(last_scan)), rows[1].finished_at);
+    assert_eq!(
+        Some(unix_seconds(last_scan)),
+        rows[1].finished_at.map(|ms| ms / 1000)
+    );
     assert!(response.get("error").is_none());
 
     // The next call starts a scan.

@@ -23,13 +23,8 @@ pub struct IndexEntry {
 
 /// A row of the `tracks` table.
 ///
-/// The column `has_lyrics` has no field. The server has no lyrics
-/// (`docs/design.md` section 4), and no statement reads or writes the
-/// column. A row that is inserted holds the default of the schema, which
-/// is 0.
-///
-/// The columns `title_lc` and `album_artist_name` have no field either:
-/// statements compare them, and no caller reads them.
+/// The columns `title_lc` and `album_artist_name` have no field: statements
+/// compare them, and no caller reads them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
     pub id: String,

@@ -258,12 +258,12 @@ async fn remove_file(server: &TestServer, id: &str) {
         .expect("give the track a placeholder path");
 }
 
-/// The time of the clock in Unix seconds.
-fn unix_now() -> i64 {
+/// The time of the clock in Unix milliseconds.
+fn unix_now_ms() -> i64 {
     let elapsed = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("the clock is after 1970");
-    i64::try_from(elapsed.as_secs()).expect("the time fits")
+    i64::try_from(elapsed.as_millis()).expect("the time fits")
 }
 
 /// The three artists of the standard library with the names of their
@@ -285,7 +285,7 @@ async fn get_indexes_returns_the_artists_of_the_library_in_their_indexes() {
     let server = TestServer::standard().await;
     let rows = scan_rows(&server).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
-    let last_modified = rows[0].finished_at.expect("the scan has ended") * 1000;
+    let last_modified = rows[0].finished_at.expect("the scan has ended");
 
     let index: Vec<Value> = standard_artists(&server)
         .iter()
@@ -540,18 +540,20 @@ async fn get_indexes_with_a_parameter_that_is_no_integer_is_error_0() {
 
 #[tokio::test]
 async fn last_modified_is_the_end_time_of_the_scan_in_milliseconds() {
-    let before = unix_now();
+    let before = unix_now_ms();
     let server = TestServer::standard().await;
-    let after = unix_now();
+    let after = unix_now_ms();
 
     let rows = scan_rows(&server).await;
     assert_eq!(rows.len(), 1, "{rows:?}");
+    assert!(rows[0].changed_library, "{rows:?}");
     let finished_at = rows[0].finished_at.expect("the scan has ended");
-    assert!((before..=after).contains(&finished_at), "{finished_at}");
 
+    // The value is the stored end time, which is the time of the clock in
+    // milliseconds.
     let value = last_modified(&server).await;
-    assert_eq!(value, finished_at * 1000);
-    // The value is a time in milliseconds: it has thirteen digits.
+    assert_eq!(value, finished_at);
+    assert!((before..=after).contains(&value), "{value}");
     assert_eq!(value.to_string().len(), 13, "{value}");
 
     // Requests do not change it.
@@ -658,8 +660,7 @@ async fn last_modified_changes_with_a_scan_that_changes_the_library_and_with_no_
     }
     assert_eq!(scan_rows(&server).await.len(), 3);
 
-    // A file of a new artist. The scans run in the same second in most runs
-    // of the test, and the time is greater all the same.
+    // A file of a new artist.
     let extra = LibraryBuilder::new()
         .track("Zeta Line", "Extra", "One", 1, "mp3")
         .build();
@@ -672,7 +673,11 @@ async fn last_modified_changes_with_a_scan_that_changes_the_library_and_with_no_
     assert!(second > first, "{second} {first}");
     let rows = scan_rows(&server).await;
     let finished_at = rows.last().and_then(|scan| scan.finished_at);
-    assert_eq!(Some(second / 1000), finished_at, "{rows:?}");
+    assert_eq!(Some(second), finished_at, "{rows:?}");
+    // The flag of each scan so far: the first scan and the scan that added
+    // the file changed the library, and the two scans between them did not.
+    let flags: Vec<bool> = rows.iter().map(|scan| scan.changed_library).collect();
+    assert_eq!(flags, [true, false, false, true]);
 
     // The client that holds the old time gets the artists with the new one.
     let answer = indexes(&server, &[("ifModifiedSince", &since(first))]).await;
@@ -697,9 +702,9 @@ async fn last_modified_changes_with_a_scan_that_changes_the_library_and_with_no_
     assert_eq!(changes(&server.rescan().await), (0, 0, 0, 0));
     assert_eq!(last_modified(&server).await, second);
 
-    // A cover image for an album that had none. The scan sets the cover and
-    // stores no change of a track. The artists are the same, and so is the
-    // time.
+    // A cover image for an album that had none. The scan stores no change
+    // of a track and writes the album row, so the time is greater, although
+    // the artists are the same.
     let paper_maps = server.album.paper_maps.as_str();
     let aurora_field = server.artist.aurora_field.as_str();
     let album = directory(&server, aurora_field).await["child"][1].clone();
@@ -713,7 +718,11 @@ async fn last_modified_changes_with_a_scan_that_changes_the_library_and_with_no_
     assert_eq!(changes(&server.rescan().await), (0, 0, 0, 0));
     let album = directory(&server, aurora_field).await["child"][1].clone();
     assert_eq!(album["coverArt"], paper_maps);
-    assert_eq!(last_modified(&server).await, second);
+    let with_cover = last_modified(&server).await;
+    assert!(with_cover > second, "{with_cover} {second}");
+    // The next scan finds the cover as it is stored and keeps the time.
+    assert_eq!(changes(&server.rescan().await), (0, 0, 0, 0));
+    assert_eq!(last_modified(&server).await, with_cover);
 
     // A file that moved.
     fs::rename(
@@ -723,14 +732,14 @@ async fn last_modified_changes_with_a_scan_that_changes_the_library_and_with_no_
     .expect("move the file");
     assert_eq!(changes(&server.rescan().await), (0, 0, 1, 0));
     let third = last_modified(&server).await;
-    assert!(third > second, "{third} {second}");
+    assert!(third > with_cover, "{third} {with_cover}");
 
     // The files of an artist are deleted.
     fs::remove_dir_all(server.path("Marlow Quartet")).expect("delete the directory");
     assert_eq!(changes(&server.rescan().await), (0, 0, 0, 2));
     let fourth = last_modified(&server).await;
     assert!(fourth > third, "{fourth} {third}");
-    for old in [first, second, third] {
+    for old in [first, second, with_cover, third] {
         let answer = indexes(&server, &[("ifModifiedSince", &since(old))]).await;
         assert_eq!(answer["lastModified"], fourth, "{old}");
         assert_eq!(
@@ -745,8 +754,37 @@ async fn last_modified_changes_with_a_scan_that_changes_the_library_and_with_no_
     );
 }
 
+/// Starts a scan in the `scans` table of `server` and returns its ID. The
+/// scan has no end time.
+async fn start_scan_row(server: &TestServer) -> i64 {
+    server
+        .db()
+        .write(|conn| scans::insert(conn))
+        .await
+        .expect("start a scan")
+}
+
+/// Ends the scan `id` in the `scans` table of `server`, with the flag
+/// `changed_library` and `error`.
+async fn end_scan_row(server: &TestServer, id: i64, changed_library: bool, error: Option<&str>) {
+    let error = error.map(str::to_owned);
+    server
+        .db()
+        .write(move |conn| {
+            scans::finish(
+                conn,
+                id,
+                &ScanCounts::default(),
+                changed_library,
+                error.as_deref(),
+            )
+        })
+        .await
+        .expect("end the scan");
+}
+
 #[tokio::test]
-async fn a_scan_without_an_end_time_and_a_scan_with_an_error_return_the_artists() {
+async fn a_scan_without_an_end_time_returns_the_artists_and_the_flag_of_a_scan_decides_the_time() {
     let server = TestServer::standard().await;
     let all = indexes(&server, &[]).await;
     let last = all["lastModified"].as_i64().expect("a time");
@@ -757,49 +795,121 @@ async fn a_scan_without_an_end_time_and_a_scan_with_an_error_return_the_artists(
 
     // A scan runs. It can have stored changes, so the answer holds the
     // artists. The time is still the one of the scan that ended.
-    let running = server
-        .db()
-        .write(|conn| scans::insert(conn))
-        .await
-        .expect("start a scan");
+    let running = start_scan_row(&server).await;
     assert_eq!(indexes(&server, &since).await, all);
 
-    // The scan ends without a change and without an error: the time stays.
-    let end = |id: i64, error: Option<&'static str>| {
-        let db = server.db().clone();
-        async move {
-            db.write(move |conn| scans::finish(conn, id, &ScanCounts::default(), error))
-                .await
-                .expect("end the scan");
-        }
-    };
-    end(running, None).await;
+    // The scan ends without a change of the library: the time stays.
+    end_scan_row(&server, running, false, None).await;
     assert_eq!(indexes(&server, &since).await, unchanged);
 
-    // A cancelled scan keeps what it stored, so its end is a new time. It
-    // is greater than the old one, also in the same second.
-    let cancelled = server
-        .db()
-        .write(|conn| scans::insert(conn))
-        .await
-        .expect("start a scan");
-    end(cancelled, Some("cancelled")).await;
+    // An error does not move the time. A cancelled scan that stored
+    // nothing, and a scan that could not read a path and stored nothing,
+    // changed nothing.
+    for error in ["cancelled", "music folder \"/music\" cannot be read"] {
+        let id = start_scan_row(&server).await;
+        end_scan_row(&server, id, false, Some(error)).await;
+        assert_eq!(indexes(&server, &since).await, unchanged, "{error}");
+    }
+
+    // A cancelled scan that stored a batch changed the library. Its end is
+    // a new time, and the client gets the artists with it.
+    let cancelled = start_scan_row(&server).await;
+    end_scan_row(&server, cancelled, true, Some("cancelled")).await;
     let after_cancel = last_modified(&server).await;
     assert!(after_cancel > last, "{after_cancel} {last}");
     let answer = indexes(&server, &since).await;
     assert_eq!(answer["index"], all["index"]);
     assert_eq!(answer["lastModified"], after_cancel);
 
-    // The scan after it completes what the cancelled scan left, so it
-    // counts without a change of a track.
-    let next = server
+    // The scan after it changes nothing and keeps the time.
+    let next = start_scan_row(&server).await;
+    end_scan_row(&server, next, false, None).await;
+    assert_eq!(last_modified(&server).await, after_cancel);
+}
+
+#[tokio::test]
+async fn two_scans_that_end_within_one_millisecond_have_two_times_in_their_order() {
+    let server = TestServer::standard().await;
+    let unchanged =
+        |last: i64| json!({ "ignoredArticles": IGNORED_ARTICLES, "lastModified": last });
+
+    // Two scans that change the library end in one write, the second one
+    // directly after the first: within one millisecond of the clock in most
+    // of the rounds.
+    for round in 0..20 {
+        let before = last_modified(&server).await;
+        let (first, second) = server
+            .db()
+            .write(|conn| {
+                let counts = ScanCounts::default();
+                let first = scans::insert(conn)?;
+                scans::finish(conn, first, &counts, true, None)?;
+                let second = scans::insert(conn)?;
+                scans::finish(conn, second, &counts, true, None)?;
+                Ok((first, second))
+            })
+            .await
+            .expect("write the scans");
+        let rows = scan_rows(&server).await;
+        let end_of = |id: i64| {
+            let row = rows.iter().find(|scan| scan.id == id).expect("a scan row");
+            row.finished_at.expect("the scan has ended")
+        };
+        let (first, second) = (end_of(first), end_of(second));
+        assert!(
+            before < first && first < second,
+            "{round}: {before} {first} {second}"
+        );
+
+        // The time is the end of the second scan. A client that holds the
+        // time of the first one gets the artists, and a client that holds
+        // the time of the second one does not.
+        assert_eq!(last_modified(&server).await, second, "{round}");
+        let answer = indexes(&server, &[("ifModifiedSince", &first.to_string())]).await;
+        assert_eq!(answer["lastModified"], second, "{round}");
+        assert_eq!(index_names(&answer).len(), 3, "{round}: {answer}");
+        assert_eq!(
+            indexes(&server, &[("ifModifiedSince", &second.to_string())]).await,
+            unchanged(second),
+            "{round}"
+        );
+    }
+
+    // The end time of a scan is after the one of the scan before it, also
+    // when the clock is not: the last scan ended one hour ahead of the clock.
+    let ahead = unix_now_ms() + 3_600_000;
+    server
         .db()
-        .write(|conn| scans::insert(conn))
+        .write(move |conn| {
+            conn.execute(
+                "UPDATE scans SET finished_at = ?1 WHERE id = (SELECT max(id) FROM scans)",
+                params![ahead],
+            )?;
+            Ok(())
+        })
         .await
-        .expect("start a scan");
-    end(next, None).await;
-    let after_next = last_modified(&server).await;
-    assert!(after_next > after_cancel, "{after_next} {after_cancel}");
+        .expect("set the end time");
+    assert_eq!(last_modified(&server).await, ahead);
+    for expected in [ahead + 1, ahead + 2] {
+        let id = start_scan_row(&server).await;
+        end_scan_row(&server, id, true, None).await;
+        assert_eq!(last_modified(&server).await, expected);
+    }
+    // A scan that changed nothing keeps the time and takes the next end
+    // time, and the scan after it that changed the library has the one
+    // after that.
+    let id = start_scan_row(&server).await;
+    end_scan_row(&server, id, false, None).await;
+    assert_eq!(last_modified(&server).await, ahead + 2);
+    let id = start_scan_row(&server).await;
+    end_scan_row(&server, id, true, None).await;
+    assert_eq!(last_modified(&server).await, ahead + 4);
+
+    // The stored end times are in the order of the scans.
+    let rows = scan_rows(&server).await;
+    let ends: Vec<i64> = rows.iter().filter_map(|scan| scan.finished_at).collect();
+    assert_eq!(ends.len(), rows.len());
+    assert!(ends.windows(2).all(|pair| pair[0] < pair[1]), "{ends:?}");
 }
 
 #[tokio::test]

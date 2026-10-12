@@ -289,23 +289,6 @@ pub fn file_path(conn: &Connection, track: &Track) -> Result<Option<PathBuf>> {
     }))
 }
 
-/// Returns the end time of the scan that finished last, in Unix seconds, or
-/// `None` when no scan has finished.
-///
-/// A scan that runs has no end time and does not count. A cancelled scan has
-/// one and counts, because it keeps the changes it stored.
-/// `scans::last_finished` returns the same time as ISO 8601 text.
-///
-/// The time changes with every scan, also with one that found nothing
-/// changed. `lastModified` of `getIndexes` is `indexes::last_modified`,
-/// which does not.
-pub fn last_scan_finished_at(conn: &Connection) -> Result<Option<i64>> {
-    let finished_at = conn
-        .prepare_cached("SELECT max(finished_at) FROM scans")?
-        .query_row([], |row| row.get(0))?;
-    Ok(finished_at)
-}
-
 /// Runs `sql`, whose one parameter is a JSON array of IDs, with `ids` and
 /// reads every row with `read`.
 ///
@@ -417,7 +400,6 @@ mod tests {
 
     use super::*;
     use crate::db::Db;
-    use crate::db::queries::scans::{self, ScanCounts};
     use crate::db::queries::tracks::TrackContent;
     use crate::db::queries::{albums, artists, folders as folder_rows};
     use crate::library::tags::TrackMeta;
@@ -1077,38 +1059,6 @@ mod tests {
         let paths: Vec<&Path> = rows.iter().map(|folder| folder.path.as_path()).collect();
         assert_eq!(paths, [Path::new("/music"), Path::new("/other")]);
         assert!(rows[0].id < rows[1].id);
-    }
-
-    #[test]
-    fn last_scan_finished_at_is_the_end_of_the_latest_scan_that_finished() {
-        let db = Db::open_memory().unwrap();
-        let read = |db: &Db| db.with_reader(last_scan_finished_at).unwrap();
-        assert_eq!(read(&db), None);
-
-        // A scan that runs has no end time.
-        let first = db.with_writer(|conn| scans::insert(conn)).unwrap();
-        assert_eq!(read(&db), None);
-
-        let finish = |db: &Db, id: i64, finished_at: i64, error: Option<&str>| {
-            db.with_writer(|conn| {
-                scans::finish(conn, id, &ScanCounts::default(), error)?;
-                conn.execute(
-                    "UPDATE scans SET finished_at = ?2 WHERE id = ?1",
-                    [id, finished_at],
-                )?;
-                Ok(())
-            })
-            .unwrap();
-        };
-        finish(&db, first, 1_000, None);
-        assert_eq!(read(&db), Some(1_000));
-
-        // A later scan that runs does not hide the scan that finished.
-        let second = db.with_writer(|conn| scans::insert(conn)).unwrap();
-        assert_eq!(read(&db), Some(1_000));
-        // A cancelled scan has an end time and counts.
-        finish(&db, second, 2_000, Some("cancelled"));
-        assert_eq!(read(&db), Some(2_000));
     }
 
     #[test]
