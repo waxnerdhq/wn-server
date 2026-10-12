@@ -59,7 +59,7 @@
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 
-use super::browse::json_array;
+use super::browse::{json_array, tracks_exist};
 use super::int;
 use crate::db::Result;
 
@@ -302,19 +302,6 @@ fn stored_entries(conn: &Connection, user_id: i64) -> Result<Vec<(i64, String)>>
         .query_map([user_id], |row| Ok((row.get(0)?, row.get(1)?)))?
         .collect::<rusqlite::Result<_>>()?;
     Ok(entries)
-}
-
-/// Whether every ID of `track_ids` is the ID of a track row. A track without
-/// a file has a row (`docs/design.md` section 3.4).
-fn tracks_exist<S: AsRef<str>>(conn: &Connection, track_ids: &[S]) -> Result<bool> {
-    let exist = conn
-        .prepare_cached(
-            "SELECT NOT EXISTS (
-               SELECT 1 FROM json_each(?1)
-               WHERE NOT EXISTS (SELECT 1 FROM tracks WHERE tracks.id = json_each.value))",
-        )?
-        .query_row([json_array(track_ids)], |row| row.get(0))?;
-    Ok(exist)
 }
 
 /// Stores the `play_queue` row of the user `user_id`: it inserts the row, or

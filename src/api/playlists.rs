@@ -33,7 +33,6 @@
 //! song, without `path` (`docs/design.md` section 3.4).
 
 use std::collections::HashMap;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use axum::extract::State;
 use rusqlite::Connection;
@@ -400,31 +399,24 @@ fn element(
     }
 }
 
-/// Runs `read` with a read connection of `db` inside one read transaction,
-/// so every statement of an answer reads one state of the database. A
-/// database that cannot be read is error 0.
+/// Runs `read` with a read connection of `db` inside one read transaction
+/// ([`Db::read_snapshot`]), so every statement of an answer reads one state
+/// of the database. A database that cannot be read is error 0.
 async fn read<T, F>(db: &Db, read: F) -> Result<T, ApiError>
 where
     F: FnOnce(&Connection) -> db::Result<T> + Send + 'static,
     T: Send + 'static,
 {
-    db.read(move |conn| {
-        // The transaction is deferred: its first statement fixes the state
-        // that the later ones read. It writes nothing, so dropping it ends
-        // it without an effect on the database.
-        let snapshot = conn.unchecked_transaction()?;
-        read(&snapshot)
-    })
-    .await
-    .map_err(|error| {
+    db.read_snapshot(read).await.map_err(|error| {
         tracing::error!(%error, "cannot read the playlists");
         ApiError::Other("the server cannot read its playlists".to_owned())
     })
 }
 
 /// Runs `write` with the write connection of `db` and the time of the write
-/// in Unix seconds. A request that the queries refused is answered with the
-/// error of [`refused`], and a database that cannot be written with error 0.
+/// in Unix seconds ([`Db::write_at`]). A request that the queries refused is
+/// answered with the error of [`refused`], and a database that cannot be
+/// written with error 0.
 ///
 /// The time is read once the write connection is held. While the clock runs
 /// forward, the request that writes later therefore does not store the
@@ -434,22 +426,13 @@ where
     F: FnOnce(&mut Connection, i64) -> db::Result<Outcome<T>> + Send + 'static,
     T: Send + 'static,
 {
-    db.write(move |conn| write(conn, unix_now()))
+    db.write_at(write)
         .await
         .map_err(|error| {
             tracing::error!(%error, "cannot write the playlist");
             ApiError::Other("the server cannot store the playlist".to_owned())
         })?
         .map_err(refused)
-}
-
-/// The time now in whole Unix seconds.
-fn unix_now() -> i64 {
-    match SystemTime::now().duration_since(UNIX_EPOCH) {
-        Ok(after) => i64::try_from(after.as_secs()).unwrap_or(i64::MAX),
-        // The clock is set to a time before 1970.
-        Err(error) => i64::try_from(error.duration().as_secs()).map_or(i64::MIN, |before| -before),
-    }
 }
 
 #[cfg(test)]

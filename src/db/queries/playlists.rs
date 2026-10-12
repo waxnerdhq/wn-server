@@ -39,7 +39,7 @@ use std::collections::HashSet;
 
 use rusqlite::{Connection, OptionalExtension, Row, TransactionBehavior, params};
 
-use super::browse::json_array;
+use super::browse::{json_array, tracks_exist};
 use super::int;
 use crate::db::Result;
 use crate::ids::{self, Kind};
@@ -372,22 +372,6 @@ fn owns(conn: &Connection, user_id: i64, id: &str) -> Result<bool> {
         .prepare_cached("SELECT EXISTS (SELECT 1 FROM playlists WHERE id = ?1 AND owner_id = ?2)")?
         .query_row(params![id, user_id], |row| row.get(0))?;
     Ok(owns)
-}
-
-/// Whether every ID of `track_ids` is the ID of a track row. A track without
-/// a file has a row (`docs/design.md` section 3.4).
-fn tracks_exist<S: AsRef<str>>(conn: &Connection, track_ids: &[S]) -> Result<bool> {
-    if track_ids.is_empty() {
-        return Ok(true);
-    }
-    let exist = conn
-        .prepare_cached(
-            "SELECT NOT EXISTS (
-               SELECT 1 FROM json_each(?1)
-               WHERE NOT EXISTS (SELECT 1 FROM tracks WHERE tracks.id = json_each.value))",
-        )?
-        .query_row([json_array(track_ids)], |row| row.get(0))?;
-    Ok(exist)
 }
 
 /// Returns the stored position and the track ID of each entry of the

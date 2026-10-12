@@ -27,7 +27,8 @@
 //! them by ID. The module of a group of API methods (`lists`, `search`,
 //! `playlists`, `play_queue`) selects IDs with its own SQL and
 //! reads the rows through `browse`, so it adds no function to another
-//! module. `indexes` is the module of the folder methods. They read their
+//! module. What several of these modules need is in `browse` and visible to
+//! the query modules only: `json_array` and `tracks_exist`. `indexes` is the module of the folder methods. They read their
 //! rows through `browse`, and the module holds what `browse` does not have:
 //! the time of the last change of the artists and whether a scan has no end
 //! time. It reads both from the `scans` table.

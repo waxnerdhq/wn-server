@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, PoisonError};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use rusqlite::{Connection, ErrorCode, InterruptHandle, OpenFlags, TransactionBehavior};
 use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard};
@@ -263,6 +263,38 @@ impl Db {
         run_blocking(move || f(&mut connection)).await
     }
 
+    /// Runs `f` as [`Db::read`] does, inside one read transaction, so every
+    /// statement of `f` reads one state of the database. The handler of a
+    /// method whose answer takes several statements reads with it.
+    pub async fn read_snapshot<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&Connection) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.read(move |conn| {
+            // The transaction is deferred: its first statement fixes the state
+            // that the later ones read. It writes nothing, so dropping it ends
+            // it without an effect on the database.
+            let snapshot = conn.unchecked_transaction()?;
+            f(&snapshot)
+        })
+        .await
+    }
+
+    /// Runs `f` as [`Db::write`] does, with the time of the write in whole
+    /// Unix seconds as its second argument.
+    ///
+    /// The time is read once the write connection is held. While the clock
+    /// runs forward, the write that runs later therefore does not get the
+    /// earlier time.
+    pub async fn write_at<T, F>(&self, f: F) -> Result<T>
+    where
+        F: FnOnce(&mut Connection, i64) -> Result<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        self.write(move |conn| f(conn, unix_now())).await
+    }
+
     /// Runs `f` with a read connection on the calling thread and blocks the
     /// thread while it waits for the connection. The read has no time limit:
     /// the commands of the CLI use this method, and no request does.
@@ -340,6 +372,15 @@ impl Db {
             }
         }
         readers[start].blocking_lock()
+    }
+}
+
+/// The time now in whole Unix seconds.
+fn unix_now() -> i64 {
+    match SystemTime::now().duration_since(UNIX_EPOCH) {
+        Ok(after) => i64::try_from(after.as_secs()).unwrap_or(i64::MAX),
+        // The clock is set to a time before 1970.
+        Err(error) => i64::try_from(error.duration().as_secs()).map_or(i64::MIN, |before| -before),
     }
 }
 
