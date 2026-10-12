@@ -245,6 +245,8 @@ impl ScanController {
     /// A time at which a scan runs, in this process or in another, starts no
     /// scan and queues none. The next scan starts one interval later.
     ///
+    /// The server calls this once. A second call starts a second task.
+    ///
     /// # Panics
     ///
     /// Panics when called outside a Tokio runtime.
@@ -294,9 +296,9 @@ async fn join(task: Option<JoinHandle<()>>, what: &str) {
 }
 
 /// The scan that a [`ScanController`] runs. Dropping the value releases the
-/// scan lock and then marks the controller as idle. That is the order in
-/// which the next `start` of the controller takes them back, so it never
-/// finds the lock of its own controller held.
+/// scan lock and then marks the controller as idle. A `start` that finds the
+/// controller idle therefore never finds the lock held by a scan of its own
+/// controller.
 struct Running {
     inner: Arc<Inner>,
     lock: Option<ScanLock>,

@@ -1527,9 +1527,10 @@ fn scan_of_the_standard_library_prints_10_seen_and_exits_0() {
         stderr(&output)
     );
 
-    // The command moved the write-ahead log into the database file.
-    let log = fs::metadata(dir.path().join("library.db-wal")).expect("the log file");
-    assert_eq!(log.len(), 0);
+    // The command moved the write-ahead log into the database file. The log
+    // file is empty, or SQLite has removed it.
+    let log = fs::metadata(dir.path().join("library.db-wal"));
+    assert_eq!(log.map_or(0, |log| log.len()), 0);
 
     // The scan stored the folder and the tracks, and its row is closed.
     let rows = folder_rows(dir.path());
