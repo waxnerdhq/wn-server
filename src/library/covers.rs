@@ -1021,20 +1021,24 @@ fn decode_limits() -> Limits {
 /// do not bound.
 ///
 /// The orientation is the one of the Exif metadata of a JPEG
-/// ([`ImageDecoder::orientation`]). It is [`Orientation::NoTransforms`] for
-/// a JPEG without Exif metadata, for metadata without an orientation, for a
-/// value that is none of the eight orientations, and for metadata that is
+/// ([`ImageDecoder::orientation`]): the value of the first entry of the
+/// first image directory that has the tag of the orientation and holds a
+/// single 16-bit number. An entry with the tag that has another format or
+/// another count is passed over, as an entry with another tag is. The
+/// orientation is [`Orientation::NoTransforms`] for a JPEG without Exif
+/// metadata, for a directory without such an entry, for a value of that
+/// entry that is none of the eight orientations, and for metadata that is
 /// cut short or that cannot be read. It is the same for a PNG, whose
 /// orientation is not read, and for a WebP, which holds no metadata in the
 /// simple file form.
 ///
 /// To read the orientation, the JPEG decoder parses the header of the image
 /// once more and copies the metadata segments as every parse of the header
-/// does (`docs/design.md` section 3.11). The copies are freed before the
-/// pixels are allocated. The Exif segment holds 64 KiB at most, and the
-/// orientation is read from it without an allocation: the reader takes the
-/// 12 bytes of each entry of the first image directory in turn, and it stops
-/// at the orientation or at the end of the segment.
+/// does (`docs/design.md` section 3.11). It then copies the Exif segment,
+/// which holds 64 KiB at most, a second time. The copies are freed before
+/// the pixels are allocated. The read of that copy allocates nothing: the
+/// reader takes the 12 bytes of each entry of the directory in turn, and it
+/// stops at the entry of the orientation or at the end of the segment.
 fn decode(bytes: &[u8], mut limits: Limits) -> Result<(DynamicImage, Orientation), ImageRefusal> {
     let mut reader = guessed(bytes)?;
     let jpeg = match reader.format() {
@@ -2010,6 +2014,23 @@ mod tests {
             assert_eq!(resized(with_exif(&plain, &exif), 80), as_stored, "{case}");
         }
         assert!(start.elapsed() < Duration::from_secs(1));
+
+        // A directory with two entries, each the 12 bytes of an entry of
+        // `exif_entry`. The reader passes over an entry with the tag that is
+        // no single 16-bit number, and the next entry decides. A value that
+        // is none of the eight ends the read.
+        let two_entries = |first: &[u8], second: &[u8]| {
+            let mut data = valid[..8].to_vec();
+            data.extend([2, 0]);
+            data.extend(&first[10..22]);
+            data.extend(&second[10..22]);
+            data.extend([0; 4]);
+            with_exif(&plain, &data)
+        };
+        let long = exif_entry(false, ORIENTATION_TAG, 4, 1, 3);
+        assert_eq!(resized(two_entries(&long, &valid), 80), turned);
+        let none_of_eight = exif_orientation(9);
+        assert_eq!(resized(two_entries(&none_of_eight, &valid), 80), as_stored);
 
         // A segment that declares fewer bytes than it holds. The length
         // counts its own two bytes and the six bytes of `Exif` and the
