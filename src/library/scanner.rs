@@ -12,6 +12,12 @@
 //! could not be read may hold any file, and a file whose content could not
 //! be read may be any file of its size.
 //!
+//! When the scanner finds that the file at the path of a row is the file of
+//! another track or a new file, the row leaves the path. It follows its own
+//! file, or it is deleted. When the scanner can do neither in this scan, the
+//! row is kept without a file, at a placeholder path, so that its ID does
+//! not name the other file.
+//!
 //! [`scan`] blocks its thread on file and database work. Files are read
 //! outside the write transactions.
 
@@ -83,11 +89,12 @@ pub struct ScanSummary {
     pub removed: u64,
     /// The calls of the tag reader, the failed ones included.
     pub tags_read: u64,
-    /// One message for each problem that kept the scan from deleting
-    /// tracks: a folder, a path or a file that cannot be read, a folder
-    /// that had tracks and has no supported file, and a removed folder
-    /// whose tracks were kept. A cancelled scan has [`CANCELLED`] as its
-    /// last message.
+    /// One message for each problem that kept the scan from finishing its
+    /// work: a folder, a path or a file that cannot be read, the number of
+    /// tracks that were kept for that reason, a folder that had tracks and
+    /// has no supported file, a removed folder whose tracks were kept, and a
+    /// track that is kept without a file. A cancelled scan has
+    /// [`CANCELLED`] as its last message.
     pub errors: Vec<String>,
 }
 
@@ -248,16 +255,6 @@ enum Outcome {
     Cancelled,
 }
 
-/// The two kinds of batch.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Batch {
-    /// The changes that vacate or take the path of a displaced row. They
-    /// are one transaction whatever their number.
-    Exchange,
-    /// At most `batch_size` changes that depend on no other change.
-    Ordinary,
-}
-
 /// What the walk and the fingerprints say about one row of the index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RowState {
@@ -379,26 +376,37 @@ enum Op {
     },
     /// The row is deleted because another track takes its path.
     Delete { row: usize },
+    /// Another track takes the path of the row, and the row is not deleted,
+    /// because a path or a file that the scan could not read may hold its
+    /// file. The row gets its placeholder path and has no file until a scan
+    /// finds its file or deletes the row.
+    Detach { row: usize },
 }
 
 /// The changes of one scan.
 #[derive(Debug, Default, PartialEq, Eq)]
 struct Plan {
     /// The changes that vacate or take the path of a displaced row. They
-    /// are stored in one transaction, or not at all.
+    /// are stored in one transaction whatever their number, because one
+    /// row takes the path that another row leaves.
     exchange: Vec<Op>,
     /// The other changes. They are stored after `exchange`, in batches.
     rest: Vec<Op>,
     /// The rows whose file is gone and that no candidate matches.
     unmatched: Vec<usize>,
-    /// The number of files whose changes wait for the next scan.
-    postponed: u64,
 }
 
 /// A change with everything that was read for it from the file.
 enum Write<'a> {
     Delete {
         id: &'a str,
+    },
+    /// The row gets its placeholder path and keeps every other value.
+    Detach {
+        id: &'a str,
+        folder_id: i64,
+        mtime: i64,
+        size: u64,
     },
     Relink {
         id: &'a str,
@@ -422,6 +430,18 @@ enum Write<'a> {
         fingerprint: String,
         meta: TrackMeta,
     },
+}
+
+impl<'a> Write<'a> {
+    /// Returns the change that gives the row `known` its placeholder path.
+    fn detach(known: &'a IndexEntry) -> Self {
+        Write::Detach {
+            id: &known.id,
+            folder_id: known.folder_id,
+            mtime: known.mtime,
+            size: known.size,
+        }
+    }
 }
 
 /// The state of one scan.
@@ -500,14 +520,12 @@ impl Scanner<'_> {
             exchange,
             rest,
             unmatched,
-            postponed,
         } = plan;
-        self.advance(postponed);
         if !exchange.is_empty() {
             if self.cancel.is_cancelled() {
                 return Ok(Outcome::Cancelled);
             }
-            self.apply(index, &states, exchange, Batch::Exchange)?;
+            self.apply(index, &states, exchange)?;
         }
         let batch_size = self.options.batch_size.max(1);
         let mut rest = rest.into_iter();
@@ -519,7 +537,7 @@ impl Scanner<'_> {
             if self.cancel.is_cancelled() {
                 return Ok(Outcome::Cancelled);
             }
-            self.apply(index, &states, batch, Batch::Ordinary)?;
+            self.apply(index, &states, batch)?;
         }
         if self.cancel.is_cancelled() {
             return Ok(Outcome::Cancelled);
@@ -567,7 +585,10 @@ impl Scanner<'_> {
                 }
                 continue;
             }
-            if is_hidden(entry.file_name()) {
+            let name = entry.file_name();
+            if is_hidden(name) || (is_dir && is_system_directory(name)) {
+                // The walk has opened the directory. Leaving it here also
+                // drops the error of a directory that cannot be listed.
                 if is_dir {
                     entries.skip_current_dir();
                 }
@@ -643,7 +664,10 @@ impl Scanner<'_> {
             ));
             return;
         };
-        if relative.file_name().is_some_and(is_hidden) {
+        // The walk skips these names, so an entry with one of them that
+        // cannot be read is no unread path.
+        let skipped = |name: &OsStr| is_hidden(name) || is_system_directory(name);
+        if relative.file_name().is_some_and(skipped) {
             return;
         }
         match rel_path(relative) {
@@ -726,24 +750,30 @@ impl Scanner<'_> {
     /// Reads what the changes of one batch need from the files, stores the
     /// changes in one transaction and runs the batch hook.
     ///
-    /// A change whose file cannot be read is left out, and the next scan
+    /// A change whose tags cannot be read is left out, and the next scan
     /// finds it again: a new file gets no row, a changed file leaves its row
-    /// as it is, and a moved file leaves its row at the old path. The changes
-    /// of [`Batch::Exchange`] depend on each other, so a moved file that
-    /// cannot be read leaves out the whole batch.
-    fn apply(
-        &mut self,
-        index: &[IndexEntry],
-        states: &[RowState],
-        batch: Vec<Op>,
-        kind: Batch,
-    ) -> Result<()> {
+    /// as it is, and a moved file does not get its row. The row of the moved
+    /// file stays at its old path when no file is there. When another file
+    /// is there, which is the case for a displaced row, the row gets its
+    /// placeholder path and the scan records an error.
+    fn apply(&mut self, index: &[IndexEntry], states: &[RowState], batch: Vec<Op>) -> Result<()> {
         let mut writes = Vec::with_capacity(batch.len());
         let mut files = 0;
-        let mut complete = true;
+        // The messages about the rows that get their placeholder path.
+        let mut detached = Vec::new();
         for op in batch {
             match op {
                 Op::Delete { row } => writes.push(Write::Delete { id: &index[row].id }),
+                Op::Detach { row } => {
+                    let known = &index[row];
+                    detached.push(format!(
+                        "track {} at \"{}\" has no file until a scan finds it: another track \
+                         took its path, and a path or a file that could not be read may hold its \
+                         file",
+                        known.id, known.rel_path
+                    ));
+                    writes.push(Write::detach(known));
+                }
                 Op::Update {
                     row,
                     file,
@@ -764,7 +794,17 @@ impl Scanner<'_> {
                     let known = &index[row];
                     let meta = if reread { self.read_tags(&file) } else { None };
                     if reread && meta.is_none() {
-                        complete = false;
+                        // The row does not move in this scan. A displaced
+                        // row leaves its path all the same, because another
+                        // file is there.
+                        if states[row] == RowState::Displaced {
+                            detached.push(format!(
+                                "track {} at \"{}\" has no file until a scan reads the tags of \
+                                 its file at \"{}\": another file is at its path",
+                                known.id, known.rel_path, file.rel_path
+                            ));
+                            writes.push(Write::detach(known));
+                        }
                         continue;
                     }
                     writes.push(Write::Relink {
@@ -791,14 +831,6 @@ impl Scanner<'_> {
                 }
             }
         }
-        if kind == Batch::Exchange && !complete {
-            tracing::warn!(
-                "the tags of a moved file cannot be read; the files that exchange paths with it \
-                 wait for the next scan"
-            );
-            self.advance(files);
-            return Ok(());
-        }
 
         let counts = self.db.with_writer(|conn| store(conn, &writes))?;
         self.summary.added += counts.added;
@@ -806,6 +838,9 @@ impl Scanner<'_> {
         self.summary.moved += counts.moved;
         self.summary.removed += counts.removed;
         self.advance(files);
+        for message in detached {
+            self.problem(message);
+        }
         if let Some(on_batch) = &self.options.on_batch {
             on_batch();
         }
@@ -831,33 +866,50 @@ impl Scanner<'_> {
         let all_hold_files =
             !self.folders.is_empty() && walks.values().all(FolderWalk::holds_files);
         let mut deleted_ids: Vec<&str> = Vec::new();
-        let mut kept: HashSet<i64> = HashSet::new();
+        // The rows in configured folders that an unread path or file keeps.
+        let mut held_back: u64 = 0;
+        // The rows that stay in each folder that is no longer configured.
+        let mut kept: HashMap<i64, u64> = HashMap::new();
         for &row in unmatched {
             let entry = &index[row];
-            let delete = !self.unread.may_be(entry)
-                && match walks.get(&entry.folder_id) {
-                    Some(walk) => walk.supported > 0,
-                    None => all_hold_files,
-                };
-            if delete {
-                deleted_ids.push(&entry.id);
-            } else {
-                kept.insert(entry.folder_id);
+            let may_be_unread = self.unread.may_be(entry);
+            match walks.get(&entry.folder_id) {
+                Some(_) if may_be_unread => held_back += 1,
+                Some(walk) if walk.supported > 0 => deleted_ids.push(&entry.id),
+                // The folder had tracks and holds no supported file. The
+                // walk recorded the error.
+                Some(_) => {}
+                None if !may_be_unread && all_hold_files => deleted_ids.push(&entry.id),
+                None => *kept.entry(entry.folder_id).or_default() += 1,
             }
+        }
+        if held_back > 0 {
+            let kept = if held_back == 1 {
+                "1 track whose file is gone was kept".to_owned()
+            } else {
+                format!("{held_back} tracks whose files are gone were kept")
+            };
+            self.problem(format!(
+                "{kept}, because a path or a file could not be read"
+            ));
         }
         let reason = if self.folders.is_empty() {
             "no music folder is configured"
         } else {
             "a configured music folder could not be read in full or has no supported file"
         };
-        for folder in unconfigured
-            .iter()
-            .filter(|folder| kept.contains(&folder.id))
-        {
-            self.problem(format!(
-                "the tracks of the removed music folder {} were kept, because {reason}",
-                describe(folder)
-            ));
+        for folder in unconfigured {
+            if let Some(&count) = kept.get(&folder.id) {
+                let (tracks, were) = if count == 1 {
+                    ("1 track".to_owned(), "was")
+                } else {
+                    (format!("{count} tracks"), "were")
+                };
+                self.problem(format!(
+                    "{tracks} of the removed music folder {} {were} kept, because {reason}",
+                    describe(folder)
+                ));
+            }
         }
 
         let removed = self.db.with_writer(|conn| {
@@ -960,9 +1012,8 @@ fn is_gone(entry: &IndexEntry, state: RowState, walks: &HashMap<i64, FolderWalk>
 /// A displaced row without a match stays at its path and takes the content
 /// of the file there, unless another row chose that file. That is the case
 /// of a file that was retagged in place. When another row chose the file,
-/// the displaced row is deleted, unless a file in `unread` may be its file.
-/// In that case every change of the exchange waits for the next scan,
-/// because the changes of the exchange depend on each other.
+/// the displaced row leaves its path: it is deleted, or it is kept without a
+/// file when a path or a file in `unread` may hold its file.
 fn plan(
     index: &[IndexEntry],
     states: &[RowState],
@@ -1016,9 +1067,13 @@ fn plan(
         let stays = displaces.filter(|&row| !matched[row]);
         match (chosen_by, stays) {
             (Some(row), stays) => {
-                // The row at the path of the file has no file any more.
+                // The row at the path of the file has no file there any more.
                 if let Some(replaced) = stays {
-                    plan.exchange.push(Op::Delete { row: replaced });
+                    plan.exchange.push(if unread.may_be(&index[replaced]) {
+                        Op::Detach { row: replaced }
+                    } else {
+                        Op::Delete { row: replaced }
+                    });
                 }
                 let known = &index[row];
                 let reread = known.mtime != file.mtime
@@ -1050,20 +1105,6 @@ fn plan(
             }
         }
     }
-
-    let keeps_a_row = plan
-        .exchange
-        .iter()
-        .any(|op| matches!(op, Op::Delete { row } if unread.may_be(&index[*row])));
-    if keeps_a_row {
-        let files = plan
-            .exchange
-            .iter()
-            .filter(|op| !matches!(op, Op::Delete { .. }))
-            .count();
-        plan.postponed = files as u64;
-        plan.exchange.clear();
-    }
     plan
 }
 
@@ -1083,10 +1124,11 @@ fn rank<'a>(missing: &IndexEntry, file: &'a FoundFile) -> (bool, usize, &'a str,
 /// Stores the changes of one batch in one transaction and returns what it
 /// changed.
 ///
-/// The deletions run first. Then every displaced row that moves is given a
-/// temporary path that no file can have. Then the rows are given their new
-/// paths. In this order two rows can exchange paths, although SQLite checks
-/// the unique index on the locator after every statement.
+/// The deletions run first. Then every displaced row that moves or that is
+/// kept without a file is given its placeholder path, which no file can
+/// have. Then the rows that move are given their new paths. In this order
+/// two rows can exchange paths, although SQLite checks the unique index on
+/// the locator after every statement.
 fn store(conn: &mut Connection, writes: &[Write<'_>]) -> Result<ScanCounts> {
     let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
     let mut counts = ScanCounts::default();
@@ -1100,22 +1142,31 @@ fn store(conn: &mut Connection, writes: &[Write<'_>]) -> Result<ScanCounts> {
         .collect();
     counts.removed = tracks::delete_tracks(&tx, &deleted)?;
     for write in writes {
-        if let Write::Relink {
-            id,
-            via_temporary: true,
-            file,
-            ..
-        } = write
-        {
-            // A relative path never starts with `/`.
-            let temporary = format!("/{id}");
-            tracks::relink_track(&tx, id, file.folder_id, &temporary, file.mtime, file.size)?;
+        match write {
+            Write::Detach {
+                id,
+                folder_id,
+                mtime,
+                size,
+            } => {
+                tracks::relink_track(&tx, id, *folder_id, &placeholder_path(id), *mtime, *size)?;
+            }
+            Write::Relink {
+                id,
+                via_temporary: true,
+                file,
+                ..
+            } => {
+                let (folder_id, mtime) = (file.folder_id, file.mtime);
+                tracks::relink_track(&tx, id, folder_id, &placeholder_path(id), mtime, file.size)?;
+            }
+            _ => {}
         }
     }
 
     for write in writes {
         match write {
-            Write::Delete { .. } => {}
+            Write::Delete { .. } | Write::Detach { .. } => {}
             Write::Relink {
                 id,
                 file,
@@ -1243,9 +1294,36 @@ fn join_components<'a>(components: impl IntoIterator<Item = Component<'a>>) -> O
     (!joined.is_empty()).then_some(joined)
 }
 
+/// Returns the path of the row `id` while the row has no file: a `/` and the
+/// ID. A relative path never starts with `/`, so no file has this path and
+/// no other row has it.
+fn placeholder_path(id: &str) -> String {
+    format!("/{id}")
+}
+
 /// Returns whether `name` starts with `.`. The scan skips such an entry.
 fn is_hidden(name: &OsStr) -> bool {
     name.as_encoded_bytes().first() == Some(&b'.')
+}
+
+/// The directories at the root of a volume that Windows keeps for itself.
+/// Their names are matched without regard to case.
+const WINDOWS_SYSTEM_DIRECTORIES: [&str; 2] = ["System Volume Information", "$RECYCLE.BIN"];
+
+/// The directory at the root of an ext file system that holds recovered
+/// files. Its name is matched in this spelling.
+const LOST_AND_FOUND: &str = "lost+found";
+
+/// Returns whether `name` is the name of a directory that the operating
+/// system keeps at the root of a volume. The scan skips such a directory:
+/// it holds no music, and the user of the server cannot list it.
+fn is_system_directory(name: &OsStr) -> bool {
+    name.to_str().is_some_and(|name| {
+        name == LOST_AND_FOUND
+            || WINDOWS_SYSTEM_DIRECTORIES
+                .iter()
+                .any(|system| system.eq_ignore_ascii_case(name))
+    })
 }
 
 /// Returns the name and the path of `folder` for a message.
@@ -1533,7 +1611,6 @@ mod tests {
                 exchange: Vec::new(),
                 rest: vec![insert("new/b.flac", "10:bb"), relink(0, "new/a.flac")],
                 unmatched: Vec::new(),
-                postponed: 0,
             }
         );
     }
@@ -1699,7 +1776,6 @@ mod tests {
                     fingerprint: "12:a2".to_owned(),
                 }],
                 unmatched: Vec::new(),
-                postponed: 0,
             }
         );
     }
@@ -1723,7 +1799,6 @@ mod tests {
                 exchange: vec![insert("p.flac", "10:cc"), relink(0, "q.flac")],
                 rest: Vec::new(),
                 unmatched: Vec::new(),
-                postponed: 0,
             }
         );
     }
@@ -1748,7 +1823,6 @@ mod tests {
                 exchange: vec![relink(1, "p.flac"), relink(0, "q.flac")],
                 rest: Vec::new(),
                 unmatched: Vec::new(),
-                postponed: 0,
             }
         );
     }
@@ -1772,7 +1846,6 @@ mod tests {
                 exchange: vec![Op::Delete { row: 0 }, relink(1, "p.flac")],
                 rest: Vec::new(),
                 unmatched: Vec::new(),
-                postponed: 0,
             }
         );
     }
@@ -1824,7 +1897,7 @@ mod tests {
     }
 
     #[test]
-    fn an_exchange_that_deletes_a_row_waits_while_an_unread_file_may_be_that_row() {
+    fn a_row_whose_path_is_taken_is_kept_without_a_file_while_an_unread_file_may_be_its_file() {
         // The file of B was moved over the file of A. A file of the size of
         // A could not be read, so the bytes of A may be in it.
         let index = [
@@ -1833,29 +1906,25 @@ mod tests {
         ];
         let states = [RowState::Displaced, RowState::Unseen];
         let candidates = || vec![candidate("p.flac", "10:bb", Some(0))];
-        let waits = Plan {
-            postponed: 1,
-            ..Plan::default()
-        };
+        let detaches = [Op::Detach { row: 0 }, relink(1, "p.flac")];
 
-        assert_eq!(
-            plan_with(&index, &states, candidates(), &unread_sizes(&[10])),
-            waits
-        );
+        let plan = plan_with(&index, &states, candidates(), &unread_sizes(&[10]));
+        assert_eq!(plan.exchange, detaches);
+        assert_eq!(plan.unmatched, [0usize; 0]);
         let paths = Unread {
             paths: true,
             sizes: HashSet::new(),
         };
-        assert_eq!(plan_with(&index, &states, candidates(), &paths), waits);
+        let plan = plan_with(&index, &states, candidates(), &paths);
+        assert_eq!(plan.exchange, detaches);
 
         // An unread file of another size cannot be the file of A.
         let plan = plan_with(&index, &states, candidates(), &unread_sizes(&[11]));
         assert_eq!(plan.exchange, [Op::Delete { row: 0 }, relink(1, "p.flac")]);
-        assert_eq!(plan.postponed, 0);
     }
 
     #[test]
-    fn an_exchange_without_a_deletion_does_not_wait_for_unread_files() {
+    fn an_exchange_of_two_paths_is_planned_the_same_while_a_file_is_unread() {
         let index = [
             entry("tr-a", 1, "p.flac", "10:aa"),
             entry("tr-b", 1, "q.flac", "10:bb"),
@@ -1870,7 +1939,29 @@ mod tests {
             &unread_sizes(&[10]),
         );
         assert_eq!(plan.exchange, [relink(1, "p.flac"), relink(0, "q.flac")]);
-        assert_eq!(plan.postponed, 0);
+    }
+
+    #[test]
+    fn the_directories_that_a_system_keeps_at_a_volume_root_are_named() {
+        for name in [
+            "System Volume Information",
+            "system volume information",
+            "$RECYCLE.BIN",
+            "$Recycle.Bin",
+            "lost+found",
+        ] {
+            assert!(is_system_directory(OsStr::new(name)), "{name}");
+        }
+        for name in ["Lost+Found", "lost+found 2", "RECYCLE.BIN", "Music", ""] {
+            assert!(!is_system_directory(OsStr::new(name)), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_placeholder_path_is_no_relative_path() {
+        let path = placeholder_path("tr-0123");
+        assert_eq!(path, "/tr-0123");
+        assert_eq!(rel_path(Path::new(&path)), None);
     }
 
     /// Returns a WAV file with `samples` samples of the value `fill`: mono,
@@ -2068,7 +2159,7 @@ mod tests {
         // The row is not deleted: the file that cannot be read has its size.
         assert_eq!(counts(&summary), (0, 0, 0, 0));
         assert_eq!(library.index(), before);
-        assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+        assert_eq!(summary.errors.len(), 2, "{:?}", summary.errors);
         let error = &summary.errors[0];
         assert!(error.contains("\"moved/a.wav\""), "{error}");
         assert!(
@@ -2079,8 +2170,12 @@ mod tests {
             error.contains("no track of 244 bytes was deleted"),
             "{error}"
         );
+        assert_eq!(
+            summary.errors[1],
+            "1 track whose file is gone was kept, because a path or a file could not be read"
+        );
         let scan = library.latest_scan();
-        assert_eq!(scan.error.as_ref(), Some(error));
+        assert_eq!(scan.error, Some(summary.errors.join("; ")));
 
         // The file can be read again and the row follows it.
         library.unreadable.borrow_mut().clear();
@@ -2111,8 +2206,9 @@ mod tests {
         assert_eq!(counts(&summary), (0, 0, 0, 1));
         assert_eq!(library.id_at("a.wav"), Some(a.clone()));
         assert_eq!(library.id_at("b.wav"), None);
-        assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+        assert_eq!(summary.errors.len(), 2, "{:?}", summary.errors);
         assert!(summary.errors[0].contains("\"c.wav\""));
+        assert!(summary.errors[1].starts_with("1 track whose file is gone was kept"));
 
         // The new file is read. It is not the first file, whose row goes.
         library.unreadable.borrow_mut().clear();
@@ -2190,7 +2286,7 @@ mod tests {
     }
 
     #[test]
-    fn an_exchange_waits_for_the_next_scan_when_the_tags_of_one_file_cannot_be_read() {
+    fn a_track_in_an_exchange_whose_tags_cannot_be_read_has_no_file_until_they_are_read() {
         let library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2)]);
         library.set_mtime("a.wav", 1_000);
         library.set_mtime("b.wav", 2_000);
@@ -2211,24 +2307,36 @@ mod tests {
             .insert(library.path("b.wav"));
         let summary = library.scan();
 
-        // Neither row moves. One row alone cannot take the path of the
-        // other.
-        assert_eq!(counts(&summary), (0, 0, 0, 0));
-        assert_eq!(library.index(), before);
+        // The second track is at its new path. The first track cannot move
+        // yet and does not keep its old path, where the file of the second
+        // track is.
+        assert_eq!(counts(&summary), (0, 0, 1, 0));
+        assert_eq!(library.id_at("a.wav"), Some(b.clone()));
+        assert_eq!(library.id_at("b.wav"), None);
+        assert_eq!(library.id_at(&format!("/{a}")), Some(a.clone()));
+        assert_eq!(
+            summary.errors,
+            [format!(
+                "track {a} at \"a.wav\" has no file until a scan reads the tags of its file at \
+                 \"b.wav\": another file is at its path"
+            )]
+        );
+        assert_eq!(library.latest_scan().error, Some(summary.errors[0].clone()));
 
         library.untaggable.borrow_mut().clear();
         let summary = library.scan();
-        assert_eq!(counts(&summary), (0, 0, 2, 0));
+        assert_eq!(counts(&summary), (0, 0, 1, 0));
+        assert_eq!(summary.errors, [""; 0]);
         assert_eq!(library.id_at("a.wav"), Some(b));
         assert_eq!(library.id_at("b.wav"), Some(a));
+        assert_eq!(library.index().len(), 2);
     }
 
     #[test]
-    fn a_file_at_the_old_path_of_a_moved_track_waits_with_the_exchange() {
+    fn a_file_at_the_old_path_of_a_moved_track_gets_its_row_while_the_moved_file_is_untagged() {
         let library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2)]);
         library.set_mtime("a.wav", 1_000);
         library.scan();
-        let before = library.index();
         let a = library.id_at("a.wav").unwrap();
 
         // The track moves and gets a new modification time, so its tags are
@@ -2243,17 +2351,96 @@ mod tests {
             .insert(library.path("moved/a.wav"));
         let summary = library.scan();
 
-        // The row stays at its old path, so the file there gets no row in
-        // this scan.
-        assert_eq!(counts(&summary), (0, 0, 0, 0));
-        assert_eq!(library.index(), before);
+        // The new file has its row at the path. The moved track is kept
+        // without a file.
+        assert_eq!(counts(&summary), (1, 0, 0, 0));
+        let placed = library.id_at("a.wav").expect("the new file has a row");
+        assert_ne!(placed, a);
+        assert_eq!(library.id_at(&format!("/{a}")), Some(a.clone()));
+        assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+        assert!(summary.errors[0].contains(&a));
+        assert!(summary.errors[0].contains("\"moved/a.wav\""));
 
         library.untaggable.borrow_mut().clear();
         let summary = library.scan();
-        assert_eq!(counts(&summary), (1, 0, 1, 0));
+        assert_eq!(counts(&summary), (0, 0, 1, 0));
+        assert_eq!(library.id_at("moved/a.wav"), Some(a));
+        assert_eq!(library.id_at("a.wav"), Some(placed));
+    }
+
+    #[test]
+    fn a_track_whose_path_another_track_takes_has_no_file_while_its_file_may_be_unread() {
+        let library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2)]);
+        library.set_mtime("a.wav", 1_000);
+        library.set_mtime("b.wav", 2_000);
+        library.scan();
+        let a = library.id_at("a.wav").unwrap();
+        let b = library.id_at("b.wav").unwrap();
+
+        // The first file moves to a place where it cannot be read. The
+        // second file moves to the old path of the first.
+        library.rename("a.wav", "moved/a.wav");
+        library.rename("b.wav", "a.wav");
+        library
+            .unreadable
+            .borrow_mut()
+            .insert(library.path("moved/a.wav"));
+        let summary = library.scan();
+
+        // The second track is at its new path. The first track is not
+        // deleted and no longer has the path, where the file of the second
+        // track is.
+        assert_eq!(counts(&summary), (0, 0, 1, 0));
+        assert_eq!(library.id_at("a.wav"), Some(b.clone()));
+        assert_eq!(library.id_at(&format!("/{a}")), Some(a.clone()));
+        assert_eq!(summary.errors.len(), 2, "{:?}", summary.errors);
+        assert!(summary.errors[0].contains("\"moved/a.wav\""));
+        assert_eq!(
+            summary.errors[1],
+            format!(
+                "track {a} at \"a.wav\" has no file until a scan finds it: another track took \
+                 its path, and a path or a file that could not be read may hold its file"
+            )
+        );
+        assert_eq!(library.latest_scan().error, Some(summary.errors.join("; ")));
+
+        // The file can be read. The first track follows it and keeps its ID.
+        library.unreadable.borrow_mut().clear();
+        let summary = library.scan();
+        assert_eq!(counts(&summary), (0, 0, 1, 0));
+        assert_eq!(summary.errors, [""; 0]);
         assert_eq!(library.id_at("moved/a.wav"), Some(a.clone()));
-        let placed = library.id_at("a.wav").expect("the new file has a row");
-        assert_ne!(placed, a);
+        assert_eq!(library.id_at(&format!("/{a}")), None);
+        assert_eq!(library.id_at("a.wav"), Some(b));
+    }
+
+    #[test]
+    fn a_track_without_a_file_is_deleted_when_every_file_is_read_and_none_is_its_file() {
+        let library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2)]);
+        library.set_mtime("a.wav", 1_000);
+        library.set_mtime("b.wav", 2_000);
+        library.scan();
+        let a = library.id_at("a.wav").unwrap();
+
+        // The second file moves over the first. A new file of the size of
+        // the first cannot be read.
+        library.rename("b.wav", "a.wav");
+        library.write("c.wav", 100, 3);
+        library
+            .unreadable
+            .borrow_mut()
+            .insert(library.path("c.wav"));
+        let summary = library.scan();
+        assert_eq!(counts(&summary), (0, 0, 1, 0));
+        assert_eq!(library.id_at(&format!("/{a}")), Some(a.clone()));
+
+        // The new file is read. It is another file, so the first track is
+        // gone.
+        library.unreadable.borrow_mut().clear();
+        let summary = library.scan();
+        assert_eq!(counts(&summary), (1, 0, 0, 1));
+        assert_eq!(summary.errors, [""; 0]);
+        assert!(library.index().iter().all(|entry| entry.id != a));
     }
 
     #[test]

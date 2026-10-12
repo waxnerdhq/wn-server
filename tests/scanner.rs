@@ -1417,9 +1417,14 @@ fn a_missing_file_keeps_its_row_while_a_folder_cannot_be_read() {
 
     assert_eq!(summary.seen, 5);
     assert_eq!((summary.moved, summary.removed), (0, 0));
-    assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+    assert_eq!(summary.errors.len(), 2, "{:?}", summary.errors);
     assert!(summary.errors[0].contains("\"Marlow Quartet\""));
     assert!(summary.errors[0].contains("no track was deleted"));
+    assert_eq!(
+        summary.errors[1],
+        "2 tracks whose files are gone were kept, because a path or a file could not be read"
+    );
+    assert_eq!(two.env.latest_scan().error, Some(summary.errors.join("; ")));
     assert_eq!(two.env.index(), before);
     assert_eq!(
         attached(&two.env.db, &moved),
@@ -1469,8 +1474,9 @@ fn a_file_moved_below_a_link_whose_target_is_gone_keeps_its_id() {
 
     assert_eq!(summary.seen, 9);
     assert_eq!((summary.moved, summary.removed), (0, 0));
-    assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+    assert_eq!(summary.errors.len(), 2, "{:?}", summary.errors);
     assert!(summary.errors[0].contains("\"Archive\""));
+    assert!(summary.errors[1].starts_with("1 track whose file is gone was kept"));
     assert_eq!(scanned.env.index(), before);
     assert_eq!(
         attached(&scanned.env.db, &id),
@@ -1521,11 +1527,15 @@ fn a_moved_file_that_cannot_be_read_keeps_its_row_and_its_id() {
 
     assert_eq!(summary.seen, 10);
     assert_eq!((summary.added, summary.moved, summary.removed), (0, 0, 0));
-    assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+    assert_eq!(summary.errors.len(), 2, "{:?}", summary.errors);
     let error = &summary.errors[0];
     assert!(error.contains(&format!("\"{to}\"")), "{error}");
     assert!(error.contains("cannot be read"), "{error}");
-    assert_eq!(scanned.env.latest_scan().error.as_ref(), Some(error));
+    assert!(summary.errors[1].starts_with("1 track whose file is gone was kept"));
+    assert_eq!(
+        scanned.env.latest_scan().error,
+        Some(summary.errors.join("; "))
+    );
     // The row is where it was, with what the user attached to it.
     assert_eq!(scanned.track_at(LOW_TIDE), before);
     assert_eq!(scanned.find(to), None);
@@ -1574,6 +1584,251 @@ fn a_changed_file_that_cannot_be_read_keeps_its_row_and_deletes_nothing() {
         }
     );
     assert_eq!(scanned.track_at(LOW_TIDE).id, row.id);
+}
+
+#[test]
+fn a_track_whose_path_another_track_takes_has_no_file_while_a_folder_cannot_be_read() {
+    let library = LibraryBuilder::standard().build();
+    shift_mtime(&library.files[0], 100);
+    shift_mtime(&library.files[1], 200);
+    let aurora = library.root.path().join("Aurora Field");
+    let marlow = library.root.path().join("Marlow Quartet");
+    let unmounted = library.root.path().join("unmounted");
+    let env = TestDb::new();
+    env.scan(&[&aurora, &marlow]);
+    let aurora_id = env.folder_id(&aurora);
+    let first = "Glass Harbour/01 Low Tide.flac";
+    let second = "Glass Harbour/02 Breakwater.flac";
+    let overwritten = env.id_at(aurora_id, first).unwrap();
+    let moved = env.id_at(aurora_id, second).unwrap();
+    attach(&env.db, &overwritten);
+    attach(&env.db, &moved);
+
+    // One file moves over another one and a third file is deleted, while
+    // the second folder cannot be read. The scan does not know whether the
+    // bytes of the overwritten track are in that folder.
+    fs::rename(aurora.join(second), aurora.join(first)).unwrap();
+    fs::remove_file(aurora.join("Glass Harbour/03 Night Ferry.flac")).unwrap();
+    fs::rename(&marlow, &unmounted).unwrap();
+    let summary = env.scan(&[&aurora, &marlow]);
+
+    // The moved track is at its new path. The overwritten track is kept,
+    // and it no longer has the path where the other file is.
+    assert_eq!((summary.moved, summary.removed), (1, 0));
+    assert_eq!(env.id_at(aurora_id, first), Some(moved.clone()));
+    assert_eq!(env.id_at(aurora_id, second), None);
+    let placeholder = format!("/{overwritten}");
+    assert_eq!(env.track(&overwritten).rel_path, placeholder);
+    assert_eq!(
+        attached(&env.db, &overwritten),
+        Some((aurora_id, placeholder.clone()))
+    );
+    assert_eq!(
+        attached(&env.db, &moved),
+        Some((aurora_id, first.to_owned()))
+    );
+    assert_eq!(summary.errors.len(), 3, "{:?}", summary.errors);
+    assert!(summary.errors[0].contains("\"Marlow Quartet\""));
+    assert_eq!(
+        summary.errors[1],
+        format!(
+            "track {overwritten} at \"{first}\" has no file until a scan finds it: another \
+             track took its path, and a path or a file that could not be read may hold its file"
+        )
+    );
+    assert_eq!(
+        summary.errors[2],
+        "1 track whose file is gone was kept, because a path or a file could not be read"
+    );
+    assert_eq!(env.latest_scan().error, Some(summary.errors.join("; ")));
+
+    // The next scan finds the same state and changes nothing. The track
+    // without a file is one of the two tracks that are kept.
+    let summary = env.scan(&[&aurora, &marlow]);
+    assert_eq!((summary.moved, summary.removed), (0, 0));
+    assert_eq!(summary.errors.len(), 2, "{:?}", summary.errors);
+    assert_eq!(
+        summary.errors[1],
+        "2 tracks whose files are gone were kept, because a path or a file could not be read"
+    );
+    assert_eq!(env.track(&overwritten).rel_path, placeholder);
+    assert_eq!(env.id_at(aurora_id, first), Some(moved.clone()));
+
+    // The second folder is back and does not hold the bytes of the
+    // overwritten track. Its row goes, and so does the row of the deleted
+    // file.
+    fs::rename(&unmounted, &marlow).unwrap();
+    let summary = env.scan(&[&aurora, &marlow]);
+    assert_eq!(
+        summary,
+        ScanSummary {
+            seen: 7,
+            removed: 2,
+            ..ScanSummary::default()
+        }
+    );
+    assert!(!env.locators().contains_key(&overwritten));
+    assert_eq!(env.id_at(aurora_id, first), Some(moved));
+}
+
+#[test]
+fn directories_that_a_system_keeps_at_a_volume_root_are_not_walked() {
+    let library = LibraryBuilder::standard().build();
+    let root = library.root.path();
+    let audio = &library.files[0];
+    for skipped in ["System Volume Information", "$Recycle.Bin", "lost+found"] {
+        fs::create_dir(root.join(skipped)).unwrap();
+        fs::copy(audio, root.join(skipped).join("01 Inside.flac")).unwrap();
+    }
+    // The name of the ext directory is matched in its own spelling.
+    fs::create_dir(root.join("Lost+Found Sessions")).unwrap();
+    fs::copy(audio, root.join("Lost+Found Sessions").join("01 Take.flac")).unwrap();
+
+    let scanned = Scanned::of(library);
+
+    let mut expected: Vec<&str> = STANDARD.to_vec();
+    expected.push("Lost+Found Sessions/01 Take.flac");
+    expected.sort_unstable();
+    let stored: Vec<String> = scanned
+        .env
+        .index()
+        .into_keys()
+        .map(|(_, rel_path)| rel_path)
+        .collect();
+    assert_eq!(stored, expected);
+    assert_eq!(scanned.env.latest_scan().counts.seen, 11);
+    assert_eq!(scanned.env.latest_scan().error, None);
+}
+
+// A symbolic link is created with a Unix call. On Windows the call needs a
+// privilege that a test run does not have.
+#[cfg(unix)]
+#[test]
+fn an_entry_that_the_walk_skips_and_cannot_read_does_not_hold_deletions_back() {
+    for name in [
+        "lost+found",
+        "System Volume Information",
+        "$RECYCLE.BIN",
+        ".Trashes",
+    ] {
+        let scanned = Scanned::new();
+        // A link whose target is gone cannot be read. Under another name it
+        // is an unread path.
+        std::os::unix::fs::symlink(scanned.path("no target"), scanned.path(name)).unwrap();
+        fs::remove_file(scanned.path(LOW_TIDE)).unwrap();
+        let summary = scanned.rescan();
+
+        assert_eq!(
+            summary,
+            ScanSummary {
+                seen: 9,
+                removed: 1,
+                ..ScanSummary::default()
+            },
+            "{name}"
+        );
+        assert_eq!(scanned.find(LOW_TIDE), None, "{name}");
+    }
+
+    // The same link under an ordinary name holds the deletion back.
+    let scanned = Scanned::new();
+    std::os::unix::fs::symlink(scanned.path("no target"), scanned.path("Archive")).unwrap();
+    fs::remove_file(scanned.path(LOW_TIDE)).unwrap();
+    let summary = scanned.rescan();
+    assert_eq!(summary.removed, 0);
+    assert_eq!(summary.errors.len(), 2, "{:?}", summary.errors);
+    assert!(summary.errors[0].contains("\"Archive\""));
+    assert!(scanned.find(LOW_TIDE).is_some());
+}
+
+/// A directory that the process cannot list. Dropping the value gives the
+/// permission back, so that the directory of the test can be deleted.
+#[cfg(unix)]
+struct Unlistable(PathBuf);
+
+#[cfg(unix)]
+impl Unlistable {
+    /// Creates the directory with one audio file in it and takes every
+    /// permission from it. Returns `None` when the process can list the
+    /// directory anyway, which is the case for a process that runs as root.
+    fn new(path: PathBuf, audio: &Path) -> Option<Self> {
+        fs::create_dir(&path).unwrap();
+        fs::copy(audio, path.join("01 Inside.flac")).unwrap();
+        set_mode(&path, 0o000);
+        let unlistable = Self(path);
+        if fs::read_dir(&unlistable.0).is_ok() {
+            eprintln!("not checked: the process lists a directory that has no permission");
+            return None;
+        }
+        Some(unlistable)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for Unlistable {
+    fn drop(&mut self) {
+        set_mode(&self.0, 0o755);
+    }
+}
+
+// File modes exist on Unix only.
+#[cfg(unix)]
+#[test]
+fn a_system_directory_that_cannot_be_listed_does_not_hold_deletions_back() {
+    let scanned = Scanned::new();
+    let audio = scanned.path(BREAKWATER);
+    let Some(_system) = Unlistable::new(scanned.path("lost+found"), &audio) else {
+        return;
+    };
+    fs::remove_file(scanned.path(LOW_TIDE)).unwrap();
+    let summary = scanned.rescan();
+
+    // The directory is not walked and is no error.
+    assert_eq!(
+        summary,
+        ScanSummary {
+            seen: 9,
+            removed: 1,
+            ..ScanSummary::default()
+        }
+    );
+    assert_eq!(scanned.find(LOW_TIDE), None);
+}
+
+// File modes exist on Unix only.
+#[cfg(unix)]
+#[test]
+fn a_directory_with_an_ordinary_name_that_cannot_be_listed_holds_deletions_back() {
+    let scanned = Scanned::new();
+    let audio = scanned.path(BREAKWATER);
+    let Some(private) = Unlistable::new(scanned.path("Private"), &audio) else {
+        return;
+    };
+    fs::remove_file(scanned.path(LOW_TIDE)).unwrap();
+    let summary = scanned.rescan();
+
+    assert_eq!(summary.seen, 9);
+    assert_eq!(summary.removed, 0);
+    assert_eq!(summary.errors.len(), 2, "{:?}", summary.errors);
+    assert!(summary.errors[0].contains("\"Private\""));
+    assert!(summary.errors[0].contains("no track was deleted"));
+    assert!(summary.errors[1].starts_with("1 track whose file is gone was kept"));
+    assert!(scanned.find(LOW_TIDE).is_some());
+
+    // The directory can be listed again. Its file is new and the missing
+    // track goes.
+    drop(private);
+    let summary = scanned.rescan();
+    assert_eq!(
+        summary,
+        ScanSummary {
+            seen: 10,
+            added: 1,
+            removed: 1,
+            tags_read: 1,
+            ..ScanSummary::default()
+        }
+    );
 }
 
 #[test]
