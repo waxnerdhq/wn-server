@@ -27,7 +27,10 @@
 //! them by ID. The module of a group of API methods (`lists`, `search`,
 //! `playlists`, `play_queue`, `lyrics`) selects IDs with its own SQL and
 //! reads the rows through `browse`, so it adds no function to another
-//! module.
+//! module. `indexes` is the module of the folder methods. They read their
+//! rows through `browse`, and the module holds what `browse` does not have:
+//! the time of the last change of the artists and whether a scan has no end
+//! time. It reads both from the `scans` table.
 
 pub mod tracks;
 
@@ -54,5 +57,7 @@ pub mod users;
 pub mod scans;
 
 pub mod folders;
+
+pub mod indexes;
 
 mod int;

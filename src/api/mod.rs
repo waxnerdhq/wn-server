@@ -38,7 +38,7 @@ pub mod system;
 
 pub mod browse;
 
-// folders
+pub mod folders;
 
 pub mod lists;
 
@@ -244,9 +244,9 @@ pub const METHODS: &[(&str, Handler)] = &[
 
     ("getGenres", handler!(browse::get_genres)),
 
-    ("getIndexes", not_implemented),
+    ("getIndexes", handler!(folders::get_indexes)),
 
-    ("getMusicDirectory", not_implemented),
+    ("getMusicDirectory", handler!(folders::get_music_directory)),
 
     ("getVideos", not_implemented),
 
