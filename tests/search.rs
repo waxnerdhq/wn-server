@@ -10,7 +10,7 @@ use axum::http::StatusCode;
 use rusqlite::params;
 use serde_json::{Value, json};
 use wn_server::VERSION;
-use wn_server::api::model;
+use wn_server::api::{self, model, xml};
 use wn_server::config::Config;
 use wn_server::db::queries::tracks::{self, TrackContent};
 use wn_server::db::queries::{albums, artists, folders};
@@ -97,6 +97,61 @@ fn xml_error(code: u32, message: &str) -> String {
         "failed",
         &format!(r#"<error code="{code}" message="{message}"/>"#),
     )
+}
+
+/// The JSON body of a successful response whose response object holds `rest`
+/// after the fields of the envelope.
+fn json_document(rest: &str) -> String {
+    format!(
+        concat!(
+            r#"{{"subsonic-response":{{"status":"ok","version":"1.16.1","type":"wn-server","#,
+            r#""serverVersion":"{}","openSubsonic":true,{}}}}}"#
+        ),
+        VERSION, rest
+    )
+}
+
+/// The text between the start tag and the end tag of the element `name` of
+/// the XML document `xml`. The start tag has no attribute.
+fn element_content<'a>(xml: &'a str, name: &str) -> &'a str {
+    let (_, rest) = xml
+        .split_once(&format!("<{name}>"))
+        .unwrap_or_else(|| panic!("no <{name}> in {xml}"));
+    let (content, _) = rest
+        .split_once(&format!("</{name}>"))
+        .unwrap_or_else(|| panic!("no </{name}> in {xml}"));
+    content
+}
+
+/// The names of the child elements of the element `parent` of the XML
+/// document `xml`, in the order of the document. Every child element must be
+/// an empty element, as an item of a list of a search result is.
+fn child_names<'a>(xml: &'a str, parent: &str) -> Vec<&'a str> {
+    element_content(xml, parent)
+        .split('<')
+        .skip(1)
+        .map(|element| {
+            assert!(element.ends_with("/>"), "<{element} has content: {xml}");
+            element
+                .split([' ', '/'])
+                .next()
+                .expect("a split has a first part")
+        })
+        .collect()
+}
+
+/// The names of `artists` elements `artist`, `albums` elements `album` and
+/// `songs` elements `song`, in the order of the Subsonic schema.
+fn schema_names(artists: usize, albums: usize, songs: usize) -> Vec<&'static str> {
+    [("artist", artists), ("album", albums), ("song", songs)]
+        .into_iter()
+        .flat_map(|(name, count)| std::iter::repeat_n(name, count))
+        .collect()
+}
+
+/// The position of the first element `name` in the XML document `xml`.
+fn first_element(xml: &str, name: &str) -> Option<usize> {
+    xml.find(&format!("<{name} "))
 }
 
 fn to_json(model: impl serde::Serialize) -> Value {
@@ -1509,6 +1564,7 @@ async fn search3_in_xml_has_the_elements_of_the_subsonic_schema() {
     let aurora = &server.artist.aurora_field;
 
     // One list at a time: the whole document.
+    let artist = format!(r#"<artist albumCount="2" id="{aurora}" name="Aurora Field"/>"#);
     let xml = server
         .get_xml(
             "search3",
@@ -1517,13 +1573,19 @@ async fn search3_in_xml_has_the_elements_of_the_subsonic_schema() {
         .await;
     assert_eq!(
         xml,
-        xml_document(&format!(
-            r#"<searchResult3><artist albumCount="2" id="{aurora}" name="Aurora Field"/></searchResult3>"#
-        ))
+        xml_document(&format!("<searchResult3>{artist}</searchResult3>"))
     );
 
     let catalogue = server.catalogue().await;
     let created = model::iso8601(catalogue.album("Paper Maps").created_at);
+    let album = format!(
+        concat!(
+            r#"<album artist="Aurora Field" artistId="{}" created="{}""#,
+            r#" duration="2" genre="Electronic" id="{}" name="Paper Maps" playCount="0""#,
+            r#" songCount="3" year="2021"/>"#
+        ),
+        aurora, created, server.album.paper_maps
+    );
     let xml = server
         .get_xml(
             "search3",
@@ -1532,17 +1594,31 @@ async fn search3_in_xml_has_the_elements_of_the_subsonic_schema() {
         .await;
     assert_eq!(
         xml,
-        xml_document(&format!(
-            concat!(
-                r#"<searchResult3><album artist="Aurora Field" artistId="{}" created="{}""#,
-                r#" duration="2" genre="Electronic" id="{}" name="Paper Maps" playCount="0""#,
-                r#" songCount="3" year="2021"/></searchResult3>"#
-            ),
-            aurora, created, server.album.paper_maps
-        ))
+        xml_document(&format!("<searchResult3>{album}</searchResult3>"))
     );
 
     let created = model::iso8601(catalogue.song("Legend").track.created_at);
+    let legend = catalogue.song("Legend");
+    let song = format!(
+        concat!(
+            r#"<song album="Paper Maps" albumId="{album}" artist="Aurora Field""#,
+            r#" artistId="{artist}" bitDepth="0" bitRate="{bit_rate}" channelCount="1""#,
+            r#" contentType="audio/mpeg" created="{created}" discNumber="2" duration="1""#,
+            r#" genre="Electronic" id="{id}" isDir="false" mediaType="song" parent="{album}""#,
+            r#" path="Aurora Field/Paper Maps/01 Legend.mp3" playCount="0""#,
+            r#" samplingRate="22050" size="{size}" suffix="mp3" title="Legend" track="1""#,
+            r#" type="music" year="2021"/>"#
+        ),
+        album = server.album.paper_maps,
+        artist = aurora,
+        bit_rate = legend
+            .track
+            .bitrate_kbps
+            .expect("an MP3 file has a bitrate"),
+        created = created,
+        id = server.track.legend,
+        size = legend.track.size,
+    );
     let xml = server
         .get_xml(
             "search3",
@@ -1553,30 +1629,36 @@ async fn search3_in_xml_has_the_elements_of_the_subsonic_schema() {
             ],
         )
         .await;
-    let song = catalogue.song("Legend");
+    assert_eq!(
+        xml,
+        xml_document(&format!("<searchResult3>{song}</searchResult3>"))
+    );
+
+    // The three lists in one document, in the order of the Subsonic schema:
+    // the artist, then the album, then the song. "Paper Maps" is the second
+    // album and "Legend" the fourth song that `aurora` matches.
+    let xml = server
+        .get_xml(
+            "search3",
+            &[
+                ("query", "aurora"),
+                ("artistCount", "1"),
+                ("albumCount", "1"),
+                ("albumOffset", "1"),
+                ("songCount", "1"),
+                ("songOffset", "3"),
+            ],
+        )
+        .await;
     assert_eq!(
         xml,
         xml_document(&format!(
-            concat!(
-                r#"<searchResult3><song album="Paper Maps" albumId="{album}" artist="Aurora Field""#,
-                r#" artistId="{artist}" bitDepth="0" bitRate="{bit_rate}" channelCount="1""#,
-                r#" contentType="audio/mpeg" created="{created}" discNumber="2" duration="1""#,
-                r#" genre="Electronic" id="{id}" isDir="false" mediaType="song" parent="{album}""#,
-                r#" path="Aurora Field/Paper Maps/01 Legend.mp3" playCount="0""#,
-                r#" samplingRate="22050" size="{size}" suffix="mp3" title="Legend" track="1""#,
-                r#" type="music" year="2021"/></searchResult3>"#
-            ),
-            album = server.album.paper_maps,
-            artist = aurora,
-            bit_rate = song.track.bitrate_kbps.expect("an MP3 file has a bitrate"),
-            created = created,
-            id = server.track.legend,
-            size = song.track.size,
+            "<searchResult3>{artist}{album}{song}</searchResult3>"
         ))
     );
 
-    // The three lists together: one `artist`, two `album` and seven `song`
-    // elements inside `searchResult3`.
+    // Every match of `aurora`: one `artist`, then two `album`, then seven
+    // `song` elements inside `searchResult3`.
     let xml = server.get_xml("search3", &[("query", "aurora")]).await;
     let start = xml_document("<searchResult3>");
     let start = start.trim_end_matches("</subsonic-response>");
@@ -1585,9 +1667,11 @@ async fn search3_in_xml_has_the_elements_of_the_subsonic_schema() {
         xml.ends_with("</searchResult3></subsonic-response>"),
         "{xml}"
     );
-    assert_eq!(xml.matches("<artist ").count(), 1, "{xml}");
-    assert_eq!(xml.matches("<album ").count(), 2, "{xml}");
-    assert_eq!(xml.matches("<song ").count(), 7, "{xml}");
+    assert_eq!(
+        child_names(&xml, "searchResult3"),
+        schema_names(1, 2, 7),
+        "{xml}"
+    );
 
     // No match: an empty element.
     assert_eq!(
@@ -1601,6 +1685,7 @@ async fn search2_in_xml_has_the_elements_of_the_subsonic_schema() {
     let server = TestServer::standard().await;
     let aurora = &server.artist.aurora_field;
 
+    let artist = format!(r#"<artist id="{aurora}" name="Aurora Field"/>"#);
     let xml = server
         .get_xml(
             "search2",
@@ -1609,13 +1694,22 @@ async fn search2_in_xml_has_the_elements_of_the_subsonic_schema() {
         .await;
     assert_eq!(
         xml,
-        xml_document(&format!(
-            r#"<searchResult2><artist id="{aurora}" name="Aurora Field"/></searchResult2>"#
-        ))
+        xml_document(&format!("<searchResult2>{artist}</searchResult2>"))
     );
 
     let catalogue = server.catalogue().await;
     let created = model::iso8601(catalogue.album("Paper Maps").created_at);
+    let album = format!(
+        concat!(
+            r#"<album album="Paper Maps" artist="Aurora Field""#,
+            r#" artistId="{artist}" created="{created}" duration="2" genre="Electronic""#,
+            r#" id="{id}" isDir="true" mediaType="album" parent="{artist}" playCount="0""#,
+            r#" title="Paper Maps" year="2021"/>"#
+        ),
+        artist = aurora,
+        created = created,
+        id = server.album.paper_maps
+    );
     let xml = server
         .get_xml(
             "search2",
@@ -1624,17 +1718,7 @@ async fn search2_in_xml_has_the_elements_of_the_subsonic_schema() {
         .await;
     assert_eq!(
         xml,
-        xml_document(&format!(
-            concat!(
-                r#"<searchResult2><album album="Paper Maps" artist="Aurora Field""#,
-                r#" artistId="{artist}" created="{created}" duration="2" genre="Electronic""#,
-                r#" id="{id}" isDir="true" mediaType="album" parent="{artist}" playCount="0""#,
-                r#" title="Paper Maps" year="2021"/></searchResult2>"#
-            ),
-            artist = aurora,
-            created = created,
-            id = server.album.paper_maps
-        ))
+        xml_document(&format!("<searchResult2>{album}</searchResult2>"))
     );
 
     // A song is the same element as in `search3`.
@@ -1643,17 +1727,188 @@ async fn search2_in_xml_has_the_elements_of_the_subsonic_schema() {
         ("artistCount", "0"),
         ("albumCount", "0"),
     ];
+    let songs = server.get_xml("search2", &params).await;
     assert_eq!(
-        server.get_xml("search2", &params).await,
+        songs,
         server
             .get_xml("search3", &params)
             .await
             .replace("searchResult3", "searchResult2")
     );
+    let song = element_content(&songs, "searchResult2");
+    assert_eq!(child_names(&songs, "searchResult2"), ["song"], "{songs}");
+
+    // The three lists in one document, in the order of the Subsonic schema:
+    // the artist, then the album, then the song. "Paper Maps" is the second
+    // album and "Legend" the fourth song that `aurora` matches.
+    let xml = server
+        .get_xml(
+            "search2",
+            &[
+                ("query", "aurora"),
+                ("artistCount", "1"),
+                ("albumCount", "1"),
+                ("albumOffset", "1"),
+                ("songCount", "1"),
+                ("songOffset", "3"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        xml,
+        xml_document(&format!(
+            "<searchResult2>{artist}{album}{song}</searchResult2>"
+        ))
+    );
     assert_eq!(
         server.get_xml("search2", &[("query", "zzz")]).await,
         xml_document("<searchResult2/>")
     );
+}
+
+/// Checks the order of the child elements of the XML answer of `method`:
+/// every `artist` element, then every `album` element, then every `song`
+/// element, which is the sequence of the Subsonic schema. The standard
+/// library has three artists, four albums and ten songs.
+async fn xml_lists_follow_the_schema_sequence(method: &str) {
+    let server = TestServer::standard().await;
+    let key = result_key(method);
+
+    // The three lists.
+    let xml = server.get_xml(method, &[("query", "")]).await;
+    let artist = first_element(&xml, "artist");
+    let album = first_element(&xml, "album");
+    let song = first_element(&xml, "song");
+    assert!(artist.is_some(), "{method}: {xml}");
+    assert!(artist < album && album < song, "{method}: {xml}");
+    assert_eq!(
+        child_names(&xml, key),
+        schema_names(3, 4, 10),
+        "{method}: {xml}"
+    );
+
+    // One list is empty: the two others keep their order.
+    for (empty, expected) in [
+        ("artistCount", schema_names(0, 4, 10)),
+        ("albumCount", schema_names(3, 0, 10)),
+        ("songCount", schema_names(3, 4, 0)),
+    ] {
+        let xml = server.get_xml(method, &[("query", ""), (empty, "0")]).await;
+        assert_eq!(child_names(&xml, key), expected, "{method} {empty}: {xml}");
+    }
+    let xml = server
+        .get_xml(method, &[("query", ""), ("songCount", "0")])
+        .await;
+    let artist = first_element(&xml, "artist");
+    assert!(artist.is_some(), "{method}: {xml}");
+    assert!(artist < first_element(&xml, "album"), "{method}: {xml}");
+    assert_eq!(first_element(&xml, "song"), None, "{method}: {xml}");
+
+    // A page of each list: the order does not depend on the items.
+    let xml = server
+        .get_xml(
+            method,
+            &[
+                ("query", ""),
+                ("artistCount", "2"),
+                ("artistOffset", "1"),
+                ("albumCount", "3"),
+                ("albumOffset", "1"),
+                ("songCount", "5"),
+                ("songOffset", "5"),
+            ],
+        )
+        .await;
+    assert_eq!(
+        child_names(&xml, key),
+        schema_names(2, 3, 5),
+        "{method}: {xml}"
+    );
+}
+
+#[tokio::test]
+async fn search3_in_xml_writes_artists_then_albums_then_songs() {
+    xml_lists_follow_the_schema_sequence("search3").await;
+}
+
+#[tokio::test]
+async fn search2_in_xml_writes_artists_then_albums_then_songs() {
+    xml_lists_follow_the_schema_sequence("search2").await;
+}
+
+/// The order of the XML child elements has no effect on JSON: the keys of
+/// every object are in byte order, so the lists are `album`, `artist` and
+/// `song`.
+#[tokio::test]
+async fn json_documents_keep_the_byte_order_of_their_keys() {
+    let server = TestServer::standard().await;
+    let catalogue = server.catalogue().await;
+    let body = async |method: &str, query: &str| {
+        let response = server
+            .get_raw(method, &[("query", query), ("f", "json")])
+            .await;
+        assert_eq!(content_type(&response), "application/json", "{method}");
+        body_string(response).await
+    };
+    for (method, key) in METHODS {
+        // No match: the whole document as text.
+        assert_eq!(
+            body(method, "zzz").await,
+            json_document(&format!(r#""{key}":{{"album":[],"artist":[],"song":[]}}"#)),
+            "{method}"
+        );
+
+        // The whole library: the whole document as text. A `Value` writes
+        // its keys in byte order.
+        let whole = if method == "search3" {
+            whole_result3(&catalogue)
+        } else {
+            whole_result2(&catalogue)
+        };
+        let text = body(method, "").await;
+        assert_eq!(
+            text,
+            json_document(&format!(r#""{key}":{whole}"#)),
+            "{method}"
+        );
+        let list = |name: &str| text.find(&format!(r#""{name}":["#));
+        let (album, artist, song) = (list("album"), list("artist"), list("song"));
+        assert!(album.is_some(), "{method}: {text}");
+        assert!(album < artist && artist < song, "{method}: {text}");
+    }
+}
+
+/// The fields of the envelope of a JSON answer. Every other key of the
+/// response object of a successful answer is the key of the method.
+const ENVELOPE_FIELDS: [&str; 5] = ["status", "version", "type", "serverVersion", "openSubsonic"];
+
+/// The method table (`api::METHODS`) holds the handlers and not the keys of
+/// their answers, so this test calls every method and reads the key of each
+/// successful answer. `query` is the one parameter that the methods of the
+/// table of `api::xml::CHILD_ORDER` require.
+#[tokio::test]
+async fn every_element_of_the_xml_child_order_is_the_key_of_an_answer() {
+    let server = TestServer::bare(Config::default()).await;
+    let mut keys = HashSet::new();
+    for (method, _) in api::METHODS {
+        let response = server.get_json(method, &[("query", "")]).await;
+        if response["status"] != "ok" {
+            continue;
+        }
+        let response = response.as_object().expect("the response is an object");
+        keys.extend(
+            response
+                .keys()
+                .filter(|key| !ENVELOPE_FIELDS.contains(&key.as_str()))
+                .cloned(),
+        );
+    }
+    for (element, _) in xml::CHILD_ORDER {
+        assert!(
+            keys.contains(*element),
+            "no method of the table answers with `{element}`: {keys:?}"
+        );
+    }
 }
 
 #[tokio::test]
