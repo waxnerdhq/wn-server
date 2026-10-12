@@ -195,7 +195,7 @@ The server answers OpenSubsonic requests at `/rest/<method>` and `/rest/<method>
 
 <!-- api/search.rs -->
 
-<!-- api/annotate.rs -->
+- `star` and `unstar` take `id`, `albumId` and `artistId`, each any number of times. `id` takes the ID of a song, an album or an artist. `setRating` takes `id` and `rating`: 1 to 5 sets the rating and 0 removes it. Any other rating returns error 0. An ID that names no item returns error 70. A request changes every item it names or none: after an error no star and no rating of the request is stored. `star` for an item that has a star sets the time of the star to the time of the new request. `unstar` for an item without a star succeeds. `getStarred2` and `getStarred` list the starred artists, albums and songs, the one starred last first, and `musicFolderId` limits them to one music folder. Stars and ratings belong to the user of the request. A song keeps them when its file is renamed or moved, and an album or an artist keeps them when the spelling of its name changes.
 
 <!-- api/playlists.rs -->
 
