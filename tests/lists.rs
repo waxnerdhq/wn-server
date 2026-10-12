@@ -17,11 +17,11 @@ use wn_server::api::model;
 use wn_server::config::Config;
 use wn_server::db::queries::annotations::Annotation;
 use wn_server::db::queries::tracks::{self, TrackContent};
-use wn_server::db::queries::{albums, artists, folders, users};
+use wn_server::db::queries::{albums, artists, folders};
 use wn_server::ids::{self, Kind};
 use wn_server::library::tags::TrackMeta;
 
-use common::{Catalogue, StandardServer, TestServer};
+use common::{Catalogue, StandardServer, TestServer, error, error_10, owner_id, remove_file};
 
 /// The message of the error for a `type` that is no list type.
 const UNKNOWN_TYPE: &str = "parameter type must be one of random, newest, highest, frequent, \
@@ -71,16 +71,6 @@ const ALBUM_METHODS: [(&str, &str, &str); 2] = [
     ("getAlbumList2", "albumList2", "name"),
     ("getAlbumList", "albumList", "title"),
 ];
-
-/// The `error` object with `code` and `message`.
-fn error(code: u32, message: &str) -> Value {
-    json!({ "code": code, "message": message })
-}
-
-/// The `error` object of error 10 that names `parameter`.
-fn error_10(parameter: &str) -> Value {
-    error(10, &format!("required parameter is missing: {parameter}"))
-}
 
 /// The `error` object of error 0 for a value of `parameter` that is no
 /// integer from 0 to 4294967295.
@@ -227,18 +217,6 @@ fn song_element(catalogue: &Catalogue, id: &str, annotation: Option<&Annotation>
     serde_json::to_value(model::child(row, annotation)).expect("an element serialises")
 }
 
-/// The ID of the owner account of `server`.
-async fn owner_id(server: &TestServer) -> i64 {
-    server
-        .db()
-        .read(users::get_owner)
-        .await
-        .expect("read the owner")
-        .expect("the server has an owner")
-        .user
-        .id
-}
-
 /// Writes an annotation row of the owner for each item of `rows`: the ID,
 /// the item type and the values.
 async fn annotate(server: &TestServer, rows: Vec<(String, &'static str, Annotation)>) {
@@ -291,28 +269,6 @@ fn plays(play_count: u64, last_played_at: i64) -> Annotation {
         last_played_at: Some(last_played_at),
         ..Annotation::default()
     }
-}
-
-/// Gives the track `id` its placeholder path, as the scanner does for a
-/// track that it keeps without a file.
-async fn remove_file(server: &TestServer, id: &str) {
-    let id = id.to_owned();
-    server
-        .db()
-        .write(move |conn| {
-            let track = tracks::get_track(conn, &id)?.expect("the track exists");
-            let placeholder = tracks::placeholder_path(&id);
-            tracks::relink_track(
-                conn,
-                &id,
-                track.folder_id,
-                &placeholder,
-                track.mtime,
-                track.size,
-            )
-        })
-        .await
-        .expect("give the track a placeholder path");
 }
 
 /// One track that [`written`] stores.

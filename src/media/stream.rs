@@ -44,7 +44,7 @@
 //! # What ends a transcode
 //!
 //! [`transcoded`] owns the stream of the transcoder until the first output
-//! arrives, and a task owns it from then on ([`hand_over`]). The stream is
+//! arrives, and a task owns it from then on (`hand_over`). The stream is
 //! dropped, which ends the transcode and returns what it holds, when:
 //!
 //! - the output ends before its first byte, or the first byte has not come
@@ -344,7 +344,7 @@ enum Refusal {
 /// - HTTP 304, HTTP 416 and an error are answered from it. They open no file
 ///   and take no permit, so they do not wait for one.
 /// - HTTP 200 and 206 take a permit, and then `ServeFile` answers the GET
-///   request. The body of the response owns the permit ([`holding`]). When
+///   request. The body of the response owns the permit (`holding`). When
 ///   that answer has another status, because the file changed in between,
 ///   the permit returns with the answer.
 /// - A request that gets no permit within `permit_wait` is HTTP 503 with
@@ -475,7 +475,7 @@ async fn answer(
 /// - A future of this function that is dropped while it waits for the first
 ///   output drops the stream with it.
 /// - From the first output on, a task hands the chunks of the stream over
-///   to the body of the response ([`hand_over`]). It ends the transcode
+///   to the body of the response (`hand_over`). It ends the transcode
 ///   when the body is dropped, which is what a client that disconnects
 ///   causes, and when the client takes no chunk for
 ///   `config.write_timeout_ms`.

@@ -6,7 +6,9 @@
 //! ones of the suite that connect to a socket. Each one runs `run_server` on
 //! `127.0.0.1` with port 0, so the system chooses a free port, and speaks
 //! HTTP/1.1 over a `TcpStream`. No test starts the mDNS daemon: the step that
-//! withdraws the advertisement is a closure of the test.
+//! withdraws the advertisement is a closure of the test. No test starts
+//! ffmpeg: the options of a test do not ask for the probe
+//! (`ServerOptions::probe`), so `run_server` runs no program.
 //!
 //! A test holds a request in progress with a route that it adds to the
 //! server, and a scan with the batch hook of the scanner. The tests assert
@@ -62,11 +64,13 @@ use wn_server::library::scan_controller::ScanHooks;
 use wn_server::library::scanner::CANCELLED;
 use wn_server::server::{ServerError, ServerOptions, StopStep, run_server};
 
-use common::transcoder::no_ffmpeg;
 use common::{
     API_VERSION, CLIENT, LibraryBuilder, OWNER, OWNER_PASSWORD, captured_log, fixtures_dir,
     subsonic_response, token, urlencode,
 };
+// File modes exist on Unix only, and so does the helper that sets them.
+#[cfg(unix)]
+use common::set_mode;
 
 /// The longest time a test waits for an event of its server. Each of these
 /// waits ends with its event, milliseconds after the cause of the event, so
@@ -152,16 +156,13 @@ fn wal_len(data_dir: &DataDir) -> u64 {
 }
 
 /// The config of the servers of this file: `127.0.0.1` with a port that the
-/// system chooses, a grace of one hour, no scan at startup and no ffmpeg.
+/// system chooses, a grace of one hour and no scan at startup.
 fn config() -> Config {
     let mut config = Config::default();
     config.server.bind = "127.0.0.1".parse().expect("an address");
     config.server.port = 0;
     config.server.shutdown_grace_ms = HOUR_MS;
     config.library.scan_on_start = false;
-    // The server probes this path for ffmpeg and finds no program, so no
-    // test of this file starts the ffmpeg of the machine.
-    config.transcoding.ffmpeg = no_ffmpeg();
     config
 }
 
@@ -1023,6 +1024,13 @@ async fn startup_log_names_version_data_directory_address_folders_and_auth() {
         server.cancel.cancel();
         server.ended().await.expect("the server stops in order");
     }
+
+    // The config of these servers names the program `ffmpeg`, which is the
+    // default. No server of this file asks for the probe, so none ran the
+    // program: the log of the test process has neither line of the probe,
+    // `ffmpeg is available` and `ffmpeg is not available`.
+    assert_eq!(config().transcoding.ffmpeg, "ffmpeg");
+    assert_eq!(log.lines_with("ffmpeg is "), [""; 0]);
 }
 
 /// How a music folder becomes unavailable in [`unavailable_folder_cycle`].
@@ -1085,25 +1093,15 @@ impl Drop for Unplugged {
     }
 }
 
-/// Sets the permission bits of a directory.
-#[cfg(unix)]
-fn set_mode(path: &Path, mode: u32) {
-    use std::os::unix::fs::PermissionsExt;
-
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-        .unwrap_or_else(|error| panic!("set the mode of {}: {error}", path.display()));
-}
-
 /// Loads the config file at `path` as `run` does, and gives the server the
-/// address, the grace and the ffmpeg path of the servers of this file. The
-/// file cannot name port 0.
+/// address and the grace of the servers of this file. The file cannot name
+/// port 0.
 fn load_config(path: &Path) -> Config {
     let mut loaded = Config::load(path).expect("the config loads");
     let test = config();
     loaded.server.bind = test.server.bind;
     loaded.server.port = test.server.port;
     loaded.server.shutdown_grace_ms = test.server.shutdown_grace_ms;
-    loaded.transcoding.ffmpeg = test.transcoding.ffmpeg;
     loaded
 }
 

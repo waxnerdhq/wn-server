@@ -1134,3 +1134,742 @@ pub fn captured_log() -> LogBuffer {
     })
     .clone()
 }
+
+// A test binary that names none of these items has no use for the re-export.
+#[allow(unused_imports)]
+pub use rows::{
+    ATTACHED, Dump, ROWID, attached_rows, dump, dump_of, forbid_writes, table_names, without_scans,
+};
+
+/// What the tests of the migrations and of the scanner share to check that a
+/// step kept the rows of a database or wrote none: the rows of every table,
+/// and triggers that fail a write.
+///
+/// The module is one block of this file with its own imports, as `scanned`
+/// is.
+mod rows {
+    use std::collections::BTreeMap;
+
+    use rusqlite::Connection;
+    use rusqlite::types::Value;
+    use wn_server::db::Db;
+
+    /// The name that [`dump`] gives the rowid of a row.
+    pub const ROWID: &str = "_rowid";
+
+    /// The tables whose rows a user or a scan attaches to the tracks, the albums
+    /// and the artists.
+    pub const ATTACHED: [&str; 6] = [
+        "annotations",
+        "play_queue",
+        "play_queue_tracks",
+        "playlist_tracks",
+        "playlists",
+        "users",
+    ];
+
+    /// The rows of every table by the name of the table: for each row in rowid
+    /// order, the rowid under the name [`ROWID`], and the name and the value of
+    /// every column.
+    pub type Dump = BTreeMap<String, Vec<Vec<(String, Value)>>>;
+
+    /// The names of the tables of the database of `conn`, in the order of the
+    /// names.
+    pub fn table_names(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+        conn.prepare(
+            "SELECT name FROM main.sqlite_schema
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect()
+    }
+
+    /// The rows of every table of the database of `conn`.
+    pub fn dump(conn: &Connection) -> rusqlite::Result<Dump> {
+        let mut tables = Dump::new();
+        for table in table_names(conn)? {
+            let mut select = conn.prepare(&format!(
+                "SELECT rowid AS {ROWID}, * FROM main.{table} ORDER BY rowid"
+            ))?;
+            let names: Vec<String> = select
+                .column_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            let rows = select
+                .query_map([], |row| {
+                    names
+                        .iter()
+                        .enumerate()
+                        .map(|(index, name)| Ok((name.clone(), row.get(index)?)))
+                        .collect()
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            tables.insert(table, rows);
+        }
+        Ok(tables)
+    }
+
+    /// The rows of every table of `db`, read on the calling thread.
+    pub fn dump_of(db: &Db) -> Dump {
+        db.with_reader(|conn| Ok(dump(conn)?)).unwrap()
+    }
+
+    /// The rows of the tables of [`ATTACHED`].
+    pub fn attached_rows(dump: &Dump) -> Vec<&Vec<Vec<(String, Value)>>> {
+        ATTACHED.iter().map(|table| &dump[*table]).collect()
+    }
+
+    /// Returns `dump` without the table `scans`, which gets a row with every
+    /// scan.
+    pub fn without_scans(dump: &Dump) -> Dump {
+        let mut dump = dump.clone();
+        dump.remove("scans");
+        dump
+    }
+
+    /// Fails every statement on the write connection, which the scanner uses,
+    /// that writes a row of the library or a row that is attached to it.
+    pub fn forbid_writes(db: &Db) {
+        db.with_writer(|conn| {
+            for table in ["tracks", "albums", "artists"].iter().chain(&ATTACHED) {
+                for (event, verb) in [
+                    ("INSERT", "inserted"),
+                    ("UPDATE", "updated"),
+                    ("DELETE", "deleted"),
+                ] {
+                    conn.execute_batch(&format!(
+                        "CREATE TEMP TRIGGER no_{table}_{verb} BEFORE {event} ON {table}
+                         BEGIN SELECT RAISE(ABORT, 'a row of {table} was {verb}'); END;"
+                    ))?;
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+}
+
+// A test binary that names none of these items has no use for the re-export.
+#[allow(unused_imports)]
+pub use shared::{
+    Row, album, artist, as_user, child_names, column, config_without_auth, entry_xml, error,
+    error_0, error_10, failed, failed_lines, file, first_element, get_album, get_song, guest,
+    header_of, index_names, is_time_between, json_document, json_ok, mtime, ok, ok_empty, owner_id,
+    post_body, remove_file, request_lines, retag, row, rows, scan_rows, schema_names, server,
+    server_without_auth, set_bitrate, set_modified, song, to_json, two_folder_server, unix_now,
+    unix_time, wav, with_orientation, xml_document, xml_failed, xml_ok, xml_ok_empty,
+};
+// File modes exist on Unix only.
+#[cfg(unix)]
+#[allow(unused_imports)]
+pub use shared::set_mode;
+
+/// The helpers that several test files use: the documents that a test
+/// expects, servers and requests, rows of the database, and files of a
+/// library. A helper that two test files need is defined here, once.
+///
+/// The module is one block of this file with its own imports, as `scanned`
+/// is.
+mod shared {
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+    use axum::body::Body;
+    use axum::http::{HeaderName, Request, header};
+    use axum::response::Response;
+    use lofty::config::WriteOptions;
+    use lofty::file::TaggedFileExt;
+    use lofty::tag::{ItemKey, TagExt};
+    use rusqlite::params;
+    use serde_json::{Value, json};
+    use wn_server::VERSION;
+    use wn_server::api::model;
+    use wn_server::config::Config;
+    use wn_server::db::Db;
+    use wn_server::db::queries::browse::{self, Album, Artist, Song};
+    use wn_server::db::queries::scans::{self, Scan};
+    use wn_server::db::queries::tracks::{self, Track};
+    use wn_server::db::queries::users;
+
+    use super::{
+        API_VERSION, CLIENT, LibraryBuilder, TestLibrary, TestServer, body_string, captured_log,
+        content_type, subsonic_response,
+    };
+
+    // The documents and the values that a test expects in a response.
+
+    /// The `error` object with `code` and `message`.
+    pub fn error(code: u32, message: &str) -> Value {
+        json!({ "code": code, "message": message })
+    }
+
+    /// The `error` object with code 0 and `message`.
+    pub fn error_0(message: &str) -> Value {
+        json!({ "code": 0, "message": message })
+    }
+
+    /// The `error` object of error 10 that names `parameter`.
+    pub fn error_10(parameter: &str) -> Value {
+        error(10, &format!("required parameter is missing: {parameter}"))
+    }
+
+    /// The `subsonic-response` object of a success without a payload.
+    pub fn ok_empty() -> Value {
+        json!({
+            "status": "ok",
+            "version": "1.16.1",
+            "type": "wn-server",
+            "serverVersion": VERSION,
+            "openSubsonic": true,
+        })
+    }
+
+    /// The `subsonic-response` object of a success that carries `value` under
+    /// `key`.
+    pub fn ok(key: &str, value: Value) -> Value {
+        let mut response = ok_empty();
+        response[key] = value;
+        response
+    }
+
+    /// The `subsonic-response` object of the error `code` with `message`.
+    pub fn failed(code: u32, message: &str) -> Value {
+        json!({
+            "status": "failed",
+            "version": "1.16.1",
+            "type": "wn-server",
+            "serverVersion": VERSION,
+            "openSubsonic": true,
+            "error": { "code": code, "message": message },
+        })
+    }
+
+    /// The JSON body that has `status` and then `rest`. `rest` is the text that
+    /// follows the envelope fields inside the response object.
+    pub fn json_document(status: &str, rest: &str) -> String {
+        format!(
+            concat!(
+                r#"{{"subsonic-response":{{"status":"{}","version":"1.16.1","type":"wn-server","#,
+                r#""serverVersion":"{}","openSubsonic":true{}}}}}"#
+            ),
+            status, VERSION, rest
+        )
+    }
+
+    /// The JSON body of a successful response whose response object holds `rest`
+    /// after the fields of the envelope.
+    pub fn json_ok(rest: &str) -> String {
+        format!(
+            concat!(
+                r#"{{"subsonic-response":{{"status":"ok","version":"1.16.1","type":"wn-server","#,
+                r#""serverVersion":"{}","openSubsonic":true,{}}}}}"#
+            ),
+            VERSION, rest
+        )
+    }
+
+    /// The XML body of a success whose root element holds `content`.
+    pub fn xml_ok(content: &str) -> String {
+        xml_document("ok", &format!(">{content}</subsonic-response>"))
+    }
+
+    /// The XML body of a success without a payload.
+    pub fn xml_ok_empty() -> String {
+        xml_document("ok", "/>")
+    }
+
+    /// The XML body of the error `code` with `message`.
+    pub fn xml_failed(code: u32, message: &str) -> String {
+        let error = format!(r#"<error code="{code}" message="{message}"/>"#);
+        xml_document("failed", &format!(">{error}</subsonic-response>"))
+    }
+
+    /// The XML body that has `status` and then `rest`. `rest` is the text that
+    /// follows the last attribute of the root element.
+    pub fn xml_document(status: &str, rest: &str) -> String {
+        format!(
+            concat!(
+                r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+                r#"<subsonic-response xmlns="http://subsonic.org/restapi" status="{}""#,
+                r#" version="1.16.1" type="wn-server" serverVersion="{}" openSubsonic="true"{}"#
+            ),
+            status, VERSION, rest
+        )
+    }
+
+    /// The JSON value of a response model.
+    pub fn to_json(model: impl serde::Serialize) -> Value {
+        serde_json::to_value(model).expect("the model serialises")
+    }
+
+    /// The position of the first element `name` in the XML document `xml`.
+    pub fn first_element(xml: &str, name: &str) -> Option<usize> {
+        xml.find(&format!("<{name} "))
+    }
+
+    /// The names of `artists` elements `artist`, `albums` elements `album` and
+    /// `songs` elements `song`, in the order of the Subsonic schema.
+    pub fn schema_names(artists: usize, albums: usize, songs: usize) -> Vec<&'static str> {
+        [("artist", artists), ("album", albums), ("song", songs)]
+            .into_iter()
+            .flat_map(|(name, count)| std::iter::repeat_n(name, count))
+            .collect()
+    }
+
+    /// Whether `text` is the ISO 8601 form of a time from `from` to `to`, both
+    /// in Unix seconds, as the models write a time.
+    pub fn is_time_between(text: &Value, from: i64, to: i64) -> bool {
+        (from..=to).any(|time| *text == model::iso8601(time))
+    }
+
+    /// The names of the child elements of the element `parent` of the XML
+    /// document `xml`, in the order of the document. The start tag of `parent`
+    /// has no attribute. Every child element must be an empty element, as an
+    /// item of a list of starred items or of a search result is.
+    pub fn child_names<'a>(xml: &'a str, parent: &str) -> Vec<&'a str> {
+        let (_, rest) = xml
+            .split_once(&format!("<{parent}>"))
+            .unwrap_or_else(|| panic!("no <{parent}> in {xml}"));
+        let (content, _) = rest
+            .split_once(&format!("</{parent}>"))
+            .unwrap_or_else(|| panic!("no </{parent}> in {xml}"));
+        content
+            .split('<')
+            .skip(1)
+            .map(|element| {
+                assert!(element.ends_with("/>"), "<{element} has content: {xml}");
+                element
+                    .split([' ', '/'])
+                    .next()
+                    .expect("a split has a first part")
+            })
+            .collect()
+    }
+
+    /// The values of `field` of the items of the list `list`.
+    pub fn column<'a>(list: &'a Value, field: &str) -> Vec<&'a Value> {
+        list.as_array()
+            .unwrap_or_else(|| panic!("no list: {list}"))
+            .iter()
+            .map(|item| &item[field])
+            .collect()
+    }
+
+    /// The names of the indexes of an `indexes` or `artists` element, each with
+    /// the names of its artists.
+    pub fn index_names(element: &Value) -> Vec<(String, Vec<String>)> {
+        let text = |value: &Value| value.as_str().expect("a string").to_owned();
+        element["index"]
+            .as_array()
+            .unwrap_or_else(|| panic!("no index list: {element}"))
+            .iter()
+            .map(|index| {
+                let names = index["artist"]
+                    .as_array()
+                    .expect("an artist list")
+                    .iter()
+                    .map(|artist| text(&artist["name"]))
+                    .collect();
+                (text(&index["name"]), names)
+            })
+            .collect()
+    }
+
+    // Servers, requests, and what a test reads from a response and from the
+    // log.
+
+    /// A server without a library that authenticates.
+    pub async fn server() -> TestServer {
+        TestServer::bare(Config::default()).await
+    }
+
+    /// A server with `auth.disabled_unsafe = true`.
+    pub async fn server_without_auth() -> TestServer {
+        let mut config = Config::default();
+        config.auth.disabled_unsafe = true;
+        TestServer::bare(config).await
+    }
+
+    /// The config with `auth.disabled_unsafe = true`.
+    pub fn config_without_auth() -> Config {
+        let mut config = Config::default();
+        config.auth.disabled_unsafe = true;
+        config
+    }
+
+    /// A server with two music folders, scanned, and the libraries that are the
+    /// folders. The first folder holds "Aurora Field" and one album of "Shared
+    /// Artist". The second holds "Marlow Quartet" and another album of "Shared
+    /// Artist".
+    pub async fn two_folder_server() -> (TestServer, TestLibrary, TestLibrary) {
+        let first = LibraryBuilder::new()
+            .track("Aurora Field", "Glass Harbour", "Low Tide", 1, "flac")
+            .track("Shared Artist", "First", "One", 1, "mp3")
+            .build();
+        let second = LibraryBuilder::new()
+            .track("Marlow Quartet", "Slow Rivers", "Upstream", 1, "m4a")
+            .track("Shared Artist", "Second", "Two", 1, "ogg")
+            .build();
+        let mut config = Config::default();
+        config.library.folders = vec![
+            first.root.path().to_path_buf(),
+            second.root.path().to_path_buf(),
+        ];
+        config.library.scan_poll_ms = 10;
+        let server = TestServer::bare(config).await;
+        server.scan_and_wait().await;
+        (server, first, second)
+    }
+
+    /// `request` with the parameters that authenticate the user `name` with the
+    /// password `password`.
+    pub fn as_user<'a>(
+        name: &'a str,
+        password: &'a str,
+        request: &[(&'a str, &'a str)],
+    ) -> Vec<(&'a str, &'a str)> {
+        let mut merged = request.to_vec();
+        merged.extend([
+            ("u", name),
+            ("p", password),
+            ("v", API_VERSION),
+            ("c", CLIENT),
+        ]);
+        merged
+    }
+
+    /// `request` with the parameters that authenticate the user `guest` with the
+    /// password `secret`. A test adds that user to its server before it sends
+    /// the request.
+    pub fn guest<'a>(request: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+        as_user("guest", "secret", request)
+    }
+
+    /// Sends `POST /rest/<method>` with `body` as the form body and returns the
+    /// `subsonic-response` object. `body` holds every parameter of the request.
+    pub async fn post_body(server: &TestServer, method: &str, body: String) -> Value {
+        let request = Request::post(format!("/rest/{method}"))
+            .header(header::CONTENT_TYPE, "application/x-www-form-urlencoded")
+            .body(Body::from(body))
+            .expect("a request");
+        let response = server.request(request).await;
+        assert_eq!(content_type(&response), "application/json", "{method}");
+        subsonic_response(&body_string(response).await)
+    }
+
+    /// The `song` object of `getSong` for the track `id`.
+    pub async fn get_song(server: &TestServer, id: &str) -> Value {
+        let mut response = server.get_json("getSong", &[("id", id)]).await;
+        assert_eq!(response["status"], "ok", "{response}");
+        response["song"].take()
+    }
+
+    /// The `album` object of `getAlbum` for the album `id`, with its `song`
+    /// list.
+    pub async fn get_album(server: &TestServer, id: &str) -> Value {
+        let mut response = server.get_json("getAlbum", &[("id", id)]).await;
+        assert_eq!(response["status"], "ok", "{response}");
+        response["album"].take()
+    }
+
+    /// The element of the song `id` in XML under the name `entry`: the `song`
+    /// element of `getSong` with the other name.
+    pub async fn entry_xml(server: &TestServer, id: &str) -> String {
+        let body = server.get_xml("getSong", &[("id", id)]).await;
+        let start = body.find("<song ").expect("a song element");
+        let end = body
+            .rfind("</subsonic-response>")
+            .expect("the end of the root element");
+        body[start..end].replacen("<song ", "<entry ", 1)
+    }
+
+    /// The value of the header `name` of `response`.
+    pub fn header_of<'a>(response: &'a Response, name: &HeaderName) -> Option<&'a str> {
+        response
+            .headers()
+            .get(name)
+            .map(|value| value.to_str().expect("an ASCII header value"))
+    }
+
+    /// The lines of the captured log that report a failed attempt of the client
+    /// `client`. Every test of a test binary logs to the same buffer, so a
+    /// test finds its lines by a client name that only it sends.
+    pub fn failed_lines(client: &str) -> Vec<String> {
+        captured_log()
+            .lines_with(&format!(r#"client="{client}""#))
+            .into_iter()
+            .filter(|line| line.contains("authentication failed"))
+            .collect()
+    }
+
+    /// The lines of the captured log that carry the span of a request of the
+    /// client `client`. Every test of a test binary logs to the same buffer,
+    /// so a test finds its request by a client name that only it sends.
+    pub fn request_lines(client: &str) -> Vec<String> {
+        captured_log().lines_with(&format!(r#"c="{client}""#))
+    }
+
+    // Rows of the database of a server.
+
+    /// The ID of the owner account of `server`.
+    pub async fn owner_id(server: &TestServer) -> i64 {
+        server
+            .db()
+            .read(users::get_owner)
+            .await
+            .expect("read the owner")
+            .expect("the server has an owner")
+            .user
+            .id
+    }
+
+    /// The time now in whole Unix seconds.
+    pub fn unix_now() -> i64 {
+        let elapsed = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("the clock is after 1970");
+        i64::try_from(elapsed.as_secs()).expect("the time fits")
+    }
+
+    /// Gives the track `id` its placeholder path, as the scanner does for a
+    /// track that it keeps without a file.
+    pub async fn remove_file(server: &TestServer, id: &str) {
+        let id = id.to_owned();
+        server
+            .db()
+            .write(move |conn| {
+                let track = tracks::get_track(conn, &id)?.expect("the track exists");
+                let placeholder = tracks::placeholder_path(&id);
+                tracks::relink_track(
+                    conn,
+                    &id,
+                    track.folder_id,
+                    &placeholder,
+                    track.mtime,
+                    track.size,
+                )
+            })
+            .await
+            .expect("give the track a placeholder path");
+    }
+
+    /// One row of the `annotations` table: `user_id`, `item_id`, `item_type`,
+    /// `starred_at`, `rating`, `play_count` and `last_played_at`.
+    pub type Row = (
+        i64,
+        String,
+        String,
+        Option<i64>,
+        Option<u8>,
+        i64,
+        Option<i64>,
+    );
+
+    /// Every row of the `annotations` table, in the order of the users and then
+    /// of the item IDs.
+    pub async fn rows(server: &TestServer) -> Vec<Row> {
+        server
+            .db()
+            .read(|conn| {
+                let mut select = conn.prepare(
+                    "SELECT user_id, item_id, item_type, starred_at, rating, play_count,
+                       last_played_at
+                     FROM annotations ORDER BY user_id, item_id",
+                )?;
+                let rows = select
+                    .query_map([], |row| {
+                        Ok((
+                            row.get(0)?,
+                            row.get(1)?,
+                            row.get(2)?,
+                            row.get(3)?,
+                            row.get(4)?,
+                            row.get(5)?,
+                            row.get(6)?,
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
+                Ok(rows)
+            })
+            .await
+            .expect("read the annotations")
+    }
+
+    /// The row of the track `id`, as `browse::track` reads it.
+    pub async fn song(server: &TestServer, id: &str) -> Song {
+        let id = id.to_owned();
+        server
+            .db()
+            .read(move |conn| browse::track(conn, &id))
+            .await
+            .expect("read the track")
+            .expect("the track exists")
+    }
+
+    /// The row of the album `id`, as `browse::album` reads it.
+    pub async fn album(server: &TestServer, id: &str) -> Album {
+        let id = id.to_owned();
+        server
+            .db()
+            .read(move |conn| browse::album(conn, &id))
+            .await
+            .expect("read the album")
+            .expect("the album exists")
+    }
+
+    /// The row of the artist `id`, as `browse::artist` reads it.
+    pub async fn artist(server: &TestServer, id: &str) -> Artist {
+        let id = id.to_owned();
+        server
+            .db()
+            .read(move |conn| browse::artist(conn, &id))
+            .await
+            .expect("read the artist")
+            .expect("the artist exists")
+    }
+
+    /// Reads the row of the track `id`.
+    pub async fn row(db: &Db, id: &str) -> Track {
+        let id = id.to_owned();
+        db.read(move |conn| tracks::get_track(conn, &id))
+            .await
+            .expect("read the track")
+            .expect("the track exists")
+    }
+
+    /// Sets `bitrate_kbps` of the track `id`.
+    pub async fn set_bitrate(db: &Db, id: &str, bitrate_kbps: u32) {
+        let id = id.to_owned();
+        db.write(move |conn| {
+            conn.execute(
+                "UPDATE tracks SET bitrate_kbps = ?1 WHERE id = ?2",
+                params![bitrate_kbps, id],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("set the bitrate");
+    }
+
+    /// The rows of the `scans` table in the order of the scans.
+    pub async fn scan_rows(server: &TestServer) -> Vec<Scan> {
+        server.db().read(scans::list).await.expect("read the scans")
+    }
+
+    // Files of a library.
+
+    /// Returns the path of the file `name` in the directory of the album `album`
+    /// of `artist` in `library`.
+    pub fn file(library: &TestLibrary, artist: &str, album: &str, name: &str) -> PathBuf {
+        library.root.path().join(artist).join(album).join(name)
+    }
+
+    /// Returns the modification time of the file at `path` in Unix seconds.
+    pub fn mtime(path: &Path) -> i64 {
+        let modified = fs::metadata(path)
+            .and_then(|metadata| metadata.modified())
+            .unwrap_or_else(|error| panic!("read the time of {}: {error}", path.display()));
+        let seconds = modified
+            .duration_since(UNIX_EPOCH)
+            .expect("a time after 1970")
+            .as_secs();
+        i64::try_from(seconds).expect("a time that fits")
+    }
+
+    /// Sets the modification time of the file at `path`.
+    pub fn set_modified(path: &Path, time: SystemTime) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_modified(time))
+            .unwrap_or_else(|error| panic!("set the time of {}: {error}", path.display()));
+    }
+
+    /// The time `seconds` Unix seconds.
+    pub fn unix_time(seconds: i64) -> SystemTime {
+        let distance = Duration::from_secs(seconds.unsigned_abs());
+        if seconds >= 0 {
+            UNIX_EPOCH + distance
+        } else {
+            UNIX_EPOCH - distance
+        }
+    }
+
+    /// Sets the permission bits of a file.
+    #[cfg(unix)]
+    pub fn set_mode(path: &Path, mode: u32) {
+        use std::os::unix::fs::PermissionsExt;
+
+        fs::set_permissions(path, fs::Permissions::from_mode(mode))
+            .unwrap_or_else(|error| panic!("set the mode of {}: {error}", path.display()));
+    }
+
+    /// Sets the tag `key` of an audio file to `text`. The file gets a later
+    /// modification time than it had, so that the scanner sees the change.
+    pub fn retag(path: &Path, key: ItemKey, text: &str) {
+        let before = fs::metadata(path).unwrap().modified().unwrap();
+        let mut file = lofty::read_from_path(path)
+            .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+        let tag = file
+            .primary_tag_mut()
+            .unwrap_or_else(|| panic!("{} has no primary tag", path.display()));
+        tag.insert_text(key, text.to_owned());
+        tag.save_to_path(path, WriteOptions::default())
+            .unwrap_or_else(|error| panic!("write the tag of {}: {error}", path.display()));
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .and_then(|file| file.set_modified(before + Duration::from_secs(5)))
+            .unwrap_or_else(|error| panic!("set the time of {}: {error}", path.display()));
+    }
+
+    /// Returns the JPEG file `jpeg` with Exif metadata that declares
+    /// `orientation`, a value from 1 to 8. The metadata is an APP1 segment after
+    /// the start marker of the file. It holds `Exif`, two zero bytes and the
+    /// Exif data: the byte order of Intel, the offset of the first directory,
+    /// and that directory with one entry, which has the tag 0x0112, the format
+    /// of a 16-bit number, one value and the orientation.
+    pub fn with_orientation(jpeg: &[u8], orientation: u8) -> Vec<u8> {
+        assert_eq!(jpeg[..2], [0xff, 0xd8], "the start marker of a JPEG");
+        let mut exif = b"Exif\0\0II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
+        exif.extend([orientation, 0, 0, 0]);
+        // The offset of the next directory: there is none.
+        exif.extend([0; 4]);
+        let length = u16::try_from(exif.len() + 2).expect("a short segment");
+        let mut bytes = vec![0xff, 0xd8, 0xff, 0xe1];
+        bytes.extend(length.to_be_bytes());
+        bytes.extend(exif);
+        bytes.extend(&jpeg[2..]);
+        bytes
+    }
+
+    /// Returns a WAV file with `data_len` bytes of samples: mono, 8 kHz, 16-bit
+    /// PCM. The samples are a fixed sequence in which no 64 KiB window repeats.
+    pub fn wav(data_len: u32) -> Vec<u8> {
+        let mut bytes = Vec::new();
+        bytes.extend(b"RIFF");
+        bytes.extend((36 + data_len).to_le_bytes());
+        bytes.extend(b"WAVEfmt ");
+        bytes.extend(16u32.to_le_bytes());
+        bytes.extend(1u16.to_le_bytes()); // PCM
+        bytes.extend(1u16.to_le_bytes()); // channels
+        bytes.extend(8000u32.to_le_bytes()); // sample rate
+        bytes.extend(16000u32.to_le_bytes()); // bytes per second
+        bytes.extend(2u16.to_le_bytes()); // bytes per frame
+        bytes.extend(16u16.to_le_bytes()); // bits per sample
+        bytes.extend(b"data");
+        bytes.extend(data_len.to_le_bytes());
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let end = bytes.len() + data_len as usize;
+        while bytes.len() < end {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            bytes.extend(state.to_le_bytes());
+        }
+        bytes.truncate(end);
+        bytes
+    }
+}

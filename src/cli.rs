@@ -28,7 +28,7 @@ use crate::db::{Db, DbError};
 use crate::discovery;
 use crate::library::scan_controller::{ScanLock, ScanLockError};
 use crate::library::scanner::{self, ScanOptions, ScanSummary};
-use crate::server::{self, ServerError, ServerOptions, StopStep};
+use crate::server::{self, FfmpegProbe, ServerError, ServerOptions, StopStep};
 
 /// The environment variable that supplies the password to `init` and
 /// `user set-password`.
@@ -370,13 +370,10 @@ fn serve(data_dir: &DataDir) -> Result<(), CliError> {
             tracing::info!("the mDNS advertisement is withdrawn");
         }
     });
-    let options = ServerOptions {
-        withdraw: Some(Box::new({
-            let withdraw = withdraw.clone();
-            move || withdraw.run()
-        })),
-        ..ServerOptions::default()
-    };
+    let options = run_options(Box::new({
+        let withdraw = withdraw.clone();
+        move || withdraw.run()
+    }));
     let outcome = runtime.block_on(async {
         let (signals, received) = mpsc::channel(1);
         tokio::spawn(forward_stop_signals(signals));
@@ -393,6 +390,18 @@ fn serve(data_dir: &DataDir) -> Result<(), CliError> {
     // the process, as the scan of a process that is killed does.
     runtime.shutdown_background();
     outcome
+}
+
+/// What the `run` command adds to its server: `withdraw`, the step that
+/// withdraws the mDNS advertisement, and the probe of ffmpeg. The command is
+/// the one caller of `run_server` that asks for the probe, so it is the one
+/// that starts the program of `transcoding.ffmpeg`.
+fn run_options(withdraw: StopStep) -> ServerOptions {
+    ServerOptions {
+        withdraw: Some(withdraw),
+        probe: FfmpegProbe::Run,
+        ..ServerOptions::default()
+    }
 }
 
 /// Runs the server on the database of `data_dir` until it ends, and stops it
@@ -1836,11 +1845,33 @@ mod tests {
         }
     }
 
+    #[test]
+    fn run_command_asks_for_the_probe_of_ffmpeg_and_passes_its_step() {
+        let ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let options = run_options(Box::new({
+            let ran = Arc::clone(&ran);
+            move || ran.store(true, std::sync::atomic::Ordering::SeqCst)
+        }));
+        // The server of the command probes the program of
+        // `transcoding.ffmpeg`. The default of the options does not.
+        assert_eq!(options.probe, FfmpegProbe::Run);
+        assert_eq!(ServerOptions::default().probe, FfmpegProbe::Skip);
+
+        // The step is the one of the caller, and the options add nothing
+        // else.
+        let withdraw = options.withdraw.expect("the step of the command");
+        withdraw();
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(options.listening.is_none());
+        assert!(!options.routes.has_routes());
+        assert!(options.scan.batch_size.is_none());
+        assert!(options.scan.on_batch.is_none());
+    }
+
     /// A data directory whose database holds the owner account, and the
     /// config of a server that scans the music folder `folder` at startup.
     /// The server listens on `127.0.0.1` with a port that the system
-    /// chooses. Its grace is one hour and its short grace is `short`. It
-    /// finds no ffmpeg.
+    /// chooses. Its grace is one hour and its short grace is `short`.
     async fn server_setup(
         folder: &Path,
         short: std::time::Duration,
@@ -1856,10 +1887,6 @@ mod tests {
         config.server.shutdown_grace_ms = 3_600_000;
         config.server.shutdown_grace_short_ms =
             u64::try_from(short.as_millis()).expect("a short time");
-        // The server probes this path for ffmpeg. The data directory holds
-        // no such file, so the test starts no ffmpeg of the machine.
-        let no_ffmpeg = data_dir.path().join("no-ffmpeg");
-        config.transcoding.ffmpeg = no_ffmpeg.to_str().expect("a Unicode path").to_owned();
         assert!(config.library.scan_on_start);
         (dir, data_dir, config)
     }

@@ -317,6 +317,24 @@ pub(super) fn json_array<S: AsRef<str>>(ids: &[S]) -> String {
     serde_json::to_string(&ids).expect("a list of strings serialises to JSON")
 }
 
+/// Whether every ID of `track_ids` is the ID of a track row. A track without
+/// a file has a row (`docs/design.md` section 3.4).
+///
+/// `playlists` and `play_queue` call it before they store a list of tracks.
+pub(super) fn tracks_exist<S: AsRef<str>>(conn: &Connection, track_ids: &[S]) -> Result<bool> {
+    if track_ids.is_empty() {
+        return Ok(true);
+    }
+    let exist = conn
+        .prepare_cached(
+            "SELECT NOT EXISTS (
+               SELECT 1 FROM json_each(?1)
+               WHERE NOT EXISTS (SELECT 1 FROM tracks WHERE tracks.id = json_each.value))",
+        )?
+        .query_row([json_array(track_ids)], |row| row.get(0))?;
+    Ok(exist)
+}
+
 /// Returns the rows of `rows` in the order of `ids`. `id_of` returns the ID
 /// of a row. An ID without a row adds nothing, and an ID that `ids` holds
 /// twice adds its row twice.

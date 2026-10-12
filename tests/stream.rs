@@ -8,22 +8,21 @@
 mod common;
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::path::PathBuf;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use axum::body::Body;
-use axum::http::header::HeaderName;
 use axum::http::{Method, Request, StatusCode, header};
 use axum::response::Response;
 use http_body_util::BodyExt;
-use rusqlite::params;
 use wn_server::config::Config;
 use wn_server::db::Db;
 use wn_server::db::queries::tracks::{self, Track};
 
 use common::{
     API_VERSION, CLIENT, LibraryBuilder, OWNER, OWNER_PASSWORD, ScannedServer, TestServer,
-    body_bytes, body_string, captured_log, content_type, subsonic_response, urlencode,
+    body_bytes, body_string, captured_log, content_type, header_of, row, set_bitrate, set_modified,
+    subsonic_response, unix_time, urlencode, wav,
 };
 
 /// Parameters of a request, and request headers: names and values.
@@ -128,14 +127,6 @@ async fn error_of(response: Response) -> (u64, String) {
     (code, message.to_owned())
 }
 
-/// The value of the header `name` of `response`.
-fn header_of<'a>(response: &'a Response, name: &HeaderName) -> Option<&'a str> {
-    response
-        .headers()
-        .get(name)
-        .map(|value| value.to_str().expect("an ASCII header value"))
-}
-
 /// Checks that `response` is HTTP 200 with the whole of `file` as its body,
 /// the content type `mime` and the headers of a file.
 async fn assert_whole_file(response: Response, file: &[u8], mime: &str, case: &str) {
@@ -153,15 +144,6 @@ async fn assert_whole_file(response: Response, file: &[u8], mime: &str, case: &s
     );
     assert_eq!(header_of(&response, &header::CONTENT_RANGE), None, "{case}");
     assert_eq!(body_bytes(response).await, file, "{case}");
-}
-
-/// Reads the row of the track `id`.
-async fn row(db: &Db, id: &str) -> Track {
-    let id = id.to_owned();
-    db.read(move |conn| tracks::get_track(conn, &id))
-        .await
-        .expect("read the track")
-        .expect("the track exists")
 }
 
 /// Reads the row of the track at the relative path `rel_path`.
@@ -186,25 +168,6 @@ async fn row_and_file(server: &ScannedServer, id: &str) -> (Track, Vec<u8>) {
     let track = row(server.db(), id).await;
     let file = fs::read(server.path(&track.rel_path)).expect("read the file of the track");
     (track, file)
-}
-
-/// The time `seconds` Unix seconds.
-fn unix_time(seconds: i64) -> SystemTime {
-    let distance = Duration::from_secs(seconds.unsigned_abs());
-    if seconds >= 0 {
-        UNIX_EPOCH + distance
-    } else {
-        UNIX_EPOCH - distance
-    }
-}
-
-/// Sets the modification time of the file at `path`.
-fn set_modified(path: &Path, time: SystemTime) {
-    fs::File::options()
-        .write(true)
-        .open(path)
-        .and_then(|file| file.set_modified(time))
-        .unwrap_or_else(|error| panic!("set the time of {}: {error}", path.display()));
 }
 
 /// Decodes the percent escapes of `text`.
@@ -244,35 +207,6 @@ fn disposition(value: &str) -> (&str, String) {
         "{value}"
     );
     (plain, percent_decode(encoded))
-}
-
-/// Returns a WAV file with `data_len` bytes of samples: mono, 8 kHz, 16-bit
-/// PCM. The samples are a fixed sequence in which no part repeats, so a
-/// part of the file is found at one offset only.
-fn wav(data_len: u32) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend(b"RIFF");
-    bytes.extend((36 + data_len).to_le_bytes());
-    bytes.extend(b"WAVEfmt ");
-    bytes.extend(16u32.to_le_bytes());
-    bytes.extend(1u16.to_le_bytes()); // PCM
-    bytes.extend(1u16.to_le_bytes()); // channels
-    bytes.extend(8000u32.to_le_bytes()); // sample rate
-    bytes.extend(16000u32.to_le_bytes()); // bytes per second
-    bytes.extend(2u16.to_le_bytes()); // bytes per frame
-    bytes.extend(16u16.to_le_bytes()); // bits per sample
-    bytes.extend(b"data");
-    bytes.extend(data_len.to_le_bytes());
-    let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
-    let end = bytes.len() + data_len as usize;
-    while bytes.len() < end {
-        state ^= state << 13;
-        state ^= state >> 7;
-        state ^= state << 17;
-        bytes.extend(state.to_le_bytes());
-    }
-    bytes.truncate(end);
-    bytes
 }
 
 /// The size of the samples of the file of [`wav_server`]: 1 MiB, which is
@@ -651,20 +585,6 @@ async fn head_request_returns_the_headers_of_the_file_and_no_body() {
         assert_eq!(header_of(&response, &header::CONTENT_RANGE), None);
         assert!(body_bytes(response).await.is_empty(), "{headers:?}");
     }
-}
-
-/// Sets `bitrate_kbps` of the track `id`.
-async fn set_bitrate(db: &Db, id: &str, bitrate_kbps: u32) {
-    let id = id.to_owned();
-    db.write(move |conn| {
-        conn.execute(
-            "UPDATE tracks SET bitrate_kbps = ?1 WHERE id = ?2",
-            params![bitrate_kbps, id],
-        )?;
-        Ok(())
-    })
-    .await
-    .expect("set the bitrate");
 }
 
 #[tokio::test]
@@ -1208,7 +1128,7 @@ async fn large_file_is_read_in_chunks_as_the_client_takes_them() {
 /// an entry is the state of the open file. On macOS it is not, and opening
 /// the entry duplicates the descriptor, whose state is then read.
 #[cfg(unix)]
-fn open_descriptors(path: &Path) -> usize {
+fn open_descriptors(path: &std::path::Path) -> usize {
     use std::os::unix::fs::MetadataExt;
 
     let file = fs::metadata(path).expect("the state of the file");

@@ -9,13 +9,11 @@ mod common;
 
 use axum::http::StatusCode;
 use serde_json::{Value, json};
-use wn_server::VERSION;
 use wn_server::config::Config;
-use wn_server::db::queries::tracks;
 
 use common::{
     API_VERSION, CLIENT, OWNER, OWNER_PASSWORD, StandardServer, TestServer, body_string,
-    content_type,
+    config_without_auth, content_type, json_document, remove_file, xml_document,
 };
 
 /// Parameters of a request: names and values.
@@ -39,31 +37,6 @@ const MISSING_ID: &str = "required parameter is missing: id";
 /// The status that the table in `docs/design.md` section 4 gives the two
 /// methods.
 const DESIGN_STATUS: &str = "empty result: no lyrics in version 1";
-
-/// The JSON body that has `status` and then `rest`. `rest` is the text that
-/// follows the envelope fields inside the response object.
-fn json_document(status: &str, rest: &str) -> String {
-    format!(
-        concat!(
-            r#"{{"subsonic-response":{{"status":"{}","version":"1.16.1","type":"wn-server","#,
-            r#""serverVersion":"{}","openSubsonic":true{}}}}}"#
-        ),
-        status, VERSION, rest
-    )
-}
-
-/// The XML body that has `status` and then `rest`. `rest` is the text that
-/// follows the last attribute of the root element.
-fn xml_document(status: &str, rest: &str) -> String {
-    format!(
-        concat!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>"#,
-            r#"<subsonic-response xmlns="http://subsonic.org/restapi" status="{}""#,
-            r#" version="1.16.1" type="wn-server" serverVersion="{}" openSubsonic="true"{}"#
-        ),
-        status, VERSION, rest
-    )
-}
 
 /// The JSON body of `getLyrics`: a `lyrics` element whose text is empty.
 fn lyrics_json() -> String {
@@ -141,35 +114,6 @@ async fn track_ids(server: &StandardServer) -> Vec<String> {
         .collect();
     assert_eq!(ids.len(), 10);
     ids
-}
-
-/// Gives the track `id` its placeholder path, as the scanner does for a
-/// track that it keeps without a file.
-async fn remove_file(server: &TestServer, id: &str) {
-    let id = id.to_owned();
-    server
-        .db()
-        .write(move |conn| {
-            let track = tracks::get_track(conn, &id)?.expect("the track exists");
-            let placeholder = tracks::placeholder_path(&id);
-            tracks::relink_track(
-                conn,
-                &id,
-                track.folder_id,
-                &placeholder,
-                track.mtime,
-                track.size,
-            )
-        })
-        .await
-        .expect("give the track a placeholder path");
-}
-
-/// The config with `auth.disabled_unsafe = true`.
-fn config_without_auth() -> Config {
-    let mut config = Config::default();
-    config.auth.disabled_unsafe = true;
-    config
 }
 
 /// The methods of `docs/design.md` section 4 whose status is `status`, in

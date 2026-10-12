@@ -91,7 +91,7 @@ pub fn placeholder_path(id: &str) -> String {
 /// Every reader of `tracks` asks here before it builds a file path
 /// (`docs/design.md` section 3.4). A placeholder path is never joined to a
 /// folder path, because `Path::join` replaces the folder with a root path.
-/// In SQL the same test is [`HAS_FILE_SQL`].
+/// In SQL the same test is `HAS_FILE_SQL`.
 pub fn has_file(rel_path: &str) -> bool {
     !rel_path.starts_with('/')
 }

@@ -54,7 +54,7 @@
 //! [`FfmpegTranscoder::probe`] runs the program twice when the server
 //! starts: `<ffmpeg> -version`, and `<ffmpeg> -hide_banner -encoders`, which
 //! lists the encoders of the build. A target is available when the list
-//! holds its encoder ([`encoder`]). A job for a target that is not available
+//! holds its encoder (`encoder`). A job for a target that is not available
 //! is [`TranscodeError::Unavailable`] and starts no process: every job when
 //! the program does not run, and the jobs of one target when the build lacks
 //! one encoder. The probe logs one warning for what is missing. No request
@@ -78,12 +78,12 @@
 //!   output within the limit, when the client disconnects, when the client
 //!   takes no chunk for the write timeout, and when the server stops.
 //! - When the output has ended, the process ends by itself. A process that
-//!   has not ended after [`EXIT_WAIT`] is killed.
+//!   has not ended after `EXIT_WAIT` is killed.
 //!
 //! A task then waits for the process, so that the system keeps no entry for
 //! it, and returns the permit. A process that ended by itself with a
 //! failure status is logged once, at `warn`, with the status and the ID of
-//! the track ([`ProcessEnd`]). A process that the server killed is not a
+//! the track (`ProcessEnd`). A process that the server killed is not a
 //! failure.
 
 use std::ffi::OsString;
@@ -231,11 +231,11 @@ pub struct FfmpegTranscoder {
 impl FfmpegTranscoder {
     /// Builds the transcoder of `config` and probes the program of
     /// `config.ffmpeg` once: `<ffmpeg> -version`, and then
-    /// `<ffmpeg> -hide_banner -encoders` ([`probed`]).
+    /// `<ffmpeg> -hide_banner -encoders` (`probed`).
     ///
     /// The result is logged: the version line of the program at `info`, and
     /// at most one warning, which says why the program is not available or
-    /// which encoder it lacks ([`Probe::warning`]). The transcoder starts no
+    /// which encoder it lacks (`Probe::warning`). The transcoder starts no
     /// process for a target that the probe did not find, and a job for such
     /// a target is [`TranscodeError::Unavailable`].
     pub async fn probe(config: &Transcoding) -> Self {
@@ -252,6 +252,14 @@ impl FfmpegTranscoder {
             tracing::warn!(ffmpeg = %config.ffmpeg, "{warning}");
         }
         Self::new(config, found.targets())
+    }
+
+    /// The transcoder of `config` for a server that did not probe its
+    /// program. It has no target, as the transcoder of a program that does
+    /// not run has none: every job is [`TranscodeError::Unavailable`], and
+    /// the transcoder starts no process.
+    pub fn without_program(config: &Transcoding) -> Self {
+        Self::new(config, Vec::new())
     }
 
     /// The transcoder of `config`. `targets` is the result of the probe: the
@@ -390,7 +398,7 @@ impl Transcoder for FfmpegTranscoder {
     /// a process that the system does not start.
     ///
     /// A process that ends by itself with a failure status is logged at
-    /// `warn` with the status and the ID of the track ([`log_end`]).
+    /// `warn` with the status and the ID of the track (`log_end`).
     fn spawn(&self, job: TranscodeJob) -> TranscodeFuture<'_> {
         Box::pin(async move {
             let track = job.track.clone();
@@ -1874,6 +1882,34 @@ mod tests {
         assert!(asked.elapsed() < LIMIT, "{:?}", asked.elapsed());
         let waited = sleeping.try_wait().expect("the state of the process");
         assert!(waited.is_some(), "the process was not waited for");
+    }
+
+    #[tokio::test]
+    async fn transcoder_without_a_program_is_unavailable_and_starts_no_process() {
+        // The program is the test binary, which runs. A transcoder that
+        // started it would return a stream.
+        let program = std::env::current_exe().expect("the test binary");
+        let config = Transcoding {
+            ffmpeg: program.to_str().expect("a Unicode path").to_owned(),
+            max_concurrent: 1,
+            ..Transcoding::default()
+        };
+        let transcoder = FfmpegTranscoder::without_program(&config);
+        assert_eq!(transcoder.targets, []);
+
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let path = dir.path().join("a.flac");
+        for target in TARGETS {
+            let error = transcoder
+                .spawn(job(path.to_str().unwrap(), target, 96, 0))
+                .await
+                .expect_err("no stream");
+            assert!(matches!(error, TranscodeError::Unavailable), "{error:?}");
+            assert_eq!(error.to_string(), "ffmpeg not available");
+            // No job took a permit, which a job takes before its process
+            // starts.
+            assert_eq!(transcoder.semaphore.available_permits(), 1);
+        }
     }
 
     /// The directory of the committed audio fixtures.

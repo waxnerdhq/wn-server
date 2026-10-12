@@ -13,7 +13,7 @@ wn-server is a headless music server. It scans a local music collection into SQL
 - `src/media/`: streaming and transcoding.
 - `src/discovery.rs`, `src/server.rs`: mDNS and composition.
 - `docs/design.md`: the design. An issue cites it by section heading.
-- `tests/`: router-level integration tests. `tests/fixtures/audio/`: five tiny audio files. `tests/common/mod.rs`: `LibraryBuilder` and `TestServer`.
+- `tests/`: router-level integration tests. `tests/fixtures/audio/`: five tiny audio files. `tests/common/mod.rs`: `LibraryBuilder`, `TestServer` and the helpers that several test files use. A helper that two test files need is defined there, once, and not in the two files.
 - `examples/make-library.rs`: writes the library of the end-to-end session. `examples/e2e.rs`: the end-to-end client session.
 - `xtask/`: the `cargo xtask check` command. `scripts/check.sh`: its Unix wrapper. `scripts/make-fixtures.sh`: regenerates the fixtures (maintainer tool, Unix).
 - `scripts/orchestrator/`: the scripts of the merge sequence (see Orchestration).
@@ -22,7 +22,7 @@ wn-server is a headless music server. It scans a local music collection into SQL
 ## Tooling
 
 - Rust 1.98.1, pinned in `rust-toolchain.toml`. Edition 2024. `unsafe_code = "forbid"`.
-- `cargo xtask check` runs `cargo fmt --all -- --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings` and `cargo test --locked --workspace`. The `xtask` alias passes `--locked`, so a `Cargo.lock` that does not match the manifests fails the check. It is the one definition of the checks and runs on Linux, Windows and macOS. `scripts/check.sh` calls it.
+- `cargo xtask check` runs four checks in this order: `cargo fmt --all -- --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings`, `cargo test --locked --workspace` and `cargo doc --locked --workspace --no-deps` with `RUSTDOCFLAGS="-D warnings"`. The fourth check fails on a warning of rustdoc, such as a link in a doc comment that names no item, or a link from the documentation of a public item to a private item. The `xtask` alias passes `--locked`, so a `Cargo.lock` that does not match the manifests fails the check. It is the one definition of the checks and runs on Linux, Windows and macOS. `scripts/check.sh` calls it.
 - The project builds and runs on Linux, Windows and macOS. Code that needs one OS is behind `#[cfg(unix)]` or `#[cfg(windows)]` with a comment saying why. Relative paths are stored with `/` separators. Scripts a contributor needs are Rust (`xtask`, `examples/`), not shell or Python.
 - CI is Woodpecker (`.woodpecker/check.yaml`), one Linux container, no cache. The pipeline runs on pull requests only. It runs `cargo xtask check` natively and `cargo clippy --locked --workspace --all-targets --target x86_64-pc-windows-gnu -- -D warnings` as a Windows cross build. The pipeline sets `CARGO_INCREMENTAL=0` and `CARGO_PROFILE_DEV_DEBUG=line-tables-only` for its builds, which shortens them. A local `cargo xtask check` runs with cargo's defaults. macOS is verified by the local `cargo xtask check` run on the developer's Mac before every push. Windows tests run natively by hand until a Windows agent exists.
 - The project is licensed Apache-2.0. A new dependency needs a licence compatible with that (MIT, Apache-2.0, BSD, ISC, Zlib, MPL-2.0 as a dependency). GPL, LGPL and AGPL crates are not added. All dependencies are declared in the root `Cargo.toml`; a feature PR does not add one without saying so in the PR.
@@ -83,6 +83,6 @@ wn-server is a headless music server. It scans a local music collection into SQL
 
 - Before pushing: `cargo xtask check` passes on the developer's machine.
 - Behaviour visible over HTTP has a router-level test in `tests/`. Pure logic has unit tests next to the code.
-- Transcoding tests use `FakeTranscoder`; the four tests that run ffmpeg are `#[ignore]`. A test that runs `run_server` sets `transcoding.ffmpeg` to a path that names no program, such as `common::transcoder::no_ffmpeg()`, so that the default suite starts no ffmpeg.
+- Transcoding tests use `FakeTranscoder`; the four tests that run ffmpeg are `#[ignore]`. `run_server` probes ffmpeg only when its caller passes `FfmpegProbe::Run` in `ServerOptions::probe`, which the `run` command does. The default is `FfmpegProbe::Skip`, so a test that runs `run_server` starts no ffmpeg, whatever its config names. A test of the probe passes `FfmpegProbe::Run` and sets `transcoding.ffmpeg` to a path that names no program.
 - A PR description states which tests were added and, for manual checks (mDNS, real clients, native Windows runs), pastes the command and its output.
 - The reviewer checks that each acceptance criterion in the issue is covered by a test or a recorded manual check, and that nothing from the issue's out-of-scope list was built.

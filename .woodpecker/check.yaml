@@ -10,8 +10,8 @@
 # What the pipeline verifies for each OS:
 #
 # - Linux: `cargo xtask check` runs natively in the container. It runs rustfmt,
-#   clippy with warnings as errors, and the test suite, each for the whole
-#   workspace.
+#   clippy with warnings as errors, the test suite, and rustdoc with warnings
+#   as errors, each for the whole workspace.
 # - Windows: clippy compiles the whole workspace for the
 #   x86_64-pc-windows-gnu target. That covers every crate, every test and
 #   example, every dependency and every build script. No test runs and no
@@ -28,8 +28,11 @@ steps:
   #
   # Nothing is cached between runs. A run is three builds from an empty target
   # directory: clippy for the host, the tests for the host, and clippy for the
-  # Windows target. A run takes several minutes on the 2 CPUs that the step
-  # requests.
+  # Windows target. rustdoc runs after the first two and is no fourth build:
+  # it reads the metadata that the clippy build wrote for the dependencies.
+  # It checks again the few crates that have other features in a build
+  # without the dev-dependencies, and the crates that use those. A run takes
+  # several minutes on the 2 CPUs that the step requests.
   - name: check
     image: rust:1.98.1-bookworm
     # Cargo settings for the builds of this pipeline. Cargo.toml does not hold

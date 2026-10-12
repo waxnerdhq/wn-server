@@ -25,14 +25,13 @@ use axum::body::Body;
 use axum::http::{HeaderMap, Request, StatusCode, header};
 use axum::response::Response;
 use image::{ImageFormat, Rgb, RgbImage};
-use serde_json::{Value, json};
-use wn_server::VERSION;
-use wn_server::db::queries::{albums, tracks};
+use serde_json::Value;
+use wn_server::db::queries::albums;
 
 use common::{
     API_VERSION, CLIENT, LibraryBuilder, OWNER, OWNER_PASSWORD, PICTURE_PNG, ScannedServer,
-    TestLibrary, TestServer, body_bytes, body_string, content_type, form_request, get_request,
-    subsonic_response, urlencode,
+    TestServer, body_bytes, body_string, content_type, failed, file, form_request, get_request,
+    mtime, remove_file, subsonic_response, urlencode, with_orientation, xml_failed,
 };
 
 /// The message of error 70.
@@ -43,31 +42,6 @@ const INVALID_SIZE: &str = "parameter size must be an integer from 0 to 42949672
 
 /// The value of `Cache-Control` of a response with a cover.
 const CACHE_CONTROL: &str = "public, max-age=86400";
-
-/// The `subsonic-response` object of the error `code` with `message`.
-fn failed(code: u32, message: &str) -> Value {
-    json!({
-        "status": "failed",
-        "version": "1.16.1",
-        "type": "wn-server",
-        "serverVersion": VERSION,
-        "openSubsonic": true,
-        "error": { "code": code, "message": message },
-    })
-}
-
-/// The XML body of the error `code` with `message`.
-fn xml_failed(code: u32, message: &str) -> String {
-    format!(
-        concat!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>"#,
-            r#"<subsonic-response xmlns="http://subsonic.org/restapi" status="failed""#,
-            r#" version="1.16.1" type="wn-server" serverVersion="{}" openSubsonic="true">"#,
-            r#"<error code="{}" message="{}"/></subsonic-response>"#
-        ),
-        VERSION, code, message
-    )
-}
 
 /// `params` followed by the password of the owner, `v` and `c`. A request
 /// that a test builds itself carries them.
@@ -209,12 +183,6 @@ fn etag(id: &str, size: u32, mtime: i64) -> String {
     }
 }
 
-/// Returns the path of the file `name` in the directory of the album `album`
-/// of `artist` in `library`.
-fn file(library: &TestLibrary, artist: &str, album: &str, name: &str) -> PathBuf {
-    library.root.path().join(artist).join(album).join(name)
-}
-
 /// Writes an image of `width` × `height` pixels to `path`. The extension of
 /// the path selects the encoding. `shade` is the blue value of every pixel,
 /// so two images of one size differ.
@@ -222,38 +190,6 @@ fn write_image(path: &Path, width: u32, height: u32, shade: u8) {
     RgbImage::from_fn(width, height, |x, y| Rgb([x as u8, y as u8, shade]))
         .save(path)
         .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
-}
-
-/// Returns the JPEG file `jpeg` with Exif metadata that declares
-/// `orientation`, a value from 1 to 8. The metadata is an APP1 segment after
-/// the start marker of the file. It holds `Exif`, two zero bytes and the
-/// Exif data: the byte order of Intel, the offset of the first directory,
-/// and that directory with one entry, which has the tag 0x0112, the format
-/// of a 16-bit number, one value and the orientation.
-fn with_orientation(jpeg: &[u8], orientation: u8) -> Vec<u8> {
-    assert_eq!(jpeg[..2], [0xff, 0xd8], "the start marker of a JPEG");
-    let mut exif = b"Exif\0\0II*\0\x08\0\0\0\x01\0\x12\x01\x03\0\x01\0\0\0".to_vec();
-    exif.extend([orientation, 0, 0, 0]);
-    // The offset of the next directory: there is none.
-    exif.extend([0; 4]);
-    let length = u16::try_from(exif.len() + 2).expect("a short segment");
-    let mut bytes = vec![0xff, 0xd8, 0xff, 0xe1];
-    bytes.extend(length.to_be_bytes());
-    bytes.extend(exif);
-    bytes.extend(&jpeg[2..]);
-    bytes
-}
-
-/// Returns the modification time of the file at `path` in Unix seconds.
-fn mtime(path: &Path) -> i64 {
-    let modified = fs::metadata(path)
-        .and_then(|metadata| metadata.modified())
-        .unwrap_or_else(|error| panic!("read the time of {}: {error}", path.display()));
-    let seconds = modified
-        .duration_since(UNIX_EPOCH)
-        .expect("a time after 1970")
-        .as_secs();
-    i64::try_from(seconds).expect("a time that fits")
 }
 
 /// Sets the modification time of the file at `path` to `seconds` after 1970.
@@ -291,28 +227,6 @@ async fn server_with_cover(
     let server = TestServer::scanned(library).await;
     let album = server.catalogue().await.album("Glass Harbour").id.clone();
     (server, album, cover_file)
-}
-
-/// Gives the track `id` its placeholder path, as the scanner does for a
-/// track that it keeps without a file.
-async fn remove_file(server: &TestServer, id: &str) {
-    let id = id.to_owned();
-    server
-        .db()
-        .write(move |conn| {
-            let track = tracks::get_track(conn, &id)?.expect("the track exists");
-            let placeholder = tracks::placeholder_path(&id);
-            tracks::relink_track(
-                conn,
-                &id,
-                track.folder_id,
-                &placeholder,
-                track.mtime,
-                track.size,
-            )
-        })
-        .await
-        .expect("give the track a placeholder path");
 }
 
 /// Polls `request` until it has returned `Pending` `waits` times, and

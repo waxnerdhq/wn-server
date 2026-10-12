@@ -6,11 +6,12 @@ mod common;
 use std::path::PathBuf;
 
 use serde_json::{Value, json};
-use wn_server::VERSION;
-use wn_server::config::Config;
 use wn_server::db::queries::folders;
 
-use common::{OWNER, OWNER_PASSWORD, TestServer, body_string, content_type, subsonic_response};
+use common::{
+    OWNER, OWNER_PASSWORD, TestServer, body_string, content_type, error, server,
+    server_without_auth, subsonic_response, xml_document,
+};
 
 /// The protocol version that the requests without the auth defaults send.
 const V: (&str, &str) = ("v", "1.16.1");
@@ -29,18 +30,6 @@ const USER_ATTRIBUTES: &str = concat!(
     r#" settingsRole="false" shareRole="false" streamRole="true" uploadRole="false""#,
     r#" username="owner" videoConversionRole="false""#
 );
-
-/// A server that authenticates.
-async fn server() -> TestServer {
-    TestServer::bare(Config::default()).await
-}
-
-/// A server with `auth.disabled_unsafe = true`.
-async fn server_without_auth() -> TestServer {
-    let mut config = Config::default();
-    config.auth.disabled_unsafe = true;
-    TestServer::bare(config).await
-}
 
 /// Adds the music folders `/music/rock` and `/music/jazz` to the database of
 /// `server`. Returns their IDs.
@@ -73,24 +62,6 @@ fn owner_user(folder: &[i64]) -> Value {
         "videoConversionRole": false,
         "folder": folder,
     })
-}
-
-/// The `error` object with `code` and `message`.
-fn error(code: u32, message: &str) -> Value {
-    json!({ "code": code, "message": message })
-}
-
-/// The XML body that has `status` and then `rest`. `rest` is the text that
-/// follows the last attribute of the root element.
-fn xml_document(status: &str, rest: &str) -> String {
-    format!(
-        concat!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>"#,
-            r#"<subsonic-response xmlns="http://subsonic.org/restapi" status="{}""#,
-            r#" version="1.16.1" type="wn-server" serverVersion="{}" openSubsonic="true"{}"#
-        ),
-        status, VERSION, rest
-    )
 }
 
 #[tokio::test]

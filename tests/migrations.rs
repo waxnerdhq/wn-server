@@ -21,7 +21,10 @@ use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
 
-use common::{LibraryBuilder, TestServer};
+use common::{
+    Dump, LibraryBuilder, TestServer, attached_rows, dump, dump_of, forbid_writes, table_names,
+    without_scans,
+};
 use lofty::config::WriteOptions;
 use lofty::file::TaggedFileExt;
 use lofty::tag::{ItemKey, TagExt};
@@ -48,63 +51,6 @@ const V2_MIGRATION: &str = include_str!("../migrations/0002_tracks_album_artist_
 /// The names of the files of the second and the third migration.
 const SECOND: &str = "0002_tracks_album_artist_name.sql";
 const THIRD: &str = "0003_scans_milliseconds_and_drop_has_lyrics.sql";
-
-/// The name that [`dump`] gives the rowid of a row.
-const ROWID: &str = "_rowid";
-
-/// The tables whose rows a user or a scan attaches to the tracks, the albums
-/// and the artists.
-const ATTACHED: [&str; 6] = [
-    "annotations",
-    "play_queue",
-    "play_queue_tracks",
-    "playlist_tracks",
-    "playlists",
-    "users",
-];
-
-/// The rows of every table by the name of the table: for each row in rowid
-/// order, the rowid under the name [`ROWID`], and the name and the value of
-/// every column.
-type Dump = BTreeMap<String, Vec<Vec<(String, Value)>>>;
-
-fn table_names(conn: &Connection) -> rusqlite::Result<Vec<String>> {
-    conn.prepare(
-        "SELECT name FROM main.sqlite_schema
-         WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
-    )?
-    .query_map([], |row| row.get(0))?
-    .collect()
-}
-
-fn dump(conn: &Connection) -> rusqlite::Result<Dump> {
-    let mut tables = Dump::new();
-    for table in table_names(conn)? {
-        let mut select = conn.prepare(&format!(
-            "SELECT rowid AS {ROWID}, * FROM main.{table} ORDER BY rowid"
-        ))?;
-        let names: Vec<String> = select
-            .column_names()
-            .into_iter()
-            .map(str::to_owned)
-            .collect();
-        let rows = select
-            .query_map([], |row| {
-                names
-                    .iter()
-                    .enumerate()
-                    .map(|(index, name)| Ok((name.clone(), row.get(index)?)))
-                    .collect()
-            })?
-            .collect::<rusqlite::Result<_>>()?;
-        tables.insert(table, rows);
-    }
-    Ok(tables)
-}
-
-fn dump_of(db: &Db) -> Dump {
-    db.with_reader(|conn| Ok(dump(conn)?)).unwrap()
-}
 
 fn user_version(conn: &Connection) -> i64 {
     conn.pragma_query_value(None, "user_version", |row| row.get(0))
@@ -191,19 +137,6 @@ fn identities(dump: &Dump) -> [Vec<Vec<Value>>; 3] {
             &["id", "artist_id", "album_id", "folder_id", "rel_path"],
         ),
     ]
-}
-
-/// The rows of the tables of [`ATTACHED`].
-fn attached(dump: &Dump) -> Vec<&Vec<Vec<(String, Value)>>> {
-    ATTACHED.iter().map(|table| &dump[*table]).collect()
-}
-
-/// Returns `dump` without the table `scans`, which gets a row with every
-/// scan.
-fn without_scans(dump: &Dump) -> Dump {
-    let mut dump = dump.clone();
-    dump.remove("scans");
-    dump
 }
 
 fn text(value: &Value) -> Option<String> {
@@ -362,27 +295,6 @@ fn retitle(path: &Path, title: &str) {
     file.set_modified(before + Duration::from_secs(5)).unwrap();
 }
 
-/// Fails every statement on the write connection, which the scanner uses,
-/// that writes a row of the library or a row that is attached to it.
-fn forbid_writes(db: &Db) {
-    db.with_writer(|conn| {
-        for table in ["tracks", "albums", "artists"].iter().chain(&ATTACHED) {
-            for (event, verb) in [
-                ("INSERT", "inserted"),
-                ("UPDATE", "updated"),
-                ("DELETE", "deleted"),
-            ] {
-                conn.execute_batch(&format!(
-                    "CREATE TEMP TRIGGER no_{table}_{verb} BEFORE {event} ON {table}
-                     BEGIN SELECT RAISE(ABORT, 'a row of {table} was {verb}'); END;"
-                ))?;
-            }
-        }
-        Ok(())
-    })
-    .unwrap();
-}
-
 #[test]
 fn a_library_scanned_at_schema_version_1_keeps_its_ids_and_what_is_attached_to_them() {
     // The first artist is spelled in one way in the album artist tags and in
@@ -514,7 +426,7 @@ fn a_library_scanned_at_schema_version_1_keeps_its_ids_and_what_is_attached_to_t
     }
     assert_eq!(artist_names(&one_read), artist_names(&before));
     assert_eq!(identities(&one_read), identities(&migrated));
-    assert_eq!(attached(&one_read), attached(&migrated));
+    assert_eq!(attached_rows(&one_read), attached_rows(&migrated));
 
     // A full scan reads every file, and every row gets its album artist: the
     // album artist tag, the track artist of the file without that tag, and
@@ -556,8 +468,8 @@ fn a_library_scanned_at_schema_version_1_keeps_its_ids_and_what_is_attached_to_t
         ]
     );
     assert_eq!(identities(&filled), identities(&migrated));
-    assert_eq!(attached(&filled), attached(&migrated));
-    assert_eq!(attached(&filled), attached(&before));
+    assert_eq!(attached_rows(&filled), attached_rows(&migrated));
+    assert_eq!(attached_rows(&filled), attached_rows(&before));
 
     // Every row has its album artist. A scan that finds no file changed
     // writes no row.

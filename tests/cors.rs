@@ -13,7 +13,7 @@ use wn_server::config::Config;
 
 use common::{
     API_VERSION, OWNER, OWNER_PASSWORD, TestServer, body_string, captured_log, content_type,
-    form_request, subsonic_response, urlencode,
+    failed_lines, form_request, server, subsonic_response, urlencode,
 };
 
 /// The origin of the page of a browser-based client.
@@ -29,11 +29,6 @@ const AS_OWNER: [(&str, &str); 4] = [
 
 /// The value of `Access-Control-Expose-Headers`.
 const EXPOSED: &str = "Content-Range, Accept-Ranges, Content-Length";
-
-/// A server that authenticates.
-async fn server() -> TestServer {
-    TestServer::bare(Config::default()).await
-}
 
 /// A request as the page at [`ORIGIN`] sends it: `method` for
 /// `/rest/<name>` with `params` in the query string, the `Origin` header and
@@ -78,16 +73,6 @@ async fn envelope(response: Response) -> Value {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(content_type(&response), "application/json");
     subsonic_response(&body_string(response).await)
-}
-
-/// The lines of the captured log that report a failed attempt of the client
-/// `client`.
-fn failed_lines(client: &str) -> Vec<String> {
-    captured_log()
-        .lines_with(&format!(r#"client="{client}""#))
-        .into_iter()
-        .filter(|line| line.contains("authentication failed"))
-        .collect()
 }
 
 #[tokio::test]

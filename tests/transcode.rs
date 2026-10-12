@@ -21,17 +21,15 @@ use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use axum::Router;
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::header::HeaderName;
 use axum::http::{Method, Request, StatusCode, header};
 use axum::response::Response;
 use axum::routing::get;
 use http_body_util::BodyExt;
-use rusqlite::params;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
@@ -44,12 +42,13 @@ use wn_server::db::queries::users;
 use wn_server::library::scanner::{self, ScanOptions};
 use wn_server::media::stream::{self as media_stream, Target};
 use wn_server::media::transcode::TranscodeJob;
-use wn_server::server::{ServerOptions, run_server};
+use wn_server::server::{FfmpegProbe, ServerOptions, run_server};
 
-use common::transcoder::{FAKE_CHUNK, FAKE_TRANSCODE, FakeFailure, FakeTranscoder, no_ffmpeg};
+use common::transcoder::{FAKE_CHUNK, FAKE_TRANSCODE, FakeFailure, FakeTranscoder};
 use common::{
     API_VERSION, CLIENT, LibraryBuilder, OWNER, OWNER_PASSWORD, ScannedServer, StandardServer,
-    TestServer, body_bytes, body_string, captured_log, content_type, subsonic_response, urlencode,
+    TestServer, body_bytes, body_string, captured_log, content_type, header_of, request_lines, row,
+    set_bitrate, set_modified, subsonic_response, unix_time, urlencode,
 };
 
 /// Parameters of a request, and request headers: names and values.
@@ -148,14 +147,6 @@ async fn stream_error(server: &TestServer, id: &str, params: Pairs<'_>) -> (u64,
     (code, message.to_owned())
 }
 
-/// The value of the header `name` of `response`.
-fn header_of<'a>(response: &'a Response, name: &HeaderName) -> Option<&'a str> {
-    response
-        .headers()
-        .get(name)
-        .map(|value| value.to_str().expect("an ASCII header value"))
-}
-
 /// Checks that `response` has the status and the headers of a transcode
 /// with the content type `mime`: no ranges, no caching, and none of the
 /// headers that describe a file.
@@ -182,33 +173,10 @@ fn assert_transcode_headers(response: &Response, mime: &str, case: &str) {
     }
 }
 
-/// Reads the row of the track `id`.
-async fn row(db: &Db, id: &str) -> Track {
-    let id = id.to_owned();
-    db.read(move |conn| tracks::get_track(conn, &id))
-        .await
-        .expect("read the track")
-        .expect("the track exists")
-}
-
 /// The resolved path of the file of `track`, which is the path that the
 /// transcoder gets.
 fn resolved(server: &ScannedServer, track: &Track) -> PathBuf {
     fs::canonicalize(server.path(&track.rel_path)).expect("the path of the file")
-}
-
-/// Sets `bitrate_kbps` of the track `id`.
-async fn set_bitrate(db: &Db, id: &str, bitrate_kbps: u32) {
-    let id = id.to_owned();
-    db.write(move |conn| {
-        conn.execute(
-            "UPDATE tracks SET bitrate_kbps = ?1 WHERE id = ?2",
-            params![bitrate_kbps, id],
-        )?;
-        Ok(())
-    })
-    .await
-    .expect("set the bitrate");
 }
 
 /// `len` bytes that repeat after 251 bytes. The size of a chunk of the
@@ -707,12 +675,6 @@ async fn next_chunk(body: &mut Body) -> Option<Result<Vec<u8>, axum::Error>> {
     Some(frame.map(|frame| frame.into_data().expect("a data frame").to_vec()))
 }
 
-/// The lines of the captured log that the requests of the client `client`
-/// wrote.
-fn log_lines(client: &str) -> Vec<String> {
-    captured_log().lines_with(&format!(r#"c="{client}""#))
-}
-
 #[tokio::test]
 async fn transcode_without_output_is_error_0_and_no_empty_stream() {
     let server = TestServer::standard().await;
@@ -959,7 +921,7 @@ async fn client_that_reads_nothing_loses_its_transcode_at_the_write_timeout() {
 
     // The log has the line of the request and one line at `info` that says
     // why the stream ended, and no line at `error`.
-    let lines = log_lines(CLIENT_NAME);
+    let lines = request_lines(CLIENT_NAME);
     let with = |text: &str| lines.iter().filter(|line| line.contains(text)).count();
     assert_eq!(lines.len(), 2, "{lines:?}");
     assert_eq!(with("finished processing request"), 1, "{lines:?}");
@@ -1016,7 +978,7 @@ async fn http_503_of_a_busy_transcoder_is_not_logged_at_error() {
     // The line of each request, at the level of a `stream` request, and the
     // line of the handler that says why, at `info`. The trace layer adds no
     // line at `error`, as it does for a 5xx status that is a failure.
-    let lines = log_lines(CLIENT_NAME);
+    let lines = request_lines(CLIENT_NAME);
     let with = |text: &str| lines.iter().filter(|line| line.contains(text)).count();
     assert_eq!(lines.len(), 4, "{lines:?}");
     assert_eq!(with("status=503"), 2, "{lines:?}");
@@ -1025,20 +987,6 @@ async fn http_503_of_a_busy_transcoder_is_not_logged_at_error() {
     assert_eq!(with(" INFO "), 2, "{lines:?}");
     assert_eq!(with("ERROR"), 0, "{lines:?}");
     assert_eq!(with("response failed"), 0, "{lines:?}");
-}
-
-/// The time `seconds` Unix seconds.
-fn unix_time(seconds: i64) -> SystemTime {
-    UNIX_EPOCH + Duration::from_secs(seconds.unsigned_abs())
-}
-
-/// Sets the modification time of the file at `path`.
-fn set_modified(path: &std::path::Path, time: SystemTime) {
-    fs::File::options()
-        .write(true)
-        .open(path)
-        .and_then(|file| file.set_modified(time))
-        .unwrap_or_else(|error| panic!("set the time of {}: {error}", path.display()));
 }
 
 /// Checks that `server` answers every request that selects a transcode of
@@ -1370,10 +1318,14 @@ async fn server_without_ffmpeg_starts_with_one_warning_and_serves_original_files
     config.library.scan_on_start = false;
     config.transcoding.ffmpeg = missing.to_str().expect("a Unicode path").to_owned();
 
+    // The server probes the program of its config, as the server of the
+    // `run` command does. This is the one test of the suite that asks for
+    // the probe.
     let cancel = CancellationToken::new();
     let (listening, bound) = oneshot::channel();
     let options = ServerOptions {
         listening: Some(listening),
+        probe: FfmpegProbe::Run,
         ..ServerOptions::default()
     };
     let mut task = tokio::spawn({
@@ -1493,14 +1445,14 @@ async fn stop_with_the_short_grace_ends_the_transcodes_that_wait_for_ffmpeg_and_
     config.server.shutdown_grace_short_ms = SHORT_GRACE_MS;
     config.library.folders = vec![root.clone()];
     config.library.scan_on_start = false;
-    config.transcoding.ffmpeg = no_ffmpeg();
     config.transcoding.first_output_wait_ms = NO_END_MS;
     config.transcoding.write_timeout_ms = NO_END_MS;
 
-    // `run_server` builds the transcoder that runs ffmpeg and gives a test
-    // no way to replace it. A route next to the API answers as the handler
-    // of `stream` answers a request that selects a transcode: with
-    // `media::stream::transcoded`, here with the transcoder of the test.
+    // The transcoder of the server is the one that runs ffmpeg, and this
+    // server has not probed it, so it starts no process. A route next to
+    // the API answers as the handler of `stream` answers a request that
+    // selects a transcode: with `media::stream::transcoded`, here with the
+    // transcoder of the test.
     let transcoder = Arc::new(FakeTranscoder::default());
     let routes = Router::new().route(
         "/transcode",

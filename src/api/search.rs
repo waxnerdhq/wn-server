@@ -13,8 +13,8 @@
 //!   after the other. A query of more than 1024 characters or of more than
 //!   32 different terms is error 0.
 //! - `artistCount`, `albumCount` and `songCount` are the most items of a
-//!   list. The default is [`DEFAULT_COUNT`], and a larger value than
-//!   [`MAX_COUNT`] counts as [`MAX_COUNT`].
+//!   list. The default is `DEFAULT_COUNT`, and a larger value than
+//!   `MAX_COUNT` counts as `MAX_COUNT`.
 //! - `artistOffset`, `albumOffset` and `songOffset` are the number of
 //!   matches that a list leaves out at its start. The default is 0.
 //! - `musicFolderId` names a music folder. The lists then hold only what has

@@ -8,12 +8,11 @@ use axum::http::{Request, StatusCode, header};
 use serde_json::{Value, json};
 use wn_server::VERSION;
 use wn_server::api::{EXTENSIONS, METHODS};
-use wn_server::config::Config;
 use wn_server::db::queries::users;
 
 use common::{
-    OWNER, TestServer, body_string, captured_log, content_type, form_request, subsonic_response,
-    token, urlencode,
+    OWNER, body_string, captured_log, content_type, error_0, form_request, json_document,
+    request_lines, server, subsonic_response, token, urlencode, xml_document,
 };
 
 /// The methods that return `not supported` in local mode for good
@@ -44,46 +43,12 @@ const NOT_SUPPORTED: [&str; 23] = [
     "getTranscodeStream",
 ];
 
-async fn server() -> TestServer {
-    TestServer::bare(Config::default()).await
-}
-
-/// The JSON body that has `status` and then `rest`. `rest` is the text that
-/// follows the envelope fields inside the response object.
-fn json_document(status: &str, rest: &str) -> String {
-    format!(
-        concat!(
-            r#"{{"subsonic-response":{{"status":"{}","version":"1.16.1","type":"wn-server","#,
-            r#""serverVersion":"{}","openSubsonic":true{}}}}}"#
-        ),
-        status, VERSION, rest
-    )
-}
-
-/// The XML body that has `status` and then `rest`. `rest` is the text that
-/// follows the last attribute of the root element.
-fn xml_document(status: &str, rest: &str) -> String {
-    format!(
-        concat!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>"#,
-            r#"<subsonic-response xmlns="http://subsonic.org/restapi" status="{}""#,
-            r#" version="1.16.1" type="wn-server" serverVersion="{}" openSubsonic="true"{}"#
-        ),
-        status, VERSION, rest
-    )
-}
-
 /// The XML body of error 0 with `message`.
 fn xml_error_0(message: &str) -> String {
     xml_document(
         "failed",
         &format!(r#"><error code="0" message="{message}"/></subsonic-response>"#),
     )
-}
-
-/// The `error` object of error 0 with `message`.
-fn error_0(message: &str) -> Value {
-    json!({ "code": 0, "message": message })
 }
 
 #[tokio::test]
@@ -369,13 +334,6 @@ async fn other_http_methods_are_http_405() {
             "{method}"
         );
     }
-}
-
-/// The lines of the captured log that carry the span of a request of the
-/// client `client`. Every test of this file logs to the same buffer, so a
-/// test finds its request by a client name that only it sends.
-fn request_lines(client: &str) -> Vec<String> {
-    captured_log().lines_with(&format!(r#"c="{client}""#))
 }
 
 /// The one line of the captured log that reports the request of the client

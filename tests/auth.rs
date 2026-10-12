@@ -19,8 +19,8 @@ use wn_server::config::{Config, DataDir};
 use wn_server::server::{ServerError, ServerOptions, run_server};
 
 use common::{
-    OWNER, OWNER_PASSWORD, TestServer, body_string, captured_log, content_type, form_request,
-    subsonic_response, token,
+    OWNER, OWNER_PASSWORD, TestServer, body_string, captured_log, content_type, error, error_10,
+    failed_lines, form_request, server, server_without_auth, subsonic_response, token, xml_failed,
 };
 
 /// Parameters of a request: names and values.
@@ -40,31 +40,9 @@ const SESAME_HEX: &str = "736573616d65";
 const SESAME_SALT: &str = "c19b2d";
 const SESAME_TOKEN: &str = "26719a1196d2a940705a59634eb18eab";
 
-/// A server that authenticates.
-async fn server() -> TestServer {
-    TestServer::bare(Config::default()).await
-}
-
-/// A server with `auth.disabled_unsafe = true`.
-async fn server_without_auth() -> TestServer {
-    let mut config = Config::default();
-    config.auth.disabled_unsafe = true;
-    TestServer::bare(config).await
-}
-
 /// Calls `ping` with `params` and `f=json`, and no other parameter.
 async fn ping(server: &TestServer, params: Pairs<'_>) -> Value {
     server.get_json_noauth("ping", params).await
-}
-
-/// The `error` object with `code` and `message`.
-fn error(code: u32, message: &str) -> Value {
-    json!({ "code": code, "message": message })
-}
-
-/// The `error` object of error 10 that names `parameter`.
-fn error_10(parameter: &str) -> Value {
-    error(10, &format!("required parameter is missing: {parameter}"))
 }
 
 /// The `error` object of error 40.
@@ -89,19 +67,6 @@ fn json_error_document(code: u32, message: &str) -> String {
             r#"{{"subsonic-response":{{"status":"failed","version":"1.16.1","type":"wn-server","#,
             r#""serverVersion":"{}","openSubsonic":true,"#,
             r#""error":{{"code":{},"message":"{}"}}}}}}"#
-        ),
-        VERSION, code, message
-    )
-}
-
-/// The XML body of a failed response with `code` and `message`.
-fn xml_error_document(code: u32, message: &str) -> String {
-    format!(
-        concat!(
-            r#"<?xml version="1.0" encoding="UTF-8"?>"#,
-            r#"<subsonic-response xmlns="http://subsonic.org/restapi" status="failed""#,
-            r#" version="1.16.1" type="wn-server" serverVersion="{}" openSubsonic="true">"#,
-            r#"<error code="{}" message="{}"/></subsonic-response>"#
         ),
         VERSION, code, message
     )
@@ -386,7 +351,7 @@ async fn auth_error_is_the_documented_envelope_in_json_and_xml() {
         assert_eq!(content_type(&response), "application/xml", "{method}");
         assert_eq!(
             body_string(response).await,
-            xml_error_document(40, "wrong username or password"),
+            xml_failed(40, "wrong username or password"),
             "{method}"
         );
     }
@@ -411,7 +376,7 @@ async fn auth_error_is_the_documented_envelope_in_json_and_xml() {
         assert_eq!(content_type(&response), "application/xml", "{code}");
         assert_eq!(
             body_string(response).await,
-            xml_error_document(code, message),
+            xml_failed(code, message),
             "{code}"
         );
     }
@@ -734,17 +699,6 @@ async fn auth_defaults_of_the_test_server_authenticate_each_request_with_a_new_s
     // The `noauth` helpers add nothing.
     let response = server.get_json_noauth("ping", &[]).await;
     assert_eq!(response["error"], error_10("v"));
-}
-
-/// The lines of the captured log that report a failed attempt of the client
-/// `client`. Every test of this file logs to the same buffer, so a test
-/// finds its lines by a client name that only it sends.
-fn failed_lines(client: &str) -> Vec<String> {
-    captured_log()
-        .lines_with(&format!(r#"client="{client}""#))
-        .into_iter()
-        .filter(|line| line.contains("authentication failed"))
-        .collect()
 }
 
 #[tokio::test]
