@@ -7,9 +7,10 @@
 //!
 //! `id` and `size` come from the client. The handler checks their form and
 //! passes them to [`Covers::get`]. It builds no path and opens no file. The
-//! service resolves the ID through the database, and it owns the limits on
-//! the size, on the bytes of a source and on the memory of a decoded image,
-//! and the rule that no symbolic link is followed to an image.
+//! service resolves the ID through the database, and it owns the steps of
+//! the size, the limits on the bytes of a source and on the memory of a
+//! decoded image, the rule that no symbolic link is followed to an image,
+//! and the rule that no source outside the music folders is read.
 //!
 //! - `id` is required: an absent one is error 10. A value that
 //!   [`ids::parse`] rejects is error 70, and it reaches neither the service
@@ -50,7 +51,7 @@ use super::envelope::ApiError;
 use super::params::Params;
 use crate::auth::extract::Authed;
 use crate::ids;
-use crate::library::covers::{Cover, CoverError, Covers, MAX_SIZE};
+use crate::library::covers::{self, Cover, CoverError, Covers};
 
 /// The value of `Cache-Control` of a response with a cover: every cache may
 /// store the response and reuse it for one day, in seconds, without a
@@ -62,9 +63,11 @@ const CACHE_CONTROL: &str = "public, max-age=86400";
 ///
 /// Without `size`, and with `size=0`, the body is the image as its source
 /// stores it, with the content type of its format: `image/jpeg`, `image/png`
-/// or `image/webp`. With another `size` the body is a JPEG whose longer side
-/// is at most `size` pixels, and at most 2000 pixels. The content type is
-/// the one that the service reports.
+/// or `image/webp`. With another `size` the body is a JPEG at the step of
+/// the size: the smallest of 80, 160, 320, 640, 1280 and 2000 pixels that is
+/// not smaller than `size`, and 2000 pixels for a larger `size`. Its longer
+/// side is at most the step, and it is not enlarged. The content type is the
+/// one that the service reports.
 ///
 /// The response has `Content-Length`, `Cache-Control` and `ETag`. A request
 /// whose `If-None-Match` names the entity tag gets HTTP 304 without a body.
@@ -141,14 +144,15 @@ fn unavailable(id: &str, error: &CoverError) -> ApiError {
 ///
 /// `<size>` is the size that the cover is served at: 0 for the image as its
 /// source stores it, which a request without `size` and with `size=0` gets,
-/// and at most [`MAX_SIZE`], which every larger size counts as. Two requests
-/// that get the same bytes have the same tag. `mtime` is the modification
-/// time that the last scan stored for the source of the cover. The three
-/// parts are the ones in the name of the cache file of a resized cover.
+/// and otherwise the step of the size ([`covers::served_size`]). Two
+/// requests that get the same bytes have the same tag, so every size of one
+/// step has one tag. `mtime` is the modification time that the last scan
+/// stored for the source of the cover. The three parts are the ones in the
+/// name of the cache file of a resized cover.
 ///
 /// `id` has the form that [`ids::parse`] accepts.
 fn entity_tag(id: &str, size: Option<u32>, mtime: i64) -> String {
-    let served = size.unwrap_or(0).min(MAX_SIZE);
+    let served = covers::served_size(size).unwrap_or(0);
     format!("{id}-{served}-{mtime}")
 }
 
@@ -255,14 +259,17 @@ mod tests {
 
     /// A library in a temporary directory: a memory database, the cover
     /// service, and one album whose cover is the image file `cover.png` of
-    /// [`SIDE`] × [`SIDE`] pixels with the time [`MTIME`]. The cache
-    /// directory, `cache/covers`, does not exist until the service writes to
-    /// it.
+    /// [`SIDE`] × [`SIDE`] pixels with the time [`MTIME`]. The directory
+    /// `music` of the temporary directory holds the file and is the one
+    /// music folder. The cache directory, `cache/covers`, does not exist
+    /// until the service writes to it.
     struct Library {
         dir: TempDir,
         db: Db,
         covers: Covers,
         album_id: String,
+        /// The ID of the artist of the album.
+        artist_id: String,
         /// The bytes of `cover.png`.
         image: Vec<u8>,
     }
@@ -279,48 +286,64 @@ mod tests {
             let image = fs::read(&cover).expect("read the cover file");
 
             let db = Db::open_memory().expect("a memory database");
-            let source = cover.to_str().expect("a Unicode path").to_owned();
-            let album_id = db
+            let folder = music.clone();
+            let artist_id = db
                 .write(move |conn| {
-                    folders::sync_folders(conn, &[music])?;
-                    let artist = artists::upsert_by_key(conn, "Aurora Field")?;
-                    let album = albums::upsert_by_key(
-                        conn,
-                        &artist,
-                        "Glass Harbour",
-                        "Aurora Field",
-                        false,
-                    )?;
+                    folders::sync_folders(conn, &[folder])?;
+                    artists::upsert_by_key(conn, "Aurora Field")
+                })
+                .await
+                .expect("insert the folder and the artist");
+            let cache_dir = dir.path().join("cache").join("covers");
+            let covers = Covers::new(cache_dir, db.clone(), vec![music]);
+            let mut library = Self {
+                dir,
+                db,
+                covers,
+                album_id: String::new(),
+                artist_id,
+                image,
+            };
+            library.album_id = library.album("Glass Harbour").await;
+            library
+        }
+
+        /// Inserts the album `title` with `cover.png` as its cover and
+        /// returns its ID. A title that an album has returns that album.
+        async fn album(&self, title: &str) -> String {
+            let cover = self.dir.path().join("music").join("cover.png");
+            let source = cover.to_str().expect("a Unicode path").to_owned();
+            let (artist, title) = (self.artist_id.clone(), title.to_owned());
+            self.db
+                .write(move |conn| {
+                    let album =
+                        albums::upsert_by_key(conn, &artist, &title, "Aurora Field", false)?;
                     albums::set_cover(conn, &album, Some(&source), Some(MTIME))?;
                     Ok(album)
                 })
                 .await
-                .expect("insert the album");
-            let covers = Covers::new(dir.path().join("cache").join("covers"), db.clone());
-            Self {
-                dir,
-                db,
-                covers,
-                album_id,
-                image,
-            }
+                .expect("insert the album")
         }
 
         fn cache_dir(&self) -> PathBuf {
             self.dir.path().join("cache").join("covers")
         }
 
-        /// The path of the cache file of the cover of the album at `size`.
+        /// The path of the cache file of the cover of the album at the step
+        /// `size`.
         fn cache_file(&self, size: u32) -> PathBuf {
-            self.cache_dir()
-                .join(format!("{}-{size}-{MTIME}.jpg", self.album_id))
+            self.cache_file_of(&self.album_id, size)
         }
 
-        /// The names of the entries of the temporary directory, which holds
-        /// the music folder and, when the service wrote a cover, `cache`.
-        fn entries(&self) -> Vec<String> {
-            let mut names: Vec<String> = fs::read_dir(self.dir.path())
-                .expect("read the temporary directory")
+        /// The path of the cache file of the cover `id` at the step `size`.
+        fn cache_file_of(&self, id: &str, size: u32) -> PathBuf {
+            self.cache_dir().join(format!("{id}-{size}-{MTIME}.jpg"))
+        }
+
+        /// The names of the entries of the directory `path`, in order.
+        fn names_in(path: &std::path::Path) -> Vec<String> {
+            let mut names: Vec<String> = fs::read_dir(path)
+                .expect("read the directory")
                 .map(|entry| entry.expect("a directory entry").file_name())
                 .map(|name| name.into_string().expect("a Unicode name"))
                 .collect();
@@ -328,9 +351,15 @@ mod tests {
             names
         }
 
-        /// The parameters of a request for the cover of the album at `size`.
-        fn query(&self, size: u32) -> Params {
-            Params::from_query(&format!("id={}&size={size}", self.album_id))
+        /// The names of the entries of the temporary directory, which holds
+        /// the music folder and, when the service wrote a cover, `cache`.
+        fn entries(&self) -> Vec<String> {
+            Self::names_in(self.dir.path())
+        }
+
+        /// The parameters of a request for the cover `id` at `size`.
+        fn query(id: &str, size: u32) -> Params {
+            Params::from_query(&format!("id={id}&size={size}"))
         }
 
         /// Answers a request with the query string `query` and no header.
@@ -402,20 +431,30 @@ mod tests {
             entity_tag(ALBUM, Some(0), MTIME),
             entity_tag(ALBUM, None, MTIME)
         );
-        assert_eq!(
-            entity_tag(ALBUM, Some(64), MTIME),
-            "al-0123456789abcdef0123456789abcdef-64-1700000000"
-        );
-        // A size over the limit of the service counts as the limit.
+        // A size has the tag of its step, so the sizes of one step have one
+        // tag.
+        let step_320 = "al-0123456789abcdef0123456789abcdef-320-1700000000";
+        for size in [161, 290, 300, 310, 320] {
+            assert_eq!(entity_tag(ALBUM, Some(size), MTIME), step_320, "{size}");
+        }
+        assert_ne!(entity_tag(ALBUM, Some(160), MTIME), step_320);
+        assert_ne!(entity_tag(ALBUM, Some(321), MTIME), step_320);
+        for step in covers::SIZE_STEPS {
+            assert_eq!(
+                entity_tag(ALBUM, Some(step), MTIME),
+                format!("{ALBUM}-{step}-{MTIME}")
+            );
+        }
+        // A size over the largest step counts as that step.
         let largest = "al-0123456789abcdef0123456789abcdef-2000-1700000000";
-        for size in [MAX_SIZE, MAX_SIZE + 1, 5000, u32::MAX] {
+        for size in [1281, 1999, 2000, 2001, 5000, u32::MAX] {
             assert_eq!(entity_tag(ALBUM, Some(size), MTIME), largest, "{size}");
         }
-        assert_ne!(entity_tag(ALBUM, Some(1999), MTIME), largest);
+        assert_ne!(entity_tag(ALBUM, Some(1280), MTIME), largest);
         // A file can have a time before 1970.
         assert_eq!(
             entity_tag(ALBUM, Some(1), -5),
-            "al-0123456789abcdef0123456789abcdef-1--5"
+            "al-0123456789abcdef0123456789abcdef-80--5"
         );
     }
 
@@ -513,18 +552,19 @@ mod tests {
         assert_eq!(header_of(&response, header::ETAG), Some(tag.as_str()));
         assert_eq!(body_of(response).await, library.image);
 
-        // A resized cover is a JPEG, and it is the file of the cache.
+        // A resized cover is a JPEG, and it is the file of the cache. Its
+        // tag and its file have the step of the size.
         let response = library
-            .call(&format!("id={id}&size=4"))
+            .call(&format!("id={id}&size=64"))
             .await
             .expect("a resized cover");
         assert_eq!(
             header_of(&response, header::CONTENT_TYPE),
             Some("image/jpeg")
         );
-        let tag = format!("\"{id}-4-{MTIME}\"");
+        let tag = format!("\"{id}-80-{MTIME}\"");
         assert_eq!(header_of(&response, header::ETAG), Some(tag.as_str()));
-        let cached = fs::read(library.cache_file(4)).expect("read the cache file");
+        let cached = fs::read(library.cache_file(80)).expect("read the cache file");
         assert_eq!(
             header_of(&response, header::CONTENT_LENGTH),
             Some(cached.len().to_string().as_str())
@@ -559,7 +599,7 @@ mod tests {
 
         // The tag of another size, of another time and of another cover is
         // not the tag of this cover.
-        let other_size = format!("\"{}-64-{MTIME}\"", library.album_id);
+        let other_size = format!("\"{}-80-{MTIME}\"", library.album_id);
         let other_time = format!("\"{}-0-{}\"", library.album_id, MTIME + 1);
         let other_cover = format!("\"{ALBUM}-0-{MTIME}\"");
         for value in [other_size, other_time, other_cover] {
@@ -614,7 +654,84 @@ mod tests {
             .expect("read the cache directory")
             .map(|entry| entry.expect("a directory entry").path())
             .collect();
-        assert_eq!(cached, [library.cache_file(64)]);
+        assert_eq!(cached, [library.cache_file(80)]);
+    }
+
+    /// `id` and `size` are the two values of a request. The test sends
+    /// values that would name a file outside the cache directory if they
+    /// were part of a path, and checks which files exist afterwards.
+    #[tokio::test]
+    async fn hostile_id_or_size_makes_no_file_outside_the_cache_directory() {
+        let library = Library::new().await;
+        let id = library.album_id.as_str();
+        // A file next to the cache and the music folder, which a path built
+        // from `..` would reach.
+        let secret = library.dir.path().join("secret.jpg");
+        fs::write(&secret, b"secret").expect("write the file");
+
+        // Sizes that are no number are refused before the cover is read.
+        let invalid =
+            ApiError::Other("parameter size must be an integer from 0 to 4294967295".to_owned());
+        for size in [
+            "..%2F..%2Fsecret",
+            "..%2F..%2Fmusic%2Fcover.png",
+            "64%2F..%2F..%2Fsecret",
+            "%2Fetc%2Fpasswd",
+            "..%5C..%5Csecret",
+            "64%00",
+            "64.jpg",
+            "tmp.0",
+            "-64",
+        ] {
+            let query = format!("id={id}&size={size}");
+            let error = library.call(&query).await.expect_err("no cover");
+            assert_eq!(error, invalid, "{query}");
+        }
+        // IDs that are no ID are refused with every size.
+        for value in [
+            "..%2F..%2Fsecret",
+            "al-..%2F..%2F..%2Fsecret",
+            "%2Fetc%2Fpasswd",
+            "..%5C..%5Csecret",
+        ] {
+            for size in ["1", "64", "2000", "4294967295"] {
+                let query = format!("id={value}&size={size}");
+                let error = library.call(&query).await.expect_err("no cover");
+                assert_eq!(error, ApiError::NotFound, "{query}");
+            }
+        }
+        assert_eq!(library.entries(), ["music", "secret.jpg"]);
+
+        // Every number is a size. The cache gets one file for each step that
+        // was asked for, in the cache directory and with the name of the
+        // step.
+        for size in ["1", "64", "80", "81", "2000", "2001", "4294967295"] {
+            let query = format!("id={id}&size={size}");
+            let response = library.call(&query).await.expect("a resized cover");
+            assert_eq!(response.status(), StatusCode::OK, "{query}");
+        }
+        assert_eq!(library.entries(), ["cache", "music", "secret.jpg"]);
+        assert_eq!(
+            Library::names_in(&library.dir.path().join("cache")),
+            ["covers"]
+        );
+        let mut cached: Vec<PathBuf> = fs::read_dir(library.cache_dir())
+            .expect("read the cache directory")
+            .map(|entry| entry.expect("a directory entry").path())
+            .collect();
+        cached.sort();
+        let mut expected = [80, 160, 2000].map(|step| library.cache_file(step));
+        expected.sort();
+        assert_eq!(cached, expected);
+        // The music folder holds the cover file as it was, and no other
+        // file.
+        let music = library.dir.path().join("music");
+        assert_eq!(Library::names_in(&music), ["cover.png"]);
+        assert_eq!(
+            fs::read(music.join("cover.png")).expect("read the cover file"),
+            library.image
+        );
+        assert_eq!(fs::read(&secret).expect("read the file"), b"secret");
     }
 
     #[tokio::test]
@@ -700,22 +817,25 @@ mod tests {
 
         let mut ended = Vec::new();
         for waits in 1.. {
-            // Every request asks for a size of its own, which the cache does
-            // not hold.
-            let size = u32::try_from(waits).expect("a small number");
-            let params = library.query(size);
+            // Every request asks for the cover of an album of its own, which
+            // the cache does not hold. The sizes of a step share one cache
+            // file, so a size of its own would not be a cover of its own.
+            let album = library.album(&format!("Dropped {waits}")).await;
+            let params = Library::query(&album, 64);
             let mut request = Box::pin(cover_response(&library.covers, &params, &headers));
             let finished = advance(request.as_mut(), waits).await;
             drop(request);
 
-            // A request for another size is answered. Its cover is made
-            // after everything that the dropped request left behind.
-            let control = library.query(1000 + size);
+            // A request for the cover of another album is answered. Its
+            // cover is made after everything that the dropped request left
+            // behind.
+            let other = library.album(&format!("Answered {waits}")).await;
+            let control = Library::query(&other, 64);
             let response = cover_response(&library.covers, &control, &headers)
                 .await
                 .expect("a cover");
             assert_eq!(response.status(), StatusCode::OK, "after {waits} waits");
-            assert!(library.cache_file(1000 + size).is_file());
+            assert!(library.cache_file_of(&other, 80).is_file());
 
             match finished {
                 // The request was not dropped before its end, so its cover
@@ -723,17 +843,17 @@ mod tests {
                 Some(response) => {
                     let response = response.expect("a cover");
                     assert_eq!(response.status(), StatusCode::OK);
-                    assert!(library.cache_file(size).is_file());
+                    assert!(library.cache_file_of(&album, 80).is_file());
                     break;
                 }
-                None => ended.push(size),
+                None => ended.push(album),
             }
         }
 
-        for size in &ended {
+        for album in &ended {
             assert!(
-                !library.cache_file(*size).exists(),
-                "the cover of the size {size} was made after its request ended"
+                !library.cache_file_of(album, 80).exists(),
+                "the cover of the album {album} was made after its request ended"
             );
         }
         // The request waits at least once: for the task that makes its

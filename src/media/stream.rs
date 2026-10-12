@@ -24,6 +24,10 @@
 //! Both checks read the path and not an open file. `ServeFile` and ffmpeg
 //! open the path after them, so a file that is exchanged between the checks
 //! and the open is served for that one request.
+//!
+//! The first check is `path_in_folders`. `library::covers` calls the same
+//! function for the source of a cover, so `getCoverArt` serves no file
+//! outside the folders either (`docs/design.md` section 3.11).
 
 use std::fmt::Write as _;
 use std::fs;
@@ -470,8 +474,28 @@ fn refused(track: &Track, refusal: &Refusal) -> ApiError {
     ApiError::NotFound
 }
 
-/// Returns the resolved path of the file at `path` when the file may be
-/// served as the track whose row has `size` and `mtime`.
+/// Why [`path_in_folders`] returns no path.
+#[derive(Debug)]
+pub(crate) enum NotInFolders {
+    /// The path cannot be resolved. The file is gone, a link of the path
+    /// leads nowhere, or the server may not read a directory of the path.
+    Unreadable(io::Error),
+    /// A symbolic link of the path leads out of the folders. The value is
+    /// the resolved path.
+    Outside(PathBuf),
+}
+
+impl From<NotInFolders> for Refusal {
+    fn from(refusal: NotInFolders) -> Self {
+        match refusal {
+            NotInFolders::Unreadable(error) => Refusal::Unreadable(error),
+            NotInFolders::Outside(real) => Refusal::Outside(real),
+        }
+    }
+}
+
+/// Returns the resolved path of `path` when it is inside one of `folders`,
+/// the configured music folders.
 ///
 /// `fs::canonicalize` resolves every symbolic link of the path, so the
 /// result names the file itself. That file must be inside the resolved path
@@ -479,6 +503,27 @@ fn refused(track: &Track, refusal: &Refusal) -> ApiError {
 /// folder that cannot be resolved holds no file. The folders are resolved
 /// for every call and no result is kept, so a folder link that changes is
 /// followed from the next request on.
+///
+/// [`library_file`] calls the function for [`raw`] and [`transcoded`], and
+/// `library::covers` calls it for the source of a cover, so a track and a
+/// cover are under one rule. The function blocks on the file system.
+pub(crate) fn path_in_folders(path: &Path, folders: &[PathBuf]) -> Result<PathBuf, NotInFolders> {
+    let real = fs::canonicalize(path).map_err(NotInFolders::Unreadable)?;
+    let in_library = folders
+        .iter()
+        .filter_map(|folder| fs::canonicalize(folder).ok())
+        .any(|folder| real.starts_with(folder));
+    if in_library {
+        Ok(real)
+    } else {
+        Err(NotInFolders::Outside(real))
+    }
+}
+
+/// Returns the resolved path of the file at `path` when the file may be
+/// served as the track whose row has `size` and `mtime`.
+///
+/// The file must be inside one of `folders` ([`path_in_folders`]).
 ///
 /// The file must be a regular file with the size `size` and the modification
 /// time `mtime`, in whole Unix seconds as the scanner stores it. This is the
@@ -489,14 +534,7 @@ fn library_file(
     size: u64,
     mtime: i64,
 ) -> Result<PathBuf, Refusal> {
-    let real = fs::canonicalize(path).map_err(Refusal::Unreadable)?;
-    let in_library = folders
-        .iter()
-        .filter_map(|folder| fs::canonicalize(folder).ok())
-        .any(|folder| real.starts_with(folder));
-    if !in_library {
-        return Err(Refusal::Outside(real));
-    }
+    let real = path_in_folders(path, folders)?;
 
     let state = fs::metadata(&real).map_err(Refusal::Unreadable)?;
     let modified = state.modified().map_err(Refusal::Unreadable)?;

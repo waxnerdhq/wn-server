@@ -842,6 +842,7 @@ impl TestServer {
         let scan = ScanController::new(settings);
         let scan_poll_ms = config.library.scan_poll_ms;
         let transcoder = Arc::new(FakeTranscoder::default());
+        let folders = config.library.folders.clone();
 
         // The fields follow the layout rule in the module comment of
         // `wn_server::api`.
@@ -851,7 +852,7 @@ impl TestServer {
 
             db: db.clone(),
 
-            covers: wn_server::library::covers::Covers::new(cache_dir.path(), db.clone()),
+            covers: wn_server::library::covers::Covers::new(cache_dir.path(), db.clone(), folders),
 
             transcoder: transcoder.clone(),
 

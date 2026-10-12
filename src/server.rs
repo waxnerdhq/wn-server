@@ -194,7 +194,11 @@ pub async fn run_server(
     }
     config.library.warn_unavailable_folders();
     let db = open_database(data_dir).await?;
-    let covers = crate::library::covers::Covers::new(data_dir.covers_cache_dir(), db.clone());
+    let covers = crate::library::covers::Covers::new(
+        data_dir.covers_cache_dir(),
+        db.clone(),
+        config.library.folders.clone(),
+    );
 
     let addr = bind_addr(&config);
     let bind_error = |source| ServerError::Bind { addr, source };
@@ -1052,6 +1056,51 @@ mod tests {
         ended(&scan).await;
         scan.stop().await;
         assert!(!stale.exists(), "{}", stale.display());
+    }
+
+    /// The scan removes the resized covers of the tracks that have no row.
+    /// The removal is a part of the scan, which runs on a thread of its own:
+    /// the server has started, and it reads its database, while every file
+    /// is still in the cache.
+    #[tokio::test]
+    async fn scan_at_startup_removes_the_covers_of_tracks_without_a_row_after_the_start() {
+        let folder = music_folder(1);
+        let (_dir, data_dir, db) = library();
+        let mut config = config(&[folder.path()]);
+        config.library.scan_on_start = true;
+
+        // The cache holds the covers of 1000 tracks that no row has, as a
+        // server leaves them whose scans removed no cover of a track, and
+        // the cover of an album.
+        let cache = data_dir.covers_cache_dir();
+        fs::create_dir_all(&cache).expect("create the cache");
+        let stale: Vec<PathBuf> = (0..1000)
+            .map(|track| cache.join(format!("tr-{track:032x}-300-1000.jpg")))
+            .collect();
+        for path in &stale {
+            fs::write(path, "a resized cover").expect("write the cached cover");
+        }
+        let of_album = cache.join("al-00000000000000000000000000000001-300-1000.jpg");
+        fs::write(&of_album, "a resized cover").expect("write the cached cover");
+
+        // The function returns while the scan runs, and the scan has removed
+        // no file when it has stored its first batch.
+        let (hooks, mut gate) = Gate::hooks();
+        let scan = start(&config, &data_dir, &db, hooks).await;
+        gate.reached().await;
+        assert!(scan.status().scanning);
+        assert!(stale.iter().all(|path| path.exists()));
+        assert_eq!(folder_rows(&db).await.len(), 1);
+        assert_eq!(track_count(&db).await, 1);
+
+        gate.open();
+        ended(&scan).await;
+        scan.stop().await;
+        let left: Vec<&PathBuf> = stale.iter().filter(|path| path.exists()).collect();
+        assert!(left.is_empty(), "{left:?}");
+        // The cover of the album stays, and so does the music folder.
+        assert!(of_album.exists());
+        assert_eq!(fs::read_dir(folder.path()).expect("list").count(), 1);
     }
 
     // A path that is not valid Unicode is built from raw bytes, which only

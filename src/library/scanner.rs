@@ -75,10 +75,11 @@ pub struct ScanOptions {
     /// The directory of the resized covers, `cache/covers` in the data
     /// directory (`DataDir::covers_cache_dir`). The scan removes the files of
     /// an album there when the cover of the album changes and when the album
-    /// is deleted. With `None` the scan removes no file, and a resized cover
-    /// of an old image can be served for a new image with the same
-    /// modification time. Every caller that scans the library of a data
-    /// directory sets it.
+    /// is deleted, and the files of a track when the track has no row. With
+    /// `None` the scan removes no file, and a resized cover of an old image
+    /// can be served for a new image with the same modification time. Every
+    /// caller that scans the library of a data directory sets it. The scan
+    /// writes no file there and removes no file anywhere else.
     pub covers_cache_dir: Option<PathBuf>,
 }
 
@@ -148,8 +149,9 @@ pub struct ScanSummary {
 /// year and the genre of every album and the album count of every artist.
 /// It sets the cover of every album whose directory it saw, and removes the
 /// resized covers of an album from [`ScanOptions::covers_cache_dir`] when
-/// the cover of the album changed or the album was deleted. An album and an
-/// artist keep their ID while a track refers to them.
+/// the cover of the album changed or the album was deleted. It removes the
+/// resized covers of every track that has no row from the same directory.
+/// An album and an artist keep their ID while a track refers to them.
 ///
 /// The function blocks. An async caller runs it with
 /// `tokio::task::spawn_blocking`. `cancel` is checked during the walk,
@@ -158,8 +160,8 @@ pub struct ScanSummary {
 /// that is in progress. A cancelled scan keeps the batches it committed,
 /// stores nothing of the batch it was reading, deletes nothing and returns a
 /// summary whose last error is [`CANCELLED`]. It deletes no album, no artist
-/// and no annotation and sets no cover. It recomputes the counts, so that
-/// they describe the tracks it stored.
+/// and no annotation, sets no cover and removes no resized cover. It
+/// recomputes the counts, so that they describe the tracks it stored.
 ///
 /// # Errors
 ///
@@ -800,7 +802,9 @@ impl Scanner<'_> {
     ///
     /// A scan that was cancelled deletes no row and sets no cover, because
     /// it did not store every change it found. `walks` is read for a scan
-    /// that completed only.
+    /// that completed only. A scan that was cancelled removes no resized
+    /// cover either: a server that stops waits for its scan, and the next
+    /// scan that completes removes the files.
     fn aggregate(&mut self, outcome: &Outcome, walks: &HashMap<i64, FolderWalk>) -> Result<()> {
         let seen = match outcome {
             Outcome::Completed => Some(Seen {
@@ -813,8 +817,8 @@ impl Scanner<'_> {
         self.summary.albums = aggregated.albums;
         self.summary.artists = aggregated.artists;
         // The transaction is committed and the write connection is free.
-        if let Some(cache_dir) = &self.options.covers_cache_dir {
-            remove_cached_covers(cache_dir, &aggregated.stale_covers);
+        if let (Some(cache_dir), Outcome::Completed) = (&self.options.covers_cache_dir, outcome) {
+            remove_cached_covers(self.db, cache_dir, &aggregated.stale_covers);
         }
         Ok(())
     }
@@ -2025,18 +2029,44 @@ fn cover_rank(name: &str) -> Option<usize> {
     Some(stem * COVER_EXTENSIONS.len() + extension)
 }
 
-/// Removes the resized covers of the albums `album_ids` from the cover cache
-/// `cache_dir`. A file of the cache is named
-/// `<cover ID>-<size>-<cover mtime>.jpg`, and the cover ID of an album is
-/// its ID (`docs/design.md` sections 3.3 and 3.5).
+/// The number of track IDs that [`remove_cached_covers`] looks up while it
+/// holds one read connection.
+const TRACK_LOOKUPS: usize = 500;
+
+/// Removes the stale resized covers from the cover cache `cache_dir`: the
+/// files of the albums `album_ids`, and the files of every track that has no
+/// row in `db`. A file of the cache is named
+/// `<cover ID>-<size>-<cover mtime>.jpg`, and a cover ID is the ID of an
+/// album or of a track (`docs/design.md` sections 3.3 and 3.5).
+///
+/// The files of a track are removed when no row has the ID of the track, so
+/// the function needs no list of the tracks that this scan deleted. It also
+/// removes the files of a track that an earlier scan deleted, and the files
+/// that the cover service wrote after such a scan listed the directory. A
+/// file of an album is removed for the albums in `album_ids` and for no other
+/// album.
+///
+/// The directory is listed first, and the database is asked afterwards. The
+/// cover service writes a file for a track that has a row, and an ID is
+/// given once. A track that has no row after its file was listed is
+/// therefore a deleted track, and never a new one.
+///
+/// Every path that the function removes is the path of an entry that the
+/// listing of `cache_dir` returned: a name of the directory, joined to the
+/// path of the directory. No other path is built, so no file outside the
+/// directory is removed. An entry that is a symbolic link is removed as a
+/// link, and its target stays.
+///
+/// The function lists the directory once for a scan, on the thread of the
+/// scan, and holds no write connection. The lookups of
+/// [`TRACK_LOOKUPS`] tracks share one read connection, which is free between
+/// two such groups.
 ///
 /// A file that cannot be removed stays, with a warning. A cache directory
-/// that does not exist holds no file.
-fn remove_cached_covers(cache_dir: &Path, album_ids: &[String]) {
-    if album_ids.is_empty() {
-        return;
-    }
-    let stale: HashSet<&str> = album_ids.iter().map(String::as_str).collect();
+/// that does not exist holds no file. When the database cannot be read, the
+/// files of the tracks stay, with a warning, and the next scan removes them.
+fn remove_cached_covers(db: &Db, cache_dir: &Path, album_ids: &[String]) {
+    let stale_albums: HashSet<&str> = album_ids.iter().map(String::as_str).collect();
     let entries = match fs::read_dir(cache_dir) {
         Ok(entries) => entries,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return,
@@ -2049,6 +2079,8 @@ fn remove_cached_covers(cache_dir: &Path, album_ids: &[String]) {
             return;
         }
     };
+    // The files whose name starts with the ID of a track, by that ID.
+    let mut of_tracks: HashMap<String, Vec<PathBuf>> = HashMap::new();
     for entry in entries {
         let entry = match entry {
             Ok(entry) => entry,
@@ -2062,20 +2094,56 @@ fn remove_cached_covers(cache_dir: &Path, album_ids: &[String]) {
             }
         };
         let name = entry.file_name();
-        if !name
-            .to_str()
-            .and_then(cached_cover_id)
-            .is_some_and(|id| stale.contains(id))
-        {
+        let Some(id) = name.to_str().and_then(cached_cover_id) else {
             continue;
+        };
+        if stale_albums.contains(id) {
+            remove_cached_cover(&entry.path());
+        } else if matches!(ids::parse(id), Some((Kind::Track, _))) {
+            of_tracks
+                .entry(id.to_owned())
+                .or_default()
+                .push(entry.path());
         }
-        if let Err(error) = fs::remove_file(entry.path()) {
-            tracing::warn!(
-                path = %entry.path().display(),
-                %error,
-                "the stale cover cannot be removed"
-            );
+    }
+
+    let track_ids: Vec<&String> = of_tracks.keys().collect();
+    for group in track_ids.chunks(TRACK_LOOKUPS) {
+        let without_row = db.with_reader(|conn| {
+            let mut without_row = Vec::new();
+            for id in group {
+                if tracks::get_track(conn, id)?.is_none() {
+                    without_row.push(*id);
+                }
+            }
+            Ok(without_row)
+        });
+        match without_row {
+            Ok(without_row) => {
+                for path in without_row.into_iter().flat_map(|id| &of_tracks[id]) {
+                    remove_cached_cover(path);
+                }
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "the tracks of the cover cache cannot be read; the files of deleted tracks stay"
+                );
+                return;
+            }
         }
+    }
+}
+
+/// Removes the file `path` of the cover cache. A file that cannot be removed
+/// stays, with a warning.
+fn remove_cached_cover(path: &Path) {
+    if let Err(error) = fs::remove_file(path) {
+        tracing::warn!(
+            path = %path.display(),
+            %error,
+            "the stale cover cannot be removed"
+        );
     }
 }
 
@@ -3709,46 +3777,197 @@ mod tests {
         assert_eq!(cached_cover_id(""), None);
     }
 
+    /// Writes a file with each of `names` to the directory `dir`.
+    fn write_files(dir: &Path, names: &[String]) {
+        for name in names {
+            fs::write(dir.join(name), b"jpeg").unwrap();
+        }
+    }
+
+    /// Returns the names of the entries of the directory `dir`, in order.
+    fn names_in(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = fs::read_dir(dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        names.sort();
+        names
+    }
+
     #[test]
     fn remove_cached_covers_removes_the_files_of_the_named_albums_only() {
+        let library = Library::new(&[]);
         let dir = tempfile::tempdir().unwrap();
         let stale = "al-00000000000000000000000000000001";
         let also_stale = "al-00000000000000000000000000000002";
         // The ID of the third album starts with the characters of the first.
+        // No row has it, and its file stays: a file of an album is removed
+        // for a named album only.
         let kept = "al-00000000000000000000000000000011";
         let names = [
-            format!("{stale}-300-1000.jpg"),
-            format!("{stale}-64-1000.jpg"),
-            format!("{also_stale}-300-2000.jpg"),
-            format!("{kept}-300-3000.jpg"),
-            "tr-00000000000000000000000000000001-300-1000.jpg".to_owned(),
+            format!("{stale}-320-1000.jpg"),
+            format!("{stale}-80-1000.jpg"),
+            format!("{also_stale}-320-2000.jpg"),
+            format!("{kept}-320-3000.jpg"),
             "notes.txt".to_owned(),
         ];
-        for name in &names {
-            fs::write(dir.path().join(name), b"jpeg").unwrap();
-        }
+        write_files(dir.path(), &names);
 
-        remove_cached_covers(dir.path(), &[stale.to_owned(), also_stale.to_owned()]);
+        let named = [stale.to_owned(), also_stale.to_owned()];
+        remove_cached_covers(&library.db, dir.path(), &named);
 
-        let mut left: Vec<String> = fs::read_dir(dir.path())
-            .unwrap()
-            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
-            .collect();
-        left.sort();
         let mut expected = names[3..].to_vec();
         expected.sort();
-        assert_eq!(left, expected);
+        assert_eq!(names_in(dir.path()), expected);
 
         // No album is named: no file is removed.
-        remove_cached_covers(dir.path(), &[]);
-        assert_eq!(fs::read_dir(dir.path()).unwrap().count(), 3);
+        remove_cached_covers(&library.db, dir.path(), &[]);
+        assert_eq!(names_in(dir.path()), expected);
+    }
+
+    #[test]
+    fn remove_cached_covers_removes_the_files_of_the_tracks_without_a_row() {
+        let library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2)]);
+        library.scan();
+        let with_row = library.id_at("a.wav").expect("the track of the file");
+        let other = library.id_at("b.wav").expect("the track of the file");
+        let album = library.album().id;
+        let deleted = "tr-00000000000000000000000000000001";
+        // An ID that differs from the ID of a row in its last character.
+        let similar = {
+            let last = if with_row.ends_with('0') { '1' } else { '0' };
+            format!("{}{last}", &with_row[..with_row.len() - 1])
+        };
+        let dir = tempfile::tempdir().unwrap();
+
+        let stale = [
+            // A step, a size that is no step, as an earlier version of the
+            // server wrote it, and a time before 1970.
+            format!("{deleted}-80-1000.jpg"),
+            format!("{deleted}-300-1000.jpg"),
+            format!("{deleted}-2000--5.jpg"),
+            format!("{similar}-320-1000.jpg"),
+        ];
+        let kept = [
+            format!("{with_row}-80-1000.jpg"),
+            format!("{with_row}-300-1000.jpg"),
+            format!("{other}-640-2000.jpg"),
+            // The files of albums: one with a row, and one whose ID no row
+            // has.
+            format!("{album}-320-1000.jpg"),
+            "al-00000000000000000000000000000001-320-1000.jpg".to_owned(),
+            // Names that start with no track ID: an ID of another kind, a
+            // value that is no ID, a temporary file of the cover service
+            // and a name without a hyphen after the ID.
+            "ar-00000000000000000000000000000001-320-1000.jpg".to_owned(),
+            "pl-00000000000000000000000000000001-320-1000.jpg".to_owned(),
+            "tr-0000000000000000000000000000001-320-1000.jpg".to_owned(),
+            "tr-0000000000000000000000000000000g-320-1000.jpg".to_owned(),
+            "TR-00000000000000000000000000000001-320-1000.jpg".to_owned(),
+            "tmp.00000000000000000000000000000001".to_owned(),
+            deleted.to_owned(),
+            "notes.txt".to_owned(),
+        ];
+        write_files(dir.path(), &stale);
+        write_files(dir.path(), &kept);
+
+        remove_cached_covers(&library.db, dir.path(), &[]);
+
+        let mut expected = kept.to_vec();
+        expected.sort();
+        assert_eq!(names_in(dir.path()), expected);
+
+        // The row of a track is deleted: its files are removed, and the
+        // files of the other track and of the album stay.
+        library
+            .db
+            .with_writer(|conn| tracks::delete_tracks(conn, &[&with_row]))
+            .unwrap();
+        remove_cached_covers(&library.db, dir.path(), &[]);
+        expected.retain(|name| !name.starts_with(&with_row));
+        assert_eq!(names_in(dir.path()), expected);
+        assert_eq!(expected.len(), kept.len() - 2);
+    }
+
+    #[test]
+    fn remove_cached_covers_looks_up_more_tracks_than_one_group_holds() {
+        let library = Library::new(&[("a.wav", 100, 1)]);
+        library.scan();
+        let with_row = library.id_at("a.wav").expect("the track of the file");
+        let dir = tempfile::tempdir().unwrap();
+        let count = 2 * TRACK_LOOKUPS + 3;
+        let stale: Vec<String> = (0..count)
+            .map(|track| format!("tr-{track:032x}-80-1000.jpg"))
+            .collect();
+        let kept = [
+            format!("{with_row}-80-1000.jpg"),
+            "al-00000000000000000000000000000001-80-1000.jpg".to_owned(),
+        ];
+        write_files(dir.path(), &stale);
+        write_files(dir.path(), &kept);
+
+        remove_cached_covers(&library.db, dir.path(), &[]);
+
+        let mut expected = kept.to_vec();
+        expected.sort();
+        assert_eq!(names_in(dir.path()), expected);
+    }
+
+    /// The function removes entries of the cache directory and nothing
+    /// else: a link in the cache is removed as a link, and a file with the
+    /// name of a stale cover in another directory stays.
+    #[cfg(unix)] // Creating a symbolic link on Windows needs a privilege.
+    #[test]
+    fn remove_cached_covers_removes_no_file_outside_the_cache_directory() {
+        use std::os::unix::fs::symlink;
+
+        let library = Library::new(&[("a.wav", 100, 1)]);
+        library.scan();
+        let dir = tempfile::tempdir().unwrap();
+        let cache = dir.path().join("cache");
+        fs::create_dir(&cache).unwrap();
+        let track = "tr-00000000000000000000000000000001-80-1000.jpg";
+        let album = "al-00000000000000000000000000000001-80-1000.jpg";
+
+        // The music folder and the directory above the cache hold files
+        // with the names of stale covers.
+        for name in [track, album] {
+            fs::write(library.path(name), b"music").unwrap();
+            fs::write(dir.path().join(name), b"above").unwrap();
+        }
+        // The cache holds links with these names, to a file and to the
+        // music folder, and a directory with the name of a stale cover.
+        symlink(library.path("a.wav"), cache.join(track)).unwrap();
+        symlink(library.dir.path(), cache.join(album)).unwrap();
+        let directory = "tr-00000000000000000000000000000002-80-1000.jpg";
+        fs::create_dir(cache.join(directory)).unwrap();
+        fs::write(cache.join(directory).join("inner.jpg"), b"inner").unwrap();
+        let audio = fs::read(library.path("a.wav")).unwrap();
+
+        let named = ["al-00000000000000000000000000000001".to_owned()];
+        remove_cached_covers(&library.db, &cache, &named);
+
+        // The links are gone. The directory cannot be removed as a file.
+        assert_eq!(names_in(&cache), [directory]);
+        assert_eq!(names_in(&cache.join(directory)), ["inner.jpg"]);
+        // The targets of the links and the files of the other directories
+        // are as they were.
+        assert_eq!(fs::read(library.path("a.wav")).unwrap(), audio);
+        assert_eq!(names_in(library.dir.path()), ["a.wav", album, track]);
+        assert_eq!(names_in(dir.path()), [album, "cache", track]);
+        for name in [track, album] {
+            assert_eq!(fs::read(library.path(name)).unwrap(), b"music");
+            assert_eq!(fs::read(dir.path().join(name)).unwrap(), b"above");
+        }
     }
 
     #[test]
     fn remove_cached_covers_accepts_a_cache_directory_that_does_not_exist() {
+        let library = Library::new(&[]);
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("cache").join("covers");
         remove_cached_covers(
+            &library.db,
             &missing,
             &["al-00000000000000000000000000000001".to_owned()],
         );

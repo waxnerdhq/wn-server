@@ -5130,6 +5130,87 @@ fn a_deleted_album_loses_its_resized_covers() {
     assert!(fresh.exists());
 }
 
+/// The ID of a track and the ID of an album that no row has.
+const NO_TRACK: &str = "tr-00000000000000000000000000000001";
+const NO_ALBUM: &str = "al-00000000000000000000000000000001";
+
+#[test]
+fn a_deleted_track_loses_its_resized_covers() {
+    let scanned = Scanned::new();
+    let cache = tempfile::tempdir().unwrap();
+    let album = scanned.env.album("Aurora Field/Glass Harbour");
+    let gone = scanned.id_at(LOW_TIDE);
+    let kept = scanned.id_at(BREAKWATER);
+    let of_gone = [
+        cache_cover(cache.path(), &gone, 80, 1000),
+        cache_cover(cache.path(), &gone, 320, 1000),
+    ];
+    // The files of a track that an earlier scan deleted, one with a size
+    // that is no step.
+    let left_earlier = [
+        cache_cover(cache.path(), NO_TRACK, 300, 1000),
+        cache_cover(cache.path(), NO_TRACK, 80, 2000),
+    ];
+    let fresh = [
+        cache_cover(cache.path(), &kept, 80, 1000),
+        cache_cover(cache.path(), &kept, 300, 1000),
+        cache_cover(cache.path(), &album.id, 80, album.cover_mtime.unwrap()),
+        cache_cover(cache.path(), NO_ALBUM, 300, 1000),
+    ];
+
+    // A scan that deletes no track removes the files of the track that has
+    // no row, and no other file.
+    assert_eq!(rescan_with_cache(&scanned, cache.path()), seen(10));
+    for path in &left_earlier {
+        assert!(!path.exists(), "{}", path.display());
+    }
+    for path in of_gone.iter().chain(&fresh) {
+        assert!(path.exists(), "{}", path.display());
+    }
+
+    // The file of a track is gone, and the scan deletes its row.
+    fs::remove_file(scanned.path(LOW_TIDE)).unwrap();
+    let summary = rescan_with_cache(&scanned, cache.path());
+
+    assert_eq!((summary.removed, summary.albums), (1, 4));
+    for path in &of_gone {
+        assert!(!path.exists(), "{}", path.display());
+    }
+    // The files of the track that has its row and the files of the albums
+    // stay, also the file of an album that no row has.
+    for path in &fresh {
+        assert!(path.exists(), "{}", path.display());
+    }
+}
+
+#[test]
+fn a_cancelled_scan_removes_no_resized_cover() {
+    let scanned = Scanned::new();
+    let cache = tempfile::tempdir().unwrap();
+    let of_no_track = cache_cover(cache.path(), NO_TRACK, 80, 1000);
+    let cancel = CancellationToken::new();
+    cancel.cancel();
+
+    let summary = scanner::scan(
+        &scanned.env.db,
+        &[scanned.root().to_path_buf()],
+        &cancel,
+        false,
+        ScanOptions {
+            covers_cache_dir: Some(cache.path().to_path_buf()),
+            ..ScanOptions::default()
+        },
+    )
+    .unwrap();
+
+    assert_eq!(summary.errors, [CANCELLED]);
+    assert!(of_no_track.exists());
+
+    // The next scan that completes removes the file.
+    assert_eq!(rescan_with_cache(&scanned, cache.path()), seen(10));
+    assert!(!of_no_track.exists());
+}
+
 #[test]
 fn a_scan_without_a_cover_cache_sets_the_covers_and_removes_no_file() {
     let scanned = Scanned::new();
