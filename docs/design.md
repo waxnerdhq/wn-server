@@ -354,7 +354,7 @@ Data directory, in order: `--data-dir`, `WN_SERVER_DATA_DIR`, then `directories:
 [server]
 bind = "0.0.0.0"
 port = 4200
-name = "<hostname>"             # instance name shown by discovery
+name = "<host label>"           # instance name shown by discovery
 log_level = "info"              # RUST_LOG overrides when set
 
 [auth]
@@ -375,7 +375,9 @@ mp3_bitrate_kbps = 320          # used when format=mp3 and maxBitRate is absent
 mdns = true
 ```
 
-Validation at load: at least one folder; each folder exists and is a directory; `port != 0`; `max_concurrent >= 1`; bitrates 32–320. Unknown keys are an error (`deny_unknown_fields`). Internal timing values (transcode permit wait, scan poll) are fields of the config structs with defaults but are not config keys; tests set them.
+The default `server.name` is the first label of the system host name (`studio` for `studio.example.com`), cut to 63 bytes at a UTF-8 character boundary. It is `wn-server` when that label is empty or the host name is not valid Unicode. `init` writes the default to `config.toml`, and a config that omits the key gets it at load. `config::host_label` returns the first label for the default name and for the mDNS target (§3.12).
+
+Validation at load: at least one folder; each folder exists and is a directory; `port != 0`; `server.name` is 1 to 63 bytes long; `max_concurrent >= 1`; bitrates 32–320. `server.name` is the DNS-SD instance name and the TXT `name` value (§3.12), and each holds at most 63 bytes. The error for `server.name` states the length of the name and names the key, the table and the file to edit. Unknown keys are an error (`deny_unknown_fields`). Internal timing values (transcode permit wait, scan poll) are fields of the config structs with defaults but are not config keys; tests set them.
 
 ### 3.6 CLI
 
@@ -521,7 +523,7 @@ A client browses the service type `_waxnerd._tcp` in the domain `local.`. The se
 | TXT | the keys of the next table |
 | A and AAAA of the target | the addresses under Addresses |
 
-- The instance name is `server.name`: 1 to 63 bytes of UTF-8. When another responder on the link holds that name with other records, the daemon renames the instance by appending ` (2)`, then ` (3)` and so on. TXT `name` keeps `server.name`. A client does not identify a server by its instance name.
+- The instance name is `server.name`: 1 to 63 bytes of UTF-8, which the validation at load enforces (§3.5). When another responder on the link holds that name with other records, the daemon renames the instance by appending ` (2)`, then ` (3)` and so on. TXT `name` keeps `server.name`. A client does not identify a server by its instance name.
 - The target label is the first label of the system host name (`studio` for `studio.example.com`). The daemon changes the label to `<label>-2`, then `<label>-3` and so on, when another responder answers its probe for the host name with an address record of the same type and another address. A client takes the target from the SRV record and builds it from no other value.
 - A client connects to an address of the A and AAAA records of the target, on the SRV port. The records can hold addresses that the server does not listen on: the responder of the operating system, where one runs, publishes the same host name with the addresses of the machine, such as IPv6 addresses when `server.bind` is an IPv4 address. A client therefore follows three rules.
   1. It skips every link-local IPv6 address (`fe80::/10`). A connection to such an address needs a zone index, and the URL of this contract carries none.
@@ -567,7 +569,7 @@ A client browses the service type `_waxnerd._tcp` in the domain `local.`. The se
 - `discovery::TxtRecord::build`, `discovery::addresses` and `discovery::interface_kinds` are pure. `discovery::Advertiser` owns the `mdns-sd` `ServiceDaemon`, which runs on its own thread. For `0.0.0.0` and `::` the registration names no address and uses `enable_addr_auto()`. For another address the registration names that address. For an IPv4 bind the daemon disables IPv6 interfaces (`disable_interface(IfKind::IPv6)`).
 - The `run` command starts the advertisement before `run_server` when `discovery.mdns` is on, and withdraws it when `run_server` has returned. Before the start it writes a new `instance.id` when the file is missing and `library.db` exists, and logs one warning. `init` refuses a data directory that has a config file and an owner account, so no other command restores the file. The ID must be a UUID in the form `init` writes.
 - The daemon probes for its names for 750 ms to one second and then announces the instance (RFC 6762 section 8.1).
-- The server runs without the advertisement when the advertisement cannot start. `run` logs one warning when `instance.id` cannot be read or is not a UUID, when `server.name` or the host label is not 1 to 63 bytes long, or when `mdns-sd` returns an error. `mdns-sd` opens its multicast sockets on the daemon thread and reports a socket it cannot open in its debug log only, so a second thread waits for the first announcement: it logs the announced name at `info`, or one warning when nothing was announced within 10 s.
+- The server runs without the advertisement when the advertisement cannot start. `run` logs one warning when `instance.id` cannot be read or is not a UUID, when the host label is longer than 63 bytes, or when `mdns-sd` returns an error. `discovery` checks the length of `server.name` as well and reports it the same way. `run` does not reach that check with a name outside 1 to 63 bytes, because the validation at load fails first (§3.5). `mdns-sd` opens its multicast sockets on the daemon thread and reports a socket it cannot open in its debug log only, so a second thread waits for the first announcement: it logs the announced name at `info`, or one warning when nothing was announced within 10 s.
 - Withdrawal: `unregister` sends a goodbye packet on every interface, the daemon repeats it after 120 ms, and `shutdown` ends the daemon thread. A client then sees the instance removed. A stop before the first announcement sends no goodbye packet, because nothing was announced. The thread that waits for the first announcement records it; a stop after the 10 s of that thread always sends the packet. A goodbye packet for an instance that was not announced would remove the records of another running server with the same instance name from the clients, for example when `run` is started twice and the second server cannot bind its port.
 - A server that ends without the goodbye packet stays in the caches of clients until its records expire. `mdns-sd` sets 120 s for the SRV and address records and 4500 s for the PTR and TXT records. These times are not part of the contract, and a client does not depend on them.
 - Windows Firewall prompts on first start for TCP 4200 and UDP 5353.
