@@ -1134,3 +1134,118 @@ pub fn captured_log() -> LogBuffer {
     })
     .clone()
 }
+
+// A test binary that names none of these items has no use for the re-export.
+#[allow(unused_imports)]
+pub use rows::{
+    ATTACHED, Dump, ROWID, attached_rows, dump, dump_of, forbid_writes, table_names, without_scans,
+};
+
+/// What the tests of the migrations and of the scanner share to check that a
+/// step kept the rows of a database or wrote none: the rows of every table,
+/// and triggers that fail a write.
+///
+/// The module is one block of this file with its own imports, as `scanned`
+/// is.
+mod rows {
+    use std::collections::BTreeMap;
+
+    use rusqlite::Connection;
+    use rusqlite::types::Value;
+    use wn_server::db::Db;
+
+    /// The name that [`dump`] gives the rowid of a row.
+    pub const ROWID: &str = "_rowid";
+
+    /// The tables whose rows a user or a scan attaches to the tracks, the albums
+    /// and the artists.
+    pub const ATTACHED: [&str; 6] = [
+        "annotations",
+        "play_queue",
+        "play_queue_tracks",
+        "playlist_tracks",
+        "playlists",
+        "users",
+    ];
+
+    /// The rows of every table by the name of the table: for each row in rowid
+    /// order, the rowid under the name [`ROWID`], and the name and the value of
+    /// every column.
+    pub type Dump = BTreeMap<String, Vec<Vec<(String, Value)>>>;
+
+    /// The names of the tables of the database of `conn`, in the order of the
+    /// names.
+    pub fn table_names(conn: &Connection) -> rusqlite::Result<Vec<String>> {
+        conn.prepare(
+            "SELECT name FROM main.sqlite_schema
+             WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+        )?
+        .query_map([], |row| row.get(0))?
+        .collect()
+    }
+
+    /// The rows of every table of the database of `conn`.
+    pub fn dump(conn: &Connection) -> rusqlite::Result<Dump> {
+        let mut tables = Dump::new();
+        for table in table_names(conn)? {
+            let mut select = conn.prepare(&format!(
+                "SELECT rowid AS {ROWID}, * FROM main.{table} ORDER BY rowid"
+            ))?;
+            let names: Vec<String> = select
+                .column_names()
+                .into_iter()
+                .map(str::to_owned)
+                .collect();
+            let rows = select
+                .query_map([], |row| {
+                    names
+                        .iter()
+                        .enumerate()
+                        .map(|(index, name)| Ok((name.clone(), row.get(index)?)))
+                        .collect()
+                })?
+                .collect::<rusqlite::Result<_>>()?;
+            tables.insert(table, rows);
+        }
+        Ok(tables)
+    }
+
+    /// The rows of every table of `db`, read on the calling thread.
+    pub fn dump_of(db: &Db) -> Dump {
+        db.with_reader(|conn| Ok(dump(conn)?)).unwrap()
+    }
+
+    /// The rows of the tables of [`ATTACHED`].
+    pub fn attached_rows(dump: &Dump) -> Vec<&Vec<Vec<(String, Value)>>> {
+        ATTACHED.iter().map(|table| &dump[*table]).collect()
+    }
+
+    /// Returns `dump` without the table `scans`, which gets a row with every
+    /// scan.
+    pub fn without_scans(dump: &Dump) -> Dump {
+        let mut dump = dump.clone();
+        dump.remove("scans");
+        dump
+    }
+
+    /// Fails every statement on the write connection, which the scanner uses,
+    /// that writes a row of the library or a row that is attached to it.
+    pub fn forbid_writes(db: &Db) {
+        db.with_writer(|conn| {
+            for table in ["tracks", "albums", "artists"].iter().chain(&ATTACHED) {
+                for (event, verb) in [
+                    ("INSERT", "inserted"),
+                    ("UPDATE", "updated"),
+                    ("DELETE", "deleted"),
+                ] {
+                    conn.execute_batch(&format!(
+                        "CREATE TEMP TRIGGER no_{table}_{verb} BEFORE {event} ON {table}
+                         BEGIN SELECT RAISE(ABORT, 'a row of {table} was {verb}'); END;"
+                    ))?;
+                }
+            }
+            Ok(())
+        })
+        .unwrap();
+    }
+}
