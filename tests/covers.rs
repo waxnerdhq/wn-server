@@ -4,7 +4,8 @@
 //! which the scanner removes them.
 //!
 //! The cover file and the embedded picture of the standard library are 2 × 2
-//! pixels, so a resized cover of 64 pixels is an enlarged image.
+//! pixels. No cover is enlarged, so a test that needs a smaller cover writes
+//! a larger image first.
 
 mod common;
 
@@ -14,6 +15,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use common::{LibraryBuilder, PICTURE_PNG, TestLibrary, captured_log};
 use image::{ImageFormat, Rgb, RgbImage};
+use lofty::config::WriteOptions;
+use lofty::file::TaggedFileExt;
+use lofty::picture::{MimeType, Picture, PictureType};
+use lofty::tag::TagExt;
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
 use wn_server::config::DataDir;
@@ -35,7 +40,11 @@ struct Scanned {
 
 impl Scanned {
     async fn standard() -> Self {
-        let library = LibraryBuilder::standard().build();
+        Self::of(LibraryBuilder::standard().build()).await
+    }
+
+    /// Scans `library` into the database of a new data directory.
+    async fn of(library: TestLibrary) -> Self {
         let data = tempfile::tempdir().expect("create the data directory");
         let data_dir = DataDir::resolve(Some(data.path())).expect("a data directory");
         let db = Db::open(data_dir.db_path()).expect("open the database");
@@ -88,10 +97,19 @@ impl Scanned {
             .await
     }
 
+    /// Returns the stored cover source of the album with the name `name`.
+    async fn cover_source(&self, name: &'static str) -> Option<String> {
+        let sql = "SELECT cover_source FROM albums WHERE name = ?1";
+        self.db
+            .read(move |conn| Ok(conn.query_row(sql, [name], |row| row.get(0))?))
+            .await
+            .unwrap_or_else(|error| panic!("the cover source of {name}: {error}"))
+    }
+
     /// Returns the path of the file `name` in the directory of the album
     /// `album` of `artist`.
     fn file(&self, artist: &str, album: &str, name: &str) -> PathBuf {
-        self.library.root.path().join(artist).join(album).join(name)
+        file(&self.library, artist, album, name)
     }
 
     async fn get(&self, id: &str, size: Option<u32>) -> Option<Cover> {
@@ -111,6 +129,38 @@ impl Scanned {
         names.sort();
         names
     }
+}
+
+/// Returns the path of the file `name` in the directory of the album `album`
+/// of `artist` in `library`.
+fn file(library: &TestLibrary, artist: &str, album: &str, name: &str) -> PathBuf {
+    library.root.path().join(artist).join(album).join(name)
+}
+
+/// Writes an image of `width` × `height` pixels to `path`. The extension of
+/// the path selects the encoding.
+fn write_image(path: &Path, width: u32, height: u32) {
+    RgbImage::from_fn(width, height, |x, y| Rgb([x as u8, y as u8, 128]))
+        .save(path)
+        .unwrap_or_else(|error| panic!("write {}: {error}", path.display()));
+}
+
+/// Adds a front cover with the content `bytes` to the tag of the audio file
+/// at `path`. The tag names `mime` as the type of the picture.
+fn embed_picture(path: &Path, bytes: &[u8], mime: MimeType) {
+    let mut file = lofty::read_from_path(path)
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    let tag = file
+        .primary_tag_mut()
+        .unwrap_or_else(|| panic!("{} has no primary tag", path.display()));
+    tag.push_picture(
+        Picture::unchecked(bytes.to_vec())
+            .pic_type(PictureType::CoverFront)
+            .mime_type(mime)
+            .build(),
+    );
+    tag.save_to_path(path, WriteOptions::default())
+        .unwrap_or_else(|error| panic!("write the tag of {}: {error}", path.display()));
 }
 
 /// Returns the modification time of the file at `path` in Unix seconds.
@@ -171,20 +221,25 @@ async fn an_album_cover_without_a_size_is_the_cover_file_or_the_embedded_picture
 }
 
 #[tokio::test]
-async fn a_sized_cover_is_a_jpeg_of_that_size_and_the_second_request_reads_the_cache() {
-    let scanned = Scanned::standard().await;
-    let cover_file = scanned.file("Aurora Field", "Glass Harbour", "cover.jpg");
+async fn a_sized_cover_is_a_jpeg_of_at_most_that_size_and_the_second_request_reads_the_cache() {
+    let library = LibraryBuilder::standard().build();
+    let cover_file = file(&library, "Aurora Field", "Glass Harbour", "cover.jpg");
+    write_image(&cover_file, 128, 64);
+    let scanned = Scanned::of(library).await;
     let first_track = scanned.file("Marlow Quartet", "Slow Rivers", "01 Upstream.m4a");
+    // The cover file is larger than 64 pixels and is scaled down. The
+    // embedded picture is 2 × 2 pixels and keeps its size.
     let albums = [
-        (scanned.album("Glass Harbour").await, mtime(&cover_file)),
-        (scanned.album("Slow Rivers").await, mtime(&first_track)),
+        ("Glass Harbour", mtime(&cover_file), (64, 32)),
+        ("Slow Rivers", mtime(&first_track), (2, 2)),
     ];
     let long_ago = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
 
     let mut names = Vec::new();
-    for (id, source_mtime) in albums {
+    for (name, source_mtime, dimensions) in albums {
+        let id = scanned.album(name).await;
         let cover = scanned.get(&id, Some(64)).await.expect("a resized cover");
-        assert_eq!(jpeg_dimensions(&cover), (64, 64));
+        assert_eq!(jpeg_dimensions(&cover), dimensions, "{name}");
         assert_eq!(cover.mtime, source_mtime);
 
         let name = format!("{id}-64-{source_mtime}.jpg");
@@ -213,8 +268,9 @@ async fn a_track_cover_is_the_embedded_picture_of_the_track() {
     assert_eq!(cover.content_type, "image/png");
     assert_eq!(cover.mtime, mtime(&file));
 
+    // The picture is 2 × 2 pixels, and a sized cover is not enlarged.
     let resized = scanned.get(&pictured, Some(64)).await.expect("a cover");
-    assert_eq!(jpeg_dimensions(&resized), (64, 64));
+    assert_eq!(jpeg_dimensions(&resized), (2, 2));
     assert_eq!(
         scanned.cache_files(),
         [format!("{pictured}-64-{}.jpg", mtime(&file))]
@@ -278,13 +334,11 @@ async fn a_scan_removes_the_cached_cover_of_a_cover_file_that_changed() {
     let old = scanned.get(&album, Some(64)).await.expect("a cover");
     let kept = scanned.get(&other, Some(64)).await.expect("a cover");
     let old_time = mtime(&cover_file);
-    assert_eq!(jpeg_dimensions(&old), (64, 64));
+    assert_eq!(jpeg_dimensions(&old), (2, 2));
     assert_eq!(scanned.cache_files().len(), 2);
 
-    // The new image is 4 × 2 pixels, and its file is one minute newer.
-    RgbImage::from_pixel(4, 2, Rgb([200, 40, 40]))
-        .save(&cover_file)
-        .expect("write the new cover");
+    // The new image is 256 × 128 pixels, and its file is one minute newer.
+    write_image(&cover_file, 256, 128);
     let new_time = old_time + 60;
     set_mtime(
         &cover_file,
@@ -310,32 +364,165 @@ async fn a_scan_removes_the_cached_cover_of_a_cover_file_that_changed() {
 }
 
 #[tokio::test]
-async fn a_corrupt_cover_file_logs_a_warning_and_is_served_without_a_size_only() {
+async fn a_cover_file_that_is_no_image_logs_a_warning_and_is_not_served() {
     let log = captured_log();
     let scanned = Scanned::standard().await;
     let cover_file = scanned.file("Aurora Field", "Glass Harbour", "cover.jpg");
     let album = scanned.album("Glass Harbour").await;
-    fs::write(&cover_file, b"this is text, not a picture").expect("damage the cover");
+    fs::write(&cover_file, b"this is text, not a picture").expect("replace the cover");
 
-    // The lines of the log that say that the cover of the album cannot be
-    // decoded.
-    let warnings = || -> Vec<String> {
+    // The lines of the log about the cover of the album that hold `text`.
+    let warnings = |text: &str| -> Vec<String> {
         log.lines_with(&album)
             .into_iter()
-            .filter(|line| line.contains("the cover image cannot be decoded"))
+            .filter(|line| line.contains(text))
             .collect()
     };
+    let decoded = "the cover image cannot be decoded";
+    let served = "is not an image that the service serves";
 
+    // With a size the bytes are not decoded.
     assert_eq!(scanned.get(&album, Some(64)).await, None);
     assert_eq!(scanned.cache_files(), [""; 0]);
-    let lines = warnings();
+    let lines = warnings(decoded);
     assert_eq!(lines.len(), 1, "{lines:?}");
     assert!(lines[0].contains("WARN"), "{}", lines[0]);
     assert!(lines[0].contains("cover.jpg"), "{}", lines[0]);
+    assert_eq!(warnings(served).len(), 0);
 
-    let cover = scanned.get(&album, None).await.expect("the stored bytes");
-    assert_eq!(cover.bytes, &b"this is text, not a picture"[..]);
-    assert_eq!(cover.content_type, "image/jpeg");
-    // A request without a size decodes nothing and logs no such line.
-    assert_eq!(warnings().len(), 1);
+    // Without a size the bytes are not returned: they are no image.
+    assert_eq!(scanned.get(&album, None).await, None);
+    let lines = warnings(served);
+    assert_eq!(lines.len(), 1, "{lines:?}");
+    assert!(lines[0].contains("WARN"), "{}", lines[0]);
+    assert!(lines[0].contains("cover.jpg"), "{}", lines[0]);
+    assert_eq!(warnings(decoded).len(), 1);
+}
+
+#[tokio::test]
+async fn an_embedded_picture_is_served_when_it_is_a_jpeg_png_or_webp_image() {
+    // Three FLAC tracks of "Glass Harbour" get a picture. The tag of each
+    // names JPEG as the type.
+    let gif = b"GIF89a\x01\x00\x01\x00\x00\x00\x00;";
+    let library = LibraryBuilder::standard().build();
+    let track_file = |name: &str| file(&library, "Aurora Field", "Glass Harbour", name);
+    embed_picture(
+        &track_file("01 Low Tide.flac"),
+        b"this is text, not a picture",
+        MimeType::Jpeg,
+    );
+    embed_picture(&track_file("02 Breakwater.flac"), gif, MimeType::Jpeg);
+    embed_picture(
+        &track_file("03 Night Ferry.flac"),
+        &PICTURE_PNG,
+        MimeType::Jpeg,
+    );
+    let scanned = Scanned::of(library).await;
+
+    // Bytes that are no image, and an image in a format that the service
+    // does not serve, are not returned.
+    for title in ["Low Tide", "Breakwater"] {
+        let track = scanned.track(title).await;
+        for size in [None, Some(0), Some(64)] {
+            assert_eq!(scanned.get(&track, size).await, None, "{title} {size:?}");
+        }
+    }
+    assert_eq!(scanned.cache_files(), [""; 0]);
+
+    // The type of a picture is the type of its content, not the type that
+    // the tag names.
+    let track = scanned.track("Night Ferry").await;
+    let cover = scanned.get(&track, None).await.expect("a cover");
+    assert_eq!(cover.bytes, &PICTURE_PNG[..]);
+    assert_eq!(cover.content_type, "image/png");
+}
+
+#[cfg(unix)] // Creating a symbolic link on Windows needs a privilege.
+#[tokio::test]
+async fn a_cover_file_that_is_a_symbolic_link_is_no_cover() {
+    use std::os::unix::fs::symlink;
+
+    // An image outside the music folder.
+    let outside = tempfile::tempdir().expect("create a directory");
+    let image = outside.path().join("elsewhere.jpg");
+    write_image(&image, 8, 8);
+
+    // "Glass Harbour" gets a link in the place of its cover file. "Slow
+    // Rivers", which has an embedded picture, gets a link as a cover file.
+    let library = LibraryBuilder::standard().build();
+    let replaced = file(&library, "Aurora Field", "Glass Harbour", "cover.jpg");
+    fs::remove_file(&replaced).expect("remove the cover file");
+    symlink(&image, &replaced).expect("create the link");
+    let added = file(&library, "Marlow Quartet", "Slow Rivers", "cover.jpg");
+    symlink(&image, &added).expect("create the link");
+    let scanned = Scanned::of(library).await;
+
+    // The scanner stores no link as a cover, so the first album has no
+    // cover and the second one keeps its embedded picture.
+    assert_eq!(scanned.cover_source("Glass Harbour").await, None);
+    let album = scanned.album("Glass Harbour").await;
+    for size in [None, Some(64)] {
+        assert_eq!(scanned.get(&album, size).await, None);
+    }
+    let track = scanned.track("Upstream").await;
+    assert_eq!(
+        scanned.cover_source("Slow Rivers").await,
+        Some(format!("embedded:{track}"))
+    );
+    let album = scanned.album("Slow Rivers").await;
+    let cover = scanned.get(&album, None).await.expect("a cover");
+    assert_eq!(cover.bytes, &PICTURE_PNG[..]);
+    assert_eq!(scanned.cache_files(), [""; 0]);
+}
+
+#[cfg(unix)] // Creating a symbolic link on Windows needs a privilege.
+#[tokio::test]
+async fn a_cover_file_that_becomes_a_symbolic_link_after_the_scan_is_not_read() {
+    use std::os::unix::fs::symlink;
+
+    let outside = tempfile::tempdir().expect("create a directory");
+    let image = outside.path().join("elsewhere.jpg");
+    write_image(&image, 8, 8);
+
+    let scanned = Scanned::standard().await;
+    let cover_file = scanned.file("Aurora Field", "Glass Harbour", "cover.jpg");
+    let album = scanned.album("Glass Harbour").await;
+    assert!(scanned.get(&album, None).await.is_some());
+
+    // The stored source still names the path. No scan has run since the
+    // file became a link.
+    fs::remove_file(&cover_file).expect("remove the cover file");
+    symlink(&image, &cover_file).expect("create the link");
+    assert!(scanned.cover_source("Glass Harbour").await.is_some());
+    for size in [None, Some(64)] {
+        assert_eq!(scanned.get(&album, size).await, None);
+    }
+    assert_eq!(scanned.cache_files(), [""; 0]);
+
+    // The next scan clears the stored source.
+    scanned.scan().await;
+    assert_eq!(scanned.cover_source("Glass Harbour").await, None);
+    assert_eq!(scanned.get(&album, None).await, None);
+}
+
+#[cfg(unix)] // Creating a symbolic link on Windows needs a privilege.
+#[tokio::test]
+async fn an_audio_file_that_is_a_symbolic_link_gives_its_embedded_picture() {
+    use std::os::unix::fs::symlink;
+
+    // The scanner follows a link to an audio file and stores its tags. The
+    // service reads the picture of the same file.
+    let outside = tempfile::tempdir().expect("create a directory");
+    let library = LibraryBuilder::standard().build();
+    let linked = file(&library, "Marlow Quartet", "Slow Rivers", "02 Delta.m4a");
+    let target = outside.path().join("delta.m4a");
+    fs::copy(&linked, &target).expect("copy the audio file");
+    fs::remove_file(&linked).expect("remove the audio file");
+    symlink(&target, &linked).expect("create the link");
+    let scanned = Scanned::of(library).await;
+
+    let track = scanned.track("Delta").await;
+    let cover = scanned.get(&track, None).await.expect("a cover");
+    assert_eq!(cover.bytes, &PICTURE_PNG[..]);
+    assert_eq!(cover.content_type, "image/png");
 }
