@@ -3676,39 +3676,332 @@ fn a_rescan_of_names_in_several_spellings_writes_no_album_row_and_no_artist_row(
     );
 }
 
+/// Returns the album artist that the track row `id` holds, which is NULL in
+/// a row that no scan has written since schema version 1.
+fn album_artist_of(db: &Db, id: &str) -> Option<String> {
+    db.with_reader(|conn| {
+        Ok(conn.query_row(
+            "SELECT album_artist_name FROM tracks WHERE id = ?1",
+            [id],
+            |row| row.get(0),
+        )?)
+    })
+    .unwrap()
+}
+
+/// What identifies the rows of a library and ties them to each other: the
+/// ID and the key of every artist, the ID, the artist and the key of every
+/// album, and the ID, the artist and the album of every track, each in ID
+/// order.
+#[derive(Debug, PartialEq, Eq)]
+struct Identities {
+    artists: Vec<(String, String)>,
+    albums: Vec<(String, String, String)>,
+    tracks: Vec<(String, String, String)>,
+}
+
+fn identities(db: &Db) -> Identities {
+    db.with_reader(|conn| {
+        let artists = conn
+            .prepare("SELECT id, key FROM artists ORDER BY id")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let albums = conn
+            .prepare("SELECT id, artist_id, key FROM albums ORDER BY id")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        let tracks = conn
+            .prepare("SELECT id, artist_id, album_id FROM tracks ORDER BY id")?
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<_>>()?;
+        Ok(Identities {
+            artists,
+            albums,
+            tracks,
+        })
+    })
+    .unwrap()
+}
+
+/// Fails every statement that writes a track row on the write connection,
+/// which the scanner uses.
+fn forbid_track_writes(db: &Db) {
+    db.with_writer(|conn| {
+        for (event, verb) in [
+            ("INSERT", "inserted"),
+            ("UPDATE", "updated"),
+            ("DELETE", "deleted"),
+        ] {
+            conn.execute_batch(&format!(
+                "CREATE TEMP TRIGGER no_tracks_{verb} BEFORE {event} ON tracks
+                 BEGIN SELECT RAISE(ABORT, 'a row of tracks was {verb}'); END;"
+            ))?;
+        }
+        Ok(())
+    })
+    .unwrap();
+}
+
 #[test]
-fn the_track_artist_tags_decide_the_spelling_of_an_artist_with_album_artist_tags() {
-    // The two tracks of the artist have an album artist tag and a track
-    // artist tag. A track row holds the track artist and not the album
-    // artist, so the track artist tags decide the spelling of the artist
-    // row.
+fn a_track_row_holds_the_album_artist_of_its_file() {
     let scanned = Scanned::new();
     let db = &scanned.env.db;
-    let artist = scanned.env.artists()["Marlow Quartet"].clone();
+    let album_artist = |rel_path: &str| album_artist_of(db, &scanned.id_at(rel_path));
+
+    // A file without an album artist tag: the track artist stands in.
+    assert_eq!(album_artist(LOW_TIDE).as_deref(), Some("Aurora Field"));
+    // A file with an album artist tag.
+    assert_eq!(album_artist(STANDARD[6]).as_deref(), Some("Marlow Quartet"));
+    // A file with the compilation flag and without an album artist tag.
+    assert_eq!(
+        album_artist(STANDARD[8]).as_deref(),
+        Some(tags::VARIOUS_ARTISTS)
+    );
+    assert_eq!(scanned.track_at(STANDARD[8]).artist_name, "Tessa Lund");
+    // Every row has a value after the scan that wrote it.
+    assert_eq!(
+        count_rows(db, "tracks WHERE album_artist_name IS NOT NULL"),
+        10
+    );
+
+    // A retag of the album artist under the same key reaches the row.
+    retag(
+        &scanned.path(STANDARD[6]),
+        &[(ItemKey::AlbumArtist, Some("marlow QUARTET"))],
+    );
+    assert_eq!(scanned.rescan().changed, 1);
+    assert_eq!(album_artist(STANDARD[6]).as_deref(), Some("marlow QUARTET"));
+    assert_eq!(scanned.track_at(STANDARD[6]).artist_name, "Marlow Quartet");
+    // A file that loses its album artist tag has its track artist again.
+    retag(&scanned.path(STANDARD[6]), &[(ItemKey::AlbumArtist, None)]);
+    assert_eq!(scanned.rescan().changed, 1);
+    assert_eq!(album_artist(STANDARD[6]).as_deref(), Some("Marlow Quartet"));
+}
+
+#[test]
+fn album_artist_tags_alone_respell_an_artist_and_keep_its_id_and_its_star() {
+    // The two tracks of the artist have an album artist tag and a track
+    // artist tag in one spelling.
+    let scanned = Scanned::new();
+    let db = &scanned.env.db;
+    let artists = scanned.env.artists();
+    let artist = artists["Marlow Quartet"].clone();
     let album = scanned.env.album("Marlow Quartet/Slow Rivers");
     star(db, &artist.id, "artist");
-    let files = &scanned.library.files[6..8];
+    star(db, &album.id, "album");
+    let locators = scanned.env.locators();
 
-    // Another spelling in the album artist tags does not reach the row.
-    for file in files {
+    // The album artist tags get another spelling. The track artist tags
+    // keep the spelling that the row has.
+    for file in &scanned.library.files[6..8] {
         retag(file, &[(ItemKey::AlbumArtist, Some("MARLOW QUARTET"))]);
     }
-    assert_eq!(scanned.rescan().changed, 2);
-    assert_eq!(scanned.env.artists()["Marlow Quartet"], artist);
-    assert_eq!(scanned.env.album("Marlow Quartet/Slow Rivers").id, album.id);
+    let summary = scanned.rescan();
 
-    // A third spelling in the track artist tags does.
-    respell_artist(files, "marlow quartet");
-    assert_eq!(scanned.rescan().changed, 2);
     assert_eq!(
-        scanned.env.artists()["marlow quartet"],
+        summary,
+        ScanSummary {
+            seen: 10,
+            changed: 2,
+            tags_read: 2,
+            ..standard()
+        }
+    );
+    // The row has the new spelling under its ID and its key, with its star.
+    let respelled = scanned.env.artists();
+    assert_eq!(
+        respelled["MARLOW QUARTET"],
         Artist {
-            name: "marlow quartet".to_owned(),
+            name: "MARLOW QUARTET".to_owned(),
             ..artist.clone()
         }
     );
+    assert_eq!(natural_key(db, "artists", &artist.id), "marlow quartet");
     assert!(starred(db, &artist.id));
-    assert_eq!(scanned.env.album("marlow quartet/Slow Rivers").id, album.id);
+    // The new spelling made no row, and the other artists are as they were.
+    assert_eq!(respelled.len(), 3);
+    assert_eq!(respelled["Aurora Field"], artists["Aurora Field"]);
+    assert_eq!(respelled["Various Artists"], artists["Various Artists"]);
+    // The album is the row it was and shows the artist under its new name.
+    // Its cover is the picture in its first track, whose file the retag
+    // wrote, so the time of the cover is the new time of that file.
+    assert_eq!(
+        scanned.env.album("MARLOW QUARTET/Slow Rivers"),
+        Album {
+            artist_name: "MARLOW QUARTET".to_owned(),
+            cover_mtime: Some(mtime(&scanned.library.files[6])),
+            ..album.clone()
+        }
+    );
+    assert!(starred(db, &album.id));
+    // The tracks are the rows they were. They name the artist row and hold
+    // both tags.
+    assert_eq!(scanned.env.locators(), locators);
+    for rel_path in &STANDARD[6..8] {
+        let track = scanned.track_at(rel_path);
+        assert_eq!(track.artist_id, artist.id);
+        assert_eq!(track.artist_name, "Marlow Quartet");
+        assert_eq!(
+            album_artist_of(db, &track.id).as_deref(),
+            Some("MARLOW QUARTET")
+        );
+    }
+    assert_eq!(count_rows(db, "annotations"), 2);
+}
+
+#[test]
+fn a_new_spelling_of_an_artist_changes_no_id_no_key_and_no_artist_of_an_album() {
+    let scanned = Scanned::new();
+    let db = &scanned.env.db;
+    let before = identities(db);
+    assert_eq!(
+        (
+            before.artists.len(),
+            before.albums.len(),
+            before.tracks.len()
+        ),
+        (3, 4, 10)
+    );
+
+    // One artist gets a new name through its album artist tags and another
+    // one through the track artist tags of files without an album artist
+    // tag.
+    for file in &scanned.library.files[6..8] {
+        retag(file, &[(ItemKey::AlbumArtist, Some("MARLOW QUARTET"))]);
+    }
+    respell_artist(&scanned.library.files[..6], "AURORA FIELD");
+    assert_eq!(scanned.rescan().changed, 8);
+
+    // Both names changed.
+    assert_eq!(
+        scanned.env.artists().into_keys().collect::<Vec<_>>(),
+        ["AURORA FIELD", "MARLOW QUARTET", "Various Artists"]
+    );
+    // No artist row was added or replaced, no key changed, every album has
+    // the artist it had, and every track has the artist and the album it
+    // had.
+    assert_eq!(identities(db), before);
+
+    // A full scan reads every file again and finds the same.
+    scanned
+        .env
+        .scan_with(&[scanned.root()], true, ScanOptions::default());
+    assert_eq!(identities(db), before);
+}
+
+/// A library of one artist with one album of three tracks, scanned once.
+/// Every file names the artist `AURORA FIELD` in its track artist tag. The
+/// album artist tags have two other spellings of that name.
+fn two_tag_spellings_library() -> Scanned {
+    let library = LibraryBuilder::new()
+        .track("AURORA FIELD", "Glass Harbour", "Low Tide", 1, "flac")
+        .album_artist("aurora field")
+        .track("AURORA FIELD", "Glass Harbour", "Breakwater", 2, "flac")
+        .album_artist("Aurora Field")
+        .track("AURORA FIELD", "Glass Harbour", "Night Ferry", 3, "flac")
+        .album_artist("Aurora Field")
+        .build();
+    Scanned::of(library)
+}
+
+#[test]
+fn the_album_artist_tags_decide_the_name_when_the_track_artist_tags_spell_it_otherwise() {
+    let scanned = two_tag_spellings_library();
+    let db = &scanned.env.db;
+    let files = &scanned.library.files;
+
+    // The first track made the row with the spelling of its album artist
+    // tag. That track carries the name, so the row keeps it. No album
+    // artist tag has the spelling of the three track artist tags.
+    let artist = one_artist(&scanned);
+    assert_eq!(artist.name, "aurora field");
+    let album = scanned.env.album("aurora field/Glass Harbour");
+    star(db, &artist.id, "artist");
+
+    // No album artist tag carries the name now. The row takes the spelling
+    // of the most album artist tags.
+    retag(&files[0], &[(ItemKey::AlbumArtist, Some("Aurora Field"))]);
+    assert_eq!(scanned.rescan().changed, 1);
+    assert_eq!(
+        one_artist(&scanned),
+        Artist {
+            name: "Aurora Field".to_owned(),
+            ..artist.clone()
+        }
+    );
+    assert_eq!(
+        scanned.env.album("Aurora Field/Glass Harbour"),
+        Album {
+            artist_name: "Aurora Field".to_owned(),
+            ..album.clone()
+        }
+    );
+
+    // Another spelling in every track artist tag does not reach the row.
+    respell_artist(files, "aurora FIELD");
+    assert_eq!(scanned.rescan().changed, 3);
+    assert_eq!(
+        one_artist(&scanned),
+        Artist {
+            name: "Aurora Field".to_owned(),
+            ..artist.clone()
+        }
+    );
+    assert_eq!(natural_key(db, "artists", &artist.id), "aurora field");
+    assert!(starred(db, &artist.id));
+    for id in scanned.env.locators().keys() {
+        assert_eq!(scanned.env.track(id).artist_name, "aurora FIELD");
+        assert_eq!(album_artist_of(db, id).as_deref(), Some("Aurora Field"));
+    }
+}
+
+#[test]
+fn a_rescan_writes_no_row_when_the_album_artist_and_the_track_artist_tags_differ() {
+    let scanned = two_tag_spellings_library();
+    let db = &scanned.env.db;
+    let artists = scanned.env.artists();
+    let albums = scanned.env.albums();
+    let index = scanned.env.index();
+    star(db, &one_artist(&scanned).id, "artist");
+    // Every row has its album artist, so a scan has nothing to fill.
+    assert_eq!(count_rows(db, "tracks WHERE album_artist_name IS NULL"), 0);
+
+    forbid_track_writes(db);
+    forbid_album_and_artist_writes(db);
+    for _ in 0..2 {
+        assert_eq!(
+            scanned.rescan(),
+            ScanSummary {
+                seen: 3,
+                albums: 1,
+                artists: 1,
+                ..ScanSummary::default()
+            }
+        );
+        assert_eq!(scanned.env.latest_scan().error, None);
+    }
+
+    assert_eq!(scanned.env.artists(), artists);
+    assert_eq!(scanned.env.albums(), albums);
+    assert_eq!(scanned.env.index(), index);
+    assert_eq!(count_rows(db, "annotations"), 1);
+    // The triggers are in force: a write of a track row and of an artist
+    // row fails.
+    for (sql, message) in [
+        (
+            "UPDATE tracks SET mtime = mtime",
+            "a row of tracks was updated",
+        ),
+        (
+            "UPDATE artists SET name = name",
+            "a row of artists was updated",
+        ),
+    ] {
+        let error = db
+            .with_writer(|conn| Ok(conn.execute(sql, [])?))
+            .unwrap_err();
+        assert!(error.to_string().contains(message), "{error}");
+    }
 }
 
 /// Scans the one folder of `scanned` with `cache` as the cover cache.

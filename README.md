@@ -169,6 +169,14 @@ errors: 0
 
 A scan with a music folder that does not exist or cannot be read reads the other folders and records an error that names the folder. `wn-server scan` logs the folder when it starts, prints that error after the summary and exits with status 1. Such a scan deletes no track, in any folder: it keeps the tracks of the unavailable folder, and it also keeps a track of another folder whose file is gone, because that file may have moved to the folder that it could not read. It stores new, changed and moved files of the folders it read. When the folder is back, the next scan finds its tracks under the same IDs, and removes the tracks whose files are gone. To remove the tracks of a folder for good, take the folder out of `library.folders`: a scan that reads every remaining folder in full, and finds music in each, then removes them.
 
+## Upgrading
+
+A newer `wn-server` upgrades `library.db` in place. The first command that opens the database (`run`, `scan`, `user` or `init`) applies the schema changes that the database lacks. The tracks, the albums and the artists keep their IDs, and the stars, the ratings, the play counts, the playlists and the play queue stay. A schema change is applied in full or not at all. When one fails, the command prints the error and exits with status 1, and the database is as it was.
+
+An older `wn-server` does not open a database that a newer one has upgraded. Every command that opens the database prints `the database has schema version N; this build supports versions 0 to M` and exits with status 1. It changes nothing in the database. There is no downgrade. To be able to return to the older version, stop the server and copy `library.db` before the upgrade.
+
+The name of an artist is a spelling from the album artist tags of its files. A file without an album artist tag counts with its artist tag. A track that was stored at schema version 1 counts with its artist tag until a scan has read its file again. A scan reads the files that changed, and `wn-server scan --full` reads every file. This changes a name only for an artist whose files spell it in one way in the album artist tags and in another way in the artist tags. Such an artist shows the spelling of the artist tags until then.
+
 ## Authentication
 
 Every API method needs a user, except `getOpenSubsonicExtensions`. The server checks the request before the method runs. A client sends the name of the owner account in `u` and one of these credentials:

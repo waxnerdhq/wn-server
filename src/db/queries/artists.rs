@@ -64,40 +64,55 @@ pub fn recompute_aggregates(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// The spelling of its artist that a track row carries, as an SQL expression
+/// over a row of `tracks`: the album artist of the file, or the track artist
+/// in a row that has no album artist.
+///
+/// Only a row that was written at schema version 1 has no album artist, and
+/// only until a scan reads its file again (`docs/design.md` section 3.3).
+/// The track artist of such a row can have the key of another artist, so
+/// [`update_names`] compares the key of the text that this expression gives.
+const CARRIED_SPELLING_SQL: &str = "coalesce(tracks.album_artist_name, tracks.artist_name)";
+
 /// Sets `name` and `sort_name` of every artist whose stored name no track
 /// carries to the spelling that the most tracks of the artist carry
 /// (`docs/design.md` section 3.3).
 ///
-/// A track row does not hold the album artist of its file. The spelling that
-/// a track carries is its track artist (`tracks.artist_name`) when that name
-/// has the key of the artist, which is the case for a track without an album
-/// artist tag and without the compilation flag. A track whose track artist
-/// has another key carries no spelling. A track without a file carries its
+/// The spelling that a track carries is the album artist of its file
+/// (`tracks.album_artist_name`): the album artist tag, or what stands in for
+/// a missing one (`TrackMeta::album_artist`). The track artist of a track
+/// that has an album artist is not read. A track without a file carries its
 /// spelling as every other track does. Among spellings that equally many
 /// tracks carry, the first in byte order is taken.
 ///
+/// A track row that was written at schema version 1 has no album artist
+/// until a scan reads its file again. It carries its track artist
+/// (`tracks.artist_name`) when that name has the key of the artist, and no
+/// spelling when the track artist has another key.
+///
 /// An artist of which no track carries a spelling keeps its name. The row of
 /// [`VARIOUS_ARTISTS`] keeps its name too: every track of it has that album
-/// artist in that spelling, whatever its track artist is.
+/// artist in that spelling, and the track artist of a row from schema
+/// version 1 does not rename it.
 ///
-/// The ID and the key of a row stay. A row whose name a track carries is not
-/// written.
+/// The ID and the key of a row stay, and no row is inserted. A row whose
+/// name a track carries is not written.
 pub fn update_names(conn: &Connection) -> Result<()> {
     let uncarried: Vec<(String, String)> = conn
-        .prepare_cached(
+        .prepare_cached(&format!(
             "SELECT id, key FROM artists
              WHERE key <> ?1 AND NOT EXISTS (
                SELECT 1 FROM tracks
-               WHERE tracks.artist_id = artists.id AND tracks.artist_name = artists.name)",
-        )?
+               WHERE tracks.artist_id = artists.id AND {CARRIED_SPELLING_SQL} = artists.name)"
+        ))?
         .query_map([ids::artist_key(VARIOUS_ARTISTS)], |row| {
             Ok((row.get(0)?, row.get(1)?))
         })?
         .collect::<rusqlite::Result<_>>()?;
-    let mut spellings = conn.prepare_cached(
-        "SELECT artist_name FROM tracks WHERE artist_id = ?1
-         GROUP BY artist_name ORDER BY count(*) DESC, artist_name",
-    )?;
+    let mut spellings = conn.prepare_cached(&format!(
+        "SELECT {CARRIED_SPELLING_SQL} AS spelling FROM tracks WHERE artist_id = ?1
+         GROUP BY spelling ORDER BY count(*) DESC, spelling"
+    ))?;
     let mut rename =
         conn.prepare_cached("UPDATE artists SET name = ?2, sort_name = ?2 WHERE id = ?1")?;
     for (id, key) in uncarried {
@@ -200,25 +215,29 @@ mod tests {
     }
 
     /// Inserts a track at `rel_path` that names the artist `artist_id` and
-    /// the album `album_id`. Its track artist is `Aurora Field`.
+    /// the album `album_id`. Its album artist and its track artist are
+    /// `Aurora Field`.
     fn track(db: &Db, id: &str, rel_path: &str, artist_id: &str, album_id: &str) {
-        track_by(db, id, rel_path, "Aurora Field", artist_id, album_id);
+        let names = ("Aurora Field", Some("Aurora Field"));
+        track_by(db, id, rel_path, names, artist_id, album_id);
     }
 
-    /// Inserts a track at `rel_path` with the track artist `track_artist`
-    /// that names the artist `artist_id` and the album `album_id`.
+    /// Inserts a track at `rel_path` that names the artist `artist_id` and
+    /// the album `album_id`. `names` holds its track artist and its album
+    /// artist. Without an album artist the row is one that was written at
+    /// schema version 1: its column `album_artist_name` holds NULL.
     fn track_by(
         db: &Db,
         id: &str,
         rel_path: &str,
-        track_artist: &str,
+        (track_artist, album_artist): (&str, Option<&str>),
         artist_id: &str,
         album_id: &str,
     ) {
         let meta = TrackMeta {
             title: "Low Tide".to_owned(),
             artist: track_artist.to_owned(),
-            album_artist: "Aurora Field".to_owned(),
+            album_artist: album_artist.unwrap_or(track_artist).to_owned(),
             album: "Glass Harbour".to_owned(),
             track_no: None,
             disc_no: None,
@@ -245,7 +264,14 @@ mod tests {
         };
         db.with_writer(|conn| {
             let folder = folders::sync_folders(conn, &[PathBuf::from("/music")])?.remove(0);
-            tracks::insert_track(conn, id, folder.id, rel_path, &content)
+            tracks::insert_track(conn, id, folder.id, rel_path, &content)?;
+            if album_artist.is_none() {
+                conn.execute(
+                    "UPDATE tracks SET album_artist_name = NULL WHERE id = ?1",
+                    [id],
+                )?;
+            }
+            Ok(())
         })
         .unwrap();
     }
@@ -384,6 +410,11 @@ mod tests {
         album_id: String,
     }
 
+    /// A track artist with another key than the artists of these tests. A
+    /// track with an album artist has it as its track artist where a test
+    /// names none, so the track artist is not a spelling of the artist.
+    const OTHER: &str = "Tessa Lund";
+
     impl Named {
         /// Inserts the artist with the name `name` and one album of it.
         fn new(name: &str) -> Self {
@@ -397,19 +428,41 @@ mod tests {
             }
         }
 
-        /// Inserts a track of the artist for each pair of a number and a
-        /// track artist. The number makes the ID and the path of the track.
+        /// Inserts a track of the artist for each pair of a number and an
+        /// album artist. The number makes the ID and the path of the track.
+        /// The track artist is [`OTHER`].
         fn add(&self, tracks: &[(u32, &str)]) {
-            for &(number, track_artist) in tracks {
-                track_by(
-                    &self.db,
-                    &format!("tr-{number:032x}"),
-                    &format!("{number}.flac"),
-                    track_artist,
-                    &self.artist_id,
-                    &self.album_id,
-                );
+            for &(number, album_artist) in tracks {
+                self.insert(number, (OTHER, Some(album_artist)));
             }
+        }
+
+        /// Inserts a track of the artist for each triple of a number, an
+        /// album artist and a track artist.
+        fn add_with_track_artist(&self, tracks: &[(u32, &str, &str)]) {
+            for &(number, album_artist, track_artist) in tracks {
+                self.insert(number, (track_artist, Some(album_artist)));
+            }
+        }
+
+        /// Inserts a track of the artist for each pair of a number and a
+        /// track artist, as schema version 1 stored it: without an album
+        /// artist.
+        fn add_from_version_1(&self, tracks: &[(u32, &str)]) {
+            for &(number, track_artist) in tracks {
+                self.insert(number, (track_artist, None));
+            }
+        }
+
+        fn insert(&self, number: u32, names: (&str, Option<&str>)) {
+            track_by(
+                &self.db,
+                &format!("tr-{number:032x}"),
+                &format!("{number}.flac"),
+                names,
+                &self.artist_id,
+                &self.album_id,
+            );
         }
 
         fn delete(&self, number: u32) {
@@ -430,6 +483,19 @@ mod tests {
                 .map(|(_, name, sort_name, _)| (name, sort_name))
                 .collect()
         }
+
+        /// Returns the ID and the key of every artist in key order.
+        fn identities(&self) -> Vec<(String, String)> {
+            self.db
+                .with_reader(|conn| {
+                    let mut select = conn.prepare("SELECT id, key FROM artists ORDER BY key")?;
+                    let identities = select
+                        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
+                        .collect::<rusqlite::Result<_>>()?;
+                    Ok(identities)
+                })
+                .unwrap()
+        }
     }
 
     /// Returns the name and the sort name of an artist with the name `name`.
@@ -445,10 +511,15 @@ mod tests {
             (2, "Aurora Field"),
             (3, "Aurora Field"),
         ]);
+        let identities = library.identities();
         assert_eq!(library.names_after_update(), [named("Aurora Field")]);
-        // The row has its ID and its key.
+        // The row has its ID and its key, and it is the one row.
+        assert_eq!(library.identities(), identities);
+        assert_eq!(
+            identities,
+            [(library.artist_id.clone(), "aurora field".to_owned())]
+        );
         assert_eq!(artist(&library.db, "aurora field"), library.artist_id);
-        assert_eq!(library.db.with_reader(rows).unwrap()[0].0, "aurora field");
     }
 
     #[test]
@@ -484,21 +555,62 @@ mod tests {
     }
 
     #[test]
-    fn update_names_leaves_out_a_track_artist_with_another_key() {
-        // The tracks have an album artist tag, which the row does not hold,
-        // and most of them have another track artist.
+    fn update_names_reads_the_album_artist_of_a_track_and_not_its_track_artist() {
+        // The row has the spelling of every track artist. The album artists
+        // have two other spellings under the same key.
+        let library = Named::new("AURORA FIELD");
+        library.add_with_track_artist(&[
+            (1, "Aurora Field", "AURORA FIELD"),
+            (2, "aurora field", "AURORA FIELD"),
+            (3, "aurora field", "AURORA FIELD"),
+        ]);
+        let identities = library.identities();
+        assert_eq!(library.names_after_update(), [named("aurora field")]);
+        // The row has its ID and its key, and it is the one row.
+        assert_eq!(library.identities(), identities);
+        assert_eq!(identities.len(), 1);
+    }
+
+    #[test]
+    fn update_names_reads_the_track_artist_of_a_row_that_has_no_album_artist() {
+        // The rows are from schema version 1. Most of them have a track
+        // artist with another key, which is no spelling of the artist.
         let library = Named::new("aurora field");
-        library.add(&[(1, "Tessa Lund"), (2, "Tessa Lund")]);
+        library.add_from_version_1(&[(1, OTHER), (2, OTHER)]);
         assert_eq!(library.names_after_update(), [named("aurora field")]);
 
-        library.add(&[(3, "Aurora Field")]);
+        library.add_from_version_1(&[(3, "Aurora Field")]);
+        assert_eq!(library.names_after_update(), [named("Aurora Field")]);
+
+        // A row with an album artist carries that spelling, and its track
+        // artist does not count. The name stays while the third track
+        // carries it.
+        library.add_with_track_artist(&[(4, "AURORA FIELD", "aurora field")]);
+        assert_eq!(library.names_after_update(), [named("Aurora Field")]);
+        library.delete(3);
+        assert_eq!(library.names_after_update(), [named("AURORA FIELD")]);
+        assert_eq!(artist(&library.db, "aurora field"), library.artist_id);
+    }
+
+    #[test]
+    fn update_names_counts_the_rows_with_and_without_an_album_artist_together() {
+        // One spelling is on a row from schema version 1 and on a row with
+        // an album artist, and another spelling is on one row.
+        let library = Named::new("aurora field");
+        library.add_from_version_1(&[(1, "Aurora Field")]);
+        library.add(&[(2, "Aurora Field"), (3, "AURORA FIELD")]);
         assert_eq!(library.names_after_update(), [named("Aurora Field")]);
     }
 
     #[test]
     fn update_names_keeps_the_name_of_various_artists() {
         let library = Named::new(VARIOUS_ARTISTS);
-        library.add(&[(1, "various artists"), (2, "Tessa Lund")]);
+        // A row from schema version 1 whose track artist has the key of the
+        // row, and one whose track artist has another key.
+        library.add_from_version_1(&[(1, "various artists"), (2, OTHER)]);
+        assert_eq!(library.names_after_update(), [named(VARIOUS_ARTISTS)]);
+
+        library.add(&[(3, VARIOUS_ARTISTS)]);
         assert_eq!(library.names_after_update(), [named(VARIOUS_ARTISTS)]);
     }
 
@@ -506,20 +618,26 @@ mod tests {
     fn update_names_writes_no_row_whose_name_a_track_carries() {
         let library = Named::new("aurora field");
         library.add(&[(1, "aurora field"), (2, "Aurora Field")]);
-        // An artist of which no track carries a spelling, and an artist
-        // without a track.
+        // An artist whose name a row from schema version 1 carries, an
+        // artist of which no track carries a spelling, and an artist without
+        // a track.
+        let carried = artist(&library.db, "Nadia Ortiz");
+        let album_id = album(&library.db, &carried, "Paper Maps");
+        let names = ("Nadia Ortiz", None);
+        let id = "tr-00000000000000000000000000000003";
+        track_by(&library.db, id, "3.flac", names, &carried, &album_id);
         let uncarried = artist(&library.db, "Marlow Quartet");
         let album_id = album(&library.db, &uncarried, "Slow Rivers");
-        let id = "tr-00000000000000000000000000000003";
+        let id = "tr-00000000000000000000000000000004";
         track_by(
             &library.db,
             id,
-            "3.flac",
-            "Tessa Lund",
+            "4.flac",
+            (OTHER, None),
             &uncarried,
             &album_id,
         );
-        artist(&library.db, "Nadia Ortiz");
+        artist(&library.db, "Zoe Akesson");
         library.names_after_update();
 
         library
