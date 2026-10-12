@@ -10,8 +10,9 @@
 //! and [`transcoded`] gives it to the transcoder, only when two things hold:
 //!
 //! - The file is inside a configured music folder after every symbolic link
-//!   of its path is resolved. The scanner follows links, so a track row can
-//!   name a path that leads out of the folders. Such a file is not served.
+//!   of its path is resolved. The scanner gives no row to a file outside the
+//!   folders, and a link that changed since the scan can still lead the path
+//!   of a row out of them. Such a file is not served.
 //! - The file has the size and the modification time that the scan stored on
 //!   the row. A file that was replaced at the path since the scan has other
 //!   bytes than the track of the ID, and it is not served under that ID.
