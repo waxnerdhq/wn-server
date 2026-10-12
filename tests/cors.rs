@@ -119,10 +119,7 @@ async fn ping_response_allows_every_origin() {
 #[tokio::test]
 async fn error_envelope_allows_every_origin() {
     let server = server().await;
-    for (name, message) in [
-        ("nope", "unknown endpoint"),
-        ("getPodcasts", "not supported"),
-    ] {
+    for (name, message) in [("nope", "unknown endpoint"), ("getVideos", "not supported")] {
         let response = server.get_raw(name, &[("f", "json")]).await;
         assert_eq!(allow_origin(&response), Some("*"), "{name}");
         let response = envelope(response).await;
@@ -234,7 +231,7 @@ async fn preflight_request_is_answered_before_authentication() {
         "ping",
         "getOpenSubsonicExtensions",
         "stream.view",
-        "getPodcasts",
+        "getVideos",
         "nope",
     ] {
         let response = server.request(preflight(name)).await;

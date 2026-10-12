@@ -410,7 +410,8 @@ impl AuthDefaults {
 /// process. No socket is opened.
 ///
 /// The database is in memory and holds the owner [`OWNER`] with the password
-/// [`OWNER_PASSWORD`].
+/// [`OWNER_PASSWORD`]. [`TestServer::db`] returns it, so a test writes the
+/// rows that its requests read.
 ///
 /// `get_raw`, `get_json`, `get_xml` and `post_form` add the auth defaults to
 /// the parameters of the caller: `u`, a token `t` with a new salt `s`, `v` and
@@ -419,6 +420,7 @@ impl AuthDefaults {
 /// that sends a password, an API key or no credential uses them.
 pub struct TestServer {
     router: Router,
+    db: Db,
 }
 
 impl TestServer {
@@ -438,7 +440,7 @@ impl TestServer {
         let state = AppState {
             config: Arc::new(config),
 
-            db,
+            db: db.clone(),
 
             // covers
 
@@ -452,7 +454,13 @@ impl TestServer {
         };
         Self {
             router: api::build_router(state),
+            db,
         }
+    }
+
+    /// The database of the server.
+    pub fn db(&self) -> &Db {
+        &self.db
     }
 
     /// Sends `request` to the router and returns the response.
