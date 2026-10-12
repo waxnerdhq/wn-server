@@ -48,7 +48,7 @@ pub mod annotate;
 
 pub mod playlists;
 
-// queue
+pub mod queue;
 
 // lyrics
 
@@ -374,9 +374,9 @@ pub const METHODS: &[(&str, Handler)] = &[
 
     ("changePassword", handler!(stubs::user_management)),
 
-    ("getPlayQueue", not_implemented),
+    ("getPlayQueue", handler!(queue::get_play_queue)),
 
-    ("savePlayQueue", not_implemented),
+    ("savePlayQueue", handler!(queue::save_play_queue)),
 
     ("getScanStatus", handler!(scan::get_scan_status)),
 
