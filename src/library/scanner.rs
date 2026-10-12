@@ -4617,6 +4617,58 @@ mod tests {
     }
 
     #[test]
+    fn a_scan_that_is_cancelled_within_a_batch_changes_the_library_when_it_stored_a_batch_before() {
+        let mut library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2)]);
+        library.scan();
+        assert!(library.latest_scan().changed_library);
+        assert_eq!(counts(&library.scan()), (0, 0, 0, 0));
+        assert!(!library.latest_scan().changed_library);
+
+        // Four new files, in batches of two. The first tag read cancels the
+        // scan, so the check before the second file of the first batch
+        // stops it. No batch is stored.
+        for (rel_path, samples, fill) in [
+            ("c.wav", 300, 3),
+            ("d.wav", 400, 4),
+            ("e.wav", 500, 5),
+            ("f.wav", 600, 6),
+        ] {
+            library.write(rel_path, samples, fill);
+        }
+        library.tag_reads.set(0);
+        library.cancel_at_tag_read.set(1);
+        let summary = library.scan_in_batches_of(2);
+        assert_eq!(summary.errors, [CANCELLED]);
+        assert_eq!(counts(&summary), (0, 0, 0, 0));
+        assert_eq!(library.index().len(), 2);
+        let scan = library.latest_scan();
+        assert_eq!(scan.error.as_deref(), Some(CANCELLED));
+        assert!(!scan.changed_library);
+
+        // The third tag read cancels the scan: the first batch is stored
+        // and the second one is not.
+        library.cancel = CancellationToken::new();
+        library.tag_reads.set(0);
+        library.cancel_at_tag_read.set(3);
+        let summary = library.scan_in_batches_of(2);
+        assert_eq!(summary.errors, [CANCELLED]);
+        assert_eq!(counts(&summary), (2, 0, 0, 0));
+        assert_eq!(library.index().len(), 4);
+        let scan = library.latest_scan();
+        assert_eq!(scan.error.as_deref(), Some(CANCELLED));
+        assert!(scan.changed_library);
+
+        // The next scan stores the second batch, and the scan after it
+        // stores nothing.
+        library.cancel = CancellationToken::new();
+        library.cancel_at_tag_read.set(0);
+        assert_eq!(counts(&library.scan_in_batches_of(2)), (2, 0, 0, 0));
+        assert!(library.latest_scan().changed_library);
+        assert_eq!(counts(&library.scan_in_batches_of(2)), (0, 0, 0, 0));
+        assert!(!library.latest_scan().changed_library);
+    }
+
+    #[test]
     fn a_track_whose_path_another_track_takes_has_no_file_while_its_file_may_be_unread() {
         let library = Library::new(&[("a.wav", 100, 1), ("b.wav", 200, 2)]);
         library.set_mtime("a.wav", 1_000);
