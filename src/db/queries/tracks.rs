@@ -4,6 +4,7 @@ use rusqlite::{Connection, OptionalExtension, Row, params};
 
 use super::int;
 use crate::db::Result;
+use crate::ids;
 use crate::library::tags::TrackMeta;
 
 /// What the scanner compares with the files on disk: the ID of a track, its
@@ -24,7 +25,10 @@ pub struct IndexEntry {
 /// A row of the `tracks` table.
 ///
 /// The columns `title_lc` and `album_artist_name` have no field: statements
-/// compare them, and no caller reads them.
+/// compare them, and no caller reads them. `title_lc` holds the normalised
+/// form of `title` (`ids::normalise`). [`insert_track`] and
+/// [`update_track_meta`] store it with the title, and
+/// [`normalise_titles`] sets it in a row that holds another value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Track {
     pub id: String,
@@ -174,7 +178,7 @@ pub fn insert_track(
         rel_path,
         content.fingerprint,
         meta.title,
-        meta.title.to_lowercase(),
+        ids::normalise(&meta.title),
         content.album_id,
         content.artist_id,
         meta.artist,
@@ -217,7 +221,7 @@ pub fn update_track_meta(conn: &Connection, id: &str, content: &TrackContent<'_>
         id,
         content.fingerprint,
         meta.title,
-        meta.title.to_lowercase(),
+        ids::normalise(&meta.title),
         content.album_id,
         content.artist_id,
         meta.artist,
@@ -240,6 +244,45 @@ pub fn update_track_meta(conn: &Connection, id: &str, content: &TrackContent<'_>
         meta.album_artist,
     ])?;
     Ok(())
+}
+
+/// Sets `title_lc` of every track to the normalised form of its title
+/// (`ids::normalise`), and returns the number of rows that it wrote. A row
+/// that holds that value is not written, so the function writes nothing
+/// when every row was stored by [`insert_track`] or [`update_track_meta`].
+///
+/// The scanner calls it in every scan (`docs/design.md` section 3.10
+/// step 6). It reads the ID, the `title` and the `title_lc` of every row
+/// and no file. It writes a row whose `title_lc` was stored under another
+/// rule: a build that lower-cased the title without composing it stored
+/// the title of a tag in decomposed form in that form, which no term
+/// matches.
+///
+/// The function writes `title_lc` and no other column. The ID, the rowid,
+/// the title, the locator and the update time of a row stay, and no row of
+/// another table is written.
+pub fn normalise_titles(conn: &Connection) -> Result<u64> {
+    let mut stale: Vec<(String, String)> = Vec::new();
+    {
+        let mut select = conn.prepare_cached("SELECT id, title, title_lc FROM tracks")?;
+        let mut rows = select.query([])?;
+        while let Some(row) = rows.next()? {
+            let title: String = row.get(1)?;
+            let stored: String = row.get(2)?;
+            let normalised = ids::normalise(&title);
+            if normalised != stored {
+                stale.push((row.get(0)?, normalised));
+            }
+        }
+    }
+    // The rows are written after the statement that reads them has ended,
+    // so the read sees no row that this function wrote.
+    let mut update = conn.prepare_cached("UPDATE tracks SET title_lc = ?2 WHERE id = ?1")?;
+    let mut written = 0;
+    for (id, title_lc) in &stale {
+        written += update.execute([id, title_lc])? as u64;
+    }
+    Ok(written)
 }
 
 /// Moves the track `id` to the locator `(folder_id, rel_path)`, stores the
@@ -794,6 +837,193 @@ mod tests {
             fixture.album_artist_name(FIRST).as_deref(),
             Some("Aurora Field")
         );
+    }
+
+    /// Titles and the `title_lc` that a row of each holds: a title in
+    /// decomposed form, the same title in composed form, a decomposed title
+    /// in upper case, a title without a letter outside ASCII, and a title
+    /// whose lower case Unicode has as one character while its upper case
+    /// has none.
+    const TITLES: [(&str, &str); 5] = [
+        ("Cafe\u{301} del Mar", "caf\u{e9} del mar"),
+        ("Caf\u{e9} del Mar", "caf\u{e9} del mar"),
+        ("A\u{30a}NGSTRO\u{308}M", "\u{e5}ngstr\u{f6}m"),
+        ("Low Tide", "low tide"),
+        ("J\u{30c}", "j\u{30c}"),
+    ];
+
+    /// The ID of the track `n` of a test that stores several tracks.
+    fn nth_id(n: usize) -> String {
+        format!("tr-{n:032x}")
+    }
+
+    /// Every column of every track row, in rowid order, with the rowid.
+    fn dump(fixture: &Fixture) -> Vec<Vec<(String, rusqlite::types::Value)>> {
+        fixture
+            .db
+            .with_reader(|conn| {
+                let mut select =
+                    conn.prepare("SELECT rowid AS _rowid, * FROM tracks ORDER BY rowid")?;
+                let names: Vec<String> = select
+                    .column_names()
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect();
+                let rows = select
+                    .query_map([], |row| {
+                        names
+                            .iter()
+                            .enumerate()
+                            .map(|(index, name)| Ok((name.clone(), row.get(index)?)))
+                            .collect()
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
+                Ok(rows)
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn insert_and_update_store_the_normalised_title() {
+        let fixture = fixture();
+        for (n, (title, title_lc)) in TITLES.into_iter().enumerate() {
+            assert_eq!(ids::normalise(title), title_lc, "{title:?}");
+            let id = nth_id(n);
+            let mut meta = full_meta();
+            meta.title = title.to_owned();
+            let content = fixture.content(&meta, "100:aa", 1000, 100);
+            fixture
+                .db
+                .with_writer(|conn| {
+                    insert_track(
+                        conn,
+                        &id,
+                        fixture.folders[0],
+                        &format!("{n}.flac"),
+                        &content,
+                    )
+                })
+                .unwrap();
+            // The title is stored as the tag spells it.
+            assert_eq!(fixture.get(&id).unwrap().title, title);
+            assert_eq!(fixture.title_lc(&id), title_lc, "{title:?}");
+        }
+
+        // An update stores the form of the new title.
+        for (n, (title, title_lc)) in TITLES.into_iter().rev().enumerate() {
+            let id = nth_id(n);
+            let mut meta = full_meta();
+            meta.title = title.to_owned();
+            let content = fixture.content(&meta, "100:aa", 1000, 100);
+            fixture
+                .db
+                .with_writer(|conn| update_track_meta(conn, &id, &content))
+                .unwrap();
+            assert_eq!(fixture.get(&id).unwrap().title, title);
+            assert_eq!(fixture.title_lc(&id), title_lc, "{title:?}");
+        }
+
+        // Every row has its value, so there is nothing to set.
+        let written = fixture
+            .db
+            .with_writer(|conn| normalise_titles(conn))
+            .unwrap();
+        assert_eq!(written, 0);
+    }
+
+    #[test]
+    fn normalise_titles_writes_the_rows_that_hold_another_value_and_no_other_column() {
+        let fixture = fixture();
+        for (n, (title, _)) in TITLES.into_iter().enumerate() {
+            let mut meta = full_meta();
+            meta.title = title.to_owned();
+            let content = fixture.content(&meta, "100:aa", 1000, 100);
+            fixture
+                .db
+                .with_writer(|conn| {
+                    let rel_path = format!("{n}.flac");
+                    insert_track(conn, &nth_id(n), fixture.folders[0], &rel_path, &content)
+                })
+                .unwrap();
+        }
+        fixture.age_rows();
+        let normalised = dump(&fixture);
+
+        // The rows as a build stored them that lower-cased the title and
+        // did not compose it. Two of the five titles are decomposed.
+        fixture
+            .db
+            .with_writer(|conn| {
+                for (n, (title, _)) in TITLES.into_iter().enumerate() {
+                    conn.execute(
+                        "UPDATE tracks SET title_lc = ?2 WHERE id = ?1",
+                        [nth_id(n), title.to_lowercase()],
+                    )?;
+                }
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(fixture.title_lc(&nth_id(0)), "cafe\u{301} del mar");
+        assert_eq!(fixture.title_lc(&nth_id(2)), "a\u{30a}ngstro\u{308}m");
+        let stale = dump(&fixture);
+        let differing = |rows: &[Vec<(String, rusqlite::types::Value)>]| {
+            let differs = |(row, other): (&Vec<_>, &Vec<_>)| row != other;
+            rows.iter()
+                .zip(&normalised)
+                .filter(|pair| differs(*pair))
+                .count()
+        };
+        assert_eq!(differing(&stale), 2);
+
+        // The two rows get their value. Every row has its rowid, its ID,
+        // its title, its update time and every other value.
+        let written = fixture
+            .db
+            .with_writer(|conn| normalise_titles(conn))
+            .unwrap();
+        assert_eq!(written, 2);
+        assert_eq!(dump(&fixture), normalised);
+        for (n, (title, title_lc)) in TITLES.into_iter().enumerate() {
+            assert_eq!(fixture.title_lc(&nth_id(n)), title_lc, "{title:?}");
+        }
+
+        // The second call finds every row with its value and writes none: a
+        // trigger fails every update of a track row.
+        fixture
+            .db
+            .with_writer(|conn| {
+                conn.execute_batch(
+                    "CREATE TEMP TRIGGER no_update BEFORE UPDATE ON tracks
+                     BEGIN SELECT RAISE(ABORT, 'a track row was updated'); END;",
+                )?;
+                Ok(())
+            })
+            .unwrap();
+        let written = fixture
+            .db
+            .with_writer(|conn| normalise_titles(conn))
+            .unwrap();
+        assert_eq!(written, 0);
+        assert_eq!(dump(&fixture), normalised);
+        // The trigger is in force.
+        let error = fixture
+            .db
+            .with_writer(|conn| Ok(conn.execute("UPDATE tracks SET mtime = mtime", [])?))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("a track row was updated"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn normalise_titles_of_a_table_without_a_row_writes_nothing() {
+        let fixture = fixture();
+        let written = fixture
+            .db
+            .with_writer(|conn| normalise_titles(conn))
+            .unwrap();
+        assert_eq!(written, 0);
     }
 
     #[test]
