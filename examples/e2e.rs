@@ -16,16 +16,18 @@
 //! the last line holds the number of steps, the number of failed steps and
 //! the time. The exit status is 0 when every step passed, 1 when one failed
 //! and 2 for wrong arguments. A session ends within 60 seconds: a request
-//! that is sent later fails, and so does its step.
+//! that is sent later fails, a response is read no longer than that, and the
+//! step of either fails.
 //!
 //! The session leaves the server as it found it, apart from three values:
 //! one more play of one track, the time of a star that it found and the time
 //! of the play queue. It removes the star and the playlist that it creates,
 //! it sets a star again that it found, and it ends with the play queue that
-//! it found. A session that ended early can leave a star, a playlist with
-//! the name of [`PLAYLIST_NAME`] and its play queue behind. The next session
-//! passes on such a server: it keeps the star, deletes the playlists of that
-//! name and does not put such a queue back.
+//! it found. It deletes no playlist but the one that it created. A session
+//! that ended early can leave a star, a playlist with the name of
+//! [`PLAYLIST_NAME`] and its play queue behind. The next session passes on
+//! such a server: it keeps the star and the playlist, and it does not put
+//! such a queue back.
 //!
 //! The client speaks HTTP/1.1 over `std::net::TcpStream` with one connection
 //! for each request. It reads a body with `Content-Length`, a chunked body
@@ -34,8 +36,9 @@
 
 use std::collections::BTreeMap;
 use std::env;
+use std::ffi::OsString;
 use std::fs;
-use std::io::{Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::process::ExitCode;
@@ -60,13 +63,14 @@ const API_VERSION: &str = "1.16.1";
 /// The time after which the session sends no request.
 const SESSION_LIMIT: Duration = Duration::from_secs(60);
 
-/// The longest time one request waits for its connection and for each read
-/// and write. A transcode request waits up to 15 s for its first byte
+/// The longest time a request waits for its connection, for a write and for
+/// the next bytes of its response. A wait also ends when the time of the
+/// session is over. A transcode request waits up to 15 s for its first byte
 /// (`docs/design.md` section 3.9).
 const REQUEST_LIMIT: Duration = Duration::from_secs(20);
 
 /// The most bytes the client reads of one response.
-const RESPONSE_LIMIT: u64 = 64 * 1024 * 1024;
+const RESPONSE_LIMIT: usize = 64 * 1024 * 1024;
 
 /// The longest time the session waits for a scan of the library to end.
 const SCAN_LIMIT: Duration = Duration::from_secs(20);
@@ -74,9 +78,9 @@ const SCAN_LIMIT: Duration = Duration::from_secs(20);
 /// The time between two `getScanStatus` requests of that wait.
 const SCAN_POLL: Duration = Duration::from_millis(100);
 
-/// The name of the playlist of the session. The session deletes every
-/// playlist of this name that it finds, which is one that an earlier session
-/// left behind.
+/// The name of the playlist of the session. The session reads and deletes
+/// its playlist by the ID that `createPlaylist` returns, so another playlist
+/// with this name has no effect on it and stays.
 const PLAYLIST_NAME: &str = "wn-server e2e session";
 
 /// The extensions that `getOpenSubsonicExtensions` lists, with their
@@ -209,8 +213,16 @@ const STEPS: &[(&str, Step)] = &[
 type Step = fn(&mut Session) -> Result<(), String>;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = env::args().skip(1).collect();
+    // The library directory is a path, which need not be Unicode.
+    let args: Vec<OsString> = env::args_os().skip(1).collect();
     let [base_url, user, password, library] = args.as_slice() else {
+        eprintln!("{USAGE}");
+        return ExitCode::from(2);
+    };
+    let (Some(base_url), Some(user), Some(password)) =
+        (base_url.to_str(), user.to_str(), password.to_str())
+    else {
+        eprintln!("e2e: the base URL, the user and the password must be Unicode text");
         eprintln!("{USAGE}");
         return ExitCode::from(2);
     };
@@ -482,6 +494,18 @@ impl Client {
             .map_err(|error| format!("{method}: {error}"))
     }
 
+    /// The time that the session has left. An error when that time is over.
+    fn time_left(&self) -> Result<Duration, String> {
+        let left = self.deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(format!(
+                "the {} seconds of the session are over",
+                SESSION_LIMIT.as_secs()
+            ));
+        }
+        Ok(left)
+    }
+
     /// Sends one request on a new connection and reads the response to the
     /// end of the connection. `path` follows the path of the base URL.
     fn send(
@@ -491,14 +515,8 @@ impl Client {
         headers: &[(&str, &str)],
         body: &[u8],
     ) -> Result<Reply, String> {
-        let left = self.deadline.saturating_duration_since(Instant::now());
-        if left.is_zero() {
-            return Err(format!(
-                "the {} seconds of the session are over",
-                SESSION_LIMIT.as_secs()
-            ));
-        }
-        let limit = left.min(REQUEST_LIMIT);
+        let named = |error: String| format!("{verb} {}: {error}", request_name(path));
+        let limit = self.time_left()?.min(REQUEST_LIMIT);
 
         let mut request = format!(
             "{verb} {}{path} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
@@ -512,19 +530,38 @@ impl Client {
         }
         request.push_str("\r\n");
 
-        let io = |error: std::io::Error| format!("{verb} {}: {error}", request_name(path));
         let mut stream = self.connect(limit)?;
-        stream.set_read_timeout(Some(limit)).map_err(io)?;
-        stream.set_write_timeout(Some(limit)).map_err(io)?;
-        stream.write_all(request.as_bytes()).map_err(io)?;
-        stream.write_all(body).map_err(io)?;
-        let mut received = Vec::new();
         stream
-            .take(RESPONSE_LIMIT)
-            .read_to_end(&mut received)
-            .map_err(io)?;
-        parse_reply(verb, &received)
-            .map_err(|error| format!("{verb} {}: {error}", request_name(path)))
+            .set_write_timeout(Some(limit))
+            .and_then(|()| stream.write_all(request.as_bytes()))
+            .and_then(|()| stream.write_all(body))
+            .map_err(|error| named(waited(&error, limit)))?;
+        let received = self.receive(&mut stream).map_err(named)?;
+        parse_reply(verb, &received).map_err(named)
+    }
+
+    /// Reads a response to the end of the connection. Each read waits for
+    /// [`REQUEST_LIMIT`] at most, and not longer than the session has left:
+    /// a response that arrives in small parts does not keep a step running
+    /// past the end of the session.
+    fn receive(&self, stream: &mut TcpStream) -> Result<Vec<u8>, String> {
+        let mut received = Vec::new();
+        let mut buffer = vec![0_u8; 64 * 1024];
+        loop {
+            let wait = self.time_left()?.min(REQUEST_LIMIT);
+            stream
+                .set_read_timeout(Some(wait))
+                .map_err(|error| error.to_string())?;
+            match stream.read(&mut buffer) {
+                Ok(0) => return Ok(received),
+                Ok(count) => received.extend_from_slice(&buffer[..count]),
+                Err(error) if error.kind() == ErrorKind::Interrupted => {}
+                Err(error) => return Err(waited(&error, wait)),
+            }
+            if received.len() > RESPONSE_LIMIT {
+                return Err(format!("the response has more than {RESPONSE_LIMIT} bytes"));
+            }
+        }
     }
 
     /// Connects to the first address of the host that accepts a connection.
@@ -540,6 +577,23 @@ impl Client {
             }
         }
         Err(last)
+    }
+}
+
+/// The text of the error of a read or of a write that waited for `limit` at
+/// most. A wait that reached its limit is the error `WouldBlock` on Unix and
+/// `TimedOut` on Windows, and the text of the system for it does not name the
+/// limit.
+fn waited(error: &io::Error, limit: Duration) -> String {
+    match error.kind() {
+        ErrorKind::WouldBlock | ErrorKind::TimedOut if limit < REQUEST_LIMIT => format!(
+            "no byte before the {} seconds of the session were over",
+            SESSION_LIMIT.as_secs()
+        ),
+        ErrorKind::WouldBlock | ErrorKind::TimedOut => {
+            format!("no byte within {} s", limit.as_secs())
+        }
+        _ => error.to_string(),
     }
 }
 
@@ -1451,21 +1505,7 @@ impl Session {
 
     // -- playlists -----------------------------------------------------------
 
-    /// Deletes the playlists with the name of the session, which earlier
-    /// sessions left behind.
-    fn delete_leftover_playlists(&self) -> Result<(), String> {
-        let answer = self.client.call("getPlaylists", &[])?;
-        for playlist in list(&answer, "/playlists/playlist")? {
-            if playlist["name"] == PLAYLIST_NAME {
-                self.client
-                    .call("deletePlaylist", &[("id", text(playlist, "/id")?)])?;
-            }
-        }
-        Ok(())
-    }
-
     fn playlist(&mut self) -> Result<(), String> {
-        self.delete_leftover_playlists()?;
         let first = self.song_of("Night Ferry")?.id.clone();
         let second = self.song_of("Low Tide")?.id.clone();
         let created = self.client.call(

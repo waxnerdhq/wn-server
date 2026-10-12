@@ -785,9 +785,9 @@ cargo run -- --data-dir /path/to/e2e-data run
 cargo run --example e2e -- http://127.0.0.1:4200 owner PASSWORD /path/to/e2e-library
 ```
 
-The four arguments are the address of the server, the name of the owner, the password and the directory of the library. Each step prints `PASS`, or `FAIL` with one line of detail, and the last line holds the number of steps, the number of failed steps and the time. The exit status is 0 when every step passed and 1 when a step failed. The session sends no request later than 60 seconds after its start.
+The four arguments are the address of the server, the name of the owner, the password and the directory of the library. Each step prints `PASS`, or `FAIL` with one line of detail, and the last line holds the number of steps, the number of failed steps and the time. The exit status is 0 when every step passed and 1 when a step failed. The session ends within 60 seconds: a request that would be sent later fails its step, and so does a response that is not complete by then.
 
-The session can run again against the same server. It removes the star and the playlist that it creates, sets a star again that it found, and ends with the play queue that it found. It adds one play to one track. Ctrl-C stops the server, and the two directories can be deleted afterwards.
+The session can run again against the same server. It removes the star and the playlist that it creates, sets a star again that it found, and ends with the play queue that it found. It deletes no other playlist. It adds one play to one track. Ctrl-C stops the server, and the two directories can be deleted afterwards.
 
 ## Licence
 
