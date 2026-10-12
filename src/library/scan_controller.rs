@@ -38,15 +38,22 @@ pub struct ScanLockError {
 /// The lock of the scans of one data directory. The process that holds it
 /// is the one that scans the library.
 ///
-/// The lock is an exclusive lock of the operating system on the lock file:
-/// `flock` on Unix and `LockFileEx` on Windows. It ends when the value is
-/// dropped, and the operating system ends it when the process ends, so a
-/// process that was killed leaves no lock behind. The file stays and has no
-/// content.
+/// The lock is an exclusive lock of the operating system on the lock file,
+/// taken with [`File::try_lock`]: `flock` on Unix and `LockFileEx` on
+/// Windows. One value holds it; the type has no `Clone`. The lock ends when
+/// the value is dropped: the drop releases it with [`File::unlock`] before
+/// the file is closed, so the lock is free when the drop returns. The
+/// operating system ends the lock when the process ends, so a process that
+/// was killed leaves no lock behind. The file stays and has no content.
+///
+/// The drop does not leave the release to the close of the file, because on
+/// Unix a close does not release the lock while a child process holds a copy
+/// of the descriptor. The `Drop` implementation states the rules of each
+/// operating system.
 #[derive(Debug)]
 pub struct ScanLock {
-    /// The open lock file. Closing it releases the lock.
-    _file: File,
+    /// The open lock file. Its lock is the scan lock.
+    file: File,
 }
 
 impl ScanLock {
@@ -67,9 +74,43 @@ impl ScanLock {
             .open(path)
             .map_err(error)?;
         match file.try_lock() {
-            Ok(()) => Ok(Some(Self { _file: file })),
+            Ok(()) => Ok(Some(Self { file })),
             Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(source)) => Err(error(source)),
+        }
+    }
+}
+
+impl Drop for ScanLock {
+    /// Releases the lock with the call that matches [`File::try_lock`], and
+    /// then the file is closed. A failure of the call is logged.
+    fn drop(&mut self) {
+        // Unix: `flock(LOCK_UN)`. A lock of `flock` belongs to the open file
+        // description and not to the descriptor (`flock(2)` of Linux and of
+        // macOS). A child process holds a copy of the descriptor from its
+        // creation to its exec, where close-on-exec closes the copy. A close
+        // releases the lock only when it closes the last copy, so a lock
+        // that is left to the close stays held while a child process that
+        // another thread starts has not reached its exec, and the next scan
+        // is refused although none runs. An unlock through one descriptor
+        // releases the lock of the description, whatever copies exist.
+        //
+        // Windows: `UnlockFile`. No child process holds the handle there.
+        // The standard library opens the file with a handle that is not
+        // inheritable, and a process that it starts inherits the
+        // inheritable handles only: the copies that it makes of the three
+        // standard handles. Tokio starts its processes through the standard
+        // library. A child process that inherits a handle is not granted
+        // its lock either (`LockFileEx`). The close of the handle releases
+        // the lock as well, after a time that depends on the resources of
+        // the system, and the documentation of `LockFileEx` recommends the
+        // explicit unlock for that reason.
+        if let Err(error) = self.file.unlock() {
+            // The close that follows ends the lock. On Unix it does so at
+            // once when no child process holds a copy of the descriptor, and
+            // at the exec of that process otherwise. On Windows it does so
+            // after the time that the system takes.
+            tracing::warn!(%error, "the scan lock was not released before its file was closed");
         }
     }
 }
@@ -295,10 +336,17 @@ async fn join(task: Option<JoinHandle<()>>, what: &str) {
     }
 }
 
-/// The scan that a [`ScanController`] runs. Dropping the value releases the
-/// scan lock and then marks the controller as idle. A `start` that finds the
-/// controller idle therefore never finds the lock held by a scan of its own
-/// controller.
+/// The scan that a [`ScanController`] runs. Dropping the value drops the
+/// [`ScanLock`] and then marks the controller as idle. The drop of the lock
+/// releases it with an unlock call, so the lock is free before the
+/// controller is idle, also while a child process holds a copy of the
+/// descriptor of the lock file. A `start` that finds the controller idle
+/// therefore does not find the lock held by a scan of its own controller.
+///
+/// The exception is an unlock call that fails, which `ScanLock` logs. The
+/// lock then ends when the file is closed, and on Unix when a child process
+/// that another thread starts has reached its exec. A `start` before that
+/// returns [`StartOutcome::RunningElsewhere`] and starts no scan.
 struct Running {
     inner: Arc<Inner>,
     lock: Option<ScanLock>,
@@ -430,14 +478,39 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::process::Stdio;
 
     use tempfile::TempDir;
+    use tokio::io::{AsyncBufReadExt, BufReader};
+    use tokio::process::{Child, Command};
 
     use super::testing::{Gate, WAIT, ended, music_folder};
     use super::*;
     use crate::db::queries::scans::{self, Scan};
     use crate::db::queries::tracks;
     use crate::library::scanner::CANCELLED;
+
+    /// The name of [`child_process_of_the_tests`] as the test harness knows
+    /// it.
+    const CHILD_TEST: &str = "library::scan_controller::tests::child_process_of_the_tests";
+
+    /// The environment variable that turns [`child_process_of_the_tests`]
+    /// into a child process of a test. Its value is the number of seconds
+    /// the process sleeps.
+    const SLEEP_VARIABLE: &str = "WN_SERVER_TEST_SCAN_LOCK_SLEEP";
+
+    /// The environment variable that names the lock file on which the child
+    /// process takes the scan lock before it sleeps.
+    const LOCK_VARIABLE: &str = "WN_SERVER_TEST_SCAN_LOCK_FILE";
+
+    /// The line that the child process writes to its standard output before
+    /// it sleeps.
+    const CHILD_SLEEPS: &str = "the child process of the tests of the scan lock sleeps";
+
+    /// The number of seconds the child process sleeps. A test ends the
+    /// process some milliseconds after its start. A process that no test
+    /// ends, ends by itself after the sleep.
+    const CHILD_SLEEP_SECONDS: u64 = 10;
 
     /// A controller over a memory database and the music folder `folder`,
     /// with the lock file `scan.lock` in `data` and the cover cache
@@ -476,6 +549,69 @@ mod tests {
 
     fn status(scanning: bool, count: u64) -> ScanStatus {
         ScanStatus { scanning, count }
+    }
+
+    /// The process that the tests of the scan lock start. A test starts the
+    /// test binary again with this test as its only test and with
+    /// [`SLEEP_VARIABLE`] set. The test then takes the scan lock on the file
+    /// of [`LOCK_VARIABLE`] when that variable is set, writes
+    /// [`CHILD_SLEEPS`] and sleeps for that number of seconds.
+    ///
+    /// In a run of the suite the variable is not set, and the test does
+    /// nothing.
+    #[test]
+    fn child_process_of_the_tests() {
+        let seconds = std::env::var(SLEEP_VARIABLE)
+            .ok()
+            .and_then(|seconds| seconds.parse::<u64>().ok());
+        if let Some(seconds) = seconds {
+            let _lock = std::env::var_os(LOCK_VARIABLE).map(|path| {
+                ScanLock::try_acquire(Path::new(&path))
+                    .expect("lock the file")
+                    .expect("the lock is free")
+            });
+            println!("{CHILD_SLEEPS}");
+            std::thread::sleep(Duration::from_secs(seconds));
+        }
+    }
+
+    /// The command of a child process that sleeps: the test binary with
+    /// [`child_process_of_the_tests`] as its only test. The output of the
+    /// test is not captured, so it is the output of the process, and the
+    /// command discards it. A process of the command is killed when its
+    /// value is dropped, so a test that fails leaves no process.
+    fn child() -> Command {
+        let mut command = Command::new(std::env::current_exe().expect("the test binary"));
+        command
+            .args([CHILD_TEST, "--exact", "--nocapture"])
+            .env(SLEEP_VARIABLE, CHILD_SLEEP_SECONDS.to_string())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .kill_on_drop(true);
+        command
+    }
+
+    /// Starts the process of `command` and reads its output up to the line
+    /// of [`CHILD_SLEEPS`], for [`WAIT`] at most: the process runs, has
+    /// taken the lock that it was asked for, and sleeps.
+    async fn sleeping(mut command: Command) -> Child {
+        command.stdout(Stdio::piped());
+        let mut child = command.spawn().expect("start the test binary");
+        let output = child.stdout.take().expect("the output is a pipe");
+        let mut lines = BufReader::new(output).lines();
+        let line = async {
+            while let Some(line) = lines.next_line().await.expect("read the output") {
+                if line == CHILD_SLEEPS {
+                    return true;
+                }
+            }
+            false
+        };
+        let sleeps = tokio::time::timeout(WAIT, line)
+            .await
+            .expect("the child process starts within the limit");
+        assert!(sleeps, "the child process ended before its sleep");
+        child
     }
 
     #[test]
@@ -519,6 +655,76 @@ mod tests {
         let error = ScanLock::try_acquire(&path).expect_err("the directory does not exist");
         let prefix = format!("cannot lock {}: ", path.display());
         assert!(error.to_string().starts_with(&prefix), "{error}");
+    }
+
+    #[tokio::test]
+    async fn dropped_scan_lock_is_free_while_a_child_process_holds_a_copy_of_its_descriptor() {
+        let data = temp_dir();
+        let path = lock_path(&data);
+        let lock = ScanLock::try_acquire(&path)
+            .expect("lock the file")
+            .expect("the lock is free");
+
+        // A child process that another thread starts holds a copy of the
+        // descriptor of the lock file until its exec. That time is short,
+        // and a test cannot set it. The standard input of a process is a
+        // copy that the process keeps for as long as it runs, and on Unix
+        // it is a descriptor of the same open file description as the one
+        // of the lock, which is what the copy of a fork is. So the child
+        // process of this test holds such a copy from its start until the
+        // test ends it. The test waits for nothing that the process does.
+        let copy = lock.file.try_clone().expect("copy the descriptor");
+        let mut command = child();
+        command.stdin(Stdio::from(copy));
+        let mut holder = command.spawn().expect("start the test binary");
+        // The copy of the command is closed: the one in the child process
+        // is left.
+        drop(command);
+        assert!(ScanLock::try_acquire(&path).expect("open").is_none());
+
+        // Without the unlock call of the drop, the lock is held here on Unix
+        // until the child process ends. On Windows the lock is one of this
+        // process, which a child process that inherits the handle is not
+        // granted (`LockFileEx`), and the test checks that the drop
+        // releases it.
+        drop(lock);
+        assert!(
+            ScanLock::try_acquire(&path).expect("open").is_some(),
+            "the lock is held after its value was dropped"
+        );
+        // The process held its copy during all of the above: it still
+        // runs. It sleeps for ten seconds, and the test ends it.
+        let exit = holder.try_wait().expect("the state of the child process");
+        assert_eq!(exit, None);
+        holder.kill().await.expect("end the child process");
+    }
+
+    #[tokio::test]
+    async fn scan_lock_of_a_process_that_was_killed_is_free() {
+        let data = temp_dir();
+        let path = lock_path(&data);
+        let mut command = child();
+        command.env(LOCK_VARIABLE, &path);
+        // The process holds the scan lock, as a `wn-server scan` that scans
+        // does, and sleeps for ten seconds.
+        let mut scanning = sleeping(command).await;
+        assert!(ScanLock::try_acquire(&path).expect("open").is_none());
+
+        // The kill ends the process at once: it drops no value and unlocks
+        // nothing. The call returns when the process has ended.
+        scanning.kill().await.expect("kill the child process");
+        // The operating system releases the lock. Windows does so after a
+        // time that depends on its resources (`LockFileEx`), so the test
+        // asks until the lock is free, for one second at most. A process
+        // that sleeps on holds the lock for ten seconds.
+        let free = async {
+            while ScanLock::try_acquire(&path).expect("open").is_none() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        };
+        tokio::time::timeout(WAIT, free)
+            .await
+            .expect("the lock of the process that was killed is free");
     }
 
     #[tokio::test]
