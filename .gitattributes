@@ -1,2 +1,8 @@
 * text=auto eol=lf
 tests/fixtures/audio/* binary
+
+# The crate's module list. Parallel PRs each add one `pub mod` line to it. With
+# the union merge driver a rebase keeps the lines of both sides and reports no
+# conflict, and `cargo fmt` then orders them. The driver applies to the whole
+# file and marks no conflict in it, so no file that holds logic has it.
+src/lib.rs merge=union
