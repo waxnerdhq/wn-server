@@ -48,6 +48,10 @@ pub struct Key {
 /// that `init` writes. `tests/readme.rs` checks that `README.md` documents
 /// each key with this default. A unit test checks the list against the
 /// default [`Config`].
+///
+/// A field of [`Config`] that is `#[serde(skip)]` is no key and is not in
+/// the list: the limits of a stop, the poll of a scan, and the limits of
+/// `stream` and of a transcode. The file cannot set them; tests do.
 pub const KEYS: &[Key] = &[
     Key {
         name: "server.bind",
@@ -996,6 +1000,21 @@ mdns = true
             .map(|key| (key.name.to_owned(), key.default.to_owned()))
             .collect();
         assert_eq!(listed, rendered);
+
+        // A file with every key of the list at its default is the default
+        // config. The parser refuses a name that is no key, which is what a
+        // field with `#[serde(skip)]` is, so the list holds keys only.
+        let mut file = String::new();
+        let mut table = "";
+        for key in KEYS {
+            let (key_table, name) = key.name.split_once('.').expect("a table and a key");
+            if key_table != table {
+                table = key_table;
+                file.push_str(&format!("[{table}]\n"));
+            }
+            file.push_str(&format!("{name} = {}\n", key.default));
+        }
+        assert_eq!(Config::parse(&file).expect("parse"), Config::default());
     }
 
     #[test]

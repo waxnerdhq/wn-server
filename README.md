@@ -268,7 +268,7 @@ The API does not report an unavailable folder. `getMusicFolders` lists the folde
 An outage ends in one of two ways:
 
 - The folder comes back. The server does not watch for the folder. The next scan after the folder is back reads it, finds its tracks under the same IDs, and removes the tracks whose files are gone.
-- The folder is taken out of `library.folders`, and the server is started again. A scan that reads every remaining folder in full, and finds music in each, then removes the tracks of that folder for good, with their stars, ratings, play counts and playlist entries.
+- The folder is taken out of `library.folders`, and the server is started again. A scan then removes the tracks of that folder permanently, with their stars, ratings, play counts and playlist entries, when three things hold: it could read every path in every remaining folder, each remaining folder holds at least one audio file, and no file with the size of the track was unreadable.
 
 ### A disk mounted below a music folder
 
@@ -276,20 +276,20 @@ A disk that is mounted on a directory below a music folder is not protected. Whi
 
 Add each disk as a music folder of its own in `library.folders`, and do not mount a disk below a music folder.
 
-A music folder that is the mount point of a disk keeps its tracks while the disk is not mounted. A scan deletes no track of a music folder that had tracks and now holds no audio file, and it records an error that names the folder. This rule protects that folder only: the scan removes a track of another folder whose file is gone.
+A music folder that is the mount point of a disk keeps its tracks while the disk is not mounted. A scan deletes no track of a music folder that had tracks and now holds no audio file, and it records an error that names the folder. The rule keeps the tracks of that folder, and the tracks of every folder that was taken out of `library.folders`. It keeps no track of another music folder: the scan removes such a track when its file is gone.
 
 ### Symbolic links
 
 The server indexes and serves only the files inside the folders of `library.folders`. A scan resolves each symbolic link that it finds in a music folder and compares the target of the link with the music folders.
 
 - A link to a file or to a directory outside every music folder is not followed. The files behind it are not in the library. Such a link is no error of the scan. The scan logs each one at the `debug` level, and the number of them in each folder at the `info` level.
-- A link to a file or to a directory inside a music folder adds no second track. A file that the scan also finds at its own path has its track there. A file that the scan finds through a link only has its track at the path of the link. That is a file in a directory that the scan skips, such as a directory whose name starts with `.`.
+- A link to a file or to a directory inside a music folder adds no second track. A file that the scan also finds at its own path has its track there. A file that the scan finds through a link only has its track at the path of the link. That is a file whose own path the scan skips, such as a path with a component that starts with `.`.
 - A music folder can itself be a symbolic link.
 - A link that cannot be resolved is an error of the scan: its target is gone, or the server may not read the path to it. The scan cannot tell what is behind the link, so it deletes no track while the link is there. Repair the link or remove it.
 
 To add the music of another disk, name its directory in `library.folders`. Do not link it into a music folder.
 
-A library can hold tracks whose files are behind a link to a place outside the music folders. The next scan that reads every folder in full, and finds music in each, removes these tracks, with their stars, ratings, play counts and playlist entries. To keep them, add the directory that the link points to to `library.folders` before that scan. The tracks then move to the new folder and keep what is attached to them. When the tracks are already removed, adding the folder creates new tracks without those values. The same holds for a track at a path through a link when the scan finds the file at its own path too: the track at the own path of the file stays, and the track at the path through the link is removed.
+A library can hold tracks whose files are behind a link to a place outside the music folders. A scan removes these tracks, with their stars, ratings, play counts and playlist entries, when three things hold: it could read every path in every music folder, no file with the size of the track was unreadable, and the music folder of the track holds at least one audio file. To keep them, add the directory that the link points to to `library.folders` before that scan. The tracks then move to the new folder and keep what is attached to them. When the tracks are already removed, adding the folder creates new tracks without those values. The same holds for a track at a path through a link when the scan finds the file at its own path too: the track at the own path of the file stays, and the track at the path through the link is removed.
 
 A hard link is no symbolic link. The server cannot tell a hard link from the file, so a hard link in a music folder to a file outside the folders is indexed and served.
 
@@ -324,7 +324,7 @@ artists: 3
 errors: 0
 ```
 
-`seen` is the number of supported audio files. `added`, `changed`, `moved` and `removed` count tracks. `albums` and `artists` are the numbers in the library after the scan. Each error of the scan follows as a line `error: <message>`. An error names the folder, the path or the file that it is about, or counts the tracks that the scan kept although their files are gone. The command exits with status 0, or with status 1 when the scan recorded an error. Warnings about files that the scan leaves for the next scan go to stderr with the log.
+`seen` is the number of supported audio files. `added`, `changed`, `moved` and `removed` count tracks. `albums` and `artists` are the numbers in the library after the scan. Each error of the scan follows as a line `error: <message>`. An error names the folder, the path, the file or the track that it is about, and some errors count the tracks that the scan kept although their files are gone. The command exits with status 0, or with status 1 when the scan recorded an error. Warnings about files that the scan leaves for the next scan go to stderr with the log.
 
 A scan that a database error ends prints that error and no summary, and the command exits with status 1.
 
@@ -349,7 +349,7 @@ A scan recognises a file by its size and by its first and its last 64 KiB.
 - A file whose tags were edited in place keeps its track as well.
 - A file that was moved and also changed between two scans is a new track. The scan removes the old track with what was attached to it. A scan between the two steps keeps the track.
 
-An album is known by its album artist and its title, and an artist by its name. Letter case, surrounding white space and the Unicode form of a name have no meaning for that. A change of the tags within these limits keeps the album or the artist with its stars and its rating. Any other change of the title or of the name makes a new album or a new artist, and the stars and the rating of the old one are removed with it. The songs keep their stars, ratings and play counts.
+An album is known by its album artist and its title, and an artist by its name. Letter case, surrounding white space and the Unicode form of a name have no meaning for that. A change of the tags within these limits keeps the album or the artist with its stars and its rating. Any other change of the title or of the name makes a new album or a new artist. The old one is removed with its stars and its rating once no track carries the old title or name. The songs keep their stars, ratings and play counts.
 
 ## Running
 
@@ -393,7 +393,7 @@ Windows ends a console program 5 seconds after its window is closed. The limit o
 
 A client needs three values:
 
-- The address of the server: `http://<address>:<port>`, for example `http://192.168.1.5:4200`. The API is below `/rest`, as in `http://192.168.1.5:4200/rest/ping`. The server speaks plain HTTP and has no TLS.
+- The address of the server: `http://<address>:<port>`, for example `http://192.168.1.5:4200`. The API is below `/rest`, as in `http://192.168.1.5:4200/rest/ping`. The server uses plain HTTP and has no TLS.
 - The user name: `owner`, or the name that `init` got with `--username`.
 - The password of that account.
 
@@ -433,7 +433,7 @@ The server answers OpenSubsonic requests at `/rest/<method>` and `/rest/<method>
 
 - `f=json` selects JSON. `f=xml` or no `f` selects XML. Any other value, `jsonp` included, returns error 0 in XML.
 - An API error is an HTTP 200 response with the status `failed` and an `error` element that holds the Subsonic error code and a message.
-- Every response carries the protocol version `1.16.1`, the type `wn-server`, the version of the server as `serverVersion`, and `openSubsonic` as `true`.
+- Every response in XML or JSON carries the protocol version `1.16.1`, the type `wn-server`, the version of the server as `serverVersion`, and `openSubsonic` as `true`.
 - In XML, the elements `searchResult2`, `searchResult3`, `starred` and `starred2` hold their `artist` elements first, then their `album` elements, then their `song` elements. That is the order of the Subsonic 1.16.1 schema.
 - A parameter that holds a number, or `true` or `false`, counts as absent when its value is empty. Any other value that is not of the type of the parameter returns error 0 with a message that names the parameter. `true` and `false` are read in any letter case.
 - The server reads the parameters, selects the format and looks up the method. It then checks the user, before the method runs. An unsupported `f`, a form body that cannot be read and an unknown method name are therefore answered without a user. Every other request without a user gets the authentication error, from every method except `getOpenSubsonicExtensions`, and also from a method that is not served.
@@ -495,7 +495,7 @@ A client that runs in a browser calls the server from a page of another origin. 
 
 ### Play queue
 
-- `savePlayQueue` saves the play queue of the user of the request, so that a client on another device goes on from there. The queue holds the songs of `id` in the order of the values, and a song that is named twice is in the queue twice. `current` is the ID of the current song, and `position` is the position within that song in milliseconds, 0 without a value. Each request replaces the whole queue. `current` must be one of the `id` values (error 0). A request with `id` values and without `current` is accepted, although the OpenSubsonic API requires `current` in it: the songs are saved with no current song, and the `position` of the request is not stored. A request without `id` and without `current` empties the queue. An ID that names no song returns error 70, and a request with more than 100 000 songs returns error 0. After an error the stored queue is the one from before the request.
+- `savePlayQueue` saves the play queue of the user of the request, so that a client on another device continues there. The queue holds the songs of `id` in the order of the values, and a song that is named twice is in the queue twice. `current` is the ID of the current song, and `position` is the position within that song in milliseconds, 0 without a value. Each request replaces the whole queue. `current` must be one of the `id` values (error 0). A request with `id` values and without `current` is accepted, although the OpenSubsonic API requires `current` in it: the songs are saved with no current song, and the `position` of the request is not stored. A request without `id` and without `current` empties the queue. An ID that names no song returns error 70, and a request with more than 100 000 songs returns error 0. After an error the stored queue is the one from before the request.
 - `getPlayQueue` returns `playQueue` with the songs as `entry`, `current`, `position`, `username`, `changed` and `changedBy`. `changed` is the time of the last request that saved the queue, in UTC (`2026-10-11T08:15:30Z`), and `changedBy` is the `c` value of that request, cut to 64 characters. The answer holds `playQueue` for an empty queue as well, with `position` 0 and without `current`. A queue that was saved without `current` is returned with its first song as `current` and with `position` 0, because the OpenSubsonic API requires a `current` that is one of the songs when the queue has songs. A user that never saved a queue gets the creation time of the account as `changed` and an empty `changedBy`. A user reads and replaces only the queue of that user.
 - The queue keeps a song when its file is renamed or moved. When a file is deleted, the scan that removes the song from the library removes it from the queue, and the other songs keep their order. When the deleted song was the current one, the song that followed it in the queue is the current one, or the last song when none followed, and `position` is 0. In a queue that was saved without `current`, the first song that is left is the current one.
 
@@ -532,9 +532,9 @@ Every other name returns error 0 with the message `unknown endpoint`, with or wi
 
 ### Transcoding
 
-- `stream` transcodes with ffmpeg when the request asks for it. `format=opus` returns Opus in Ogg (`audio/ogg`), and `format=mp3` returns MP3 (`audio/mpeg`). The bitrate is `maxBitRate` in kbps, or `transcoding.opus_bitrate_kbps` or `transcoding.mp3_bitrate_kbps` when the request has no `maxBitRate`; a transcode has 32 to 320 kbps. A file that has the requested format already is returned as it is, unless its bitrate is above `maxBitRate`: `format=mp3` on an MP3 file does not encode the file again. The suffix of the file decides whether it has the format, so an Opus stream in a file with the suffix `ogg` is encoded again for `format=opus`. `maxBitRate` without `format` returns Opus at that bitrate when the bitrate of the file is higher, and the original file otherwise. A file whose bitrate the scan could not read is transcoded for every `maxBitRate` above 0 when it is lossless, and for none when it is lossy. `maxBitRate=0` is no limit. `format=raw` returns the original file whatever `maxBitRate` is. The letter case of a `format` has no meaning, and a `format` that names none of `raw`, `opus` and `mp3` is read as no `format`.
+- `stream` transcodes with ffmpeg when the request asks for it. `format=opus` returns Opus in Ogg (`audio/ogg`), and `format=mp3` returns MP3 (`audio/mpeg`). The bitrate is `maxBitRate` in kbps, or `transcoding.opus_bitrate_kbps` or `transcoding.mp3_bitrate_kbps` when the request has no `maxBitRate`; a transcode has 32 to 320 kbps. A `maxBitRate` below 32 counts as 32. A `maxBitRate` above 320 is compared with the bitrate of the file as it is, and the transcode then has 320 kbps. A file that has the requested format already is returned as it is, unless its bitrate is above `maxBitRate`: `format=mp3` on an MP3 file does not encode the file again. The suffix of the file decides whether it has the format, so an Opus stream in a file with the suffix `ogg` is encoded again for `format=opus`. `maxBitRate` without `format` returns Opus at that bitrate when the bitrate of the file is higher, and the original file otherwise. In the comparison with `maxBitRate`, a file whose bitrate the scan could not read counts as above every limit when it is lossless and as below every limit when it is lossy. `maxBitRate=0` is no limit. `format=raw` returns the original file whatever `maxBitRate` is. The letter case of a `format` has no meaning, and a `format` that names none of `raw`, `opus` and `mp3` is read as no `format`.
 - A transcoded stream carries `Accept-Ranges: none` and `Cache-Control: no-store`. `Range` has no effect on it. `timeOffset=N` starts the stream at the second N of the track; `getOpenSubsonicExtensions` lists this as the `transcodeOffset` extension.
-- A transcoded stream never has a `Content-Length`, and the server sends every byte of it. `estimateContentLength` is accepted and has no effect. The server does not know the length of a stream before ffmpeg has written it, and it sends no estimate.
+- A transcoded stream never has a `Content-Length`, and the server sends every byte of it. `estimateContentLength` is read as `true` or `false` and has no effect. The server does not know the length of a stream before ffmpeg has written it, and it sends no estimate.
 - At most `transcoding.max_concurrent` transcodes run at the same time. A request past the limit waits up to 5 seconds and then gets HTTP 503 with `Retry-After: 5`. A client that disconnects ends its transcode. A client that takes nothing of a transcoded stream for 10 minutes, because it is paused or gone, ends it as well: the connection ends without the end of the body, and the transcode slot is free for the next request. Until then such a client holds its slot. Ask for the rest of the track with a new request and `timeOffset`. A HEAD request for a transcode gets the headers and starts no ffmpeg, so it reports neither a server at its limit nor a server without ffmpeg.
 
 ### ffmpeg
@@ -655,7 +655,7 @@ Load it:
 launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/io.github.waxnerdhq.wn-server.plist
 ```
 
-launchd then starts the server now and at each login of the user, and starts it again when it exits. This command stops the server and removes the agent from launchd:
+launchd then starts the server now and at each login of the user. With `KeepAlive`, it starts the server again after every exit, also after a start that failed, at most once in 10 seconds. This command stops the server and removes the agent from launchd:
 
 ```
 launchctl bootout gui/$(id -u)/io.github.waxnerdhq.wn-server
@@ -701,7 +701,7 @@ Create a task that starts the server when the user logs on:
 5. On **Conditions**, clear **Start the task only if the computer is on AC power**.
 6. On **Settings**, clear **Stop the task if it runs longer than**.
 
-The task runs the server in the session of the user, and the server ends when the user logs off. A logoff, a shutdown of the system and the end of the task may end the server without the steps of a stop (see [Stopping](#stopping)). The database is consistent after that.
+The task runs the server in the session of the user, in a console window on the desktop. Closing that window stops the server with the limit of 1.5 seconds. The server ends when the user logs off. A logoff, a shutdown of the system and the end of the task may end the server without the steps of a stop (see [Stopping](#stopping)). The database is consistent after that.
 
 The server does not run as a Windows service by itself. A service starts before a user logs on. To run the server as a service, use a service wrapper such as NSSM or WinSW with the program `wn-server.exe` and the arguments `--data-dir <directory> run`. The default data directory depends on the account, and a service runs under an account of its own, so the service names the data directory that `init` created.
 
