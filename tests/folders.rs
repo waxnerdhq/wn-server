@@ -9,7 +9,9 @@
 //!
 //! A song of a directory is compared with the answer of `getSong` for its
 //! ID, and the songs of an album directory with the songs of `getAlbum`.
-//! `tests/browse.rs` compares those with the files of the library.
+//! `tests/browse.rs` compares those with the files of the library. The walk
+//! of the tree passes each song ID to `stream` and compares the body with
+//! the file of the track row.
 
 mod common;
 
@@ -1197,6 +1199,19 @@ fn standard_ids(server: &StandardServer) -> [BTreeSet<String>; 3] {
     ]
 }
 
+/// The path of the file of the track `id`: the path of the row below the
+/// music folder of the server.
+async fn file_of_track(server: &StandardServer, id: &str) -> PathBuf {
+    let id = id.to_owned();
+    let rel_path = server
+        .db()
+        .read(move |conn| Ok(tracks::get_track(conn, &id)?.map(|track| track.rel_path)))
+        .await
+        .expect("read the track")
+        .expect("the track has a row");
+    server.path(&rel_path)
+}
+
 #[tokio::test]
 async fn the_tree_is_walked_from_the_indexes_to_every_song_and_back() {
     let server = TestServer::standard().await;
@@ -1250,6 +1265,13 @@ async fn the_tree_is_walked_from_the_indexes_to_every_song_and_back() {
                 let response = server.get_json("getSong", &[("id", &id)]).await;
                 assert_eq!(response["status"], "ok", "{id}: {response}");
                 assert_eq!(response["song"], *song, "{id}");
+                // The ID is also the one that `stream` takes: the body of
+                // the answer is the file of the track row.
+                let response = server.get_raw("stream", &[("id", &id)]).await;
+                assert_eq!(response.status(), StatusCode::OK, "{id}");
+                let file = fs::read(file_of_track(&server, &id).await).expect("read the file");
+                assert!(!file.is_empty(), "{id}");
+                assert!(body_bytes(response).await == file, "{id}");
                 songs.push((id, album_id.clone(), artist.clone()));
             }
         }
