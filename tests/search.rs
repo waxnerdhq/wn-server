@@ -1,0 +1,1690 @@
+//! Router tests of the search methods `search2`, `search3` and `search`
+//! (`docs/design.md` section 4).
+
+mod common;
+
+use std::collections::HashSet;
+use std::path::PathBuf;
+
+use axum::http::StatusCode;
+use rusqlite::params;
+use serde_json::{Value, json};
+use wn_server::VERSION;
+use wn_server::api::model;
+use wn_server::config::Config;
+use wn_server::db::queries::tracks::{self, TrackContent};
+use wn_server::db::queries::{albums, artists, folders};
+use wn_server::db::{self, Db};
+use wn_server::library::tags::TrackMeta;
+
+use common::{
+    Catalogue, LibraryBuilder, OWNER, StandardServer, TestServer, body_string, content_type,
+    subsonic_response,
+};
+
+/// The two methods that search the library, each with the key of its answer.
+const METHODS: [(&str, &str); 2] = [("search3", "searchResult3"), ("search2", "searchResult2")];
+
+/// The names of the artists of the standard library, in the order of a
+/// search.
+const ARTISTS: [&str; 3] = ["Aurora Field", "Marlow Quartet", "Various Artists"];
+
+/// The titles of the albums of the standard library, in the order of a
+/// search.
+const ALBUMS: [&str; 4] = [
+    "Glass Harbour",
+    "Paper Maps",
+    "Slow Rivers",
+    "Summer Sampler",
+];
+
+/// The titles of the tracks of the standard library, in the order of a
+/// search.
+const SONGS: [&str; 10] = [
+    "Breakwater",
+    "Contour",
+    "Delta",
+    "Last Train",
+    "Legend",
+    "Low Tide",
+    "Meridian",
+    "Night Ferry",
+    "Open Road",
+    "Upstream",
+];
+
+/// The message of the error for a query that is too long.
+const QUERY_TOO_LONG: &str = "parameter query must be at most 1024 characters";
+
+/// The message of the error for a query of too many terms.
+const TOO_MANY_TERMS: &str = "parameter query must have at most 32 terms";
+
+/// The `error` object with `code` and `message`.
+fn error(code: u32, message: &str) -> Value {
+    json!({ "code": code, "message": message })
+}
+
+/// The error 0 for a count or an offset that is not a number from 0 to
+/// 4294967295.
+fn not_a_number(name: &str) -> Value {
+    error(
+        0,
+        &format!("parameter {name} must be an integer from 0 to 4294967295"),
+    )
+}
+
+/// The XML body with the status `status` whose root element holds `rest`.
+fn xml_envelope(status: &str, rest: &str) -> String {
+    format!(
+        concat!(
+            r#"<?xml version="1.0" encoding="UTF-8"?>"#,
+            r#"<subsonic-response xmlns="http://subsonic.org/restapi" status="{}""#,
+            r#" version="1.16.1" type="wn-server" serverVersion="{}" openSubsonic="true">"#,
+            "{}</subsonic-response>"
+        ),
+        status, VERSION, rest
+    )
+}
+
+/// The XML body of a successful response whose root element holds `rest`.
+fn xml_document(rest: &str) -> String {
+    xml_envelope("ok", rest)
+}
+
+/// The XML body of the error with `code` and `message`.
+fn xml_error(code: u32, message: &str) -> String {
+    xml_envelope(
+        "failed",
+        &format!(r#"<error code="{code}" message="{message}"/>"#),
+    )
+}
+
+fn to_json(model: impl serde::Serialize) -> Value {
+    serde_json::to_value(model).expect("the model serialises")
+}
+
+/// The values of `field` of the items of `list`, in the order of the list.
+fn field(list: &Value, field: &str) -> Vec<String> {
+    list.as_array()
+        .unwrap_or_else(|| panic!("not a list: {list}"))
+        .iter()
+        .map(|item| {
+            item[field]
+                .as_str()
+                .unwrap_or_else(|| panic!("no {field} in {item}"))
+                .to_owned()
+        })
+        .collect()
+}
+
+/// The names of the artists, the titles of the albums and the titles of the
+/// songs of a `searchResult3` or a `searchResult2`.
+fn names(method: &str, result: &Value) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let album_title = if method == "search3" { "name" } else { "title" };
+    (
+        field(&result["artist"], "name"),
+        field(&result["album"], album_title),
+        field(&result["song"], "title"),
+    )
+}
+
+/// Sends `method` with `query` and a count of 500 for each list. Returns
+/// the names of the answer.
+async fn find(
+    server: &TestServer,
+    method: &str,
+    query: &str,
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let key = result_key(method);
+    let response = server
+        .get_json(
+            method,
+            &[
+                ("query", query),
+                ("artistCount", "500"),
+                ("albumCount", "500"),
+                ("songCount", "500"),
+            ],
+        )
+        .await;
+    assert_eq!(response["status"], "ok", "{method} {query:?}: {response}");
+    names(method, &response[key])
+}
+
+/// The key of the answer of `method`.
+fn result_key(method: &str) -> &'static str {
+    METHODS
+        .iter()
+        .find(|(name, _)| *name == method)
+        .map(|(_, key)| *key)
+        .unwrap_or_else(|| panic!("{method} is no search method"))
+}
+
+/// What [`find`] returns for these names.
+fn found(
+    artists: &[&str],
+    albums: &[&str],
+    songs: &[&str],
+) -> (Vec<String>, Vec<String>, Vec<String>) {
+    let owned = |list: &[&str]| list.iter().map(|name| (*name).to_owned()).collect();
+    (owned(artists), owned(albums), owned(songs))
+}
+
+/// The `searchResult3` of the whole library `catalogue`.
+fn whole_result3(catalogue: &Catalogue) -> Value {
+    json!({
+        "artist": ARTISTS
+            .iter()
+            .map(|name| to_json(model::artist(catalogue.artist(name), None)))
+            .collect::<Vec<_>>(),
+        "album": ALBUMS
+            .iter()
+            .map(|title| to_json(model::album(catalogue.album(title), None)))
+            .collect::<Vec<_>>(),
+        "song": SONGS
+            .iter()
+            .map(|title| to_json(model::child(catalogue.song(title), None)))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// The `searchResult2` of the whole library `catalogue`.
+fn whole_result2(catalogue: &Catalogue) -> Value {
+    json!({
+        "artist": ARTISTS
+            .iter()
+            .map(|name| to_json(model::artist_dir(catalogue.artist(name), None)))
+            .collect::<Vec<_>>(),
+        "album": ALBUMS
+            .iter()
+            .map(|title| to_json(model::child_dir_for_album(catalogue.album(title), None)))
+            .collect::<Vec<_>>(),
+        "song": SONGS
+            .iter()
+            .map(|title| to_json(model::child(catalogue.song(title), None)))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// Every ID of the standard library: the artists, the albums and the tracks.
+fn standard_ids(server: &StandardServer) -> HashSet<String> {
+    [
+        &server.artist.aurora_field,
+        &server.artist.marlow_quartet,
+        &server.artist.various_artists,
+        &server.album.glass_harbour,
+        &server.album.paper_maps,
+        &server.album.slow_rivers,
+        &server.album.summer_sampler,
+        &server.track.low_tide,
+        &server.track.breakwater,
+        &server.track.night_ferry,
+        &server.track.meridian,
+        &server.track.contour,
+        &server.track.legend,
+        &server.track.upstream,
+        &server.track.delta,
+        &server.track.open_road,
+        &server.track.last_train,
+    ]
+    .into_iter()
+    .cloned()
+    .collect()
+}
+
+/// Stores the track `n` in the music folder `folder` as the scanner stores
+/// a track, with the rows of its artist and of its album. A test uses it for
+/// names that are no file names on every OS and for libraries of many rows.
+fn add_track(
+    conn: &rusqlite::Connection,
+    n: u32,
+    folder: &str,
+    artist: &str,
+    album: &str,
+    title: &str,
+) -> db::Result<String> {
+    let folder = folders::sync_folders(conn, &[PathBuf::from(folder)])?;
+    let artist_id = artists::upsert_by_key(conn, artist)?;
+    let album_id = albums::upsert_by_key(conn, &artist_id, album, artist, false)?;
+    let meta = TrackMeta {
+        title: title.to_owned(),
+        artist: artist.to_owned(),
+        album_artist: artist.to_owned(),
+        album: album.to_owned(),
+        track_no: None,
+        disc_no: None,
+        year: None,
+        genre: None,
+        compilation: false,
+        duration_ms: 1000,
+        bitrate_kbps: None,
+        sample_rate: None,
+        bit_depth: None,
+        channels: None,
+        has_picture: false,
+        has_lyrics: false,
+        suffix: "flac".to_owned(),
+        content_type: "audio/flac".to_owned(),
+        lossless: true,
+    };
+    let content = TrackContent {
+        fingerprint: "100:aa",
+        mtime: 1000,
+        size: 100,
+        meta: &meta,
+        artist_id: &artist_id,
+        album_id: &album_id,
+    };
+    let id = format!("tr-{n:032x}");
+    tracks::insert_track(conn, &id, folder[0].id, &format!("{n}.flac"), &content)?;
+    Ok(id)
+}
+
+/// A server without music files whose database holds the tracks that `add`
+/// stores.
+async fn server_with(
+    add: impl FnOnce(&rusqlite::Connection) -> db::Result<()> + Send + 'static,
+) -> TestServer {
+    let server = TestServer::bare(Config::default()).await;
+    server
+        .db()
+        .write(move |conn| {
+            add(conn)?;
+            albums::recompute_aggregates(conn)?;
+            artists::recompute_aggregates(conn)
+        })
+        .await
+        .expect("store the library");
+    server
+}
+
+/// Gives the track `id` its placeholder path, as the scanner does for a
+/// track that it keeps without a file.
+async fn remove_file(db: &Db, id: &str) {
+    let id = id.to_owned();
+    db.write(move |conn| {
+        let track = tracks::get_track(conn, &id)?.expect("the track exists");
+        tracks::relink_track(
+            conn,
+            &id,
+            track.folder_id,
+            &tracks::placeholder_path(&id),
+            track.mtime,
+            track.size,
+        )
+    })
+    .await
+    .expect("give the track a placeholder path");
+}
+
+#[tokio::test]
+async fn search3_with_an_empty_query_returns_every_artist_album_and_song() {
+    let server = TestServer::standard().await;
+    let expected = whole_result3(&server.catalogue().await);
+
+    // `query=`, the two quotes that some clients send, and white space.
+    for query in ["", "\"\"", " ", "\" \"", "\t"] {
+        let response = server.get_json("search3", &[("query", query)]).await;
+        assert_eq!(response["status"], "ok", "{query:?}");
+        assert_eq!(response["searchResult3"], expected, "{query:?}");
+        // The answer has the envelope fields and the result, and no other.
+        assert_eq!(
+            response.as_object().map(serde_json::Map::len),
+            Some(6),
+            "{response}"
+        );
+    }
+
+    let result = &server.get_json("search3", &[("query", "")]).await["searchResult3"];
+    assert_eq!(
+        names("search3", result),
+        found(&ARTISTS, &ALBUMS, &SONGS),
+        "{result}"
+    );
+    // An artist is an `ArtistID3`, an album is an `AlbumID3` and a song is
+    // a `Child`.
+    assert_eq!(
+        result["artist"][0],
+        json!({
+            "id": server.artist.aurora_field,
+            "name": "Aurora Field",
+            "albumCount": 2,
+        })
+    );
+    let album = &result["album"][0];
+    assert_eq!(album["id"], json!(server.album.glass_harbour));
+    assert_eq!(album["name"], "Glass Harbour");
+    assert_eq!(album["artist"], "Aurora Field");
+    assert_eq!(album["artistId"], json!(server.artist.aurora_field));
+    assert_eq!(album["songCount"], 3);
+    assert_eq!(album["coverArt"], json!(server.album.glass_harbour));
+    assert_eq!(album["year"], 2019);
+    assert!(album.get("isDir").is_none(), "{album}");
+    assert!(album.get("song").is_none(), "{album}");
+    let song = &result["song"][0];
+    assert_eq!(song["id"], json!(server.track.breakwater));
+    assert_eq!(song["title"], "Breakwater");
+    assert_eq!(song["isDir"], false);
+    assert_eq!(song["parent"], json!(server.album.glass_harbour));
+    assert_eq!(song["albumId"], json!(server.album.glass_harbour));
+    assert_eq!(song["artistId"], json!(server.artist.aurora_field));
+    assert_eq!(
+        song["path"],
+        "Aurora Field/Glass Harbour/02 Breakwater.flac"
+    );
+    assert_eq!(song["type"], "music");
+}
+
+#[tokio::test]
+async fn search2_returns_the_same_matches_as_folder_elements() {
+    let server = TestServer::standard().await;
+    let expected = whole_result2(&server.catalogue().await);
+
+    for query in ["", "\"\""] {
+        let response = server.get_json("search2", &[("query", query)]).await;
+        assert_eq!(response["status"], "ok", "{query:?}");
+        assert_eq!(response["searchResult2"], expected, "{query:?}");
+        assert!(response.get("searchResult3").is_none(), "{response}");
+    }
+
+    let result = &server.get_json("search2", &[("query", "")]).await["searchResult2"];
+    assert_eq!(names("search2", result), found(&ARTISTS, &ALBUMS, &SONGS));
+    // An artist is the `Artist` of the folder methods, without an album
+    // count. An album is a `Child` that is a directory.
+    assert_eq!(
+        result["artist"][0],
+        json!({ "id": server.artist.aurora_field, "name": "Aurora Field" })
+    );
+    let album = &result["album"][0];
+    assert_eq!(album["id"], json!(server.album.glass_harbour));
+    assert_eq!(album["isDir"], true);
+    assert_eq!(album["title"], "Glass Harbour");
+    assert_eq!(album["album"], "Glass Harbour");
+    assert_eq!(album["artist"], "Aurora Field");
+    assert_eq!(album["parent"], json!(server.artist.aurora_field));
+    assert_eq!(album["coverArt"], json!(server.album.glass_harbour));
+    assert!(album.get("name").is_none(), "{album}");
+    assert!(album.get("songCount").is_none(), "{album}");
+    let song = &result["song"][0];
+    assert_eq!(song["id"], json!(server.track.breakwater));
+    assert_eq!(song["isDir"], false);
+
+    // The songs of the two methods are the same elements.
+    let result3 = &server.get_json("search3", &[("query", "")]).await["searchResult3"];
+    assert_eq!(result["song"], result3["song"]);
+}
+
+#[tokio::test]
+async fn counts_and_offsets_select_a_part_of_each_list() {
+    let server = TestServer::standard().await;
+    for (method, key) in METHODS {
+        let page = |params: &'static [(&'static str, &'static str)]| {
+            let server = &server;
+            async move {
+                let mut all = vec![("query", "")];
+                all.extend_from_slice(params);
+                let response = server.get_json(method, &all).await;
+                assert_eq!(response["status"], "ok", "{method} {params:?}");
+                names(method, &response[key])
+            }
+        };
+
+        // Each list has its own count and its own offset.
+        assert_eq!(
+            page(&[
+                ("artistCount", "1"),
+                ("albumCount", "2"),
+                ("songCount", "3")
+            ])
+            .await,
+            found(&ARTISTS[..1], &ALBUMS[..2], &SONGS[..3])
+        );
+        assert_eq!(
+            page(&[
+                ("artistCount", "1"),
+                ("artistOffset", "2"),
+                ("albumCount", "2"),
+                ("albumOffset", "1"),
+                ("songCount", "3"),
+                ("songOffset", "4"),
+            ])
+            .await,
+            found(&ARTISTS[2..], &ALBUMS[1..3], &SONGS[4..7])
+        );
+        // An offset alone leaves the default count of 20.
+        assert_eq!(
+            page(&[("songOffset", "8")]).await,
+            found(&ARTISTS, &ALBUMS, &SONGS[8..])
+        );
+        // A count of 0 is an empty list, and so is an offset past the end.
+        assert_eq!(
+            page(&[
+                ("artistCount", "0"),
+                ("albumOffset", "4"),
+                ("songOffset", "4294967295"),
+            ])
+            .await,
+            found(&[], &[], &[])
+        );
+        // An empty value is an absent parameter.
+        assert_eq!(
+            page(&[
+                ("artistCount", ""),
+                ("artistOffset", ""),
+                ("albumCount", ""),
+                ("albumOffset", ""),
+                ("songCount", ""),
+                ("songOffset", ""),
+                ("musicFolderId", ""),
+            ])
+            .await,
+            found(&ARTISTS, &ALBUMS, &SONGS)
+        );
+    }
+}
+
+#[tokio::test]
+async fn default_count_is_20_and_the_default_offset_is_0() {
+    // 25 artists, 25 albums and 25 tracks whose names sort by their number.
+    let server = server_with(|conn| {
+        for n in 0..25 {
+            let name = format!("{n:02}");
+            add_track(conn, n, "/music", &name, &name, &name)?;
+        }
+        Ok(())
+    })
+    .await;
+    let first_20: Vec<String> = (0..20).map(|n| format!("{n:02}")).collect();
+    let last_5: Vec<String> = (20..25).map(|n| format!("{n:02}")).collect();
+
+    for (method, key) in METHODS {
+        let response = server.get_json(method, &[("query", "")]).await;
+        assert_eq!(
+            names(method, &response[key]),
+            (first_20.clone(), first_20.clone(), first_20.clone()),
+            "{method}"
+        );
+        let response = server
+            .get_json(
+                method,
+                &[
+                    ("query", ""),
+                    ("artistOffset", "20"),
+                    ("albumOffset", "20"),
+                    ("songOffset", "20"),
+                ],
+            )
+            .await;
+        assert_eq!(
+            names(method, &response[key]),
+            (last_5.clone(), last_5.clone(), last_5.clone()),
+            "{method}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn count_above_500_is_500() {
+    // 501 artists, 501 albums and 501 tracks.
+    let server = server_with(|conn| {
+        for n in 0..501 {
+            let name = format!("{n:03}");
+            add_track(conn, n, "/music", &name, &name, &name)?;
+        }
+        Ok(())
+    })
+    .await;
+    let lengths = |response: &Value, key: &str| {
+        ["artist", "album", "song"].map(|list| {
+            response[key][list]
+                .as_array()
+                .unwrap_or_else(|| panic!("no {list} in {response}"))
+                .len()
+        })
+    };
+
+    for (method, key) in METHODS {
+        for count in ["500", "501", "1000", "100000", "4294967295"] {
+            let response = server
+                .get_json(
+                    method,
+                    &[
+                        ("query", ""),
+                        ("artistCount", count),
+                        ("albumCount", count),
+                        ("songCount", count),
+                    ],
+                )
+                .await;
+            assert_eq!(response["status"], "ok", "{method} {count}");
+            assert_eq!(lengths(&response, key), [500, 500, 500], "{method} {count}");
+            // The lists are the first 500 matches.
+            let (artists, albums, songs) = names(method, &response[key]);
+            for list in [artists, albums, songs] {
+                assert_eq!(list[0], "000", "{method} {count}");
+                assert_eq!(list[499], "499", "{method} {count}");
+            }
+        }
+
+        // The rest is on the next page, also when that page asks for more
+        // than 500.
+        let response = server
+            .get_json(
+                method,
+                &[
+                    ("query", ""),
+                    ("artistCount", "1000"),
+                    ("artistOffset", "500"),
+                    ("albumCount", "1000"),
+                    ("albumOffset", "500"),
+                    ("songCount", "1000"),
+                    ("songOffset", "500"),
+                ],
+            )
+            .await;
+        assert_eq!(lengths(&response, key), [1, 1, 1], "{method}");
+        let last = || vec!["500".to_owned()];
+        assert_eq!(names(method, &response[key]), (last(), last(), last()));
+    }
+}
+
+#[tokio::test]
+async fn count_or_offset_that_is_no_number_from_0_is_error_0() {
+    let server = TestServer::standard().await;
+    let numbers = [
+        "artistCount",
+        "artistOffset",
+        "albumCount",
+        "albumOffset",
+        "songCount",
+        "songOffset",
+    ];
+    for (method, key) in METHODS {
+        for name in numbers {
+            // A negative limit is no limit in SQLite, and a negative offset
+            // is no offset. Neither reaches a statement.
+            for value in [
+                "-1",
+                "-500",
+                "-9223372036854775808",
+                "4294967296",
+                "99999999999999999999",
+                "1.5",
+                "1e3",
+                "0x10",
+                "ten",
+                " 1",
+                "1;DROP TABLE tracks",
+                "NULL",
+            ] {
+                let response = server
+                    .get_json(method, &[("query", ""), (name, value)])
+                    .await;
+                assert_eq!(response["status"], "failed", "{method} {name}={value}");
+                assert_eq!(
+                    response["error"],
+                    not_a_number(name),
+                    "{method} {name}={value}"
+                );
+                assert!(response.get(key).is_none(), "{method} {name}={value}");
+            }
+        }
+        for value in ["one", "1.5", "99999999999999999999", "1 OR 1=1"] {
+            let response = server
+                .get_json(method, &[("query", ""), ("musicFolderId", value)])
+                .await;
+            assert_eq!(
+                response["error"],
+                error(0, "parameter musicFolderId must be an integer"),
+                "{method} {value}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn paging_through_the_standard_library_returns_every_id_once() {
+    let server = TestServer::standard().await;
+    let every_id = standard_ids(&server);
+    assert_eq!(every_id.len(), 17);
+
+    for (method, key) in METHODS {
+        for query in ["", "\"\""] {
+            let whole = server
+                .get_json(
+                    method,
+                    &[
+                        ("query", query),
+                        ("artistCount", "500"),
+                        ("albumCount", "500"),
+                        ("songCount", "500"),
+                    ],
+                )
+                .await;
+            for size in [1, 2, 3, 4, 7, 10, 500] {
+                // The client asks for pages of `size` until a page is
+                // shorter than that.
+                let mut seen = HashSet::new();
+                for list in ["artist", "album", "song"] {
+                    let count = format!("{list}Count");
+                    let offset = format!("{list}Offset");
+                    let other: Vec<String> = ["artist", "album", "song"]
+                        .into_iter()
+                        .filter(|name| *name != list)
+                        .map(|name| format!("{name}Count"))
+                        .collect();
+                    let size_text = size.to_string();
+                    let mut ids = Vec::new();
+                    let mut pages = 0;
+                    loop {
+                        let offset_text = (pages * size).to_string();
+                        let response = server
+                            .get_json(
+                                method,
+                                &[
+                                    ("query", query),
+                                    (count.as_str(), size_text.as_str()),
+                                    (offset.as_str(), offset_text.as_str()),
+                                    (other[0].as_str(), "0"),
+                                    (other[1].as_str(), "0"),
+                                ],
+                            )
+                            .await;
+                        assert_eq!(response["status"], "ok", "{method} {list} {size}");
+                        let page = field(&response[key][list], "id");
+                        assert!(page.len() <= size, "{method} {list} {size}");
+                        // The two other lists are empty: their count is 0.
+                        for name in ["artist", "album", "song"] {
+                            if name != list {
+                                assert_eq!(response[key][name], json!([]), "{method}");
+                            }
+                        }
+                        let last = page.len() < size;
+                        ids.extend(page);
+                        pages += 1;
+                        if last {
+                            break;
+                        }
+                        assert!(pages < 20, "{method} {list} {size}: the pages do not end");
+                    }
+                    // The pages put together are the list of one request.
+                    assert_eq!(
+                        ids,
+                        field(&whole[key][list], "id"),
+                        "{method} {query:?} {list} in pages of {size}"
+                    );
+                    for id in ids {
+                        assert!(seen.insert(id.clone()), "{id} is on two pages");
+                    }
+                }
+                assert_eq!(seen, every_id, "{method} {query:?} in pages of {size}");
+            }
+        }
+    }
+}
+
+#[tokio::test]
+async fn term_matches_a_part_of_a_name_and_two_terms_require_both() {
+    let library = LibraryBuilder::new()
+        .track("The Beatles", "Help!", "Yesterday", 1, "flac")
+        .track("The Beatles", "Abbey Road", "Come Together", 1, "mp3")
+        .track("Michael Jackson", "Thriller", "Beat It", 1, "ogg")
+        .track("Aurora Field", "Glass Harbour", "Low Tide", 1, "opus")
+        .build();
+    let server = TestServer::scanned(library).await;
+
+    for (method, _) in METHODS {
+        // `beat` is a part of "The Beatles" and of "Beat It".
+        let beat = found(
+            &["The Beatles"],
+            &["Abbey Road", "Help!"],
+            &["Beat It", "Come Together", "Yesterday"],
+        );
+        // One `*` at the end of a query is no part of the term.
+        for query in [
+            "beat",
+            "BEAT",
+            "Beat",
+            "\"beat\"",
+            " beat ",
+            "beat*",
+            "\"beat*\"",
+        ] {
+            assert_eq!(find(&server, method, query).await, beat, "{method} {query}");
+        }
+        assert_eq!(
+            find(&server, method, "beat**").await,
+            found(&[], &[], &[]),
+            "{method}"
+        );
+
+        // Two terms: both are part of a name of the item. No artist name
+        // holds `road`.
+        let both = found(&[], &["Abbey Road"], &["Come Together"]);
+        for query in ["beat road", "road beat", "ROAD  bEAT", "\"beat road\""] {
+            assert_eq!(find(&server, method, query).await, both, "{method} {query}");
+        }
+        assert_eq!(
+            find(&server, method, "beat zzz").await,
+            found(&[], &[], &[]),
+            "{method}"
+        );
+        assert_eq!(
+            find(&server, method, "the beatles").await,
+            found(
+                &["The Beatles"],
+                &["Abbey Road", "Help!"],
+                &["Come Together", "Yesterday"]
+            ),
+            "{method}"
+        );
+        // A song by its title, by the title of its album and by its artist.
+        assert_eq!(
+            find(&server, method, "tide").await,
+            found(&[], &[], &["Low Tide"])
+        );
+        assert_eq!(
+            find(&server, method, "harbour").await,
+            found(&[], &["Glass Harbour"], &["Low Tide"])
+        );
+        assert_eq!(
+            find(&server, method, "aurora").await,
+            found(&["Aurora Field"], &["Glass Harbour"], &["Low Tide"])
+        );
+        assert_eq!(
+            find(&server, method, "yesterday beatles help").await,
+            found(&[], &[], &["Yesterday"])
+        );
+    }
+}
+
+#[tokio::test]
+async fn like_wildcards_in_a_query_match_only_themselves() {
+    let library = LibraryBuilder::new()
+        .track("Per%cent", "100% Hits", "100% Pure", 1, "flac")
+        .track("Percent", "100 Hits", "100 Miles", 1, "flac")
+        .track("Under_Score", "Snake_Case", "a_b", 1, "flac")
+        .track("UnderXScore", "SnakeXCase", "axb", 1, "flac")
+        .build();
+    let server = TestServer::scanned(library).await;
+
+    for (method, _) in METHODS {
+        assert_eq!(
+            find(&server, method, "100%").await,
+            found(&[], &["100% Hits"], &["100% Pure"]),
+            "{method}"
+        );
+        assert_eq!(
+            find(&server, method, "%").await,
+            found(&["Per%cent"], &["100% Hits"], &["100% Pure"]),
+            "{method}"
+        );
+        assert_eq!(
+            find(&server, method, "_").await,
+            found(&["Under_Score"], &["Snake_Case"], &["a_b"]),
+            "{method}"
+        );
+        assert_eq!(
+            find(&server, method, "a_b").await,
+            found(&[], &[], &["a_b"]),
+            "{method}"
+        );
+        for query in ["%%", "__", "100%p", "per_cent", "%_%", "\\%", "\\_", "\\"] {
+            assert_eq!(
+                find(&server, method, query).await,
+                found(&[], &[], &[]),
+                "{method} {query}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn hostile_query_is_text_and_changes_nothing() {
+    let server = TestServer::standard().await;
+    let everything = found(&ARTISTS, &ALBUMS, &SONGS);
+    let nothing = found(&[], &[], &[]);
+    let many_terms = "x ".repeat(512);
+    let longest = "a".repeat(1024);
+    let queries = [
+        // Wildcards.
+        "%",
+        "_",
+        "%%%%",
+        "%_%_%",
+        "a%",
+        "_ide",
+        "[a-z]*",
+        "?",
+        // Quotes and the escape character.
+        "'",
+        "''",
+        "\\",
+        "\\\\",
+        "\\'",
+        "'\"'\"",
+        "`",
+        // Statements.
+        "'; DROP TABLE tracks; --",
+        "' OR '1'='1",
+        "\" OR \"\"=\"",
+        "') OR 1=1 --",
+        "%' UNION SELECT password FROM users --",
+        "?1",
+        ":query",
+        "]') --",
+        "\\\"]",
+        // A NUL character alone, inside a term and next to a term that
+        // matches.
+        "\0",
+        "glass\0",
+        "\0glass",
+        "gl\0ass",
+        "glass \0",
+        // Control characters and characters outside ASCII.
+        "\u{1}\u{2}\u{1f}",
+        "\u{7f}",
+        "\u{feff}",
+        "\u{202e}glass",
+        "\u{fffd}",
+        "zażółć",
+        "Ελληνικά",
+        "音楽",
+        "🎵🎶",
+        "e\u{301}\u{301}\u{301}",
+        // The longest queries.
+        &longest,
+        &many_terms,
+    ];
+    for (method, key) in METHODS {
+        for query in queries {
+            let response = server.get_json(method, &[("query", query)]).await;
+            assert_eq!(response["status"], "ok", "{method} {query:?}: {response}");
+            assert_eq!(names(method, &response[key]), nothing, "{method} {query:?}");
+            // XML as well: the body is a well-formed empty result.
+            assert_eq!(
+                server.get_xml(method, &[("query", query)]).await,
+                xml_document(&format!("<{key}/>")),
+                "{method} {query:?}"
+            );
+        }
+        // The library is as it was.
+        assert_eq!(find(&server, method, "").await, everything, "{method}");
+    }
+    // The account is as it was: the next request authenticates.
+    let response = server.get_json("getUser", &[("username", OWNER)]).await;
+    assert_eq!(response["status"], "ok");
+}
+
+#[tokio::test]
+async fn quotes_in_a_query_are_removed_and_other_characters_are_part_of_a_term() {
+    // The names are no file names on Windows, so the rows are stored
+    // without files.
+    let server = server_with(|conn| {
+        add_track(
+            conn,
+            1,
+            "/music",
+            "Guns N' Roses",
+            "Don't Cry",
+            "It's So Easy",
+        )?;
+        add_track(
+            conn,
+            2,
+            "/music",
+            "The \"Quoted\" Band",
+            "12\" Mixes",
+            "Say \"Hi\"",
+        )?;
+        add_track(conn, 3, "/music", "AC/DC", "Back\\Slash", "What?*")?;
+        add_track(
+            conn,
+            4,
+            "/music",
+            "Robert'); DROP TABLE tracks;--",
+            "x' OR '1'='1",
+            "<b>&amp;</b>",
+        )?;
+        Ok(())
+    })
+    .await;
+
+    for (method, key) in METHODS {
+        let cases = [
+            (
+                "n'",
+                found(&["Guns N' Roses"], &["Don't Cry"], &["It's So Easy"]),
+            ),
+            ("it's", found(&[], &[], &["It's So Easy"])),
+            (
+                "\"quoted\"",
+                found(&["The \"Quoted\" Band"], &["12\" Mixes"], &["Say \"Hi\""]),
+            ),
+            ("12\"", found(&[], &["12\" Mixes"], &["Say \"Hi\""])),
+            ("\"say hi\"", found(&[], &[], &["Say \"Hi\""])),
+            ("ac/dc", found(&["AC/DC"], &["Back\\Slash"], &["What?*"])),
+            ("k\\s", found(&[], &["Back\\Slash"], &["What?*"])),
+            ("?*", found(&[], &[], &["What?*"])),
+            (
+                "'); drop table tracks;--",
+                found(
+                    &["Robert'); DROP TABLE tracks;--"],
+                    &["x' OR '1'='1"],
+                    &["<b>&amp;</b>"],
+                ),
+            ),
+            ("'1'='1", found(&[], &["x' OR '1'='1"], &["<b>&amp;</b>"])),
+            ("<b>&amp;", found(&[], &[], &["<b>&amp;</b>"])),
+        ];
+        for (query, expected) in cases {
+            assert_eq!(
+                find(&server, method, query).await,
+                expected,
+                "{method} {query}"
+            );
+        }
+
+        // The names are escaped in XML.
+        let xml = server
+            .get_xml(method, &[("query", "robert"), ("songCount", "0")])
+            .await;
+        assert!(
+            xml.contains(r#"name="Robert'); DROP TABLE tracks;--""#)
+                || xml.contains(r#"name="Robert&apos;); DROP TABLE tracks;--""#),
+            "{xml}"
+        );
+        assert!(
+            xml.ends_with(&format!("</{key}></subsonic-response>")),
+            "{xml}"
+        );
+    }
+    assert_eq!(
+        find(&server, "search3", "").await.2,
+        ["<b>&amp;</b>", "It's So Easy", "Say \"Hi\"", "What?*"]
+    );
+}
+
+#[tokio::test]
+async fn names_outside_ascii_are_found_without_regard_to_case() {
+    let library = LibraryBuilder::new()
+        .track("Édith Piaf", "La Vie en rose", "Milord", 1, "flac")
+        .track("Edith Day", "Rio Rita", "Following the Sun", 1, "mp3")
+        .track("Кино", "Группа крови", "Звезда по имени Солнце", 1, "m4a")
+        .track("坂本龍一", "音楽図鑑", "戦場のメリークリスマス", 1, "ogg")
+        .build();
+    let server = TestServer::scanned(library).await;
+
+    for (method, _) in METHODS {
+        let piaf = found(&["Édith Piaf"], &["La Vie en rose"], &["Milord"]);
+        // Lower case, upper case, and the decomposed spelling of the query.
+        for query in ["édith", "ÉDITH", "Édith", "e\u{301}dith", "E\u{301}DITH"] {
+            assert_eq!(find(&server, method, query).await, piaf, "{method} {query}");
+        }
+        // A letter with a diacritic is not its base letter.
+        assert_eq!(
+            find(&server, method, "edith").await,
+            found(&["Edith Day"], &["Rio Rita"], &["Following the Sun"]),
+            "{method}"
+        );
+        let kino = found(&["Кино"], &["Группа крови"], &["Звезда по имени Солнце"]);
+        for query in ["кино", "КИНО", "Кино", "ин"] {
+            assert_eq!(find(&server, method, query).await, kino, "{method} {query}");
+        }
+        assert_eq!(
+            find(&server, method, "ГРУППА звезда").await,
+            found(&[], &[], &["Звезда по имени Солнце"]),
+            "{method}"
+        );
+        assert_eq!(
+            find(&server, method, "龍一").await,
+            found(&["坂本龍一"], &["音楽図鑑"], &["戦場のメリークリスマス"]),
+            "{method}"
+        );
+        assert_eq!(
+            find(&server, method, "メリー").await,
+            found(&[], &[], &["戦場のメリークリスマス"]),
+            "{method}"
+        );
+    }
+
+    // The names are the same text in XML.
+    let xml = server
+        .get_xml("search3", &[("query", "КИНО"), ("songCount", "0")])
+        .await;
+    assert!(xml.contains(r#"name="Кино""#), "{xml}");
+    assert!(xml.contains(r#"name="Группа крови""#), "{xml}");
+}
+
+#[tokio::test]
+async fn query_of_more_than_1024_characters_is_error_0() {
+    let server = TestServer::standard().await;
+    for (method, key) in METHODS {
+        // 1024 characters are a query, whatever their size in bytes.
+        for query in ["a".repeat(1024), "é".repeat(1024), "🎵".repeat(1024)] {
+            let response = server.get_json(method, &[("query", &query)]).await;
+            assert_eq!(response["status"], "ok", "{method}");
+            assert_eq!(names(method, &response[key]), found(&[], &[], &[]));
+        }
+        for query in ["a".repeat(1025), " ".repeat(1025), "\"".repeat(1025)] {
+            let response = server.get_json(method, &[("query", &query)]).await;
+            assert_eq!(response["status"], "failed", "{method}");
+            assert_eq!(response["error"], error(0, QUERY_TOO_LONG), "{method}");
+            assert!(response.get(key).is_none(), "{method}");
+        }
+
+        // A megabyte of text in a form body.
+        for query in [
+            "a".repeat(1_048_576),
+            "a ".repeat(524_288),
+            "%".repeat(1_048_576),
+        ] {
+            let response = server
+                .post_form(method, &[("query", &query), ("f", "json")])
+                .await;
+            assert_eq!(response.status(), StatusCode::OK, "{method}");
+            assert_eq!(content_type(&response), "application/json", "{method}");
+            let response = subsonic_response(&body_string(response).await);
+            assert_eq!(response["error"], error(0, QUERY_TOO_LONG), "{method}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn query_of_more_than_32_terms_is_error_0() {
+    let server = TestServer::standard().await;
+    let numbered: Vec<String> = (0..33).map(|n| format!("t{n}")).collect();
+    let at_the_bound = numbered[..32].join(" ");
+    let above_the_bound = numbered.join(" ");
+    // 33 terms of which two are one term in another letter case.
+    let repeated = format!("{at_the_bound} T0 \"t1\"");
+    // 32 parts of the names of "Low Tide" and "Breakwater" on "Glass
+    // Harbour" by Aurora Field. Both titles hold a `w`, and the third track
+    // of the album, "Night Ferry", holds none.
+    let parts = "a u r o f i e l d g s h b w t au ur ro or ra fi ie el ld gl la as ss ha ar rb bo";
+    assert_eq!(parts.split(' ').count(), 32);
+
+    for (method, key) in METHODS {
+        for query in [at_the_bound.as_str(), repeated.as_str()] {
+            let response = server.get_json(method, &[("query", query)]).await;
+            assert_eq!(response["status"], "ok", "{method} {query}");
+            assert_eq!(names(method, &response[key]), found(&[], &[], &[]));
+        }
+        assert_eq!(
+            find(&server, method, parts).await,
+            found(&[], &[], &["Breakwater", "Low Tide"]),
+            "{method}"
+        );
+
+        for query in [
+            above_the_bound.clone(),
+            format!("{parts} n"),
+            format!("{above_the_bound} \0"),
+            // 250 terms in 890 characters.
+            (0..250).map(|n| format!("{n} ")).collect(),
+        ] {
+            let response = server.get_json(method, &[("query", &query)]).await;
+            assert_eq!(response["status"], "failed", "{method} {query:?}");
+            assert_eq!(response["error"], error(0, TOO_MANY_TERMS), "{method}");
+            assert!(response.get(key).is_none(), "{method}");
+            assert_eq!(
+                server.get_xml(method, &[("query", &query)]).await,
+                xml_error(0, TOO_MANY_TERMS),
+                "{method}"
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn query_is_required_and_may_be_empty() {
+    let server = TestServer::standard().await;
+    for (method, key) in METHODS {
+        for params in [&[][..], &[("songCount", "5")], &[("Query", "glass")]] {
+            let response = server.get_json(method, params).await;
+            assert_eq!(response["status"], "failed", "{method} {params:?}");
+            assert_eq!(
+                response["error"],
+                error(10, "required parameter is missing: query"),
+                "{method} {params:?}"
+            );
+            assert!(response.get(key).is_none(), "{method} {params:?}");
+        }
+        assert_eq!(
+            server.get_xml(method, &[]).await,
+            xml_error(10, "required parameter is missing: query"),
+            "{method}"
+        );
+
+        // `query` without `=` and `query=` are the empty query.
+        let path = format!("/rest/{method}?query&f=json&u=owner&p=sesame&v=1.16.1&c=test");
+        let response = server.get_path(&path).await;
+        let response = subsonic_response(&body_string(response).await);
+        assert_eq!(response["status"], "ok", "{method}");
+        assert_eq!(
+            names(method, &response[key]),
+            found(&ARTISTS, &ALBUMS, &SONGS),
+            "{method}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn search_methods_answer_a_form_post_and_the_view_suffix() {
+    let server = TestServer::standard().await;
+    for (method, key) in METHODS {
+        // The third song of Aurora Field in title order is "Last Train".
+        let expected = found(&["Aurora Field"], &["Glass Harbour"], &["Last Train"]);
+        let response = server
+            .post_form(
+                method,
+                &[
+                    ("query", "aurora"),
+                    ("artistCount", "1"),
+                    ("albumCount", "1"),
+                    ("songCount", "1"),
+                    ("songOffset", "2"),
+                    ("f", "json"),
+                ],
+            )
+            .await;
+        assert_eq!(response.status(), StatusCode::OK, "{method}");
+        let response = subsonic_response(&body_string(response).await);
+        assert_eq!(response["status"], "ok", "{method}");
+        assert_eq!(names(method, &response[key]), expected, "{method}");
+
+        let response = server
+            .get_json(
+                &format!("{method}.view"),
+                &[
+                    ("query", "aurora"),
+                    ("artistCount", "1"),
+                    ("albumCount", "1"),
+                    ("songCount", "1"),
+                    ("songOffset", "2"),
+                ],
+            )
+            .await;
+        assert_eq!(names(method, &response[key]), expected, "{method}");
+    }
+}
+
+#[tokio::test]
+async fn music_folder_id_limits_the_lists_to_that_folder() {
+    let server = server_with(|conn| {
+        add_track(
+            conn,
+            1,
+            "/music",
+            "Aurora Field",
+            "Glass Harbour",
+            "Low Tide",
+        )?;
+        add_track(
+            conn,
+            2,
+            "/other",
+            "Aurora Field",
+            "Glass Harbour",
+            "Breakwater",
+        )?;
+        add_track(
+            conn,
+            3,
+            "/other",
+            "Marlow Quartet",
+            "Slow Rivers",
+            "Upstream",
+        )?;
+        add_track(conn, 4, "/music", "The Beatles", "Help!", "Yesterday")?;
+        Ok(())
+    })
+    .await;
+    let folder_ids: Vec<String> = server
+        .db()
+        .read(folders::list)
+        .await
+        .expect("read the music folders")
+        .into_iter()
+        .map(|folder| folder.id.to_string())
+        .collect();
+    let (music, other) = (folder_ids[0].as_str(), folder_ids[1].as_str());
+
+    for (method, key) in METHODS {
+        let in_folder = |query: &'static str, folder: &str| {
+            let server = &server;
+            let folder = folder.to_owned();
+            async move {
+                let response = server
+                    .get_json(method, &[("query", query), ("musicFolderId", &folder)])
+                    .await;
+                assert_eq!(response["status"], "ok", "{method} {query} {folder}");
+                names(method, &response[key])
+            }
+        };
+        assert_eq!(
+            in_folder("", music).await,
+            found(
+                &["Aurora Field", "The Beatles"],
+                &["Glass Harbour", "Help!"],
+                &["Low Tide", "Yesterday"]
+            ),
+            "{method}"
+        );
+        assert_eq!(
+            in_folder("", other).await,
+            found(
+                &["Aurora Field", "Marlow Quartet"],
+                &["Glass Harbour", "Slow Rivers"],
+                &["Breakwater", "Upstream"]
+            ),
+            "{method}"
+        );
+        assert_eq!(
+            in_folder("aurora", other).await,
+            found(&["Aurora Field"], &["Glass Harbour"], &["Breakwater"]),
+            "{method}"
+        );
+        assert_eq!(in_folder("beatles", other).await, found(&[], &[], &[]));
+        // The ID of no folder is no error.
+        for unknown in ["0", "-1", "99", "9223372036854775807"] {
+            assert_eq!(
+                in_folder("", unknown).await,
+                found(&[], &[], &[]),
+                "{method} {unknown}"
+            );
+        }
+        // Without the parameter the lists hold both folders.
+        assert_eq!(
+            find(&server, method, "").await,
+            found(
+                &["Aurora Field", "Marlow Quartet", "The Beatles"],
+                &["Glass Harbour", "Help!", "Slow Rivers"],
+                &["Breakwater", "Low Tide", "Upstream", "Yesterday"]
+            ),
+            "{method}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn music_folder_of_the_standard_library_holds_everything() {
+    let server = TestServer::standard().await;
+    let folder = server.folder_id.to_string();
+    let other = (server.folder_id + 1).to_string();
+    let expected = whole_result3(&server.catalogue().await);
+
+    let response = server
+        .get_json("search3", &[("query", ""), ("musicFolderId", &folder)])
+        .await;
+    assert_eq!(response["searchResult3"], expected);
+    let response = server
+        .get_json("search3", &[("query", ""), ("musicFolderId", &other)])
+        .await;
+    assert_eq!(
+        response["searchResult3"],
+        json!({ "artist": [], "album": [], "song": [] })
+    );
+}
+
+#[tokio::test]
+async fn track_without_a_file_is_listed_without_a_path_and_is_in_no_folder() {
+    let server = TestServer::standard().await;
+    let folder = server.folder_id.to_string();
+    // The two tracks of "Slow Rivers" and one of the two tracks of "Summer
+    // Sampler" lose their files.
+    remove_file(server.db(), &server.track.upstream).await;
+    remove_file(server.db(), &server.track.delta).await;
+    remove_file(server.db(), &server.track.open_road).await;
+
+    for (method, key) in METHODS {
+        // Every row is a match as before.
+        let response = server.get_json(method, &[("query", "")]).await;
+        assert_eq!(
+            names(method, &response[key]),
+            found(&ARTISTS, &ALBUMS, &SONGS),
+            "{method}"
+        );
+        for song in response[key]["song"].as_array().expect("the songs") {
+            let id = song["id"].as_str().expect("an ID");
+            let without_file = [
+                &server.track.upstream,
+                &server.track.delta,
+                &server.track.open_road,
+            ]
+            .iter()
+            .any(|track| *track == id);
+            // The element keeps its tags and has no path. No field holds
+            // the placeholder path.
+            assert_eq!(song.get("path").is_none(), without_file, "{song}");
+            assert!(!song.to_string().contains(&format!("/{id}")), "{song}");
+            assert_ne!(song["coverArt"], json!(id), "{song}");
+            assert!(song["suffix"].is_string(), "{song}");
+        }
+        assert_eq!(
+            find(&server, method, "upstream").await,
+            found(&[], &[], &["Upstream"]),
+            "{method}"
+        );
+        assert_eq!(
+            find(&server, method, "tessa").await,
+            found(&[], &[], &["Open Road"]),
+            "{method}"
+        );
+
+        // In the music folder the three tracks are left out. "Slow Rivers"
+        // and its artist have no other track. "Summer Sampler" has one.
+        let response = server
+            .get_json(method, &[("query", ""), ("musicFolderId", &folder)])
+            .await;
+        assert_eq!(
+            names(method, &response[key]),
+            found(
+                &["Aurora Field", "Various Artists"],
+                &["Glass Harbour", "Paper Maps", "Summer Sampler"],
+                &[
+                    "Breakwater",
+                    "Contour",
+                    "Last Train",
+                    "Legend",
+                    "Low Tide",
+                    "Meridian",
+                    "Night Ferry",
+                ]
+            ),
+            "{method}"
+        );
+        let response = server
+            .get_json(method, &[("query", "marlow"), ("musicFolderId", &folder)])
+            .await;
+        assert_eq!(names(method, &response[key]), found(&[], &[], &[]));
+    }
+}
+
+#[tokio::test]
+async fn elements_carry_the_annotations_of_the_user() {
+    let server = TestServer::standard().await;
+    let (artist, album, track) = (
+        server.artist.marlow_quartet.clone(),
+        server.album.slow_rivers.clone(),
+        server.track.delta.clone(),
+    );
+    server
+        .db()
+        .write(move |conn| {
+            let user: i64 =
+                conn.query_row("SELECT id FROM users WHERE name = ?1", [OWNER], |row| {
+                    row.get(0)
+                })?;
+            let mut insert = conn.prepare(
+                "INSERT INTO annotations
+                   (user_id, item_id, item_type, starred_at, rating, play_count, last_played_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            )?;
+            insert.execute(params![
+                user,
+                artist,
+                "artist",
+                1_700_000_000,
+                4,
+                0,
+                None::<i64>
+            ])?;
+            insert.execute(params![
+                user,
+                album,
+                "album",
+                1_700_000_100,
+                5,
+                7,
+                1_700_000_200
+            ])?;
+            insert.execute(params![
+                user,
+                track,
+                "track",
+                1_700_000_300,
+                3,
+                9,
+                1_700_000_400
+            ])?;
+            Ok(())
+        })
+        .await
+        .expect("store the annotations");
+
+    let response = server.get_json("search3", &[("query", "marlow")]).await;
+    let result = &response["searchResult3"];
+    assert_eq!(
+        result["artist"],
+        json!([{
+            "id": server.artist.marlow_quartet,
+            "name": "Marlow Quartet",
+            "albumCount": 1,
+            "starred": "2023-11-14T22:13:20Z",
+        }])
+    );
+    let album = &result["album"][0];
+    assert_eq!(album["starred"], "2023-11-14T22:15:00Z");
+    assert_eq!(album["userRating"], 5);
+    assert_eq!(album["playCount"], 7);
+    assert_eq!(album["played"], "2023-11-14T22:16:40Z");
+    // The songs are "Delta" and "Upstream". Only "Delta" has an annotation.
+    let delta = &result["song"][0];
+    assert_eq!(delta["id"], json!(server.track.delta));
+    assert_eq!(delta["starred"], "2023-11-14T22:18:20Z");
+    assert_eq!(delta["userRating"], 3);
+    assert_eq!(delta["playCount"], 9);
+    assert_eq!(delta["played"], "2023-11-14T22:20:00Z");
+    let upstream = &result["song"][1];
+    assert_eq!(upstream["id"], json!(server.track.upstream));
+    assert_eq!(upstream["playCount"], 0);
+    for absent in ["starred", "userRating", "played"] {
+        assert!(upstream.get(absent).is_none(), "{upstream}");
+    }
+
+    let response = server.get_json("search2", &[("query", "marlow")]).await;
+    let result = &response["searchResult2"];
+    assert_eq!(
+        result["artist"],
+        json!([{
+            "id": server.artist.marlow_quartet,
+            "name": "Marlow Quartet",
+            "starred": "2023-11-14T22:13:20Z",
+            "userRating": 4,
+        }])
+    );
+    let album = &result["album"][0];
+    assert_eq!(album["isDir"], true);
+    assert_eq!(album["starred"], "2023-11-14T22:15:00Z");
+    assert_eq!(album["userRating"], 5);
+    assert_eq!(album["playCount"], 7);
+    assert_eq!(result["song"][0]["userRating"], 3);
+}
+
+#[tokio::test]
+async fn search3_in_xml_has_the_elements_of_the_subsonic_schema() {
+    let server = TestServer::standard().await;
+    let aurora = &server.artist.aurora_field;
+
+    // One list at a time: the whole document.
+    let xml = server
+        .get_xml(
+            "search3",
+            &[("query", "aurora"), ("albumCount", "0"), ("songCount", "0")],
+        )
+        .await;
+    assert_eq!(
+        xml,
+        xml_document(&format!(
+            r#"<searchResult3><artist albumCount="2" id="{aurora}" name="Aurora Field"/></searchResult3>"#
+        ))
+    );
+
+    let catalogue = server.catalogue().await;
+    let created = model::iso8601(catalogue.album("Paper Maps").created_at);
+    let xml = server
+        .get_xml(
+            "search3",
+            &[("query", "paper"), ("artistCount", "0"), ("songCount", "0")],
+        )
+        .await;
+    assert_eq!(
+        xml,
+        xml_document(&format!(
+            concat!(
+                r#"<searchResult3><album artist="Aurora Field" artistId="{}" created="{}""#,
+                r#" duration="2" genre="Electronic" id="{}" name="Paper Maps" playCount="0""#,
+                r#" songCount="3" year="2021"/></searchResult3>"#
+            ),
+            aurora, created, server.album.paper_maps
+        ))
+    );
+
+    let created = model::iso8601(catalogue.song("Legend").track.created_at);
+    let xml = server
+        .get_xml(
+            "search3",
+            &[
+                ("query", "legend"),
+                ("artistCount", "0"),
+                ("albumCount", "0"),
+            ],
+        )
+        .await;
+    let song = catalogue.song("Legend");
+    assert_eq!(
+        xml,
+        xml_document(&format!(
+            concat!(
+                r#"<searchResult3><song album="Paper Maps" albumId="{album}" artist="Aurora Field""#,
+                r#" artistId="{artist}" bitDepth="0" bitRate="{bit_rate}" channelCount="1""#,
+                r#" contentType="audio/mpeg" created="{created}" discNumber="2" duration="1""#,
+                r#" genre="Electronic" id="{id}" isDir="false" mediaType="song" parent="{album}""#,
+                r#" path="Aurora Field/Paper Maps/01 Legend.mp3" playCount="0""#,
+                r#" samplingRate="22050" size="{size}" suffix="mp3" title="Legend" track="1""#,
+                r#" type="music" year="2021"/></searchResult3>"#
+            ),
+            album = server.album.paper_maps,
+            artist = aurora,
+            bit_rate = song.track.bitrate_kbps.expect("an MP3 file has a bitrate"),
+            created = created,
+            id = server.track.legend,
+            size = song.track.size,
+        ))
+    );
+
+    // The three lists together: one `artist`, two `album` and seven `song`
+    // elements inside `searchResult3`.
+    let xml = server.get_xml("search3", &[("query", "aurora")]).await;
+    let start = xml_document("<searchResult3>");
+    let start = start.trim_end_matches("</subsonic-response>");
+    assert!(xml.starts_with(start), "{xml}");
+    assert!(
+        xml.ends_with("</searchResult3></subsonic-response>"),
+        "{xml}"
+    );
+    assert_eq!(xml.matches("<artist ").count(), 1, "{xml}");
+    assert_eq!(xml.matches("<album ").count(), 2, "{xml}");
+    assert_eq!(xml.matches("<song ").count(), 7, "{xml}");
+
+    // No match: an empty element.
+    assert_eq!(
+        server.get_xml("search3", &[("query", "zzz")]).await,
+        xml_document("<searchResult3/>")
+    );
+}
+
+#[tokio::test]
+async fn search2_in_xml_has_the_elements_of_the_subsonic_schema() {
+    let server = TestServer::standard().await;
+    let aurora = &server.artist.aurora_field;
+
+    let xml = server
+        .get_xml(
+            "search2",
+            &[("query", "aurora"), ("albumCount", "0"), ("songCount", "0")],
+        )
+        .await;
+    assert_eq!(
+        xml,
+        xml_document(&format!(
+            r#"<searchResult2><artist id="{aurora}" name="Aurora Field"/></searchResult2>"#
+        ))
+    );
+
+    let catalogue = server.catalogue().await;
+    let created = model::iso8601(catalogue.album("Paper Maps").created_at);
+    let xml = server
+        .get_xml(
+            "search2",
+            &[("query", "paper"), ("artistCount", "0"), ("songCount", "0")],
+        )
+        .await;
+    assert_eq!(
+        xml,
+        xml_document(&format!(
+            concat!(
+                r#"<searchResult2><album album="Paper Maps" artist="Aurora Field""#,
+                r#" artistId="{artist}" created="{created}" duration="2" genre="Electronic""#,
+                r#" id="{id}" isDir="true" mediaType="album" parent="{artist}" playCount="0""#,
+                r#" title="Paper Maps" year="2021"/></searchResult2>"#
+            ),
+            artist = aurora,
+            created = created,
+            id = server.album.paper_maps
+        ))
+    );
+
+    // A song is the same element as in `search3`.
+    let params = [
+        ("query", "legend"),
+        ("artistCount", "0"),
+        ("albumCount", "0"),
+    ];
+    assert_eq!(
+        server.get_xml("search2", &params).await,
+        server
+            .get_xml("search3", &params)
+            .await
+            .replace("searchResult3", "searchResult2")
+    );
+    assert_eq!(
+        server.get_xml("search2", &[("query", "zzz")]).await,
+        xml_document("<searchResult2/>")
+    );
+}
+
+#[tokio::test]
+async fn search_is_deprecated_and_answers_error_0() {
+    let server = TestServer::standard().await;
+    let deprecated = error(0, "deprecated; use search3");
+    for name in ["search", "search.view"] {
+        for params in [
+            &[][..],
+            &[("any", "glass")],
+            &[("artist", "aurora"), ("album", "glass"), ("title", "tide")],
+            &[("count", "20"), ("offset", "0"), ("newerThan", "0")],
+            &[("query", "glass")],
+        ] {
+            let response = server.get_json(name, params).await;
+            assert_eq!(response["status"], "failed", "{name} {params:?}");
+            assert_eq!(response["error"], deprecated, "{name} {params:?}");
+            assert_eq!(
+                response.as_object().map(serde_json::Map::len),
+                Some(6),
+                "{name} {params:?}: {response}"
+            );
+        }
+        assert_eq!(
+            server.get_xml(name, &[("any", "glass")]).await,
+            xml_error(0, "deprecated; use search3"),
+            "{name}"
+        );
+        let response = server
+            .post_form(name, &[("any", "glass"), ("f", "json")])
+            .await;
+        let response = subsonic_response(&body_string(response).await);
+        assert_eq!(response["error"], deprecated, "{name}");
+    }
+}
