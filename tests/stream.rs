@@ -1261,24 +1261,55 @@ async fn response_that_the_client_drops_leaves_no_open_file_and_no_task() {
 mod links {
     use std::os::unix::fs::symlink;
 
+    use serde_json::Value;
     use tokio_util::sync::CancellationToken;
     use wn_server::config::Config;
     use wn_server::library::scanner::{self, ScanOptions};
 
     use super::*;
 
+    /// The `id` of each item of a list in a response.
+    fn ids_of(items: &Value) -> Vec<String> {
+        let items = items.as_array().expect("a list of items");
+        let mut ids: Vec<String> = items
+            .iter()
+            .map(|item| item["id"].as_str().expect("an ID").to_owned())
+            .collect();
+        ids.sort_unstable();
+        ids
+    }
+
+    /// The IDs of the songs that `search3` returns for the empty query.
+    async fn songs_of_search(server: &TestServer) -> Vec<String> {
+        let params = [("query", ""), ("songCount", "500")];
+        let response = server.get_json("search3", &params).await;
+        ids_of(&response["searchResult3"]["song"])
+    }
+
+    /// The IDs of the songs of every album that `getAlbumList2` returns, as
+    /// `getAlbum` lists them.
+    async fn songs_of_browse(server: &TestServer) -> Vec<String> {
+        let params = [("type", "alphabeticalByName"), ("size", "500")];
+        let list = server.get_json("getAlbumList2", &params).await;
+        let mut ids = Vec::new();
+        for album in ids_of(&list["albumList2"]["album"]) {
+            let response = server.get_json("getAlbum", &[("id", &album)]).await;
+            ids.extend(ids_of(&response["album"]["song"]));
+        }
+        ids.sort_unstable();
+        ids
+    }
+
     #[tokio::test]
-    async fn track_behind_a_link_out_of_the_music_folder_is_not_served() {
+    async fn no_listed_track_answers_error_70_because_of_a_link() {
         let library = LibraryBuilder::standard().build();
         let root = library.root.path().to_path_buf();
+        let album = root.join("Aurora Field").join("Glass Harbour");
         let outside = tempfile::tempdir().expect("a directory outside the library");
 
         // The file of one track is outside the folder, and a link is at its
         // path.
-        let link = root
-            .join("Aurora Field")
-            .join("Glass Harbour")
-            .join("01 Low Tide.flac");
+        let link = album.join("01 Low Tide.flac");
         let target = outside.path().join("01 Low Tide.flac");
         fs::rename(&link, &target).unwrap();
         symlink(&target, &link).unwrap();
@@ -1287,14 +1318,92 @@ mod links {
         let target = outside.path().join("Marlow Quartet");
         fs::rename(&link, &target).unwrap();
         symlink(&target, &link).unwrap();
+        // The file of one track and the directory of one artist are in a
+        // directory of the folder that the scan does not walk, behind links.
+        let store = root.join(".store");
+        fs::create_dir(&store).unwrap();
+        let link = album.join("03 Night Ferry.flac");
+        fs::rename(&link, store.join("night ferry.flac")).unwrap();
+        symlink(store.join("night ferry.flac"), &link).unwrap();
+        fs::rename(root.join("Tessa Lund"), store.join("Tessa Lund")).unwrap();
+        symlink(".store/Tessa Lund", root.join("Tessa Lund")).unwrap();
+        // Links to a file and to a directory that the scan reads at their
+        // own paths.
+        fs::create_dir(root.join("Favourites")).unwrap();
+        symlink(
+            "../Aurora Field/Glass Harbour/02 Breakwater.flac",
+            root.join("Favourites").join("breakwater.flac"),
+        )
+        .unwrap();
+        symlink(root.join("Aurora Field"), root.join("Linked Artist")).unwrap();
 
-        // The scan follows the links and gives each file its row.
+        // The scan gives no row to the three files outside the folder, and
+        // one row to each file in it.
+        let server = TestServer::scanned(library).await;
+        let catalogue = server.catalogue().await;
+        let mut titles: Vec<&str> = catalogue
+            .songs
+            .iter()
+            .map(|song| song.track.title.as_str())
+            .collect();
+        titles.sort_unstable();
+        assert_eq!(
+            titles,
+            [
+                "Breakwater",
+                "Contour",
+                "Last Train",
+                "Legend",
+                "Meridian",
+                "Night Ferry",
+                "Open Road"
+            ]
+        );
+
+        // The methods that list tracks return these seven tracks, and
+        // `stream` serves each of them with the bytes of its file.
+        let listed = songs_of_search(&server).await;
+        assert_eq!(listed.len(), 7, "{listed:?}");
+        assert_eq!(songs_of_browse(&server).await, listed);
+        for id in &listed {
+            let (track, file) = row_and_file(&server, id).await;
+            let response = stream(&server, id, &[], &[]).await;
+            assert_eq!(response.status(), StatusCode::OK, "{}", track.rel_path);
+            let mime = content_type(&response);
+            assert!(mime.starts_with("audio/"), "{}: {mime}", track.rel_path);
+            assert_eq!(body_bytes(response).await, file, "{}", track.rel_path);
+        }
+    }
+
+    #[tokio::test]
+    async fn track_behind_a_link_that_leaves_the_music_folder_after_the_scan_is_not_served() {
+        let library = LibraryBuilder::standard().build();
+        let root = library.root.path().to_path_buf();
+        // The directory of one artist is in a directory of the folder that
+        // the scan does not walk, behind a link. The scan follows the link.
+        let store = root.join(".store");
+        fs::create_dir(&store).unwrap();
+        let link = root.join("Marlow Quartet");
+        fs::rename(&link, store.join("Marlow Quartet")).unwrap();
+        symlink(store.join("Marlow Quartet"), &link).unwrap();
         let server = TestServer::scanned(library).await;
         let catalogue = server.catalogue().await;
         assert_eq!(catalogue.songs.len(), 10);
-        for title in ["Low Tide", "Upstream", "Delta"] {
+        let track = &catalogue.song("Upstream").track;
+        let file = fs::read(server.path(&track.rel_path)).unwrap();
+        let response = stream(&server, &track.id, &[], &[]).await;
+        assert_whole_file(response, &file, "audio/mp4", "Upstream").await;
+
+        // The directory moves out of the folder, and the link names its new
+        // place. The files keep their sizes and their times, so the state of
+        // each path equals its row. No scan has run.
+        let outside = tempfile::tempdir().expect("a directory outside the library");
+        let target = outside.path().join("Marlow Quartet");
+        fs::rename(store.join("Marlow Quartet"), &target).unwrap();
+        fs::remove_file(&link).unwrap();
+        symlink(&target, &link).unwrap();
+        for title in ["Upstream", "Delta"] {
             let track = &catalogue.song(title).track;
-            assert!(track.has_file(), "{title}");
             assert!(server.path(&track.rel_path).is_file(), "{title}");
             assert_eq!(
                 stream_error(&server, &track.id, &[], &[]).await,
@@ -1322,6 +1431,17 @@ mod links {
         let file = fs::read(server.path(&track.rel_path)).unwrap();
         let response = stream(&server, &track.id, &[], &[]).await;
         assert_whole_file(response, &file, "audio/flac", "Breakwater").await;
+
+        // The next scan removes the rows of the two files, and no method
+        // lists them.
+        let summary = server.rescan().await;
+        assert_eq!(summary.errors, [""; 0]);
+        assert_eq!(summary.removed, 2);
+        let listed = songs_of_search(&server).await;
+        assert_eq!(listed.len(), 8, "{listed:?}");
+        for title in ["Upstream", "Delta"] {
+            assert!(!listed.contains(&catalogue.song(title).track.id), "{title}");
+        }
     }
 
     #[tokio::test]
@@ -1359,31 +1479,31 @@ mod links {
     async fn track_behind_a_link_inside_the_music_folder_is_served() {
         let library = LibraryBuilder::standard().build();
         let root = library.root.path().to_path_buf();
-        let target = root
+        // The file of one track and the directory of one artist are in a
+        // directory of the folder that the scan does not walk. A relative
+        // link to the file and a link to the directory are at their paths.
+        let store = root.join(".store");
+        fs::create_dir(&store).unwrap();
+        let link = root
             .join("Aurora Field")
             .join("Glass Harbour")
             .join("01 Low Tide.flac");
-        let file = fs::read(&target).unwrap();
-        // A relative link to a file and a link to a directory. The targets
-        // are in the music folder.
-        fs::create_dir(root.join("Favourites")).unwrap();
-        symlink(
-            "../Aurora Field/Glass Harbour/01 Low Tide.flac",
-            root.join("Favourites").join("low tide.flac"),
-        )
-        .unwrap();
-        symlink(root.join("Aurora Field"), root.join("Linked Artist")).unwrap();
+        fs::rename(&link, store.join("low tide.flac")).unwrap();
+        symlink("../../.store/low tide.flac", &link).unwrap();
+        let link = root.join("Marlow Quartet");
+        fs::rename(&link, store.join("Marlow Quartet")).unwrap();
+        symlink(store.join("Marlow Quartet"), &link).unwrap();
 
-        // The scan gives each path of the file a row.
+        // The scan gives each file a row at the path through its link.
         let server = TestServer::scanned(library).await;
-        for rel_path in [
-            "Aurora Field/Glass Harbour/01 Low Tide.flac",
-            "Favourites/low tide.flac",
-            "Linked Artist/Glass Harbour/01 Low Tide.flac",
+        for (rel_path, mime) in [
+            ("Aurora Field/Glass Harbour/01 Low Tide.flac", "audio/flac"),
+            ("Marlow Quartet/Slow Rivers/01 Upstream.m4a", "audio/mp4"),
         ] {
             let track = row_at(server.db(), rel_path).await;
+            let file = fs::read(server.path(rel_path)).unwrap();
             let response = stream(&server, &track.id, &[], &[]).await;
-            assert_whole_file(response, &file, "audio/flac", rel_path).await;
+            assert_whole_file(response, &file, mime, rel_path).await;
             let headers = [("range", "bytes=100-199")];
             let response = stream(&server, &track.id, &[], &headers).await;
             assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT, "{rel_path}");

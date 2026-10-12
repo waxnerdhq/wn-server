@@ -578,12 +578,14 @@ async fn a_link_in_the_place_of_the_cover_file_of_a_parent_directory_is_not_read
 async fn an_audio_file_that_is_a_symbolic_link_gives_its_embedded_picture() {
     use std::os::unix::fs::symlink;
 
-    // The scanner follows a link to an audio file and stores its tags. The
-    // service reads the picture of the same file.
-    let outside = tempfile::tempdir().expect("create a directory");
+    // The audio file is in a directory of the music folder that the scanner
+    // does not walk. The scanner follows a link to it and stores its tags.
+    // The service reads the picture of the same file.
     let library = LibraryBuilder::standard().build();
     let linked = file(&library, "Marlow Quartet", "Slow Rivers", "02 Delta.m4a");
-    let target = outside.path().join("delta.m4a");
+    let store = library.root.path().join(".store");
+    fs::create_dir(&store).expect("create a directory");
+    let target = store.join("delta.m4a");
     fs::copy(&linked, &target).expect("copy the audio file");
     fs::remove_file(&linked).expect("remove the audio file");
     symlink(&target, &linked).expect("create the link");

@@ -18,6 +18,11 @@
 //! row is kept without a file, at a placeholder path, so that its ID does
 //! not name the other file.
 //!
+//! The scanner gives a row only to a file inside the configured folders. A
+//! symbolic link whose target is outside them is not followed. A link whose
+//! target is inside them is followed only when no walk reaches the target at
+//! its own path, so that a file has one row.
+//!
 //! After the track pass the scanner brings the album rows and the artist
 //! rows in line with the tracks: it deletes the rows that no track refers to,
 //! recomputes the counts and sets the cover of each album. An album row and
@@ -26,7 +31,7 @@
 //! [`scan`] blocks its thread on file and database work. Files are read
 //! outside the write transactions.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::OsStr;
 use std::fs;
 use std::io;
@@ -130,6 +135,12 @@ pub struct ScanSummary {
 /// every folder in `folders` was read in full and holds a supported file.
 /// `full` reads the fingerprint and the tags of every file.
 ///
+/// A file gets a row only when it is inside `folders` after every symbolic
+/// link of its path is resolved. A link whose target is outside `folders` is
+/// not followed. A link whose target is inside `folders` is followed when no
+/// walk reaches the target at its own path, so that a file has one row. A
+/// link that cannot be resolved is a path that cannot be read.
+///
 /// After the tracks, the scan brings the albums and the artists in line
 /// with them. It deletes every album that no track refers to, then every
 /// artist that no album and no track refers to, and the annotations of items
@@ -213,6 +224,7 @@ fn scan_with(
         options,
         reader,
         folders: configured,
+        links: Links::default(),
         unread: Unread::default(),
         summary: ScanSummary::default(),
     };
@@ -338,6 +350,9 @@ struct FolderWalk {
     /// The cover image of each directory that holds one, by the relative
     /// path of the directory.
     covers: HashMap<String, CoverFile>,
+    /// The number of symbolic links whose target is outside every configured
+    /// folder. The walk followed none of them.
+    outside_links: u64,
 }
 
 /// A cover image file that the walk saw.
@@ -430,6 +445,93 @@ impl Unread {
                 && fingerprint_size(&entry.fingerprint)
                     .is_none_or(|size| self.sizes.contains(&size)))
     }
+}
+
+/// What the walks of one scan know about the symbolic links in the folders.
+///
+/// A path here is a canonical path: the result of `fs::canonicalize`, which
+/// resolves every link of a path, or such a result joined with names that
+/// the walk read from a directory without following a link.
+#[derive(Debug, Default)]
+struct Links {
+    /// The canonical path of each configured folder whose path resolves. A
+    /// folder whose path does not resolve is an unread root and has no path
+    /// here.
+    roots: Vec<PathBuf>,
+    /// The targets of the directory links that the walks followed. A
+    /// directory is walked through one link, so that the walk ends for every
+    /// arrangement of links.
+    followed: HashSet<PathBuf>,
+    /// The files that the walks saw through a link.
+    files: HashSet<PathBuf>,
+}
+
+impl Links {
+    /// Returns whether `file`, which a walk reached through a link, gets a
+    /// row at the path through that link. It gets none when a walk reaches
+    /// the file at its own path, and when a walk saw it through another link
+    /// before. The first call for a file records it.
+    fn takes(&mut self, file: PathBuf) -> bool {
+        !walks_reach(&file, &self.roots, false) && self.files.insert(file)
+    }
+
+    /// Returns the tree that the walk reads for the link at `path`, an entry
+    /// of `tree`, whose target is the directory `target` inside a configured
+    /// folder. Returns `None` for a link that the walk does not follow.
+    ///
+    /// - A target that is the path of the entry itself is no link to another
+    ///   place. Windows reports a volume that is mounted at a directory as a
+    ///   link, and such an entry resolves to its own path. It is a directory
+    ///   of `tree`.
+    /// - A target that a walk reaches at its own path is read there. A link
+    ///   to a directory above the link is such a link, so it starts no loop.
+    /// - Any other target is followed through the first link that leads to
+    ///   it. The first call for a target records it.
+    fn tree_behind(&mut self, tree: &Tree, path: &Path, target: PathBuf) -> Option<Tree> {
+        let direct = if target == tree.canonical.join(below(tree, path)) {
+            tree.direct
+        } else if walks_reach(&target, &self.roots, true) || !self.followed.insert(target.clone()) {
+            return None;
+        } else {
+            false
+        };
+        Some(Tree {
+            path: path.to_path_buf(),
+            canonical: target,
+            direct,
+        })
+    }
+}
+
+/// A directory that the walk of a folder reads together with the directories
+/// below it. The walk follows no link while it reads a tree. The target of a
+/// link that the walk follows is a tree of its own.
+#[derive(Debug)]
+struct Tree {
+    /// The path at which the walk opens the directory: the path of the
+    /// folder, or a path below it.
+    path: PathBuf,
+    /// The canonical path of the directory.
+    canonical: PathBuf,
+    /// Whether the walk reached the directory from the folder through no
+    /// link. A file in such a tree is at its own path.
+    direct: bool,
+}
+
+/// What the walk does with a symbolic link.
+enum Link {
+    /// The walk leaves the link: its target is outside the configured
+    /// folders, cannot be resolved, is no file and no directory, or is a
+    /// directory that a walk reads without this link.
+    Skipped,
+    /// The target is a directory that the walk reads as a tree.
+    Directory(Tree),
+    /// The target is a regular file inside a configured folder.
+    File {
+        /// The canonical path of the file.
+        target: PathBuf,
+        state: fs::Metadata,
+    },
 }
 
 /// A file that may be the new place of a missing track.
@@ -543,6 +645,7 @@ struct Scanner<'a> {
     reader: &'a FileReader,
     /// The folder rows of the configured folders.
     folders: Vec<Folder>,
+    links: Links,
     unread: Unread,
     summary: ScanSummary,
 }
@@ -578,8 +681,27 @@ impl Scanner<'_> {
                 .enumerate()
                 .map(|(row, entry)| (locator(entry), row))
                 .collect();
-            for folder in self.folders.clone() {
-                let walk = self.walk(&folder, &lookup, index, &mut states, &mut found);
+            // Every folder is resolved before the first walk, because a
+            // link in one folder can point into another one.
+            let roots: Vec<io::Result<PathBuf>> = self
+                .folders
+                .iter()
+                .map(|folder| fs::canonicalize(&folder.path))
+                .collect();
+            self.links.roots = roots
+                .iter()
+                .filter_map(|root| root.as_ref().ok().cloned())
+                .collect();
+            for (folder, root) in self.folders.clone().into_iter().zip(roots) {
+                let walk = self.walk(&folder, root, &lookup, index, &mut states, &mut found);
+                if walk.outside_links > 0 {
+                    // Each link is in the debug log of the walk.
+                    tracing::info!(
+                        folder = %folder.path.display(),
+                        links = walk.outside_links,
+                        "symbolic links that point outside the music folders were not followed"
+                    );
+                }
                 if self.cancel.is_cancelled() {
                     return Ok(Outcome::Cancelled);
                 }
@@ -681,125 +803,250 @@ impl Scanner<'_> {
         Ok(())
     }
 
-    /// Walks `folder`. Marks the rows whose path holds a file and sorts the
-    /// supported files into unchanged, changed and new.
+    /// Walks `folder`, whose canonical path is `root`. Marks the rows whose
+    /// path holds a file and sorts the supported files into unchanged,
+    /// changed and new.
+    ///
+    /// The walk reads the folder as a tree and follows no symbolic link
+    /// while it reads a tree. It resolves each link it sees ([`Self::link`])
+    /// and reads the target of a link it follows as a further tree, whose
+    /// files have their paths through the link. A file that the walk reaches
+    /// through a link gets a row only when no walk reaches it at its own
+    /// path and no walk saw it through another link before
+    /// ([`Links::takes`]).
     fn walk(
         &mut self,
         folder: &Folder,
+        root: io::Result<PathBuf>,
         lookup: &HashMap<(i64, &str), usize>,
         index: &[IndexEntry],
         states: &mut [RowState],
         found: &mut Found,
     ) -> FolderWalk {
         let mut walk = FolderWalk::default();
-        let mut entries = WalkDir::new(&folder.path)
-            .follow_links(true)
-            .sort_by_file_name()
-            .into_iter();
-        while let Some(entry) = entries.next() {
-            if self.cancel.is_cancelled() {
-                break;
+        // A folder whose path does not resolve is an unread root, so that a
+        // scan that compares no link with the folder deletes nothing.
+        let directory = root.and_then(|root| Ok((fs::metadata(&root)?.is_dir(), root)));
+        let root = match directory {
+            Ok((true, root)) => root,
+            Ok((false, _)) => {
+                self.unread_root(folder, &mut walk, "it is not a directory");
+                return walk;
             }
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) => {
-                    self.walk_error(folder, &mut walk, &error);
-                    continue;
-                }
-            };
-            let is_dir = entry.file_type().is_dir();
-            if entry.depth() == 0 {
-                if !is_dir {
-                    walk.unread.push(String::new());
-                    self.problem(format!(
-                        "music folder {} cannot be read: it is not a directory; no track was \
-                         deleted",
-                        describe(folder)
-                    ));
-                }
-                continue;
+            Err(error) => {
+                self.unread_root(folder, &mut walk, &error.to_string());
+                return walk;
             }
-            let name = entry.file_name();
-            if is_hidden(name) || (is_dir && is_system_directory(name)) {
-                // The walk has opened the directory. Leaving it here also
-                // drops the error of a directory that cannot be listed.
-                if is_dir {
-                    entries.skip_current_dir();
+        };
+        let mut trees = VecDeque::from([Tree {
+            path: folder.path.clone(),
+            canonical: root,
+            direct: true,
+        }]);
+        while let Some(tree) = trees.pop_front() {
+            // A link at the path of the tree itself is followed: it is the
+            // folder, or a link that `link` resolved.
+            let mut entries = WalkDir::new(&tree.path)
+                .follow_links(false)
+                .sort_by_file_name()
+                .into_iter();
+            while let Some(entry) = entries.next() {
+                if self.cancel.is_cancelled() {
+                    return walk;
                 }
-                continue;
-            }
-            let relative = entry.path().strip_prefix(&folder.path).ok();
-            let Some(rel_path) = relative.and_then(rel_path) else {
-                tracing::warn!(
-                    path = %entry.path().display(),
-                    "the name is not valid Unicode; the entry is skipped"
-                );
-                if is_dir {
-                    entries.skip_current_dir();
-                }
-                continue;
-            };
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            if let Some(rank) = cover_rank(file_name(&rel_path)) {
-                // `library::covers` reads an image file only when its path
-                // names a regular file, so a symbolic link with the name of
-                // a cover image is no cover. A link could name any file that
-                // the server can read. The directory of the image can be a
-                // link.
-                if entry.path_is_symlink() {
-                    tracing::debug!(
-                        path = %entry.path().display(),
-                        "the cover image is a symbolic link; the image is skipped"
-                    );
-                    continue;
-                }
-                match file_state(&entry) {
-                    Ok((mtime, _)) => walk.see_cover(&rel_path, rank, mtime),
-                    // An image file is the file of no track, so it holds no
-                    // deletion back.
-                    Err(cause) => tracing::warn!(
-                        path = %entry.path().display(),
-                        cause,
-                        "the state of the cover image cannot be read; the image is skipped"
-                    ),
-                }
-                continue;
-            }
-            if !tags::is_supported(entry.path()) {
-                continue;
-            }
-            let (mtime, size) = match file_state(&entry) {
-                Ok(state) => state,
-                Err(cause) => {
-                    self.unread_path(folder, &mut walk, rel_path, &cause);
-                    continue;
-                }
-            };
-            walk.supported += 1;
-            walk.see_audio(&rel_path);
-            self.summary.seen += 1;
-            let file = FoundFile {
-                folder_id: folder.id,
-                rel_path,
-                mtime,
-                size,
-            };
-            match lookup.get(&(folder.id, file.rel_path.as_str())) {
-                Some(&row) => {
-                    states[row] = RowState::Present;
-                    let known = &index[row];
-                    if !self.full && known.mtime == mtime && known.size == size {
-                        self.advance(1);
-                    } else {
-                        found.changed.push((row, file));
+                let entry = match entry {
+                    Ok(entry) => entry,
+                    Err(error) => {
+                        self.walk_error(folder, &mut walk, &error);
+                        continue;
                     }
+                };
+                if entry.depth() == 0 {
+                    continue;
                 }
-                None => found.new.push(file),
+                let name = entry.file_name();
+                let is_dir = entry.file_type().is_dir();
+                let is_link = entry.file_type().is_symlink();
+                // A link has the type of its target, which is not known
+                // before the link is resolved. Its name alone decides, as for
+                // an entry that cannot be read.
+                if is_hidden(name) || ((is_dir || is_link) && is_system_directory(name)) {
+                    // The walk has opened the directory. Leaving it here also
+                    // drops the error of a directory that cannot be listed.
+                    if is_dir {
+                        entries.skip_current_dir();
+                    }
+                    continue;
+                }
+                let relative = entry.path().strip_prefix(&folder.path).ok();
+                let Some(rel_path) = relative.and_then(rel_path) else {
+                    tracing::warn!(
+                        path = %entry.path().display(),
+                        "the name is not valid Unicode; the entry is skipped"
+                    );
+                    if is_dir {
+                        entries.skip_current_dir();
+                    }
+                    continue;
+                };
+                // The file behind a link, or `None` for a file that is the
+                // entry itself.
+                let linked = if is_link {
+                    match self.link(folder, &mut walk, &tree, entry.path(), &rel_path) {
+                        Link::Skipped => continue,
+                        Link::Directory(target) => {
+                            trees.push_back(target);
+                            continue;
+                        }
+                        Link::File { target, state } => Some((target, state)),
+                    }
+                } else if entry.file_type().is_file() {
+                    None
+                } else {
+                    // A directory, which the walk enters by itself, or a
+                    // device, a pipe or a socket, which is not opened.
+                    continue;
+                };
+                if let Some(rank) = cover_rank(file_name(&rel_path)) {
+                    // `library::covers` reads an image file only when its
+                    // path names a regular file, so a symbolic link with the
+                    // name of a cover image is no cover. A link could name
+                    // any file that the server can read. The directory of
+                    // the image can be a link that the walk followed.
+                    if linked.is_some() {
+                        tracing::debug!(
+                            path = %entry.path().display(),
+                            "the cover image is a symbolic link; the image is skipped"
+                        );
+                        continue;
+                    }
+                    match file_state(&entry) {
+                        Ok((mtime, _)) => walk.see_cover(&rel_path, rank, mtime),
+                        // An image file is the file of no track, so it holds
+                        // no deletion back.
+                        Err(cause) => tracing::warn!(
+                            path = %entry.path().display(),
+                            cause,
+                            "the state of the cover image cannot be read; the image is skipped"
+                        ),
+                    }
+                    continue;
+                }
+                if !tags::is_supported(entry.path()) {
+                    continue;
+                }
+                // The canonical path of a file that the walk reached through
+                // a link: the target of the entry, or a file in the target
+                // of a link above it.
+                let through_link = match &linked {
+                    Some((target, _)) => Some(target.clone()),
+                    None if tree.direct => None,
+                    None => Some(tree.canonical.join(below(&tree, entry.path()))),
+                };
+                if through_link.is_some_and(|file| !self.links.takes(file)) {
+                    continue;
+                }
+                let state = match &linked {
+                    Some((_, state)) => state_of(state),
+                    None => file_state(&entry),
+                };
+                let (mtime, size) = match state {
+                    Ok(state) => state,
+                    Err(cause) => {
+                        self.unread_path(folder, &mut walk, rel_path, &cause);
+                        continue;
+                    }
+                };
+                walk.supported += 1;
+                walk.see_audio(&rel_path);
+                self.summary.seen += 1;
+                let file = FoundFile {
+                    folder_id: folder.id,
+                    rel_path,
+                    mtime,
+                    size,
+                };
+                match lookup.get(&(folder.id, file.rel_path.as_str())) {
+                    Some(&row) => {
+                        states[row] = RowState::Present;
+                        let known = &index[row];
+                        if !self.full && known.mtime == mtime && known.size == size {
+                            self.advance(1);
+                        } else {
+                            found.changed.push((row, file));
+                        }
+                    }
+                    None => found.new.push(file),
+                }
             }
         }
         walk
+    }
+
+    /// Resolves the symbolic link at `path`, an entry of `tree` with the
+    /// relative path `rel_path`, and decides what the walk does with it.
+    ///
+    /// - A link that cannot be resolved is an unread path. Its target is
+    ///   gone, a directory on the way to the target cannot be searched, or
+    ///   the link leads back to itself. The scan does not know where such a
+    ///   link points, so the files of rows may be behind it.
+    /// - A link whose target is outside every configured folder is left
+    ///   alone and counted. It is no unread path: no file behind it gets a
+    ///   row. Only the path of the target is read, not the target.
+    /// - A link to a regular file inside a configured folder is returned as
+    ///   that file.
+    /// - A link to a directory inside a configured folder is followed when
+    ///   no walk reaches the directory at its own path and no walk followed
+    ///   another link to it ([`Links::tree_behind`]).
+    /// - A link to anything else, such as a device or a pipe, is left alone.
+    fn link(
+        &mut self,
+        folder: &Folder,
+        walk: &mut FolderWalk,
+        tree: &Tree,
+        path: &Path,
+        rel_path: &str,
+    ) -> Link {
+        let target = match fs::canonicalize(path) {
+            Ok(target) => target,
+            Err(error) => {
+                self.unread_path(folder, walk, rel_path.to_owned(), &error.to_string());
+                return Link::Skipped;
+            }
+        };
+        if !inside(&target, &self.links.roots) {
+            walk.outside_links += 1;
+            tracing::debug!(
+                link = %path.display(),
+                target = %target.display(),
+                "the link points outside the music folders; it is not followed"
+            );
+            return Link::Skipped;
+        }
+        let state = match fs::metadata(&target) {
+            Ok(state) => state,
+            Err(error) => {
+                self.unread_path(folder, walk, rel_path.to_owned(), &error.to_string());
+                return Link::Skipped;
+            }
+        };
+        if state.is_file() {
+            return Link::File { target, state };
+        }
+        if !state.is_dir() {
+            // A device, a pipe or a socket. Nothing opens it.
+            return Link::Skipped;
+        }
+        match self.links.tree_behind(tree, path, target) {
+            Some(target) => Link::Directory(target),
+            None => {
+                tracing::debug!(
+                    link = %path.display(),
+                    "the walk reads the target of the link without this link; it is not followed"
+                );
+                Link::Skipped
+            }
+        }
     }
 
     /// Records what the walk of `folder` could not read.
@@ -807,12 +1054,8 @@ impl Scanner<'_> {
         let cause = error
             .io_error()
             .map_or_else(|| error.to_string(), ToString::to_string);
-        if error.depth() == 0 {
-            walk.unread.push(String::new());
-            self.problem(format!(
-                "music folder {} cannot be read: {cause}; no track was deleted",
-                describe(folder)
-            ));
+        if error.path() == Some(folder.path.as_path()) {
+            self.unread_root(folder, walk, &cause);
             return;
         }
         let relative = error
@@ -844,6 +1087,15 @@ impl Scanner<'_> {
                 "the entry cannot be read; it is skipped"
             ),
         }
+    }
+
+    /// Records that the walk could not read `folder` itself.
+    fn unread_root(&mut self, folder: &Folder, walk: &mut FolderWalk, cause: &str) {
+        walk.unread.push(String::new());
+        self.problem(format!(
+            "music folder {} cannot be read: {cause}; no track was deleted",
+            describe(folder)
+        ));
     }
 
     /// Records that the walk could not read `rel_path` in `folder`.
@@ -1793,8 +2045,69 @@ fn cached_cover_id(name: &str) -> Option<&str> {
 /// of `entry`, or the reason why they cannot be read.
 fn file_state(entry: &walkdir::DirEntry) -> std::result::Result<(i64, u64), String> {
     let metadata = entry.metadata().map_err(|error| error.to_string())?;
+    state_of(&metadata)
+}
+
+/// Returns the modification time in Unix seconds and the size that
+/// `metadata` holds, or the reason why the time cannot be read.
+fn state_of(metadata: &fs::Metadata) -> std::result::Result<(i64, u64), String> {
     let modified = metadata.modified().map_err(|error| error.to_string())?;
     Ok((unix_seconds(modified), metadata.len()))
+}
+
+/// Returns the part of `path` below the path of `tree`. `path` is the path
+/// of an entry that the walk of the tree returned.
+fn below<'a>(tree: &Tree, path: &'a Path) -> &'a Path {
+    path.strip_prefix(&tree.path).unwrap_or(path)
+}
+
+/// Returns whether `target` is one of `roots` or below one of them. Both are
+/// canonical paths.
+///
+/// The paths are compared component by component and in the letter case that
+/// they have. On macOS and on Windows, whose file systems ignore the case by
+/// default, `fs::canonicalize` returns each name as the file system stores
+/// it, so two paths of one file do not differ in case. On Windows it returns
+/// both paths in the form that starts with `\\?\`. `media::stream` compares
+/// the same paths in the same way before it serves a file, so a file that
+/// has a row here passes the check there.
+fn inside(target: &Path, roots: &[PathBuf]) -> bool {
+    roots.iter().any(|root| target.starts_with(root))
+}
+
+/// Returns whether the walk of a configured folder reaches `target` at its
+/// own path, which is through no link. `target` is a canonical path, a
+/// directory when `is_dir` is set and else a file. `roots` holds the
+/// canonical paths of the configured folders.
+///
+/// A walk reaches a path below its folder when it skips no name of the
+/// path: no name starts with `.`, no directory has the name of a system
+/// directory, and every name is valid Unicode. A file is reached when its
+/// extension is a supported one as well. The folder itself is reached
+/// whatever its name is.
+fn walks_reach(target: &Path, roots: &[PathBuf], is_dir: bool) -> bool {
+    if !is_dir && !tags::is_supported(target) {
+        return false;
+    }
+    roots.iter().any(|root| {
+        let Ok(relative) = target.strip_prefix(root) else {
+            return false;
+        };
+        let mut names = relative.components().peekable();
+        while let Some(component) = names.next() {
+            let Component::Normal(name) = component else {
+                return false;
+            };
+            let directory = is_dir || names.peek().is_some();
+            if name.to_str().is_none()
+                || is_hidden(name)
+                || (directory && is_system_directory(name))
+            {
+                return false;
+            }
+        }
+        true
+    })
 }
 
 /// Returns `time` in whole Unix seconds, rounded towards the past.
@@ -2515,6 +2828,282 @@ mod tests {
         for name in ["Lost+Found", "lost+found 2", "RECYCLE.BIN", "Music", ""] {
             assert!(!is_system_directory(OsStr::new(name)), "{name}");
         }
+    }
+
+    /// Returns an absolute path of `names` in the form that
+    /// `fs::canonicalize` returns on the OS of the test run.
+    fn canonical(names: &[&str]) -> PathBuf {
+        let mut path = PathBuf::from(if cfg!(windows) { r"\\?\C:\" } else { "/" });
+        path.extend(names);
+        path
+    }
+
+    #[test]
+    fn a_target_is_inside_a_folder_when_it_is_the_folder_or_below_it() {
+        let roots = [canonical(&["srv", "music"]), canonical(&["mnt", "more"])];
+        for names in [
+            &["srv", "music"][..],
+            &["srv", "music", "Artist"],
+            &["srv", "music", "Artist", "Album", "01.flac"],
+            &["srv", "music", ".hidden", "01.flac"],
+            &["mnt", "more"],
+            &["mnt", "more", "01.flac"],
+        ] {
+            assert!(inside(&canonical(names), &roots), "{names:?}");
+        }
+        for names in [
+            // The directories above a folder, and the root of the volume.
+            &[][..],
+            &["srv"],
+            &["mnt"],
+            // A directory next to a folder whose name starts with the name
+            // of the folder.
+            &["srv", "music2"],
+            &["srv", "music2", "01.flac"],
+            &["srv", "musi"],
+            &["srv", "other", "music"],
+            &["music"],
+            &["dev", "null"],
+        ] {
+            assert!(!inside(&canonical(names), &roots), "{names:?}");
+        }
+        assert!(!inside(&canonical(&["srv", "music"]), &[]));
+    }
+
+    #[test]
+    fn a_target_is_compared_with_the_folders_in_the_letter_case_it_has() {
+        // `fs::canonicalize` returns both paths in the case of the file
+        // system, so a path of the folder in another case is another
+        // directory, which a file system that tells the cases apart can hold.
+        let roots = [canonical(&["srv", "Music"])];
+        assert!(inside(&canonical(&["srv", "Music", "a.flac"]), &roots));
+        assert!(!inside(&canonical(&["srv", "music", "a.flac"]), &roots));
+        assert!(!inside(&canonical(&["SRV", "Music", "a.flac"]), &roots));
+    }
+
+    // The forms of a canonical path that only Windows has: a drive and a
+    // network share, both with the `\\?\` prefix.
+    #[cfg(windows)]
+    #[test]
+    fn a_windows_target_is_inside_a_folder_of_its_drive_or_its_share_only() {
+        let roots = [
+            PathBuf::from(r"\\?\C:\Music"),
+            PathBuf::from(r"\\?\UNC\nas\media\Music"),
+        ];
+        for target in [
+            r"\\?\C:\Music",
+            r"\\?\C:\Music\Artist\01.flac",
+            r"\\?\UNC\nas\media\Music\Artist\01.flac",
+        ] {
+            assert!(inside(Path::new(target), &roots), "{target}");
+        }
+        for target in [
+            r"\\?\C:\",
+            r"\\?\C:\Music2\01.flac",
+            r"\\?\D:\Music\01.flac",
+            r"\\?\UNC\nas\media\01.flac",
+            r"\\?\UNC\nas\other\Music\01.flac",
+            r"\\?\UNC\other\media\Music\01.flac",
+            // A path without the prefix is no result of `fs::canonicalize`.
+            r"C:\Music\01.flac",
+        ] {
+            assert!(!inside(Path::new(target), &roots), "{target}");
+        }
+        assert!(walks_reach(
+            Path::new(r"\\?\C:\Music\Artist\01.flac"),
+            &roots,
+            false
+        ));
+        assert!(!walks_reach(
+            Path::new(r"\\?\C:\Music\$RECYCLE.BIN\01.flac"),
+            &roots,
+            false
+        ));
+    }
+
+    #[test]
+    fn a_walk_reaches_the_paths_in_a_folder_that_have_no_skipped_name() {
+        let roots = [canonical(&["srv", "music"])];
+        let reaches = |names: &[&str], is_dir: bool| {
+            let mut path = roots[0].clone();
+            path.extend(names);
+            walks_reach(&path, &roots, is_dir)
+        };
+
+        // The folder itself, directories and supported files.
+        assert!(reaches(&[], true));
+        assert!(reaches(&["Artist"], true));
+        assert!(reaches(&["Artist", "Album"], true));
+        assert!(reaches(&["Artist", "Album", "01.flac"], false));
+        assert!(reaches(&["01.MP3"], false));
+        // A directory with the name of an audio file, and a file with the
+        // name of a system directory and a supported extension.
+        assert!(reaches(&["Album.flac"], true));
+        assert!(reaches(&["Album.flac", "01.flac"], false));
+        assert!(reaches(&["Artist", "lost+found.flac"], false));
+
+        // A name that starts with a dot, at every place of the path.
+        assert!(!reaches(&[".store"], true));
+        assert!(!reaches(&[".store", "Album"], true));
+        assert!(!reaches(&[".store", "Album", "01.flac"], false));
+        assert!(!reaches(&["Artist", ".hidden.flac"], false));
+        // A system directory, at every depth.
+        assert!(!reaches(&["lost+found"], true));
+        assert!(!reaches(&["Artist", "$RECYCLE.BIN", "01.flac"], false));
+        assert!(!reaches(&["System Volume Information", "Album"], true));
+        // A file that the walk does not take: another extension, or none.
+        assert!(!reaches(&["Artist", "notes.txt"], false));
+        assert!(!reaches(&["Artist", "cover.jpg"], false));
+        assert!(!reaches(&["Artist", "Album"], false));
+        // A file is not below the folder when it is the folder.
+        assert!(!reaches(&[], false));
+    }
+
+    #[test]
+    fn a_walk_reaches_no_path_outside_the_folders() {
+        let roots = [canonical(&["srv", "music"])];
+        for names in [
+            &[][..],
+            &["srv"],
+            &["srv", "music2", "01.flac"],
+            &["mnt", "more", "01.flac"],
+        ] {
+            assert!(!walks_reach(&canonical(names), &roots, false), "{names:?}");
+            assert!(!walks_reach(&canonical(names), &roots, true), "{names:?}");
+        }
+        assert!(!walks_reach(&canonical(&["srv", "music"]), &[], true));
+    }
+
+    #[test]
+    fn the_walk_of_a_folder_below_a_skipped_name_reaches_its_own_paths() {
+        // The name of a folder itself is exempt from the rules of the walk,
+        // so a folder can be a directory that the walk of another folder
+        // skips.
+        let roots = [
+            canonical(&["srv", "music"]),
+            canonical(&["srv", "music", ".store"]),
+        ];
+        let file = canonical(&["srv", "music", ".store", "Album", "01.flac"]);
+        assert!(walks_reach(&file, &roots, false));
+        assert!(!walks_reach(&file, &roots[..1], false));
+        assert!(walks_reach(&roots[1], &roots, true));
+    }
+
+    // A name that is not valid Unicode is built from raw bytes, which only
+    // Unix allows.
+    #[cfg(unix)]
+    #[test]
+    fn a_walk_reaches_no_path_with_a_name_that_is_not_unicode() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let roots = [canonical(&["srv", "music"])];
+        let directory = roots[0].join(OsStr::from_bytes(b"bad\xff"));
+        assert!(!walks_reach(&directory, &roots, true));
+        assert!(!walks_reach(&directory.join("01.flac"), &roots, false));
+        // The file is inside the folder all the same.
+        assert!(inside(&directory.join("01.flac"), &roots));
+    }
+
+    #[test]
+    fn a_file_behind_a_link_gets_a_row_once_and_only_when_no_walk_reaches_it() {
+        let mut links = Links {
+            roots: vec![canonical(&["srv", "music"])],
+            ..Links::default()
+        };
+        let stored = canonical(&["srv", "music", ".store", "01.flac"]);
+        // The first link to a file that no walk reaches takes it.
+        assert!(links.takes(stored.clone()));
+        assert!(!links.takes(stored.clone()));
+        assert!(links.takes(canonical(&["srv", "music", ".store", "02.flac"])));
+        // A file at a path that the walk reaches has its row there.
+        let reached = canonical(&["srv", "music", "Artist", "01.flac"]);
+        assert!(!links.takes(reached.clone()));
+        assert!(!links.takes(reached));
+        assert_eq!(links.files.len(), 2);
+    }
+
+    #[test]
+    fn a_directory_behind_a_link_is_walked_once_and_only_when_no_walk_reaches_it() {
+        let root = canonical(&["srv", "music"]);
+        let mut links = Links {
+            roots: vec![root.clone()],
+            ..Links::default()
+        };
+        // The folder is walked at a path that is not its canonical path.
+        let folder = Tree {
+            path: canonical(&["links", "music"]),
+            canonical: root.clone(),
+            direct: true,
+        };
+        let link = folder.path.join("Artist").join("link");
+
+        // A target that the walk of the folder reaches: the directory of the
+        // link, a directory above it, the folder itself and another
+        // directory of the folder.
+        for names in [&["Artist"][..], &[], &["Other", "Album"]] {
+            let mut target = root.clone();
+            target.extend(names);
+            assert!(links.tree_behind(&folder, &link, target).is_none());
+        }
+        assert!(links.followed.is_empty());
+
+        // A target that no walk reaches is a tree whose files are behind a
+        // link. A second link to it is not followed.
+        let stored = root.join(".store").join("Album");
+        let behind = links
+            .tree_behind(&folder, &link, stored.clone())
+            .expect("the first link is followed");
+        assert_eq!(behind.path, link);
+        assert_eq!(behind.canonical, stored);
+        assert!(!behind.direct);
+        let second = folder.path.join("second link");
+        assert!(
+            links
+                .tree_behind(&folder, &second, stored.clone())
+                .is_none()
+        );
+        // A link in that tree that leads back to the tree is not followed.
+        let back = behind.path.join("Disc 1").join("back");
+        assert!(links.tree_behind(&behind, &back, stored).is_none());
+    }
+
+    #[test]
+    fn an_entry_that_resolves_to_its_own_path_is_a_directory_of_its_tree() {
+        // Windows reports a volume that is mounted at a directory as a link
+        // that resolves to the path of the directory.
+        let root = canonical(&["srv", "music"]);
+        let mut links = Links {
+            roots: vec![root.clone()],
+            ..Links::default()
+        };
+        let folder = Tree {
+            path: canonical(&["links", "music"]),
+            canonical: root.clone(),
+            direct: true,
+        };
+        let mounted = folder.path.join("Volume");
+        for _ in 0..2 {
+            let tree = links
+                .tree_behind(&folder, &mounted, root.join("Volume"))
+                .expect("the directory is walked on every scan of the tree");
+            assert_eq!(tree.path, mounted);
+            assert_eq!(tree.canonical, root.join("Volume"));
+            assert!(tree.direct);
+        }
+        assert!(links.followed.is_empty());
+
+        // The same entry in a tree behind a link is a directory of that
+        // tree, whose files are behind the link.
+        let behind = Tree {
+            path: folder.path.join("link"),
+            canonical: root.join(".store"),
+            direct: false,
+        };
+        let mounted = behind.path.join("Volume");
+        let tree = links
+            .tree_behind(&behind, &mounted, root.join(".store").join("Volume"))
+            .expect("the directory is walked");
+        assert!(!tree.direct);
     }
 
     #[test]

@@ -1387,9 +1387,11 @@ fn tracks_of_a_removed_folder_are_kept_while_a_configured_folder_does_not_exist(
 fn tracks_below_a_link_whose_target_is_gone_are_kept() {
     let library = LibraryBuilder::standard().build();
     let root = library.root.path();
-    // The directory of one artist is on another volume, behind a link.
-    let volume = tempfile::tempdir().unwrap();
-    let target = volume.path().join("Marlow Quartet");
+    // The directory of one artist is in a directory of the folder that the
+    // walk skips, behind a link.
+    let store = root.join(".store");
+    fs::create_dir(&store).unwrap();
+    let target = store.join("Marlow Quartet");
     let link = root.join("Marlow Quartet");
     fs::rename(&link, &target).unwrap();
     std::os::unix::fs::symlink(&target, &link).unwrap();
@@ -1399,8 +1401,8 @@ fn tracks_below_a_link_whose_target_is_gone_are_kept() {
     assert_eq!(scanned.env.count(), 10);
     let before = scanned.env.index();
 
-    // The volume goes away. The link stays and leads nowhere.
-    let unmounted = volume.path().join("unmounted");
+    // The directory goes away. The link stays and leads nowhere.
+    let unmounted = store.join("unmounted");
     fs::rename(&target, &unmounted).unwrap();
     let summary = scanned.rescan();
 
@@ -1413,7 +1415,7 @@ fn tracks_below_a_link_whose_target_is_gone_are_kept() {
     assert!(error.contains("no track was deleted"), "{error}");
     assert_eq!(scanned.env.index(), before);
 
-    // The volume is back.
+    // The directory is back.
     fs::rename(&unmounted, &target).unwrap();
     assert_eq!(scanned.rescan(), seen(10));
     assert_eq!(scanned.env.index(), before);
@@ -1488,12 +1490,12 @@ fn a_file_moved_below_a_link_whose_target_is_gone_keeps_its_id() {
     attach(&scanned.env.db, &id);
     let before = scanned.env.index();
 
-    // The file moves to a directory on another volume, which the library
-    // reaches through a link. The volume is not mounted.
-    let volume = tempfile::tempdir().unwrap();
-    let mounted = volume.path().join("archive");
-    let unmounted = volume.path().join("unmounted");
-    fs::create_dir(&unmounted).unwrap();
+    // The file moves to a directory of the folder that the walk skips and
+    // that the library reaches through a link. The directory is not where
+    // the link points.
+    let mounted = scanned.path(".store/archive");
+    let unmounted = scanned.path(".store/unmounted");
+    fs::create_dir_all(&unmounted).unwrap();
     fs::rename(scanned.path(LOW_TIDE), unmounted.join("01 Low Tide.flac")).unwrap();
     std::os::unix::fs::symlink(&mounted, scanned.path("Archive")).unwrap();
     let summary = scanned.rescan();
@@ -1509,9 +1511,894 @@ fn a_file_moved_below_a_link_whose_target_is_gone_keeps_its_id() {
         Some((scanned.folder_id, LOW_TIDE.to_owned()))
     );
 
-    // The volume is mounted and the scan reads the file.
+    // The directory is where the link points, and the scan reads the file.
     fs::rename(&unmounted, &mounted).unwrap();
     assert_moved(&scanned, &id, LOW_TIDE, "Archive/01 Low Tide.flac");
+}
+
+// The tests of the symbolic links that the walk resolves. A symbolic link is
+// created with a Unix call. On Windows the call needs a privilege that a
+// test run does not have, so these tests run on Unix only. The unit tests in
+// `src/library/scanner.rs` compare the target of a link with the folders on
+// every OS.
+#[cfg(unix)]
+mod links {
+    use std::os::unix::fs::symlink;
+    use std::process::Command;
+    use std::sync::mpsc;
+
+    use super::common::{LogBuffer, captured_log};
+    use super::*;
+
+    /// Returns the relative path of every track row, in the order of the
+    /// locators.
+    fn stored(env: &TestDb) -> Vec<String> {
+        env.index()
+            .into_keys()
+            .map(|(_, rel_path)| rel_path)
+            .collect()
+    }
+
+    /// Returns the relative paths of the standard catalogue and `more`, in
+    /// their order.
+    fn standard_paths_and(more: &[&str]) -> Vec<String> {
+        let mut paths: Vec<String> = STANDARD
+            .iter()
+            .chain(more)
+            .map(|&path| path.to_owned())
+            .collect();
+        paths.sort_unstable();
+        paths
+    }
+
+    /// Writes an audio file with the title `title`. Files with different
+    /// titles have different bytes, and each differs from every file of the
+    /// standard library.
+    fn write_track(to: &Path, title: &str) {
+        let other = LibraryBuilder::new()
+            .track("Linked Artist", "Linked Album", title, 1, "flac")
+            .build();
+        fs::create_dir_all(to.parent().unwrap()).unwrap();
+        fs::copy(&other.files[0], to).unwrap();
+    }
+
+    /// Returns the last component of a relative path.
+    fn file_name(rel_path: &str) -> &str {
+        rel_path.rsplit_once('/').map_or(rel_path, |(_, name)| name)
+    }
+
+    /// Asserts that the latest scan was the first scan of a library whose
+    /// rows are the ten standard tracks, and that it recorded no error.
+    fn assert_first_scan_stored_the_standard_tracks(env: &TestDb) {
+        assert_eq!(stored(env), standard_paths_and(&[]));
+        let scan = env.latest_scan();
+        assert_eq!(scan.error, None);
+        assert_eq!(
+            scan.counts,
+            ScanCounts {
+                seen: 10,
+                added: 10,
+                ..ScanCounts::default()
+            }
+        );
+    }
+
+    /// Runs a scan that is not full on a thread of its own and returns its
+    /// summary. A walk that follows a link out of the folders or around a
+    /// loop does not end, and a scan that opens a named pipe waits for a
+    /// writer. The test therefore fails when the scan has not ended after
+    /// ten seconds. A scan that ends is not waited for.
+    fn scan_with_limit(env: &TestDb, folders: &[&Path]) -> ScanSummary {
+        let folders: Vec<PathBuf> = folders.iter().map(|path| path.to_path_buf()).collect();
+        let db = env.db.clone();
+        let cancel = CancellationToken::new();
+        let (done, result) = mpsc::channel();
+        let thread = std::thread::spawn({
+            let cancel = cancel.clone();
+            move || {
+                let summary = scanner::scan(&db, &folders, &cancel, false, ScanOptions::default());
+                // The receiver is gone when the test has failed.
+                let _ = done.send(summary);
+            }
+        });
+        match result.recv_timeout(Duration::from_secs(10)) {
+            Ok(summary) => summary.expect("the scan returns a summary"),
+            // The thread ended without a summary.
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                thread.join().expect("the scan does not panic");
+                unreachable!("the scan thread sends its summary");
+            }
+            // The thread is not joined: it may wait in a call that the
+            // cancellation does not end.
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                cancel.cancel();
+                panic!("the scan did not end within ten seconds");
+            }
+        }
+    }
+
+    /// The lines of the debug log that say that the scan skipped a link
+    /// below `root` whose target is outside the folders.
+    fn skipped_links(log: &LogBuffer, root: &Path) -> Vec<String> {
+        log.lines_with("the link points outside the music folders")
+            .into_iter()
+            .filter(|line| line.contains(&format!("link={}/", root.display())))
+            .inspect(|line| assert!(line.contains("DEBUG"), "{line}"))
+            .collect()
+    }
+
+    /// The lines of the info log that count the links of the folder `root`
+    /// whose target is outside the folders. A scan with such a link writes
+    /// one line.
+    fn counted_links(log: &LogBuffer, root: &Path) -> Vec<String> {
+        log.lines_with("symbolic links that point outside the music folders were not followed")
+            .into_iter()
+            .filter(|line| line.contains(&format!("folder={} links=", root.display())))
+            .inspect(|line| assert!(line.contains(" INFO "), "{line}"))
+            .collect()
+    }
+
+    #[test]
+    fn a_link_that_points_outside_the_folders_gives_no_row_and_no_error() {
+        let log = captured_log();
+        let library = LibraryBuilder::standard().build();
+        let root = library.root.path().to_path_buf();
+        // An album and a file outside the music folder.
+        let outside = tempfile::tempdir().unwrap();
+        write_track(&outside.path().join("Album/01 Elsewhere.flac"), "Elsewhere");
+        write_track(&outside.path().join("single.flac"), "Single");
+        // A link to the directory, a link to the file, a link to the first
+        // link, and a link with the name of a cover image.
+        let album = root.join("Aurora Field/Glass Harbour");
+        symlink(outside.path().join("Album"), root.join("Linked Album")).unwrap();
+        symlink(
+            outside.path().join("single.flac"),
+            album.join("04 Single.flac"),
+        )
+        .unwrap();
+        symlink("Linked Album", root.join("Second Link")).unwrap();
+        symlink(
+            outside.path().join("single.flac"),
+            root.join("Aurora Field/Paper Maps/cover.jpg"),
+        )
+        .unwrap();
+
+        let scanned = Scanned::of(library);
+        assert_first_scan_stored_the_standard_tracks(&scanned.env);
+
+        // Each link is in the debug log once, and their number is in one
+        // line of the info log that names the folder.
+        let skipped = skipped_links(&log, &root);
+        assert_eq!(skipped.len(), 4, "{skipped:?}");
+        for name in ["Linked Album", "04 Single.flac", "Second Link", "cover.jpg"] {
+            let named = skipped
+                .iter()
+                .filter(|line| line.contains(&format!("/{name} target=")));
+            assert_eq!(named.count(), 1, "{name}: {skipped:?}");
+        }
+        let counted = counted_links(&log, &root);
+        assert_eq!(counted.len(), 1, "{counted:?}");
+        assert!(counted[0].ends_with(" links=4"), "{counted:?}");
+
+        // The links hold no deletion back: a file that is gone loses its
+        // row.
+        fs::remove_file(scanned.path(BREAKWATER)).unwrap();
+        assert_eq!(
+            scanned.rescan(),
+            ScanSummary {
+                seen: 9,
+                removed: 1,
+                ..standard()
+            }
+        );
+        assert_eq!(scanned.find(BREAKWATER), None);
+        assert_eq!(scanned.env.latest_scan().error, None);
+    }
+
+    #[test]
+    fn links_to_the_root_directory_and_to_a_device_are_not_followed() {
+        let log = captured_log();
+        let library = LibraryBuilder::standard().build();
+        let root = library.root.path().to_path_buf();
+        // The root directory, and a device under the name of an audio file.
+        symlink("/", root.join("Everything")).unwrap();
+        symlink("/dev/null", root.join("Aurora Field/null.flac")).unwrap();
+
+        let env = TestDb::new();
+        scan_with_limit(&env, &[&root]);
+        assert_first_scan_stored_the_standard_tracks(&env);
+        // Both links are skipped as links out of the folders. A walk of the
+        // root directory that ends within the limit is therefore no pass.
+        let skipped = skipped_links(&log, &root);
+        assert_eq!(skipped.len(), 2, "{skipped:?}");
+        assert!(skipped[0].ends_with("/Aurora Field/null.flac target=/dev/null"));
+        assert!(skipped[1].ends_with("/Everything target=/"));
+        let counted = counted_links(&log, &root);
+        assert_eq!(counted.len(), 1, "{counted:?}");
+        assert!(counted[0].ends_with(" links=2"), "{counted:?}");
+
+        // The links hold no deletion back.
+        fs::remove_file(root.join(BREAKWATER)).unwrap();
+        assert_eq!(
+            scan_with_limit(&env, &[&root]),
+            ScanSummary {
+                seen: 9,
+                removed: 1,
+                ..standard()
+            }
+        );
+    }
+
+    #[test]
+    fn links_to_directories_above_the_link_start_no_loop() {
+        let log = captured_log();
+        // The music folder is one directory of the library, so that the
+        // directory above the folder is a directory of the test.
+        let library = LibraryBuilder::standard().build();
+        let folder = library.root.path().join("Aurora Field");
+        // The directory that holds the link, the directory above that one,
+        // and the folder itself. The walk reads each of them without the
+        // link.
+        symlink(".", folder.join("Glass Harbour/here")).unwrap();
+        symlink("..", folder.join("Glass Harbour/up")).unwrap();
+        symlink(&folder, folder.join("Paper Maps/whole folder")).unwrap();
+        // The directory above the folder is outside the folder.
+        symlink("..", folder.join("above")).unwrap();
+
+        let env = TestDb::new();
+        let first = scan_with_limit(&env, &[&folder]);
+        assert_eq!(first.errors, [""; 0]);
+        assert_eq!((first.seen, first.added), (7, 7));
+        let expected: Vec<String> = standard_paths_and(&[])
+            .into_iter()
+            .filter_map(|path| path.strip_prefix("Aurora Field/").map(str::to_owned))
+            .collect();
+        assert_eq!(stored(&env), expected);
+        let skipped = skipped_links(&log, &folder);
+        assert_eq!(skipped.len(), 1, "{skipped:?}");
+        assert!(skipped[0].contains("/above target="), "{skipped:?}");
+
+        let before = env.index();
+        let second = scan_with_limit(&env, &[&folder]);
+        assert_eq!((second.seen, second.added, second.moved), (7, 0, 0));
+        assert_eq!(env.index(), before);
+
+        // The links hold no deletion back.
+        fs::remove_file(folder.join("Glass Harbour/02 Breakwater.flac")).unwrap();
+        let third = scan_with_limit(&env, &[&folder]);
+        assert_eq!((third.seen, third.removed), (6, 1));
+        assert_eq!(third.errors, [""; 0]);
+    }
+
+    #[test]
+    fn a_named_pipe_and_a_link_to_one_are_not_opened() {
+        let library = LibraryBuilder::standard().build();
+        let root = library.root.path().to_path_buf();
+        // A named pipe under the name of an audio file. A second pipe is in
+        // a directory that the walk skips, behind a link with the name of an
+        // audio file. A process that opens a pipe to read it waits for a
+        // writer.
+        fs::create_dir(root.join(".store")).unwrap();
+        for pipe in ["Tessa Lund/pipe.flac", ".store/pipe"] {
+            let made = Command::new("mkfifo").arg(root.join(pipe)).status();
+            if !made.is_ok_and(|status| status.success()) {
+                eprintln!("not checked: mkfifo did not create a named pipe");
+                return;
+            }
+        }
+        symlink("../.store/pipe", root.join("Tessa Lund/piped.flac")).unwrap();
+
+        let env = TestDb::new();
+        scan_with_limit(&env, &[&root]);
+        assert_first_scan_stored_the_standard_tracks(&env);
+        assert_eq!(scan_with_limit(&env, &[&root]), seen(10));
+    }
+
+    #[test]
+    fn a_link_to_a_file_or_a_directory_that_the_walk_reaches_adds_no_row() {
+        let library = LibraryBuilder::standard().build();
+        let root = library.root.path().to_path_buf();
+        // A relative link to a file, and two links to directories.
+        fs::create_dir(root.join("Favourites")).unwrap();
+        symlink(
+            "../Aurora Field/Glass Harbour/01 Low Tide.flac",
+            root.join("Favourites/low tide.flac"),
+        )
+        .unwrap();
+        symlink(
+            root.join("Aurora Field/Paper Maps"),
+            root.join("Favourites/Paper Maps"),
+        )
+        .unwrap();
+        symlink(root.join("Marlow Quartet"), root.join("Linked Artist")).unwrap();
+
+        // Each file has one row, at its own path.
+        let scanned = Scanned::of(library);
+        assert_first_scan_stored_the_standard_tracks(&scanned.env);
+
+        // The rows stay at these paths from scan to scan.
+        let before = scanned.env.index();
+        for _ in 0..2 {
+            assert_eq!(scanned.rescan(), seen(10));
+            assert_eq!(scanned.env.index(), before);
+        }
+
+        // The links hold no deletion back.
+        fs::remove_file(scanned.path(BREAKWATER)).unwrap();
+        assert_eq!(
+            scanned.rescan(),
+            ScanSummary {
+                seen: 9,
+                removed: 1,
+                ..standard()
+            }
+        );
+    }
+
+    #[test]
+    fn a_link_to_a_file_or_a_directory_that_the_walk_skips_is_followed() {
+        let library = LibraryBuilder::standard().build();
+        let root = library.root.path().to_path_buf();
+        // The directory of one artist and the file of one track are in a
+        // directory of the folder that the walk skips. Links are at their
+        // paths.
+        let store = root.join(".store");
+        fs::create_dir(&store).unwrap();
+        fs::rename(root.join("Marlow Quartet"), store.join("Marlow Quartet")).unwrap();
+        symlink(".store/Marlow Quartet", root.join("Marlow Quartet")).unwrap();
+        fs::rename(root.join(LOW_TIDE), store.join("low tide.flac")).unwrap();
+        symlink(store.join("low tide.flac"), root.join(LOW_TIDE)).unwrap();
+
+        // Each file has its row at the path through its link.
+        let scanned = Scanned::of(library);
+        assert_first_scan_stored_the_standard_tracks(&scanned.env);
+        let before = scanned.env.index();
+        assert_eq!(scanned.rescan(), seen(10));
+        assert_eq!(scanned.env.index(), before);
+
+        // A second link to the directory and a second link to the file,
+        // both after the first ones in the order of the walk, add no row.
+        let album = "Aurora Field/Glass Harbour";
+        symlink(store.join("Marlow Quartet"), root.join("Second Link")).unwrap();
+        symlink(
+            store.join("low tide.flac"),
+            scanned.path(&format!("{album}/09 Again.flac")),
+        )
+        .unwrap();
+        for _ in 0..2 {
+            assert_eq!(scanned.rescan(), seen(10));
+            assert_eq!(scanned.env.index(), before);
+        }
+
+        // A link that comes before the first one in the order of the walk
+        // takes the file. The row follows with its ID.
+        let id = scanned.id_at(LOW_TIDE);
+        attach(&scanned.env.db, &id);
+        let first = format!("{album}/00 First.flac");
+        symlink(store.join("low tide.flac"), scanned.path(&first)).unwrap();
+        assert_eq!(
+            scanned.rescan(),
+            ScanSummary {
+                seen: 10,
+                moved: 1,
+                ..standard()
+            }
+        );
+        assert_eq!(scanned.find(LOW_TIDE), None);
+        assert_eq!(
+            attached(&scanned.env.db, &id),
+            Some((scanned.folder_id, first))
+        );
+        assert_eq!(scanned.rescan(), seen(10));
+    }
+
+    #[test]
+    fn a_link_into_another_folder_adds_no_row_for_a_file_that_the_walk_reaches_there() {
+        let two = TwoFolders::new();
+        let before = two.env.index();
+        let (aurora_id, marlow_id) = (
+            two.env.folder_id(&two.aurora),
+            two.env.folder_id(&two.marlow),
+        );
+        // A link to a directory and a link to a file from the first folder
+        // into the second one, and a link from the second folder to the
+        // first one.
+        symlink(two.marlow.join("Slow Rivers"), two.aurora.join("Guests")).unwrap();
+        symlink(
+            two.marlow.join("Slow Rivers/01 Upstream.m4a"),
+            two.aurora.join("Paper Maps/09 Upstream.m4a"),
+        )
+        .unwrap();
+        symlink(&two.aurora, two.marlow.join("Aurora Field")).unwrap();
+        for _ in 0..2 {
+            assert_eq!(two.rescan(), seen(9));
+            assert_eq!(two.env.index(), before);
+        }
+
+        // A file of the second folder moves to a directory that the walk of
+        // that folder skips. A link in the first folder leads to it, so the
+        // row follows the file to the path of the link.
+        let from = "Slow Rivers/02 Delta.m4a";
+        let to = "Paper Maps/08 Delta.m4a";
+        let id = two.env.id_at(marlow_id, from).unwrap();
+        attach(&two.env.db, &id);
+        move_file(&two.marlow.join(from), &two.marlow.join(".store/delta.m4a"));
+        symlink(two.marlow.join(".store/delta.m4a"), two.aurora.join(to)).unwrap();
+        assert_eq!(
+            two.rescan(),
+            ScanSummary {
+                seen: 9,
+                moved: 1,
+                ..standard()
+            }
+        );
+        assert_eq!(attached(&two.env.db, &id), Some((aurora_id, to.to_owned())));
+        assert_eq!(two.env.id_at(marlow_id, from), None);
+        assert_eq!(two.rescan(), seen(9));
+    }
+
+    #[test]
+    fn a_row_at_the_path_of_a_link_goes_when_the_walk_reaches_the_file_at_its_own_path() {
+        let scanned = Scanned::new();
+        // A directory with a copy of each file of one album. Each copy has
+        // a row of its own.
+        let album = "Aurora Field/Glass Harbour";
+        for name in [
+            "01 Low Tide.flac",
+            "02 Breakwater.flac",
+            "03 Night Ferry.flac",
+        ] {
+            copy_with_mtime(
+                &scanned.path(&format!("{album}/{name}")),
+                &scanned.path(&format!("Favourites/{name}")),
+            );
+        }
+        assert_eq!(scanned.rescan().added, 3);
+        let original = scanned.id_at(LOW_TIDE);
+        let copy = scanned.id_at("Favourites/01 Low Tide.flac");
+        attach(&scanned.env.db, &original);
+        attach(&scanned.env.db, &copy);
+
+        // A link to the album takes the place of the directory. The walk
+        // reaches the files of the album at their own paths, so it sees no
+        // file at the paths below the link, and their rows go as the rows of
+        // deleted files do.
+        fs::remove_dir_all(scanned.path("Favourites")).unwrap();
+        symlink(scanned.path(album), scanned.path("Favourites")).unwrap();
+        assert_eq!(
+            scanned.rescan(),
+            ScanSummary {
+                seen: 10,
+                removed: 3,
+                ..standard()
+            }
+        );
+        assert_eq!(stored(&scanned.env), standard_paths_and(&[]));
+        assert_eq!(
+            attached(&scanned.env.db, &original),
+            Some((scanned.folder_id, LOW_TIDE.to_owned()))
+        );
+        assert_eq!(attached(&scanned.env.db, &copy), None);
+        assert_eq!(count_rows(&scanned.env.db, "annotations"), 1);
+        assert_eq!(count_rows(&scanned.env.db, "playlist_tracks"), 1);
+    }
+
+    #[test]
+    fn a_folder_that_is_a_link_is_scanned_as_the_directory_it_points_to() {
+        let library = LibraryBuilder::standard().build();
+        let root = library.root.path().to_path_buf();
+        // The config names a link that leads to the library through a
+        // second link.
+        let elsewhere = tempfile::tempdir().unwrap();
+        symlink(&root, elsewhere.path().join("library")).unwrap();
+        let folder = elsewhere.path().join("music");
+        symlink("library", &folder).unwrap();
+        // The directory of one artist is in a directory that the walk
+        // skips, behind a link that names the directory by its own path and
+        // not through the folder link.
+        fs::create_dir(root.join(".store")).unwrap();
+        fs::rename(
+            root.join("Marlow Quartet"),
+            root.join(".store/Marlow Quartet"),
+        )
+        .unwrap();
+        symlink(
+            root.join(".store/Marlow Quartet"),
+            root.join("Marlow Quartet"),
+        )
+        .unwrap();
+        // A link that names a directory of the library through the folder
+        // link. The walk reaches that directory without it.
+        symlink(folder.join("Aurora Field"), root.join("Linked Artist")).unwrap();
+
+        let env = TestDb::new();
+        env.scan(&[&folder]);
+        assert_first_scan_stored_the_standard_tracks(&env);
+        // The folder row has the path of the config.
+        assert_eq!(env.folders().len(), 1);
+        assert_eq!(env.folders()[0].path, folder);
+        let before = env.index();
+        assert_eq!(env.scan(&[&folder]), seen(10));
+        assert_eq!(env.index(), before);
+
+        fs::remove_file(root.join(BREAKWATER)).unwrap();
+        assert_eq!(
+            env.scan(&[&folder]),
+            ScanSummary {
+                seen: 9,
+                removed: 1,
+                ..standard()
+            }
+        );
+    }
+
+    #[test]
+    fn a_row_behind_a_link_that_points_outside_goes_with_the_next_scan_that_reads_everything() {
+        let scanned = Scanned::new();
+        // The directory of one artist and the file of one track move out of
+        // the folder, and links are at their paths. The rows at the paths
+        // below the links are rows whose files the walk no longer sees.
+        let outside = tempfile::tempdir().unwrap();
+        let behind_links = [
+            BREAKWATER,
+            "Marlow Quartet/Slow Rivers/01 Upstream.m4a",
+            "Marlow Quartet/Slow Rivers/02 Delta.m4a",
+        ];
+        let ids = behind_links.map(|rel_path| scanned.id_at(rel_path));
+        for id in &ids {
+            attach(&scanned.env.db, id);
+        }
+        let kept = scanned.id_at(LOW_TIDE);
+        attach(&scanned.env.db, &kept);
+        for name in [BREAKWATER, "Marlow Quartet"] {
+            let target = outside.path().join(file_name(name));
+            fs::rename(scanned.path(name), &target).unwrap();
+            symlink(&target, scanned.path(name)).unwrap();
+        }
+        let before = scanned.env.index();
+
+        // While a directory with an ordinary name cannot be listed, the scan
+        // deletes no row: the files may be in that directory. A process
+        // that runs as root lists the directory, so this part checks nothing
+        // for it.
+        let audio = scanned.path(LOW_TIDE);
+        if let Some(private) = Unlistable::new(scanned.path("Private"), &audio) {
+            let summary = scanned.rescan();
+            assert_eq!(summary.seen, 7);
+            assert_eq!(summary.removed, 0);
+            assert_eq!(summary.errors.len(), 2, "{:?}", summary.errors);
+            assert!(summary.errors[0].contains("\"Private\""));
+            assert_eq!(
+                summary.errors[1],
+                "3 tracks whose files are gone were kept, because a path or a file could not be \
+                 read"
+            );
+            assert_eq!(scanned.env.index(), before);
+            for (id, rel_path) in ids.iter().zip(behind_links) {
+                assert_eq!(
+                    attached(&scanned.env.db, id),
+                    Some((scanned.folder_id, rel_path.to_owned()))
+                );
+            }
+            drop(private);
+        }
+        // The directory and the file in it are there in both cases, also
+        // for a process that lists the directory. They go before the next
+        // scan, which would give the file a row.
+        fs::remove_dir_all(scanned.path("Private")).unwrap();
+
+        // The scan that reads everything deletes the three rows with what
+        // is attached to them, and the album and the artist that have no
+        // other track.
+        assert_eq!(
+            scanned.rescan(),
+            ScanSummary {
+                seen: 7,
+                removed: 3,
+                albums: 3,
+                artists: 2,
+                ..ScanSummary::default()
+            }
+        );
+        assert_eq!(scanned.env.latest_scan().error, None);
+        for (id, rel_path) in ids.iter().zip(behind_links) {
+            assert_eq!(scanned.find(rel_path), None);
+            assert_eq!(attached(&scanned.env.db, id), None);
+        }
+        assert_eq!(
+            attached(&scanned.env.db, &kept),
+            Some((scanned.folder_id, LOW_TIDE.to_owned()))
+        );
+        assert_eq!(count_rows(&scanned.env.db, "annotations"), 1);
+        assert_eq!(count_rows(&scanned.env.db, "playlist_tracks"), 1);
+    }
+
+    #[test]
+    fn rows_behind_links_that_point_outside_stay_while_their_folder_has_no_supported_file() {
+        let scanned = Scanned::new();
+        let before = scanned.env.index();
+        // Every directory of the folder moves out of it, and links are at
+        // their paths.
+        let outside = tempfile::tempdir().unwrap();
+        for name in ["Aurora Field", "Marlow Quartet", "Tessa Lund"] {
+            fs::rename(scanned.path(name), outside.path().join(name)).unwrap();
+            symlink(outside.path().join(name), scanned.path(name)).unwrap();
+        }
+
+        // The rule for a folder that had tracks and yields no supported file
+        // keeps the rows.
+        let summary = scanned.rescan();
+        assert_eq!((summary.seen, summary.removed), (0, 0));
+        assert_eq!(summary.errors.len(), 1, "{:?}", summary.errors);
+        assert!(summary.errors[0].contains("has no supported file"));
+        assert_eq!(scanned.env.index(), before);
+
+        // The folder holds a file, and the rows go.
+        write_track(&scanned.path("01 Here.flac"), "Here");
+        assert_eq!(
+            scanned.rescan(),
+            ScanSummary {
+                seen: 1,
+                added: 1,
+                removed: 10,
+                tags_read: 1,
+                albums: 1,
+                artists: 1,
+                ..ScanSummary::default()
+            }
+        );
+        assert_eq!(stored(&scanned.env), ["01 Here.flac"]);
+    }
+
+    #[test]
+    fn rows_behind_a_link_that_points_outside_follow_their_files_into_a_folder_that_is_added() {
+        let scanned = Scanned::new();
+        let moved = [
+            "Marlow Quartet/Slow Rivers/01 Upstream.m4a",
+            "Marlow Quartet/Slow Rivers/02 Delta.m4a",
+        ];
+        let ids = moved.map(|rel_path| scanned.id_at(rel_path));
+        for id in &ids {
+            attach(&scanned.env.db, id);
+        }
+        // The directory of one artist is on another volume, and a link is at
+        // its path.
+        let volume = tempfile::tempdir().unwrap();
+        fs::rename(
+            scanned.path("Marlow Quartet"),
+            volume.path().join("Marlow Quartet"),
+        )
+        .unwrap();
+        symlink(
+            volume.path().join("Marlow Quartet"),
+            scanned.path("Marlow Quartet"),
+        )
+        .unwrap();
+
+        // The config names the volume as a second folder before the next
+        // scan. The rows follow their files into it with what is attached
+        // to them.
+        let summary = scanned.env.scan(&[scanned.root(), volume.path()]);
+        assert_eq!(
+            summary,
+            ScanSummary {
+                seen: 10,
+                moved: 2,
+                ..standard()
+            }
+        );
+        let volume_id = scanned.env.folder_id(volume.path());
+        for (id, rel_path) in ids.iter().zip(moved) {
+            assert_eq!(
+                attached(&scanned.env.db, id),
+                Some((volume_id, rel_path.to_owned()))
+            );
+        }
+        assert_eq!(scanned.env.scan(&[scanned.root(), volume.path()]), seen(10));
+    }
+
+    /// Creates the link `Archive` in a scanned library, in a form that
+    /// cannot be resolved.
+    type MakeLinks = fn(&Scanned);
+
+    #[test]
+    fn a_link_that_cannot_be_resolved_is_an_unread_path() {
+        let kinds: [(&str, MakeLinks); 3] = [
+            ("a target that is gone", |scanned| {
+                symlink(scanned.path("no target"), scanned.path("Archive")).unwrap();
+            }),
+            ("a link to itself", |scanned| {
+                symlink("Archive", scanned.path("Archive")).unwrap();
+            }),
+            // The second link has a name that the walk skips, so that it is
+            // no unread path of its own.
+            ("two links that name each other", |scanned| {
+                symlink(".archive", scanned.path("Archive")).unwrap();
+                symlink("Archive", scanned.path(".archive")).unwrap();
+            }),
+        ];
+        for (kind, make_links) in kinds {
+            let scanned = Scanned::new();
+            make_links(&scanned);
+            fs::remove_file(scanned.path(LOW_TIDE)).unwrap();
+            let summary = scanned.rescan();
+
+            // The scan does not know where the link points, so it deletes no
+            // track.
+            assert_eq!((summary.seen, summary.removed), (9, 0), "{kind}");
+            assert_eq!(summary.errors.len(), 2, "{kind}: {:?}", summary.errors);
+            let error = &summary.errors[0];
+            assert!(error.contains("\"Archive\""), "{kind}: {error}");
+            assert!(error.contains("cannot be read"), "{kind}: {error}");
+            assert!(error.contains("no track was deleted"), "{kind}: {error}");
+            assert_eq!(
+                summary.errors[1],
+                "1 track whose file is gone was kept, because a path or a file could not be read",
+                "{kind}"
+            );
+            assert!(scanned.find(LOW_TIDE).is_some(), "{kind}");
+
+            // The link is removed, and the row of the deleted file goes.
+            fs::remove_file(scanned.path("Archive")).unwrap();
+            assert_eq!(
+                scanned.rescan(),
+                ScanSummary {
+                    seen: 9,
+                    removed: 1,
+                    ..standard()
+                },
+                "{kind}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_link_to_a_target_that_the_process_may_not_reach_is_an_unread_path() {
+        let scanned = Scanned::new();
+        // A directory without permissions, under a name that the walk skips,
+        // so that the directory is no unread path of its own.
+        let audio = scanned.path(BREAKWATER);
+        let Some(locked) = Unlistable::new(scanned.path(".locked"), &audio) else {
+            return;
+        };
+        symlink(
+            scanned.path(".locked/01 Inside.flac"),
+            scanned.path("Archive.flac"),
+        )
+        .unwrap();
+        fs::remove_file(scanned.path(LOW_TIDE)).unwrap();
+        let summary = scanned.rescan();
+
+        assert_eq!((summary.seen, summary.removed), (9, 0));
+        assert_eq!(summary.errors.len(), 2, "{:?}", summary.errors);
+        assert!(summary.errors[0].contains("\"Archive.flac\""));
+        assert!(summary.errors[0].contains("cannot be read"));
+        assert!(summary.errors[1].starts_with("1 track whose file is gone was kept"));
+        assert!(scanned.find(LOW_TIDE).is_some());
+
+        // The target can be reached. It is a file of the folder that no walk
+        // reaches at its own path, so it gets a row at the path of the link,
+        // and the row of the deleted file goes.
+        drop(locked);
+        assert_eq!(
+            scanned.rescan(),
+            ScanSummary {
+                seen: 10,
+                added: 1,
+                removed: 1,
+                tags_read: 1,
+                ..standard()
+            }
+        );
+        assert!(scanned.find("Archive.flac").is_some());
+    }
+
+    #[test]
+    fn rows_behind_a_link_into_a_folder_whose_volume_is_away_are_kept() {
+        let two = TwoFolders::new();
+        let aurora_id = two.env.folder_id(&two.aurora);
+        // A directory of the second folder that the walk of that folder
+        // skips, and a link to it in the first folder. The file behind the
+        // link has its row in the first folder.
+        let linked = "Sessions/01 Take.flac";
+        write_track(&two.marlow.join(".store/Sessions/01 Take.flac"), "Take");
+        symlink(
+            two.marlow.join(".store/Sessions"),
+            two.aurora.join("Sessions"),
+        )
+        .unwrap();
+        assert_eq!(two.rescan().added, 1);
+        let take = two.env.id_at(aurora_id, linked).unwrap();
+        attach(&two.env.db, &take);
+        // A file of the first folder is deleted.
+        let deleted = "Glass Harbour/02 Breakwater.flac";
+        fs::remove_file(two.aurora.join(deleted)).unwrap();
+        let before = two.env.index();
+        let after_each_scan = |summary: &ScanSummary| {
+            assert_eq!(summary.removed, 0, "{:?}", summary.errors);
+            assert_eq!(two.env.index(), before);
+            assert_eq!(
+                attached(&two.env.db, &take),
+                Some((aurora_id, linked.to_owned()))
+            );
+        };
+
+        // The volume of the second folder is not mounted, and its mount
+        // point is an empty directory. The link leads nowhere. The rule for
+        // a folder without a supported file keeps the rows of the second
+        // folder only. The link is an unread path, which keeps the row
+        // behind it and every other row.
+        fs::rename(&two.marlow, two.outside("unmounted")).unwrap();
+        fs::create_dir(&two.marlow).unwrap();
+        let summary = two.rescan();
+        after_each_scan(&summary);
+        assert_eq!(summary.errors.len(), 3, "{:?}", summary.errors);
+        assert!(summary.errors[0].contains("\"Sessions\" in music folder \"Aurora Field\""));
+        assert!(summary.errors[0].contains("cannot be read"));
+        assert!(summary.errors[1].contains("\"Marlow Quartet\""));
+        assert!(summary.errors[1].contains("has no supported file"));
+        assert_eq!(
+            summary.errors[2],
+            "3 tracks whose files are gone were kept, because a path or a file could not be read"
+        );
+
+        // The path of the second folder does not exist. The folder is an
+        // unread root as well.
+        fs::remove_dir(&two.marlow).unwrap();
+        let summary = two.rescan();
+        after_each_scan(&summary);
+        assert_eq!(summary.errors.len(), 3, "{:?}", summary.errors);
+
+        // The volume is back. The row behind the link has its ID, and the
+        // row of the deleted file goes.
+        fs::rename(two.outside("unmounted"), &two.marlow).unwrap();
+        assert_eq!(
+            two.rescan(),
+            ScanSummary {
+                seen: 9,
+                removed: 1,
+                albums: 5,
+                artists: 4,
+                ..ScanSummary::default()
+            }
+        );
+        assert_eq!(two.env.id_at(aurora_id, linked), Some(take.clone()));
+        assert_eq!(two.env.id_at(aurora_id, deleted), None);
+        assert_eq!(
+            attached(&two.env.db, &take),
+            Some((aurora_id, linked.to_owned()))
+        );
+    }
+
+    #[test]
+    fn links_that_lead_around_in_a_directory_that_the_walk_skips_are_followed_once() {
+        let library = LibraryBuilder::standard().build();
+        let root = library.root.path().to_path_buf();
+        // Two directories that the walk reaches through a link only. Each
+        // has a link to the other one, and one has a link to the directory
+        // above both.
+        write_track(&root.join(".store/a/01 A.flac"), "A");
+        write_track(&root.join(".store/b/01 B.flac"), "B");
+        symlink("../b", root.join(".store/a/next")).unwrap();
+        symlink("../a", root.join(".store/b/next")).unwrap();
+        symlink("..", root.join(".store/b/up")).unwrap();
+        symlink(".store/a", root.join("Loop")).unwrap();
+
+        // The walk ends, and each file has one row.
+        let env = TestDb::new();
+        let summary = scan_with_limit(&env, &[&root]);
+        assert_eq!(summary.errors, [""; 0]);
+        assert_eq!((summary.seen, summary.added), (12, 12));
+        assert_eq!(
+            stored(&env),
+            standard_paths_and(&["Loop/01 A.flac", "Loop/next/01 B.flac"])
+        );
+        let before = env.index();
+        let summary = scan_with_limit(&env, &[&root]);
+        assert_eq!((summary.seen, summary.added, summary.moved), (12, 0, 0));
+        assert_eq!(summary.errors, [""; 0]);
+        assert_eq!(env.index(), before);
+    }
 }
 
 /// Sets the permission bits of a file.

@@ -787,39 +787,37 @@ async fn link_out_of_the_music_folder_is_not_given_to_the_transcoder() {
     let outside = tempfile::tempdir().expect("a directory outside the library");
     let album = root.join("Aurora Field").join("Glass Harbour");
 
-    // The file of one track is outside the folder, and a link is at its
-    // path. The scan follows the link and gives the file its row.
-    let link = album.join("01 Low Tide.flac");
-    let target = outside.path().join("01 Low Tide.flac");
-    fs::rename(&link, &target).unwrap();
-    symlink(&target, &link).unwrap();
-    // A link inside the folder to the file of another track.
-    symlink("02 Breakwater.flac", album.join("04 Linked.flac")).unwrap();
+    // The file of one track is in a directory of the folder that the scan
+    // does not walk, and a link is at its path. The scan follows the link
+    // and gives the file its row at the path of the link.
+    let store = root.join(".store");
+    fs::create_dir(&store).unwrap();
+    let stored = store.join("breakwater.flac");
+    fs::rename(album.join("02 Breakwater.flac"), &stored).unwrap();
+    symlink(&stored, album.join("02 Breakwater.flac")).unwrap();
 
     let server = TestServer::scanned(library).await;
     let catalogue = server.catalogue().await;
+
+    // The scan gives no row to a file behind a link out of the folder, so
+    // the link is made after the scan: the file of another track moves out
+    // of the folder, and a link is at its path. The file keeps its size and
+    // its time, so the state of the path equals the row.
     let low_tide = catalogue.song("Low Tide").track.clone();
-    assert!(server.path(&low_tide.rel_path).is_file());
+    let link = server.path(&low_tide.rel_path);
+    let target = outside.path().join("01 Low Tide.flac");
+    fs::rename(&link, &target).unwrap();
+    symlink(&target, &link).unwrap();
+    assert!(link.is_file());
     assert_not_transcoded(&server, &low_tide.id, "a link out of the folder").await;
     assert_eq!(server.transcoder().jobs(), []);
 
     // The transcoder gets the resolved path of a file behind a link that
     // stays in the folder: the path of the file itself.
-    let id: String = server
-        .db()
-        .read(|conn| {
-            let id = conn.query_row(
-                "SELECT id FROM tracks WHERE rel_path LIKE '%04 Linked.flac'",
-                [],
-                |row| row.get(0),
-            )?;
-            Ok(id)
-        })
-        .await
-        .expect("the track of the link");
+    let id = catalogue.song("Breakwater").track.id.clone();
     let response = stream(&server, &id, &[("format", "opus")]).await;
     assert_transcode_headers(&response, "audio/ogg", "a link in the folder");
-    let breakwater = fs::canonicalize(album.join("02 Breakwater.flac")).unwrap();
+    let breakwater = fs::canonicalize(&stored).unwrap();
     assert_eq!(
         server.transcoder().jobs(),
         [job(&id, breakwater, Target::Opus, 192, 0)]
