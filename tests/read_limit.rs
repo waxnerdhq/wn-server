@@ -25,7 +25,7 @@ use common::{LibraryBuilder, TestServer, body_string, captured_log, content_type
 /// The limit of the reads of a request that a test expects to fail. The
 /// read of the accounts of that request has the same limit and takes
 /// microseconds.
-const LIMIT: Duration = Duration::from_millis(100);
+const LIMIT: Duration = Duration::from_millis(300);
 
 /// A view that the statement of `getScanStatus` reads in place of the
 /// `scans` table.
@@ -109,7 +109,7 @@ async fn request_whose_statement_passes_the_limit_is_error_0_and_the_log_has_the
         assert!(line.contains("ERROR"), "{line}");
         assert!(line.contains("getScanStatus"), "{line}");
         assert!(
-            line.contains("a statement of a read was interrupted at the time limit of 100ms"),
+            line.contains("a statement of a read was interrupted at the time limit of 300ms"),
             "{line}"
         );
     }
@@ -150,8 +150,8 @@ async fn scan_completes_while_the_limit_of_a_read_is_zero() {
     config.library.scan_poll_ms = 10;
     let server = TestServer::bare(config).await;
 
-    // Every read of `Db::read` is interrupted when it starts. The scan
-    // writes and reads through the write connection, which has no limit.
+    // Every read of `Db::read` has a limit of zero. The scan writes and
+    // reads through the write connection, which has no limit.
     server.db().set_read_limit(Duration::ZERO);
     server.scan_and_wait().await;
 

@@ -377,7 +377,11 @@ impl ReadTimers {
         let mut state = self.lock();
         if !state.started {
             let thread = std::thread::Builder::new().name("db-read-limit".to_owned());
-            match thread.spawn(move || self.run()) {
+            let run = move || {
+                let _ended = ThreadEnd(self);
+                self.run();
+            };
+            match thread.spawn(run) {
                 Ok(_) => state.started = true,
                 Err(error) => {
                     drop(state);
@@ -413,7 +417,7 @@ impl ReadTimers {
     }
 
     /// The thread: interrupts the reads whose time has come and sleeps until
-    /// the time of the next one.
+    /// the time of the next one. It returns only by a panic.
     fn run(&self) {
         let mut state = self.lock();
         loop {
@@ -450,6 +454,19 @@ impl ReadTimers {
     /// a read never panics.
     fn lock(&self) -> std::sync::MutexGuard<'_, TimersState> {
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Records that the thread of a [`ReadTimers`] has ended. The thread drops
+/// this value when a panic ends it. The reads in the list then have no
+/// limit until the next read starts a new thread, which keeps the limits of
+/// all of them.
+struct ThreadEnd(&'static ReadTimers);
+
+impl Drop for ThreadEnd {
+    fn drop(&mut self) {
+        self.0.lock().started = false;
+        tracing::error!("the thread of the read limit ended; the next read starts it again");
     }
 }
 
@@ -1649,7 +1666,15 @@ mod tests {
 
     #[tokio::test]
     async fn a_read_that_waits_for_its_connection_interrupts_no_write() {
-        const LIMIT: Duration = Duration::from_millis(100);
+        const LIMIT: Duration = Duration::from_millis(400);
+        // The write holds the connection for longer than the limit.
+        const WRITE: Duration = Duration::from_millis(500);
+        // How long the read runs statements once it holds the connection.
+        // The time does not depend on the speed of the machine. An
+        // interrupt that arrives before the first statement stops nothing,
+        // so the time holds the repetition of that interrupt.
+        const READ: Duration = Duration::from_millis(100);
+        assert!(READ >= 2 * INTERRUPT_REPEAT);
 
         // A memory database has one connection, so the read waits for the
         // write.
@@ -1662,16 +1687,54 @@ mod tests {
                 .write(move |c| {
                     insert_folder(c, "/music")?;
                     started_tx.send(()).unwrap();
-                    count_for(c, 2 * LIMIT)
+                    count_for(c, WRITE)
                 })
                 .await
         });
         started_rx.await.unwrap();
 
-        // The limit of the read ends while it waits. Its time starts when it
-        // holds the connection.
-        assert_eq!(db.read(count_folders).await.unwrap(), 1);
+        // The read waits for longer than its limit. Its time starts when it
+        // holds the connection: a read whose wait counted would be
+        // interrupted while it runs its statements.
+        let folders = db
+            .read(|c| {
+                count_for(c, READ)?;
+                count_folders(c)
+            })
+            .await
+            .unwrap();
+        assert_eq!(folders, 1);
         write.await.unwrap().unwrap();
+    }
+
+    /// The thread ends only by a panic, which a test cannot cause. This test
+    /// drops the value that the thread drops when it ends. The list has its
+    /// own thread, so the test ends no thread of another test.
+    #[test]
+    fn a_thread_that_has_ended_is_started_again_by_the_next_read() {
+        let timers: &'static ReadTimers = Box::leak(Box::new(ReadTimers::new()));
+        let connection = Connection::open_in_memory().unwrap();
+
+        assert!(!timers.lock().started);
+        let id = timers
+            .add(connection.get_interrupt_handle(), READ_LIMIT)
+            .unwrap();
+        assert!(timers.lock().started);
+        assert!(!timers.remove(id));
+
+        drop(ThreadEnd(timers));
+        assert!(!timers.lock().started);
+
+        let id = timers
+            .add(connection.get_interrupt_handle(), SHORT_LIMIT)
+            .unwrap();
+        assert!(timers.lock().started);
+        let error = count_to(&connection, MANY_ROWS).unwrap_err();
+        assert!(
+            matches!(&error, DbError::Sqlite(error) if is_interrupt(error)),
+            "{error}"
+        );
+        assert!(timers.remove(id));
     }
 
     /// `Db::open` runs the migrations on the write connection before the
