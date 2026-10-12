@@ -115,6 +115,12 @@ const PROBE_LIMIT: Duration = Duration::from_secs(10);
 
 /// The most bytes the probe reads from the output of one run of the
 /// program. The encoder list of ffmpeg 8.0 with 204 encoders has 12 KiB.
+///
+/// The probe reads no byte behind the limit and closes the output there. A
+/// program that writes more ends with a failure or not within the limit of
+/// the run, and counts as not available. An encoder whose line is behind
+/// the limit of a list that the program still wrote in full counts as
+/// missing.
 const PROBE_OUTPUT_LIMIT: u64 = 64 * 1024;
 
 /// The targets of a transcode, in the order in which the probe names them.

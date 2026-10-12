@@ -7,10 +7,11 @@
 //! it. The unit tests in `src/media/transcode.rs` cover the transcoder that
 //! runs a process.
 //!
-//! Three tests open a socket on `127.0.0.1` with a port that the system
+//! Four tests open a socket on `127.0.0.1` with a port that the system
 //! chooses, because they check what a connection does: a client that
 //! disconnects during a stream, a client that disconnects before the first
-//! output, and a server that `run_server` starts without ffmpeg.
+//! output, a server that `run_server` starts without ffmpeg, and a server
+//! that stops while its transcodes wait.
 
 mod common;
 
@@ -24,25 +25,28 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::Router;
 use axum::body::Body;
+use axum::extract::State;
 use axum::http::header::HeaderName;
 use axum::http::{Method, Request, StatusCode, header};
 use axum::response::Response;
+use axum::routing::get;
 use http_body_util::BodyExt;
 use rusqlite::params;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::oneshot;
 use tokio_util::sync::CancellationToken;
+use wn_server::api::AppState;
 use wn_server::config::{Config, DataDir};
 use wn_server::db::Db;
 use wn_server::db::queries::tracks::{self, Track};
 use wn_server::db::queries::users;
 use wn_server::library::scanner::{self, ScanOptions};
-use wn_server::media::stream::Target;
+use wn_server::media::stream::{self as media_stream, Target};
 use wn_server::media::transcode::TranscodeJob;
 use wn_server::server::{ServerOptions, run_server};
 
-use common::transcoder::{FAKE_CHUNK, FAKE_TRANSCODE, FakeFailure};
+use common::transcoder::{FAKE_CHUNK, FAKE_TRANSCODE, FakeFailure, FakeTranscoder, no_ffmpeg};
 use common::{
     API_VERSION, CLIENT, LibraryBuilder, OWNER, OWNER_PASSWORD, ScannedServer, StandardServer,
     TestServer, body_bytes, body_string, captured_log, content_type, subsonic_response, urlencode,
@@ -1438,4 +1442,185 @@ async fn server_without_ffmpeg_starts_with_one_warning_and_serves_original_files
         .expect("the server ends")
         .expect("the server does not panic")
         .expect("the server stops in order");
+}
+
+#[tokio::test]
+async fn stop_with_the_short_grace_ends_the_transcodes_that_wait_for_ffmpeg_and_for_a_client() {
+    /// The short grace of the stop, in milliseconds.
+    const SHORT_GRACE_MS: u64 = 100;
+    /// A limit that the test does not outlast: the grace without `hurry`,
+    /// the limit of the first output and the write timeout. None of them
+    /// can be what ends a request of this test.
+    const NO_END_MS: u64 = 3_600_000;
+
+    let library = LibraryBuilder::new()
+        .track("Aurora Field", "Glass Harbour", "Low Tide", 1, "flac")
+        .build();
+    let root = library.root.path().to_path_buf();
+
+    // A data directory whose database holds the owner account and the
+    // scanned library, as `init` and a scan leave it.
+    let dir = tempfile::tempdir().expect("a temporary directory");
+    let data_dir = DataDir::resolve(Some(dir.path())).expect("a data directory");
+    let db = Db::open(data_dir.db_path()).expect("create the database");
+    db.write(|conn| users::insert_owner(conn, OWNER, OWNER_PASSWORD))
+        .await
+        .expect("insert the owner")
+        .expect("a new database has no owner");
+    let summary = tokio::task::spawn_blocking({
+        let (db, folders) = (db.clone(), vec![root.clone()]);
+        move || {
+            let cancel = CancellationToken::new();
+            scanner::scan(&db, &folders, &cancel, false, ScanOptions::default())
+        }
+    })
+    .await
+    .expect("the scan does not panic")
+    .expect("the scan reads and writes the database");
+    assert_eq!(summary.errors, [] as [&str; 0]);
+    let id: String = db
+        .read(|conn| Ok(conn.query_row("SELECT id FROM tracks", [], |row| row.get(0))?))
+        .await
+        .expect("the track of the library");
+    let track = row(&db, &id).await;
+    // The server opens the database itself.
+    drop(db);
+
+    let mut config = Config::default();
+    config.server.bind = "127.0.0.1".parse().expect("an address");
+    config.server.port = 0;
+    config.server.shutdown_grace_ms = NO_END_MS;
+    config.server.shutdown_grace_short_ms = SHORT_GRACE_MS;
+    config.library.folders = vec![root.clone()];
+    config.library.scan_on_start = false;
+    config.transcoding.ffmpeg = no_ffmpeg();
+    config.transcoding.first_output_wait_ms = NO_END_MS;
+    config.transcoding.write_timeout_ms = NO_END_MS;
+
+    // `run_server` builds the transcoder that runs ffmpeg and gives a test
+    // no way to replace it. A route next to the API answers as the handler
+    // of `stream` answers a request that selects a transcode: with
+    // `media::stream::transcoded`, here with the transcoder of the test.
+    let transcoder = Arc::new(FakeTranscoder::default());
+    let routes = Router::new().route(
+        "/transcode",
+        get({
+            let (transcoder, track, file) = (transcoder.clone(), track, library.files[0].clone());
+            let folders = vec![root];
+            move |State(state): State<AppState>| {
+                let (transcoder, track) = (transcoder.clone(), track.clone());
+                let (folders, file) = (folders.clone(), file.clone());
+                async move {
+                    let job = job(&track.id, file, Target::Opus, 96, 0);
+                    let config = &state.config.transcoding;
+                    let transcoder = transcoder.as_ref();
+                    media_stream::transcoded(
+                        &track,
+                        job,
+                        &folders,
+                        &Method::GET,
+                        transcoder,
+                        config,
+                    )
+                    .await
+                }
+            }
+        }),
+    );
+
+    let (cancel, hurry) = (CancellationToken::new(), CancellationToken::new());
+    let (listening, bound) = oneshot::channel();
+    let options = ServerOptions {
+        listening: Some(listening),
+        routes,
+        hurry: hurry.clone(),
+        ..ServerOptions::default()
+    };
+    let mut task = tokio::spawn({
+        let (cancel, data_dir) = (cancel.clone(), data_dir.clone());
+        async move { run_server(config, &data_dir, cancel, options).await }
+    });
+    let addr = tokio::time::timeout(LIMIT, bound)
+        .await
+        .expect("the listener is bound")
+        .expect("the server sends its address");
+
+    // The first request: its transcode has written nothing, and its handler
+    // waits for the first output.
+    let silent = transcoder.feed();
+    let mut waits_for_ffmpeg = send_get(addr, "/transcode", &[]).await;
+    tokio::time::timeout(LIMIT, transcoder.streams_open(1))
+        .await
+        .expect("the first request reaches the transcoder");
+
+    // The second request: its transcode writes without an end, and its
+    // client reads the start of the response and then nothing. The server
+    // fills the buffers of the connection, and the stream then waits for
+    // the client under the write timeout.
+    transcoder.endless();
+    let mut reads_nothing = send_get(addr, "/transcode", &[]).await;
+    let mut received = Vec::new();
+    let began = async {
+        while !received.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = reads_nothing
+                .read_buf(&mut received)
+                .await
+                .expect("read the response");
+            assert_ne!(read, 0, "the connection ended");
+        }
+    };
+    tokio::time::timeout(LIMIT, began)
+        .await
+        .expect("the second response begins");
+    let head = String::from_utf8_lossy(&received).to_ascii_lowercase();
+    assert!(head.starts_with("http/1.1 200 ok\r\n"), "{head}");
+    assert!(head.contains("content-type: audio/ogg\r\n"), "{head}");
+    assert_eq!(transcoder.open_streams(), 2);
+    // The time for the buffers to fill. It is a lower bound: a stream that
+    // still has room when the stop begins is ended by the same stop.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(transcoder.open_streams(), 2);
+
+    // The stop signal has a short limit, so `hurry` is cancelled before the
+    // token of the stop, as the `run` command does it.
+    let stop_began = Instant::now();
+    hurry.cancel();
+    cancel.cancel();
+
+    // Both transcodes end: the server drops the handler and the body at the
+    // end of the short grace, and each drops the stream of its transcoder.
+    // The limit of the first output and the write timeout have an hour left.
+    tokio::time::timeout(LIMIT, transcoder.streams_open(0))
+        .await
+        .expect("the stop ends the two transcodes");
+    assert!(silent.is_closed());
+    tokio::time::timeout(LIMIT, &mut task)
+        .await
+        .expect("the server ends within the limit of the test")
+        .expect("the server does not panic")
+        .expect("the server stops in order");
+    // The requests had the short grace. A wait does not end early.
+    let stopped_after = stop_began.elapsed();
+    assert!(
+        stopped_after >= Duration::from_millis(SHORT_GRACE_MS),
+        "{stopped_after:?}"
+    );
+
+    // The client of the handler reads the end of the connection and no
+    // response.
+    let mut answer = Vec::new();
+    let ended = async {
+        loop {
+            match waits_for_ffmpeg.read_buf(&mut answer).await {
+                // A connection that the server closes ends with a reset on
+                // some systems, which counts as the end.
+                Ok(0) | Err(_) => break,
+                Ok(_) => {}
+            }
+        }
+    };
+    tokio::time::timeout(LIMIT, ended)
+        .await
+        .expect("the server ends the connection");
+    assert_eq!(String::from_utf8_lossy(&answer), "");
 }

@@ -102,8 +102,11 @@ const NO_OUTPUT: &str = "ffmpeg produced no output";
 /// took no chunk for the write timeout.
 const CLIENT_TOOK_NOTHING: &str = "the client took no chunk of the stream within the write timeout";
 
-/// The start of the value of a `Range` header in the one unit that the
-/// server understands.
+/// The start of the value of a `Range` header that the server reads: the
+/// unit `bytes` in lower case. The names of range units have no letter case
+/// (RFC 9110 section 14.1), so `Bytes=` names the same unit. The server
+/// ignores a `Range` header in that spelling, which it may do for every
+/// `Range` header (section 14.2).
 const RANGE_UNIT: &[u8] = b"bytes=";
 
 /// The value of `Retry-After` of the response to a request that got no
@@ -549,7 +552,9 @@ async fn body_from_first_output(
                     %error,
                     "the output of the transcode cannot be read; the request gets an error"
                 ),
-                Ok(_) => tracing::warn!(
+                // The transcoder logs how its process ended, at `warn` for a
+                // failure, so this line adds no second warning.
+                Ok(_) => tracing::info!(
                     %track,
                     "the transcode ended without output; the request gets an error"
                 ),
@@ -828,12 +833,15 @@ fn whole_file_for_long_suffix(range: &HeaderValue, size: u64) -> HeaderValue {
 /// of `headers` and with `range` as its `Range` header. Nothing else of the
 /// client request is part of it.
 ///
-/// `range` is passed on only when its value starts with `bytes=`. A server
-/// ignores a `Range` header whose unit it does not understand (RFC 9110
-/// section 14.2), and `ServeFile` answers such a header with HTTP 416. A
-/// request with another unit is therefore a request without a range, which
-/// gets the whole file. A `bytes=` range that `ServeFile` cannot parse keeps
-/// the answer of `ServeFile`.
+/// `range` is passed on only when its value starts with `bytes=`
+/// ([`RANGE_UNIT`]). A server ignores a `Range` header whose unit it does
+/// not understand (RFC 9110 section 14.2), and `ServeFile` answers such a
+/// header with HTTP 416. A request with another unit is therefore a request
+/// without a range, which gets the whole file. So is a request that writes
+/// the unit in another letter case, such as `Bytes=0-1`: the unit is the
+/// one that the server understands, and the server ignores the header, as
+/// it may. A `bytes=` range that `ServeFile` cannot parse keeps the answer
+/// of `ServeFile`.
 fn file_request(head: bool, headers: &HeaderMap, range: Option<&HeaderValue>) -> Request<()> {
     let mut request = Request::new(());
     if head {

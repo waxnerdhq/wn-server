@@ -53,6 +53,7 @@ struct State {
     bytes: Vec<u8>,
     failure: Option<FakeFailure>,
     stays_open: bool,
+    endless: bool,
     known_length: bool,
     feed: Option<Feed>,
     jobs: Vec<TranscodeJob>,
@@ -76,6 +77,7 @@ impl Default for FakeTranscoder {
                 bytes: FAKE_TRANSCODE.to_vec(),
                 failure: None,
                 stays_open: false,
+                endless: false,
                 known_length: false,
                 feed: None,
                 jobs: Vec::new(),
@@ -107,6 +109,15 @@ impl FakeTranscoder {
     /// when it is dropped.
     pub fn stay_open(&self) {
         self.state().stays_open = true;
+    }
+
+    /// Makes the streams that start from now on yield chunk after chunk
+    /// without an end, as the output of an ffmpeg that writes faster than
+    /// its client reads. Such a stream yields a chunk whenever it is asked
+    /// for one, so it waits for its reader and never for the transcoder. It
+    /// ends when it is dropped.
+    pub fn endless(&self) {
+        self.state().endless = true;
     }
 
     /// Makes the streams that start from now on bodies of a known length:
@@ -191,7 +202,10 @@ impl Transcoder for FakeTranscoder {
             }
 
             type Chunks = Pin<Box<dyn Stream<Item = io::Result<Bytes>> + Send>>;
-            let chunks: Chunks = if let Some(mut feed) = state.feed.take() {
+            let chunks: Chunks = if state.endless {
+                let chunk = Bytes::from(vec![0x4f; FAKE_CHUNK]);
+                Box::pin(stream::repeat(chunk).map(Ok))
+            } else if let Some(mut feed) = state.feed.take() {
                 Box::pin(
                     stream::poll_fn(move |cx| feed.poll_recv(cx)).map(|chunk| Ok(chunk.into())),
                 )
