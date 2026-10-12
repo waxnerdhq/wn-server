@@ -12,15 +12,29 @@
 //! a file path. An ID that [`ids::parse`] rejects has no cover. An accepted
 //! ID selects a row, and the service opens the paths that the scanner stored
 //! for that row. The name of a cached file is built from the ID that the row
-//! holds, the size after [`MAX_SIZE`] is applied, and the modification time
-//! that the row holds.
+//! holds, the step of the size ([`SIZE_STEPS`]), and the modification time
+//! that the row holds. An ID in the form of [`ids::parse`], a step and a
+//! time hold no path separator, so the name is one component of a path and
+//! the file is in the cache directory.
+//!
+//! # Sizes
+//!
+//! A size is rounded up to the next of the six [`SIZE_STEPS`] before the
+//! cache is read, so a cover has at most six files in the cache for one
+//! modification time. `docs/design.md` section 3.11 states the size of these
+//! files.
 //!
 //! # Files from the music folders
 //!
 //! The files come from the music folders, and a file there can be damaged,
 //! or put there to make the server return another file or to exhaust its
-//! memory. Two rules decide what the service returns:
+//! memory. Three rules decide what the service returns:
 //!
+//! - A source is read, and a cached cover of it is returned, when the path
+//!   of the source is inside a configured music folder after every symbolic
+//!   link of the path is resolved. The check is the one of `stream`
+//!   (`media::stream::path_in_folders`). A directory link that leads out of
+//!   the folders therefore gives no cover.
 //! - An image file is read when its path names a regular file. A path that
 //!   names a symbolic link, a directory or a device is not read. The same
 //!   rule holds for a file of the cache.
@@ -70,10 +84,19 @@ use crate::db::{self, Db, DbError};
 use crate::ids::{self, Kind};
 use crate::library::scanner::EMBEDDED;
 use crate::library::tags;
+use crate::media::stream::{NotInFolders, path_in_folders};
 
 /// The largest size of a resized cover: the length of its longer side in
 /// pixels. A request for a larger size is served at this size.
 pub const MAX_SIZE: u32 = 2000;
+
+/// The sizes of the resized covers: the length of the longer side in pixels.
+/// A request for a size is served at the smallest step that is not smaller
+/// than the size, and at the largest step when the size is over it
+/// ([`served_size`]). Each step is twice the step before it, up to
+/// [`MAX_SIZE`]. The cache holds one file of a cover for each step that a
+/// client asked for, so six at most.
+pub const SIZE_STEPS: [u32; 6] = [80, 160, 320, 640, 1280, MAX_SIZE];
 
 /// The largest source image that the service reads, in bytes. A larger image
 /// has no cover, resized or not, because the service holds a cover in
@@ -144,6 +167,9 @@ struct Inner {
     /// The directory of the resized covers.
     cache_dir: PathBuf,
     db: Db,
+    /// The configured music folders. A source outside all of them is not
+    /// read.
+    folders: Vec<PathBuf>,
     /// One permit for each source image that the service may hold.
     decode_permits: Arc<Semaphore>,
     /// The resized covers that are being made, by the name of their cache
@@ -201,6 +227,30 @@ enum LoadError {
     NotAFile,
     #[error("it holds {0} bytes and the limit is {MAX_SOURCE_BYTES}")]
     TooLarge(u64),
+    /// The resolved path of the source is inside no music folder. The value
+    /// is the resolved path.
+    #[error("it is outside the music folders, at {}", .0.display())]
+    Outside(PathBuf),
+}
+
+impl From<NotInFolders> for LoadError {
+    fn from(refusal: NotInFolders) -> Self {
+        match refusal {
+            NotInFolders::Unreadable(error) => LoadError::Io(error),
+            NotInFolders::Outside(real) => LoadError::Outside(real),
+        }
+    }
+}
+
+/// What the cache holds for a resized cover.
+enum Cached {
+    /// The source of the cover is outside the music folders. Neither the
+    /// source nor the cache is read.
+    Outside,
+    /// The cache file of the cover.
+    Hit(Vec<u8>),
+    /// The cache does not hold the cover.
+    Miss,
 }
 
 /// Why bytes are not served or not decoded as an image.
@@ -219,7 +269,7 @@ enum ImageRefusal {
 struct Job {
     cover_id: String,
     origin: Origin,
-    /// The length of the longer side in pixels, 1 to [`MAX_SIZE`].
+    /// The length of the longer side in pixels, one of [`SIZE_STEPS`].
     size: u32,
     /// The name of the cache file.
     name: String,
@@ -271,12 +321,14 @@ impl Covers {
     /// Returns the service that caches resized covers in `cache_dir` and
     /// reads the library from `db`. `cache_dir` is `cache/covers` of the data
     /// directory. The service creates the directory when it caches the first
-    /// cover.
-    pub fn new(cache_dir: impl Into<PathBuf>, db: Db) -> Self {
+    /// cover. `folders` are the configured music folders, `library.folders`
+    /// of the config: the service reads no source outside them.
+    pub fn new(cache_dir: impl Into<PathBuf>, db: Db, folders: Vec<PathBuf>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 cache_dir: cache_dir.into(),
                 db,
+                folders,
                 decode_permits: Arc::new(Semaphore::new(DECODE_PERMITS)),
                 in_progress: Mutex::default(),
                 decodes: AtomicU64::new(0),
@@ -293,9 +345,12 @@ impl Covers {
     /// decoded. The content type is the type of the format that the header
     /// has: `image/jpeg`, `image/png` or `image/webp`.
     ///
-    /// With another `size` the result is a JPEG whose longer side is at most
-    /// `size` pixels, and at most [`MAX_SIZE`] pixels when `size` is larger.
-    /// An image whose sides are within the size keeps its size: no image is
+    /// With another `size` the result is a JPEG at the step of the size
+    /// ([`served_size`]): its longer side is at most the smallest of
+    /// [`SIZE_STEPS`] that is not smaller than `size`, and at most
+    /// [`MAX_SIZE`] pixels when `size` is larger. The result can therefore
+    /// be larger than `size`, and two sizes of one step give the same bytes.
+    /// An image whose sides are within the step keeps its size: no image is
     /// enlarged. The resized cover is read from the cache directory, and
     /// made and stored there when the cache does not hold it. Requests that
     /// ask for the same resized cover while it is being made share one
@@ -312,6 +367,9 @@ impl Covers {
     /// - The source is gone, cannot be read or is larger than
     ///   [`MAX_SOURCE_BYTES`]. The image file is a symbolic link or another
     ///   file that is not a regular file.
+    /// - The path of the source leads out of the configured music folders
+    ///   when its symbolic links are resolved. No cached cover of such a
+    ///   source is returned either.
     /// - The bytes of the source do not start with the header of a JPEG,
     ///   PNG or WebP image. The service logs a warning.
     /// - A size is given and the image cannot be decoded: it is damaged, it
@@ -339,9 +397,9 @@ impl Covers {
         let Some(source) = source else {
             return Ok(None);
         };
-        match effective_size(size) {
+        match served_size(size) {
             None => self.original(source).await,
-            Some(size) => self.resized(source, size).await,
+            Some(step) => self.resized(source, step).await,
         }
     }
 
@@ -361,11 +419,12 @@ impl Covers {
             .acquire_owned()
             .await
             .map_err(|_| CoverError::Unfinished)?;
+        let inner = Arc::clone(&self.inner);
         let verified = run_blocking(move || {
             // The permit is held until the bytes are verified. The copies
             // that the verification makes are freed by then.
             let _permit = permit;
-            let bytes = load(&cover_id, &origin)?;
+            let bytes = load(&cover_id, &origin, &inner.folders)?;
             match verify(&bytes) {
                 Ok(format) => Some((bytes, format.to_mime_type())),
                 Err(error) => {
@@ -390,25 +449,37 @@ impl Covers {
     }
 
     /// Returns the image of `source` as a JPEG whose longer side is at most
-    /// `size` pixels, from the cache or made now.
+    /// `size` pixels, from the cache or made now. `size` is one of
+    /// [`SIZE_STEPS`].
+    ///
+    /// The path of the source is compared with the music folders before the
+    /// cache is read, so a cover that was cached for a source that is
+    /// outside the folders now is not returned.
     async fn resized(&self, source: Source, size: u32) -> Result<Option<Cover>, CoverError> {
         let Source {
             cover_id,
             mtime,
             origin,
         } = source;
-        let name = cache_name(&cover_id, size, mtime);
-        let path = self.inner.cache_dir.join(&name);
-        let cached = run_blocking(move || read_cached(&path)).await?.flatten();
-        let bytes = match cached {
-            Some(bytes) => Some(Bytes::from(bytes)),
-            None => {
-                let job = Job {
-                    cover_id,
-                    origin,
-                    size,
-                    name,
-                };
+        let Some(name) = cache_name(&cover_id, size, mtime) else {
+            return Ok(None);
+        };
+        let job = Job {
+            cover_id,
+            origin,
+            size,
+            name,
+        };
+        let inner = Arc::clone(&self.inner);
+        let looked_up = run_blocking(move || {
+            let cached = inner.cached(&job);
+            (cached, job)
+        });
+        let bytes = match looked_up.await? {
+            // The lookup panicked, so the place of the source is not known.
+            None | Some((Cached::Outside, _)) => None,
+            Some((Cached::Hit(bytes), _)) => Some(Bytes::from(bytes)),
+            Some((Cached::Miss, job)) => {
                 let mut progress = self.join_or_start(job);
                 let state = progress
                     .wait_for(|state| matches!(state, Progress::Done(_)))
@@ -486,6 +557,25 @@ impl Inner {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Returns what the cache holds for the cover of `job`.
+    ///
+    /// The path of the source is resolved first. A source outside the music
+    /// folders is logged at the level `info`, as `stream` logs such a file,
+    /// and the cache is not read for it. A path that cannot be resolved
+    /// names a source that is gone or that cannot be read. The cache answers
+    /// for it, and [`load`] reads no such source on a miss.
+    fn cached(&self, job: &Job) -> Cached {
+        if let Err(NotInFolders::Outside(real)) = path_in_folders(job.origin.path(), &self.folders)
+        {
+            log_outside(&job.cover_id, &job.origin, &real);
+            return Cached::Outside;
+        }
+        match read_cached(&self.cache_dir.join(&job.name)) {
+            Some(bytes) => Cached::Hit(bytes),
+            None => Cached::Miss,
+        }
+    }
+
     /// Makes the resized cover of `job` and stores it in the cache.
     ///
     /// Returns `None` when the job stops without an outcome: no request
@@ -541,7 +631,7 @@ impl Inner {
     /// Reads the image of `job` and returns it as a JPEG of the size of the
     /// job. Returns `None`, with a warning, when the image cannot be decoded.
     fn resize(&self, job: &Job) -> Option<Vec<u8>> {
-        let bytes = load(&job.cover_id, &job.origin)?;
+        let bytes = load(&job.cover_id, &job.origin, &self.folders)?;
         self.decodes.fetch_add(1, Ordering::Relaxed);
         match resize(bytes, job.size, decode_limits()) {
             Ok(jpeg) => Some(jpeg),
@@ -572,18 +662,33 @@ impl Inner {
 
 /// Returns the size that a request for `size` is served at: `None` for a
 /// request without a size and for the size 0, which both ask for the image
-/// as it is stored, and at most [`MAX_SIZE`] otherwise.
-fn effective_size(size: Option<u32>) -> Option<u32> {
-    size.filter(|size| *size != 0)
-        .map(|size| size.min(MAX_SIZE))
+/// as it is stored, and otherwise the step of the size. The step is the
+/// smallest of [`SIZE_STEPS`] that is not smaller than the size, and
+/// [`MAX_SIZE`], the largest step, for a size over it.
+///
+/// A size is never rounded down, so a cover is not smaller than the client
+/// asked for unless its image is. Sizes of one step are served with the same
+/// bytes, from one cache file, under one entity tag.
+pub fn served_size(size: Option<u32>) -> Option<u32> {
+    let size = size.filter(|size| *size != 0)?;
+    let step = SIZE_STEPS.iter().find(|step| **step >= size);
+    Some(step.copied().unwrap_or(MAX_SIZE))
 }
 
 /// Returns the name of the cache file of a resized cover:
 /// `<cover ID>-<size>-<mtime>.jpg` (`docs/design.md` section 3.5). The
 /// caller passes the ID and the modification time that a row holds and a
-/// size that [`effective_size`] returned.
-fn cache_name(cover_id: &str, size: u32, mtime: i64) -> String {
-    format!("{cover_id}-{size}-{mtime}.jpg")
+/// size that [`served_size`] returned.
+///
+/// Returns `None` when `cover_id` has not the form of an ID
+/// ([`ids::parse`]). A name is therefore built from two letters, hex
+/// characters, digits, hyphens and `.jpg` alone: it is one component of a
+/// path, and the file of that name is in the cache directory. The IDs of the
+/// rows have the form, so the check refuses a value that should not reach
+/// this function.
+fn cache_name(cover_id: &str, size: u32, mtime: i64) -> Option<String> {
+    ids::parse(cover_id)?;
+    Some(format!("{cover_id}-{size}-{mtime}.jpg"))
 }
 
 /// Returns what the cover ID `id` of the kind `kind` resolves to, or `None`
@@ -672,10 +777,17 @@ fn has_image_extension(path: &Path) -> bool {
 }
 
 /// Reads the bytes of the image at `origin`. Returns `None` when there is no
-/// image to serve: the track has no picture, the file is gone, or the image
-/// cannot be read. The last case is logged as a warning.
-fn load(cover_id: &str, origin: &Origin) -> Option<Vec<u8>> {
-    match read_origin(origin) {
+/// image to serve: the track has no picture, the file is gone, the file is
+/// outside `folders`, the configured music folders, or the image cannot be
+/// read.
+///
+/// A file that is gone is logged at the level `debug`. A file outside the
+/// folders and an image that cannot be read are logged at the level `info`.
+/// A client asks for the cover of every item of a list, so each of these
+/// lines is written once for each request while its cause stays. The scan
+/// reports a folder that cannot be read once, as a warning.
+fn load(cover_id: &str, origin: &Origin, folders: &[PathBuf]) -> Option<Vec<u8>> {
+    match read_origin(origin, folders) {
         Ok(bytes) => bytes,
         Err(LoadError::Io(error)) if error.kind() == io::ErrorKind::NotFound => {
             tracing::debug!(
@@ -685,8 +797,12 @@ fn load(cover_id: &str, origin: &Origin) -> Option<Vec<u8>> {
             );
             None
         }
+        Err(LoadError::Outside(real)) => {
+            log_outside(cover_id, origin, &real);
+            None
+        }
         Err(error) => {
-            tracing::warn!(
+            tracing::info!(
                 cover = cover_id,
                 path = %origin.path().display(),
                 %error,
@@ -697,14 +813,35 @@ fn load(cover_id: &str, origin: &Origin) -> Option<Vec<u8>> {
     }
 }
 
+/// Logs that the source of the cover `cover_id` at `origin` is not served,
+/// because `real`, its resolved path, is inside no music folder.
+fn log_outside(cover_id: &str, origin: &Origin, real: &Path) {
+    tracing::info!(
+        cover = cover_id,
+        path = %origin.path().display(),
+        resolved = %real.display(),
+        "the source of the cover is outside the music folders; the cover is not served"
+    );
+}
+
 /// Reads the bytes of the image at `origin`. Returns `None` when `origin` is
 /// an audio file without an embedded picture.
 ///
+/// The file is read when its path is inside one of `folders`, the configured
+/// music folders, after every symbolic link of the path is resolved
+/// ([`path_in_folders`]). A path that cannot be resolved is not read.
+///
 /// An image file is read by [`read_regular_file`], which follows no
-/// symbolic link. An audio file is read through a link, as the scanner reads
-/// it (`docs/design.md` section 1.3): the result is the picture that the tag
-/// reader finds in the tag of the file, and never the bytes of the file.
-fn read_origin(origin: &Origin) -> Result<Option<Vec<u8>>, LoadError> {
+/// symbolic link to the file. An audio file is read through a link, as the
+/// scanner reads it (`docs/design.md` section 1.3): the result is the
+/// picture that the tag reader finds in the tag of the file, and never the
+/// bytes of the file.
+///
+/// The check of the folders reads the path, and the file is opened after it.
+/// A directory of the path that is exchanged for a link between the two is
+/// followed for that one read.
+fn read_origin(origin: &Origin, folders: &[PathBuf]) -> Result<Option<Vec<u8>>, LoadError> {
+    path_in_folders(origin.path(), folders)?;
     match origin {
         Origin::File(path) => read_regular_file(path).map(Some),
         Origin::Embedded(path) => {
@@ -732,7 +869,8 @@ fn read_origin(origin: &Origin) -> Result<Option<Vec<u8>>, LoadError> {
 /// without following a link, and a link is not a regular file. The file
 /// that is then opened must be the file whose state was read, so a path
 /// that is changed to a link between the two steps is not read either. A
-/// directory in the path can be a link.
+/// directory in the path can be a link. For the source of a cover,
+/// [`read_origin`] checks first where such a link leads.
 fn read_regular_file(path: &Path) -> Result<Vec<u8>, LoadError> {
     let named = fs::symlink_metadata(path)?;
     if !named.is_file() {
@@ -940,8 +1078,8 @@ fn settle_rename(renamed: io::Result<()>, temp: &Path, dest: &Path) -> io::Resul
 /// and 32 random hex characters.
 ///
 /// The scanner removes the files of the cache whose name starts with the ID
-/// of an album and a hyphen (`docs/design.md` section 3.10). This name has no
-/// hyphen, so it starts with no cover ID.
+/// of an album or of a track and a hyphen (`docs/design.md` section 3.10).
+/// This name has no hyphen, so it starts with no cover ID.
 fn temp_name() -> String {
     let mut bytes = [0u8; 16];
     rand::fill(&mut bytes);
@@ -969,6 +1107,7 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::time::{Duration, Instant};
 
     use image::{Luma, LumaA, Rgb, Rgba};
@@ -982,10 +1121,10 @@ mod tests {
     /// The modification time of the covers that the tests store.
     const MTIME: i64 = 1_700_000_000;
 
-    /// A library in a temporary directory: a music folder, a memory database
-    /// that holds the folder and one artist, and the cover service. The cache
-    /// directory, `cache/covers`, does not exist until the service writes to
-    /// it.
+    /// A library in a temporary directory: the music folder `music`, which
+    /// is the one configured folder, a memory database that holds the folder
+    /// and one artist, and the cover service. The cache directory,
+    /// `cache/covers`, does not exist until the service writes to it.
     struct Library {
         dir: TempDir,
         db: Db,
@@ -1000,14 +1139,16 @@ mod tests {
             let music = dir.path().join("music");
             fs::create_dir(&music).expect("create the music folder");
             let db = Db::open_memory().expect("a memory database");
+            let folder = music.clone();
             let (folder_id, artist_id) = db
                 .write(move |conn| {
-                    let folder = folders::sync_folders(conn, &[music])?.remove(0);
+                    let folder = folders::sync_folders(conn, &[folder])?.remove(0);
                     Ok((folder.id, artists::upsert_by_key(conn, "Aurora Field")?))
                 })
                 .await
                 .expect("insert the folder and the artist");
-            let covers = Covers::new(dir.path().join("cache").join("covers"), db.clone());
+            let cache_dir = dir.path().join("cache").join("covers");
+            let covers = Covers::new(cache_dir, db.clone(), vec![music]);
             Self {
                 dir,
                 db,
@@ -1140,6 +1281,12 @@ mod tests {
 
         async fn get(&self, id: &str, size: Option<u32>) -> Option<Cover> {
             self.covers.get(id, size).await.expect("no error")
+        }
+
+        /// Returns the name of the cache file of the cover `id` at the step
+        /// `size`, for a cover with the time [`MTIME`].
+        fn cache_name(&self, id: &str, size: u32) -> String {
+            cache_name(id, size, MTIME).expect("the ID of a row")
         }
 
         /// Returns the names of the files in the cache directory in order.
@@ -1301,28 +1448,103 @@ mod tests {
     }
 
     #[test]
-    fn a_size_of_zero_is_no_size_and_a_size_over_the_maximum_is_the_maximum() {
-        assert_eq!(effective_size(None), None);
-        assert_eq!(effective_size(Some(0)), None);
-        assert_eq!(effective_size(Some(1)), Some(1));
-        assert_eq!(effective_size(Some(64)), Some(64));
-        assert_eq!(effective_size(Some(MAX_SIZE)), Some(2000));
-        assert_eq!(effective_size(Some(MAX_SIZE + 1)), Some(2000));
-        assert_eq!(effective_size(Some(u32::MAX)), Some(2000));
+    fn a_size_is_served_at_the_smallest_step_that_is_not_smaller() {
+        assert_eq!(SIZE_STEPS, [80, 160, 320, 640, 1280, 2000]);
+        // No size and the size 0 ask for the image as it is stored.
+        assert_eq!(served_size(None), None);
+        assert_eq!(served_size(Some(0)), None);
+
+        // The first and the last size of each step, and the size after it.
+        let mut first = 1;
+        for step in SIZE_STEPS {
+            for size in [first, (first + step) / 2, step - 1, step] {
+                assert_eq!(served_size(Some(size)), Some(step), "{size}");
+            }
+            // The size after the largest step is served at that step.
+            if step != MAX_SIZE {
+                assert_ne!(served_size(Some(step + 1)), Some(step), "{step}");
+            }
+            first = step + 1;
+        }
+        // A size is rounded up and never down.
+        for size in (1..=MAX_SIZE).step_by(13) {
+            let step = served_size(Some(size)).expect("a step");
+            assert!(step >= size && SIZE_STEPS.contains(&step), "{size} {step}");
+        }
+        assert_eq!(served_size(Some(64)), Some(80));
+        assert_eq!(served_size(Some(290)), Some(320));
+        assert_eq!(served_size(Some(300)), Some(320));
+        assert_eq!(served_size(Some(310)), Some(320));
+        assert_eq!(served_size(Some(321)), Some(640));
+
+        // A size over the largest step is served at the largest step.
+        assert_eq!(MAX_SIZE, SIZE_STEPS[SIZE_STEPS.len() - 1]);
+        for size in [MAX_SIZE, MAX_SIZE + 1, 5000, u32::MAX] {
+            assert_eq!(served_size(Some(size)), Some(2000), "{size}");
+        }
     }
 
     #[test]
     fn the_name_of_a_cache_file_holds_the_id_the_size_and_the_time() {
         let id = "al-0123456789abcdef0123456789abcdef";
         assert_eq!(
-            cache_name(id, 300, 1_700_000_000),
-            "al-0123456789abcdef0123456789abcdef-300-1700000000.jpg"
+            cache_name(id, 320, 1_700_000_000).as_deref(),
+            Some("al-0123456789abcdef0123456789abcdef-320-1700000000.jpg")
         );
         // A file from before 1970 has a negative time.
         assert_eq!(
-            cache_name(id, 64, -5),
-            "al-0123456789abcdef0123456789abcdef-64--5.jpg"
+            cache_name(id, 80, -5).as_deref(),
+            Some("al-0123456789abcdef0123456789abcdef-80--5.jpg")
         );
+    }
+
+    #[test]
+    fn the_name_of_a_cache_file_is_one_component_of_a_path() {
+        let cache_dir = Path::new("data").join("cache").join("covers");
+        let ids = [
+            "al-0123456789abcdef0123456789abcdef",
+            "tr-ffffffffffffffffffffffffffffffff",
+            "al-00000000000000000000000000000000",
+        ];
+        for id in ids {
+            for size in [0, 1, 80, MAX_SIZE, u32::MAX] {
+                for mtime in [0, 1_700_000_000, -1, i64::MIN, i64::MAX] {
+                    let name = cache_name(id, size, mtime).expect("a name");
+                    assert!(
+                        name.bytes()
+                            .all(|byte| byte.is_ascii_alphanumeric() || b"-.".contains(&byte)),
+                        "{name}"
+                    );
+                    assert!(!name.starts_with('.'), "{name}");
+                    let path = cache_dir.join(&name);
+                    assert_eq!(path.parent(), Some(cache_dir.as_path()), "{name}");
+                    assert_eq!(path.file_name(), Some(OsStr::new(&name)), "{name}");
+                    assert_eq!(path.components().count(), 4, "{name}");
+                }
+            }
+        }
+
+        // A value that is no ID gives no name, so no path is built from it.
+        let hostile = [
+            "",
+            "..",
+            "../../secret",
+            "al-../../../secret",
+            "/etc/passwd",
+            "al-/etc/passwd",
+            r"al-..\..\secret",
+            r"C:\secret",
+            "al-0123456789abcdef0123456789abcdef/../../secret",
+            "al-0123456789abcdef0123456789abcdef\0",
+            "al-0123456789abcdef0123456789abcde/",
+            "AL-0123456789abcdef0123456789abcdef",
+            "al-0123456789ABCDEF0123456789abcdef",
+            "xx-0123456789abcdef0123456789abcdef",
+            "tmp.0123456789abcdef0123456789abcdef",
+        ];
+        for id in hostile {
+            assert_eq!(cache_name(id, 80, MTIME), None, "{id:?}");
+        }
     }
 
     #[test]
@@ -1380,6 +1602,37 @@ mod tests {
         // One pixel over the size is scaled down.
         assert_eq!(resized(png(5, 2), 4), (4, 2));
         assert_eq!(resized(png(2, 5), 4), (2, 4));
+    }
+
+    /// `docs/design.md` section 3.11 states the bytes of the cache files of
+    /// one cover from two figures: the pixels of the six steps, and the
+    /// bytes that the encoder writes for a pixel of an image that it
+    /// compresses badly.
+    #[test]
+    fn a_resized_cover_of_noise_takes_two_bytes_for_each_pixel_at_most() {
+        let pixels: u64 = SIZE_STEPS.iter().map(|step| u64::from(step * step)).sum();
+        assert_eq!(pixels, 6_182_400);
+
+        // Each channel of each pixel is 0 or 255, from a generator with a
+        // fixed start, so the image is the same in every run.
+        let mut state: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut bit = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            if (state >> 40) & 1 == 0 { 0 } else { 255 }
+        };
+        let side = 320;
+        let noise = image::RgbImage::from_fn(side, side, |_, _| Rgb([bit(), bit(), bit()]));
+        let source = encoded(noise, ImageFormat::Png);
+        let jpeg = resize(source, side, decode_limits()).expect("resize the image");
+        assert_eq!(jpeg_dimensions(&jpeg), (side, side));
+
+        let (bytes, pixels) = (jpeg.len() as u64, u64::from(side * side));
+        assert!(bytes <= 2 * pixels, "{bytes} bytes for {pixels} pixels");
+        // The image is one that the encoder compresses badly: a photograph
+        // takes about a quarter of a byte for each pixel.
+        assert!(bytes >= pixels, "{bytes} bytes for {pixels} pixels");
     }
 
     #[test]
@@ -1558,6 +1811,10 @@ mod tests {
         assert_eq!(MAX_SOURCE_BYTES, 16 * 1024 * 1024);
         assert_eq!(DECODE_PERMITS, 1);
         assert_eq!(MAX_SIZE, 2000);
+        // Six steps are the six files that one cover has in the cache at
+        // most.
+        assert_eq!(SIZE_STEPS.len(), 6);
+        assert!(SIZE_STEPS.is_sorted_by(|smaller, larger| smaller < larger));
 
         let header = header_limits();
         assert_eq!(header.max_image_width, None);
@@ -1693,17 +1950,120 @@ mod tests {
         assert_eq!(library.covers.decodes(), 0);
         assert_eq!(library.cache_files(), [""; 0]);
 
-        // A directory in the path can be a link. The image file in it is a
-        // regular file and is read.
+        // A directory in the path can be a link to a directory of the music
+        // folder. The image file in it is a regular file and is read.
+        let inside = library.music().join("Store");
+        fs::create_dir(&inside).expect("create the directory");
+        fs::write(inside.join("cover.jpg"), jpeg(4, 2)).expect("write the image");
         let linked_dir = library.music().join("Linked");
-        symlink(library.dir.path(), &linked_dir).expect("link the directory");
+        symlink(&inside, &linked_dir).expect("link the directory");
         let through_link = library.album("Paper Maps").await;
-        let path = linked_dir.join("outside.jpg");
+        let path = linked_dir.join("cover.jpg");
         library
             .set_cover(&through_link, path.to_str().expect("a Unicode path"), MTIME)
             .await;
         let cover = library.get(&through_link, None).await.expect("a cover");
-        assert_eq!(cover.bytes, fs::read(&outside).expect("read the image"));
+        assert_eq!(cover.bytes, jpeg(4, 2));
+    }
+
+    /// The cover file is a regular file with the name of a cover, so the
+    /// rule for a link in the place of an image file does not refuse it.
+    /// Its directory is reached through a link that leaves the music folder.
+    #[cfg(unix)] // Creating a symbolic link on Windows needs a privilege.
+    #[tokio::test]
+    async fn a_cover_file_below_a_directory_link_out_of_the_folders_is_not_served() {
+        use std::os::unix::fs::symlink;
+
+        let library = Library::new().await;
+        let elsewhere = library.dir.path().join("elsewhere");
+        fs::create_dir(&elsewhere).expect("create the directory");
+        fs::write(elsewhere.join("cover.png"), png(160, 80)).expect("write the image");
+        let linked_dir = library.music().join("Glass Harbour");
+        symlink(&elsewhere, &linked_dir).expect("link the directory");
+        let id = library.album("Glass Harbour").await;
+        let stored = linked_dir.join("cover.png");
+        library
+            .set_cover(&id, stored.to_str().expect("a Unicode path"), MTIME)
+            .await;
+        // The file is there, and its path names a regular file.
+        assert_eq!(
+            read_regular_file(&stored).expect("a regular file"),
+            png(160, 80)
+        );
+
+        for size in [None, Some(0), Some(80), Some(300), Some(MAX_SIZE)] {
+            assert_eq!(library.get(&id, size).await, None, "{size:?}");
+        }
+        // The image was not decoded, and no cache file was written.
+        assert_eq!(library.covers.decodes(), 0);
+        assert!(!library.cache_dir().exists());
+
+        // A cover that the cache holds for the source is not returned.
+        fs::create_dir_all(library.cache_dir()).expect("create the cache directory");
+        let name = library.cache_name(&id, 80);
+        fs::write(library.cache_dir().join(&name), b"cached earlier").expect("write the file");
+        assert_eq!(library.get(&id, Some(80)).await, None);
+        assert_eq!(library.cache_files(), [name.as_str()]);
+
+        // The same link inside the music folder gives the cover.
+        fs::remove_file(&linked_dir).expect("remove the link");
+        let inside = library.music().join("Store");
+        fs::create_dir(&inside).expect("create the directory");
+        fs::write(inside.join("cover.png"), png(160, 80)).expect("write the image");
+        symlink(&inside, &linked_dir).expect("link the directory");
+        let cover = library.get(&id, None).await.expect("a cover");
+        assert_eq!(cover.bytes, png(160, 80));
+        let cover = library.get(&id, Some(160)).await.expect("a resized cover");
+        assert_eq!(jpeg_dimensions(&cover.bytes), (160, 80));
+    }
+
+    #[test]
+    fn a_source_is_read_when_its_resolved_path_is_inside_a_folder() {
+        let dir = tempfile::tempdir().expect("a temporary directory");
+        let music = dir.path().join("music");
+        let other = dir.path().join("other");
+        for folder in [&music, &other] {
+            fs::create_dir(folder).expect("create the directory");
+            fs::write(folder.join("cover.jpg"), jpeg(4, 2)).expect("write the image");
+        }
+        let inside = Origin::File(music.join("cover.jpg"));
+        let outside = Origin::File(other.join("cover.jpg"));
+        let folders = [music.clone()];
+
+        let read = read_origin(&inside, &folders).expect("a source of the folder");
+        assert_eq!(read, Some(jpeg(4, 2)));
+        let error = read_origin(&outside, &folders).expect_err("outside the folder");
+        let resolved = fs::canonicalize(other.join("cover.jpg")).expect("resolve the path");
+        assert!(
+            matches!(&error, LoadError::Outside(real) if *real == resolved),
+            "{error}"
+        );
+        assert_eq!(load("al-0", &outside, &folders), None);
+
+        // A path that leaves the folder through `..`, and a server without a
+        // folder.
+        let dotted = Origin::File(music.join("..").join("other").join("cover.jpg"));
+        let error = read_origin(&dotted, &folders).expect_err("outside the folder");
+        assert!(matches!(error, LoadError::Outside(_)), "{error}");
+        let error = read_origin(&inside, &[]).expect_err("no folder");
+        assert!(matches!(error, LoadError::Outside(_)), "{error}");
+
+        // The second folder holds the file.
+        let read = read_origin(&outside, &[music.clone(), other.clone()]).expect("a source");
+        assert_eq!(read, Some(jpeg(4, 2)));
+
+        // A path that cannot be resolved is a source that is gone. It is
+        // not read as a source outside the folders.
+        let gone = Origin::File(music.join("gone.jpg"));
+        let error = read_origin(&gone, &folders).expect_err("no file");
+        assert!(
+            matches!(&error, LoadError::Io(io) if io.kind() == io::ErrorKind::NotFound),
+            "{error}"
+        );
+        // The audio file of an embedded picture is under the same rule.
+        let error = read_origin(&Origin::Embedded(other.join("cover.jpg")), &folders)
+            .expect_err("outside the folder");
+        assert!(matches!(error, LoadError::Outside(_)), "{error}");
     }
 
     #[cfg(unix)] // Creating a symbolic link on Windows needs a privilege.
@@ -1713,24 +2073,24 @@ mod tests {
 
         let library = Library::new().await;
         let (id, _) = library
-            .album_with_cover("Glass Harbour", "cover.png", &png(4, 2))
+            .album_with_cover("Glass Harbour", "cover.png", &png(160, 80))
             .await;
         let target = library.dir.path().join("outside.txt");
         fs::write(&target, b"not a cover").expect("write the file");
-        let cached = library.cache_dir().join(cache_name(&id, 2, MTIME));
+        let cached = library.cache_dir().join(library.cache_name(&id, 80));
         fs::create_dir_all(library.cache_dir()).expect("create the cache directory");
         symlink(&target, &cached).expect("create the link");
 
         // The cover is made from its source. The rename puts a regular file
         // in the place of the link, and the target of the link stays.
-        let cover = library.get(&id, Some(2)).await.expect("a resized cover");
-        assert_eq!(jpeg_dimensions(&cover.bytes), (2, 1));
+        let cover = library.get(&id, Some(80)).await.expect("a resized cover");
+        assert_eq!(jpeg_dimensions(&cover.bytes), (80, 40));
         assert_eq!(library.covers.decodes(), 1);
         let state = fs::symlink_metadata(&cached).expect("the state of the cache file");
         assert!(state.is_file());
         assert_eq!(fs::read(&target).expect("read the file"), b"not a cover");
 
-        assert_eq!(library.get(&id, Some(2)).await, Some(cover));
+        assert_eq!(library.get(&id, Some(80)).await, Some(cover));
         assert_eq!(library.covers.decodes(), 1);
     }
 
@@ -1773,17 +2133,17 @@ mod tests {
     async fn a_sized_cover_is_a_jpeg_that_is_cached_and_not_decoded_again() {
         let library = Library::new().await;
         let (id, source) = library
-            .album_with_cover("Glass Harbour", "cover.png", &png(128, 96))
+            .album_with_cover("Glass Harbour", "cover.png", &png(160, 120))
             .await;
 
-        let cover = library.get(&id, Some(64)).await.expect("a resized cover");
+        let cover = library.get(&id, Some(80)).await.expect("a resized cover");
         assert_eq!(cover.content_type, "image/jpeg");
         assert_eq!(cover.mtime, MTIME);
-        assert_eq!(jpeg_dimensions(&cover.bytes), (64, 48));
+        assert_eq!(jpeg_dimensions(&cover.bytes), (80, 60));
         assert_eq!(library.covers.decodes(), 1);
 
         // The cache holds the cover under its name and no other file.
-        let name = format!("{id}-64-{MTIME}.jpg");
+        let name = format!("{id}-80-{MTIME}.jpg");
         assert_eq!(library.cache_files(), [name.as_str()]);
         let cached = fs::read(library.cache_dir().join(&name)).expect("read the cache file");
         assert_eq!(cover.bytes, cached);
@@ -1791,13 +2151,112 @@ mod tests {
         // The second request reads the cache file. It decodes nothing, and
         // it does not read the source, which is gone here.
         fs::remove_file(&source).expect("remove the source");
-        assert_eq!(library.get(&id, Some(64)).await, Some(cover));
+        assert_eq!(library.get(&id, Some(80)).await, Some(cover));
         assert_eq!(library.covers.decodes(), 1);
         assert_eq!(library.cache_files(), [name.as_str()]);
 
-        // Another size is another cover, and its source is gone.
-        assert_eq!(library.get(&id, Some(32)).await, None);
+        // Another step is another cover, and its source is gone.
+        assert_eq!(library.get(&id, Some(81)).await, None);
         assert_eq!(library.get(&id, None).await, None);
+    }
+
+    #[tokio::test]
+    async fn sizes_of_one_step_are_one_cover_and_one_cache_file() {
+        let library = Library::new().await;
+        let (id, _) = library
+            .album_with_cover("Glass Harbour", "cover.png", &png(640, 480))
+            .await;
+
+        // 290, 300 and 310 are sizes of the step 320.
+        let cover = library.get(&id, Some(290)).await.expect("a resized cover");
+        assert_eq!(jpeg_dimensions(&cover.bytes), (320, 240));
+        let name = format!("{id}-320-{MTIME}.jpg");
+        assert_eq!(library.cache_files(), [name.as_str()]);
+        for size in [300, 310, 161, 320] {
+            assert_eq!(library.get(&id, Some(size)).await.as_ref(), Some(&cover));
+        }
+        // One image was decoded, and the cache holds one file.
+        assert_eq!(library.covers.decodes(), 1);
+        assert_eq!(library.cache_files(), [name.as_str()]);
+
+        // The sizes next to the step are other covers.
+        let smaller = library.get(&id, Some(160)).await.expect("a resized cover");
+        assert_eq!(jpeg_dimensions(&smaller.bytes), (160, 120));
+        let larger = library.get(&id, Some(321)).await.expect("a resized cover");
+        assert_eq!(jpeg_dimensions(&larger.bytes), (640, 480));
+        assert_eq!(library.covers.decodes(), 3);
+        assert_eq!(
+            library.cache_files(),
+            [
+                format!("{id}-160-{MTIME}.jpg"),
+                name,
+                format!("{id}-640-{MTIME}.jpg")
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_size_between_two_steps_is_served_at_the_larger_step_and_nothing_is_enlarged() {
+        let library = Library::new().await;
+        let (id, _) = library
+            .album_with_cover("Glass Harbour", "cover.png", &png(1000, 500))
+            .await;
+        // The size, the step that it is served at, and the size of the
+        // cover. The image is 1000 pixels wide: it is scaled down to a step
+        // below that, and it keeps its size at a step above that.
+        let cases = [
+            (1, 80, (80, 40)),
+            (81, 160, (160, 80)),
+            (300, 320, (320, 160)),
+            (500, 640, (640, 320)),
+            (700, 1280, (1000, 500)),
+            (1000, 1280, (1000, 500)),
+            (1500, 2000, (1000, 500)),
+            (5000, 2000, (1000, 500)),
+        ];
+        for (size, step, dimensions) in cases {
+            let cover = library.get(&id, Some(size)).await.expect("a resized cover");
+            assert_eq!(jpeg_dimensions(&cover.bytes), dimensions, "{size}");
+            let cached = library.cache_dir().join(library.cache_name(&id, step));
+            assert_eq!(
+                cover.bytes,
+                fs::read(&cached).expect("read the cache file"),
+                "{size}"
+            );
+        }
+        // A cover is never smaller than the size that was asked for, unless
+        // the image is.
+        let cover = library.get(&id, Some(300)).await.expect("a resized cover");
+        assert!(jpeg_dimensions(&cover.bytes).0 >= 300);
+    }
+
+    #[tokio::test]
+    async fn every_size_gives_at_most_six_cache_files_for_one_cover() {
+        let library = Library::new().await;
+        let (id, _) = library
+            .album_with_cover("Glass Harbour", "cover.png", &png(4, 2))
+            .await;
+
+        // The sizes around every step, and sizes over the whole range.
+        let mut sizes: Vec<u32> = (1..=2200).step_by(37).collect();
+        for step in SIZE_STEPS {
+            sizes.extend([step - 1, step, step + 1]);
+        }
+        sizes.extend([1_000_000, u32::MAX]);
+        for size in sizes {
+            let cover = library.get(&id, Some(size)).await.expect("a cover");
+            assert_eq!(jpeg_dimensions(&cover.bytes), (4, 2), "{size}");
+        }
+
+        let expected: Vec<String> = {
+            let mut names = SIZE_STEPS
+                .map(|step| library.cache_name(&id, step))
+                .to_vec();
+            names.sort();
+            names
+        };
+        assert_eq!(library.cache_files(), expected);
+        assert_eq!(library.covers.decodes(), SIZE_STEPS.len() as u64);
     }
 
     #[tokio::test]
@@ -1810,14 +2269,14 @@ mod tests {
         let cover = library.get(&id, Some(64)).await.expect("a cover");
         assert_eq!(cover.content_type, "image/jpeg");
         assert_eq!(jpeg_dimensions(&cover.bytes), (4, 2));
-        // Each size has its cache file, also when the covers are the same.
+        // Each step has its cache file, also when the covers are the same.
         let largest = library.get(&id, Some(MAX_SIZE)).await.expect("a cover");
         assert_eq!(jpeg_dimensions(&largest.bytes), (4, 2));
         assert_eq!(
             library.cache_files(),
             [
                 format!("{id}-2000-{MTIME}.jpg"),
-                format!("{id}-64-{MTIME}.jpg")
+                format!("{id}-80-{MTIME}.jpg")
             ]
         );
     }
@@ -1829,39 +2288,53 @@ mod tests {
             .album_with_cover("Glass Harbour", "cover.png", &png(4, 2))
             .await;
         fs::create_dir_all(library.cache_dir()).expect("create the cache directory");
-        let name = format!("{id}-64-{MTIME}.jpg");
+        let name = format!("{id}-80-{MTIME}.jpg");
         fs::write(library.cache_dir().join(name), b"cached earlier").expect("write the file");
 
-        let cover = library.get(&id, Some(64)).await.expect("the cached cover");
-        assert_eq!(cover.bytes, &b"cached earlier"[..]);
-        assert_eq!(cover.content_type, "image/jpeg");
+        // Every size of the step is served from the file.
+        for size in [1, 64, 80] {
+            let cover = library
+                .get(&id, Some(size))
+                .await
+                .expect("the cached cover");
+            assert_eq!(cover.bytes, &b"cached earlier"[..]);
+            assert_eq!(cover.content_type, "image/jpeg");
+        }
         assert_eq!(library.covers.decodes(), 0);
+
+        // A file with a size that is no step is not read: an earlier
+        // version of the server wrote such files.
+        let name = format!("{id}-300-{MTIME}.jpg");
+        fs::write(library.cache_dir().join(name), b"cached earlier").expect("write the file");
+        let cover = library.get(&id, Some(300)).await.expect("a cover");
+        assert_eq!(jpeg_dimensions(&cover.bytes), (4, 2));
+        assert_eq!(library.covers.decodes(), 1);
     }
 
     #[tokio::test]
     async fn a_new_modification_time_of_the_cover_is_a_new_cache_file() {
         let library = Library::new().await;
         let (id, path) = library
-            .album_with_cover("Glass Harbour", "cover.png", &png(4, 2))
+            .album_with_cover("Glass Harbour", "cover.png", &png(160, 80))
             .await;
-        let first = library.get(&id, Some(2)).await.expect("a resized cover");
+        let first = library.get(&id, Some(80)).await.expect("a resized cover");
 
-        fs::write(&path, png(2, 4)).expect("replace the cover file");
+        fs::write(&path, png(80, 160)).expect("replace the cover file");
         library
             .set_cover(&id, path.to_str().expect("a Unicode path"), MTIME + 60)
             .await;
-        let second = library.get(&id, Some(2)).await.expect("a resized cover");
+        let second = library.get(&id, Some(80)).await.expect("a resized cover");
 
-        assert_eq!(jpeg_dimensions(&first.bytes), (2, 1));
-        assert_eq!(jpeg_dimensions(&second.bytes), (1, 2));
+        assert_eq!(jpeg_dimensions(&first.bytes), (80, 40));
+        assert_eq!(jpeg_dimensions(&second.bytes), (40, 80));
         assert_eq!(second.mtime, MTIME + 60);
         assert_eq!(library.covers.decodes(), 2);
         // The scanner removes the file of the old time (`tests/covers.rs`).
         assert_eq!(
             library.cache_files(),
             [
-                format!("{id}-2-{MTIME}.jpg"),
-                format!("{id}-2-{}.jpg", MTIME + 60)
+                format!("{id}-80-{MTIME}.jpg"),
+                format!("{id}-80-{}.jpg", MTIME + 60)
             ]
         );
     }
@@ -1884,6 +2357,19 @@ mod tests {
         }
         assert_eq!(library.covers.decodes(), 1);
         assert_eq!(library.cache_files(), [name.as_str()]);
+
+        // An image that is smaller than the maximum has its own size at the
+        // maximum and over it.
+        let (small, _) = library
+            .album_with_cover("Paper Maps", "cover.png", &png(300, 150))
+            .await;
+        for size in [2000, 5000, u32::MAX] {
+            let cover = library.get(&small, Some(size)).await.expect("a cover");
+            assert_eq!(jpeg_dimensions(&cover.bytes), (300, 150), "{size}");
+        }
+        let mut names = vec![name, format!("{small}-2000-{MTIME}.jpg")];
+        names.sort();
+        assert_eq!(library.cache_files(), names);
     }
 
     #[tokio::test]
@@ -1977,7 +2463,7 @@ mod tests {
             .album_with_cover("Summer Sampler", "cover.png", &png(MAX_SOURCE_SIDE, 1))
             .await;
         let cover = library.get(&id, Some(64)).await.expect("a resized cover");
-        assert_eq!(jpeg_dimensions(&cover.bytes), (64, 1));
+        assert_eq!(jpeg_dimensions(&cover.bytes), (80, 1));
     }
 
     #[tokio::test]
@@ -1996,8 +2482,10 @@ mod tests {
         let (id, _) = library
             .album_with_cover("Slow Rivers", "cover.webp", &LOSSY_WEBP)
             .await;
+        // The image is 8 × 4 pixels and is within every step. The unit test
+        // of `resize` scales it down.
         let cover = library.get(&id, Some(4)).await.expect("a resized cover");
-        assert_eq!(jpeg_dimensions(&cover.bytes), (4, 2));
+        assert_eq!(jpeg_dimensions(&cover.bytes), (8, 4));
     }
 
     #[tokio::test]
@@ -2176,17 +2664,18 @@ mod tests {
     async fn requests_for_one_uncached_cover_at_one_time_decode_it_once() {
         let library = Library::new().await;
         let (id, _) = library
-            .album_with_cover("Glass Harbour", "cover.png", &png(4, 2))
+            .album_with_cover("Glass Harbour", "cover.png", &png(160, 80))
             .await;
-        let name = cache_name(&id, 2, MTIME);
+        let name = library.cache_name(&id, 80);
 
         // While the test holds the permit, the job waits before it decodes
-        // and every request finds it in progress.
+        // and every request finds it in progress. The sizes are sizes of one
+        // step, so the requests ask for one cover.
         let permits = hold_decodes(&library.covers).await;
         let requests: Vec<_> = (0..8)
-            .map(|_| {
+            .map(|request| {
                 let (covers, id) = (library.covers.clone(), id.clone());
-                tokio::spawn(async move { covers.get(&id, Some(2)).await })
+                tokio::spawn(async move { covers.get(&id, Some(73 + request)).await })
             })
             .collect();
         wait_until(|| library.covers.waiting(&name) == requests.len()).await;
@@ -2199,7 +2688,7 @@ mod tests {
             let cover = request.await.expect("the request ends");
             covers.push(cover.expect("no error").expect("a resized cover"));
         }
-        assert_eq!(jpeg_dimensions(&covers[0].bytes), (2, 1));
+        assert_eq!(jpeg_dimensions(&covers[0].bytes), (80, 40));
         assert!(covers.iter().all(|cover| *cover == covers[0]));
         assert_eq!(library.covers.decodes(), 1);
         assert_eq!(library.cache_files(), [name.as_str()]);
@@ -2207,7 +2696,7 @@ mod tests {
         wait_until(|| library.covers.inner.in_progress().is_empty()).await;
 
         // A later request reads the cache.
-        assert_eq!(library.get(&id, Some(2)).await.as_ref(), Some(&covers[0]));
+        assert_eq!(library.get(&id, Some(80)).await.as_ref(), Some(&covers[0]));
         assert_eq!(library.covers.decodes(), 1);
     }
 
@@ -2218,7 +2707,7 @@ mod tests {
         let (id, _) = library
             .album_with_cover("Glass Harbour", "cover.png", &whole[..whole.len() - 40])
             .await;
-        let name = cache_name(&id, 32, MTIME);
+        let name = library.cache_name(&id, 80);
 
         let permits = hold_decodes(&library.covers).await;
         let requests: Vec<_> = (0..8)
@@ -2238,14 +2727,16 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn covers_of_different_sizes_are_jobs_of_their_own_that_wait_for_the_permit() {
+    async fn covers_of_different_steps_are_jobs_of_their_own_that_wait_for_the_permit() {
         let library = Library::new().await;
+        // The image is wider than the largest step, so the width of each
+        // cover is its step.
         let (id, _) = library
-            .album_with_cover("Glass Harbour", "cover.png", &png(8, 4))
+            .album_with_cover("Glass Harbour", "cover.png", &png(4096, 2))
             .await;
 
         let permits = hold_decodes(&library.covers).await;
-        let sizes = [1, 2, 3, 4, 5, 6];
+        let sizes = SIZE_STEPS;
         let requests: Vec<_> = sizes
             .map(|size| {
                 let (covers, id) = (library.covers.clone(), id.clone());
@@ -2253,7 +2744,7 @@ mod tests {
             })
             .into_iter()
             .collect();
-        // Each size is a job of its own, and none decodes without a permit.
+        // Each step is a job of its own, and none decodes without a permit.
         wait_until(|| library.covers.inner.in_progress().len() == sizes.len()).await;
         assert_eq!(library.covers.decodes(), 0);
         assert_eq!(library.covers.inner.decode_permits.available_permits(), 0);
@@ -2304,14 +2795,14 @@ mod tests {
     async fn a_job_that_no_request_waits_for_is_dropped_before_it_decodes() {
         let library = Library::new().await;
         let (id, _) = library
-            .album_with_cover("Glass Harbour", "cover.png", &png(4, 2))
+            .album_with_cover("Glass Harbour", "cover.png", &png(160, 80))
             .await;
-        let name = cache_name(&id, 2, MTIME);
+        let name = library.cache_name(&id, 80);
 
         let permits = hold_decodes(&library.covers).await;
         let request = {
             let (covers, id) = (library.covers.clone(), id.clone());
-            tokio::spawn(async move { covers.get(&id, Some(2)).await })
+            tokio::spawn(async move { covers.get(&id, Some(80)).await })
         };
         wait_until(|| library.covers.waiting(&name) == 1).await;
         request.abort();
@@ -2325,8 +2816,8 @@ mod tests {
         assert_eq!(library.cache_files(), [""; 0]);
 
         // A later request makes the cover.
-        let cover = library.get(&id, Some(2)).await.expect("a resized cover");
-        assert_eq!(jpeg_dimensions(&cover.bytes), (2, 1));
+        let cover = library.get(&id, Some(80)).await.expect("a resized cover");
+        assert_eq!(jpeg_dimensions(&cover.bytes), (80, 40));
         assert_eq!(library.covers.decodes(), 1);
         assert_eq!(library.cache_files(), [name.as_str()]);
     }
@@ -2335,15 +2826,15 @@ mod tests {
     async fn a_job_goes_on_while_one_request_waits_for_it() {
         let library = Library::new().await;
         let (id, _) = library
-            .album_with_cover("Glass Harbour", "cover.png", &png(4, 2))
+            .album_with_cover("Glass Harbour", "cover.png", &png(160, 80))
             .await;
-        let name = cache_name(&id, 2, MTIME);
+        let name = library.cache_name(&id, 80);
 
         let permits = hold_decodes(&library.covers).await;
         let mut requests: Vec<_> = (0..8)
             .map(|_| {
                 let (covers, id) = (library.covers.clone(), id.clone());
-                tokio::spawn(async move { covers.get(&id, Some(2)).await })
+                tokio::spawn(async move { covers.get(&id, Some(80)).await })
             })
             .collect();
         wait_until(|| library.covers.waiting(&name) == requests.len()).await;
@@ -2358,15 +2849,17 @@ mod tests {
 
         drop(permits);
         let cover = last.await.expect("the request ends").expect("no error");
-        assert_eq!(jpeg_dimensions(&cover.expect("a cover").bytes), (2, 1));
+        assert_eq!(jpeg_dimensions(&cover.expect("a cover").bytes), (80, 40));
         assert_eq!(library.covers.decodes(), 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_request_that_comes_when_the_last_one_left_gets_its_cover() {
         let library = Library::new().await;
+        // The image is wider than the largest step, so the width of each
+        // cover is its step.
         let (id, _) = library
-            .album_with_cover("Glass Harbour", "cover.png", &png(64, 32))
+            .album_with_cover("Glass Harbour", "cover.png", &png(4096, 2))
             .await;
         let get = |size: u32| {
             let (covers, id) = (library.covers.clone(), id.clone());
@@ -2376,11 +2869,10 @@ mod tests {
         // The second request finds the job of the first one, which leaves
         // at that moment, or no job. In both cases it gets the cover, and
         // the cover is made once.
-        let sizes = 1..=8;
-        for size in sizes.clone() {
+        for size in SIZE_STEPS {
             let permits = hold_decodes(&library.covers).await;
             let first = get(size);
-            wait_until(|| library.covers.waiting(&cache_name(&id, size, MTIME)) == 1).await;
+            wait_until(|| library.covers.waiting(&library.cache_name(&id, size)) == 1).await;
             first.abort();
             let second = get(size);
             drop(permits);
@@ -2392,7 +2884,7 @@ mod tests {
                 "size {size}"
             );
         }
-        assert_eq!(library.covers.decodes(), sizes.count() as u64);
+        assert_eq!(library.covers.decodes(), SIZE_STEPS.len() as u64);
         wait_until(|| library.covers.inner.in_progress().is_empty()).await;
     }
 
@@ -2402,11 +2894,11 @@ mod tests {
         let (id, _) = library
             .album_with_cover("Glass Harbour", "cover.png", &png(512, 256))
             .await;
-        let name = cache_name(&id, 64, MTIME);
+        let name = library.cache_name(&id, 80);
 
         let request = {
             let (covers, id) = (library.covers.clone(), id.clone());
-            tokio::spawn(async move { covers.get(&id, Some(64)).await })
+            tokio::spawn(async move { covers.get(&id, Some(80)).await })
         };
         // The request is ended while its image is decoded, or after it was
         // answered when the decoding was faster than this test. The cover
@@ -2417,8 +2909,8 @@ mod tests {
 
         wait_until(|| library.cache_files() == [name.as_str()]).await;
         wait_until(|| library.covers.inner.in_progress().is_empty()).await;
-        let cover = library.get(&id, Some(64)).await.expect("the cached cover");
-        assert_eq!(jpeg_dimensions(&cover.bytes), (64, 32));
+        let cover = library.get(&id, Some(80)).await.expect("the cached cover");
+        assert_eq!(jpeg_dimensions(&cover.bytes), (80, 40));
         assert_eq!(library.covers.decodes(), 1);
     }
 
@@ -2427,16 +2919,17 @@ mod tests {
         let dir = tempfile::tempdir().expect("a temporary directory");
         let library = Library::new().await;
         let (id, _) = library
-            .album_with_cover("Glass Harbour", "cover.png", &png(4, 2))
+            .album_with_cover("Glass Harbour", "cover.png", &png(160, 80))
             .await;
         // The cache directory cannot be created below a file.
         let blocked = dir.path().join("cache");
         fs::write(&blocked, b"a file").expect("write the file");
-        let covers = Covers::new(blocked.join("covers"), library.db.clone());
+        let folders = vec![library.music()];
+        let covers = Covers::new(blocked.join("covers"), library.db.clone(), folders);
 
         for decodes in [1, 2] {
-            let cover = covers.get(&id, Some(2)).await.expect("no error");
-            assert_eq!(jpeg_dimensions(&cover.expect("a cover").bytes), (2, 1));
+            let cover = covers.get(&id, Some(80)).await.expect("no error");
+            assert_eq!(jpeg_dimensions(&cover.expect("a cover").bytes), (80, 40));
             assert_eq!(covers.decodes(), decodes);
         }
         assert_eq!(fs::read(&blocked).expect("read the file"), b"a file");

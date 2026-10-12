@@ -5,7 +5,8 @@
 //!
 //! The cover file and the embedded picture of the standard library are 2 × 2
 //! pixels. No cover is enlarged, so a test that needs a smaller cover writes
-//! a larger image first.
+//! a larger image first. A size is served at its step, and the smallest step
+//! is 80 pixels.
 
 mod common;
 
@@ -48,7 +49,8 @@ impl Scanned {
         let data = tempfile::tempdir().expect("create the data directory");
         let data_dir = DataDir::resolve(Some(data.path())).expect("a data directory");
         let db = Db::open(data_dir.db_path()).expect("open the database");
-        let covers = Covers::new(data_dir.covers_cache_dir(), db.clone());
+        let folders = vec![library.root.path().to_path_buf()];
+        let covers = Covers::new(data_dir.covers_cache_dir(), db.clone(), folders);
         let scanned = Self {
             library,
             data_dir,
@@ -230,16 +232,17 @@ async fn an_album_cover_without_a_size_is_the_cover_file_or_the_embedded_picture
 }
 
 #[tokio::test]
-async fn a_sized_cover_is_a_jpeg_of_at_most_that_size_and_the_second_request_reads_the_cache() {
+async fn a_sized_cover_is_a_jpeg_of_at_most_its_step_and_the_second_request_reads_the_cache() {
     let library = LibraryBuilder::standard().build();
     let cover_file = file(&library, "Aurora Field", "Glass Harbour", "cover.jpg");
-    write_image(&cover_file, 128, 64);
+    write_image(&cover_file, 160, 80);
     let scanned = Scanned::of(library).await;
     let first_track = scanned.file("Marlow Quartet", "Slow Rivers", "01 Upstream.m4a");
-    // The cover file is larger than 64 pixels and is scaled down. The
-    // embedded picture is 2 × 2 pixels and keeps its size.
+    // The size 64 is served at the step 80. The cover file is larger than
+    // 80 pixels and is scaled down. The embedded picture is 2 × 2 pixels and
+    // keeps its size.
     let albums = [
-        ("Glass Harbour", mtime(&cover_file), (64, 32)),
+        ("Glass Harbour", mtime(&cover_file), (80, 40)),
         ("Slow Rivers", mtime(&first_track), (2, 2)),
     ];
     let long_ago = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
@@ -251,19 +254,70 @@ async fn a_sized_cover_is_a_jpeg_of_at_most_that_size_and_the_second_request_rea
         assert_eq!(jpeg_dimensions(&cover), dimensions, "{name}");
         assert_eq!(cover.mtime, source_mtime);
 
-        let name = format!("{id}-64-{source_mtime}.jpg");
+        let name = format!("{id}-80-{source_mtime}.jpg");
         let cached = scanned.data_dir.covers_cache_dir().join(&name);
         assert_eq!(cover.bytes, fs::read(&cached).expect("read the cache file"));
 
         // A request that made the cover again would write a new file with
-        // the present time.
+        // the present time. Another size of the step reads the same file.
         set_mtime(&cached, long_ago);
-        assert_eq!(scanned.get(&id, Some(64)).await, Some(cover));
+        assert_eq!(scanned.get(&id, Some(64)).await.as_ref(), Some(&cover));
+        assert_eq!(scanned.get(&id, Some(80)).await, Some(cover));
         assert_eq!(mtime(&cached), 1_000_000_000);
         names.push(name);
     }
     names.sort();
     assert_eq!(scanned.cache_files(), names);
+}
+
+#[tokio::test]
+async fn requests_for_the_sizes_290_300_and_310_create_one_cache_file() {
+    let library = LibraryBuilder::standard().build();
+    let cover_file = file(&library, "Aurora Field", "Glass Harbour", "cover.jpg");
+    write_image(&cover_file, 640, 480);
+    let scanned = Scanned::of(library).await;
+    let id = scanned.album("Glass Harbour").await;
+
+    let first = scanned.get(&id, Some(290)).await.expect("a resized cover");
+    assert_eq!(jpeg_dimensions(&first), (320, 240));
+    for size in [300, 310] {
+        assert_eq!(scanned.get(&id, Some(size)).await.as_ref(), Some(&first));
+    }
+    assert_eq!(
+        scanned.cache_files(),
+        [format!("{id}-320-{}.jpg", mtime(&cover_file))]
+    );
+}
+
+#[tokio::test]
+async fn a_size_above_the_largest_step_is_the_largest_step_or_the_size_of_the_image() {
+    // The cover file of one album is larger than the largest step. The
+    // picture of the other album is 2 × 2 pixels.
+    let library = LibraryBuilder::standard().build();
+    let cover_file = file(&library, "Aurora Field", "Glass Harbour", "cover.png");
+    write_image(&cover_file, 2400, 12);
+    fs::remove_file(file(&library, "Aurora Field", "Glass Harbour", "cover.jpg"))
+        .expect("remove the cover file");
+    let scanned = Scanned::of(library).await;
+    let large = scanned.album("Glass Harbour").await;
+    let small = scanned.album("Slow Rivers").await;
+
+    for size in [2001, 2400, 5000, u32::MAX] {
+        let cover = scanned.get(&large, Some(size)).await.expect("a cover");
+        assert_eq!(jpeg_dimensions(&cover), (2000, 10), "{size}");
+        let cover = scanned.get(&small, Some(size)).await.expect("a cover");
+        assert_eq!(jpeg_dimensions(&cover), (2, 2), "{size}");
+    }
+    // Each cover has the one file of the largest step.
+    let files = scanned.cache_files();
+    assert_eq!(files.len(), 2, "{files:?}");
+    for id in [large, small] {
+        let prefix = format!("{id}-2000-");
+        assert!(
+            files.iter().any(|name| name.starts_with(&prefix)),
+            "{files:?}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -282,7 +336,7 @@ async fn a_track_cover_is_the_embedded_picture_of_the_track() {
     assert_eq!(jpeg_dimensions(&resized), (2, 2));
     assert_eq!(
         scanned.cache_files(),
-        [format!("{pictured}-64-{}.jpg", mtime(&file))]
+        [format!("{pictured}-80-{}.jpg", mtime(&file))]
     );
 
     // A track without a picture, an album without a cover file and without
@@ -364,12 +418,137 @@ async fn a_scan_removes_the_cached_cover_of_a_cover_file_that_changed() {
     assert_eq!(scanned.cache_files(), [kept_name.as_str()]);
 
     let new = scanned.get(&album, Some(64)).await.expect("a cover");
-    assert_eq!(jpeg_dimensions(&new), (64, 32));
+    assert_eq!(jpeg_dimensions(&new), (80, 40));
     assert_eq!(new.mtime, new_time);
-    let mut names = vec![format!("{album}-64-{new_time}.jpg"), kept_name];
+    let mut names = vec![format!("{album}-80-{new_time}.jpg"), kept_name];
     names.sort();
     assert_eq!(scanned.cache_files(), names);
     assert_eq!(scanned.get(&other, Some(64)).await, Some(kept));
+}
+
+#[tokio::test]
+async fn a_scan_removes_the_cached_covers_of_a_track_whose_row_it_deleted() {
+    let scanned = Scanned::standard().await;
+    let delta_file = scanned.file("Marlow Quartet", "Slow Rivers", "02 Delta.m4a");
+    let delta = scanned.track("Delta").await;
+    let upstream = scanned.track("Upstream").await;
+    let album = scanned.album("Slow Rivers").await;
+    let other = scanned.album("Glass Harbour").await;
+
+    // Two steps of the track that the test deletes, and one cover of the
+    // other track, of its album and of another album.
+    for (id, size) in [
+        (&delta, 80),
+        (&delta, 320),
+        (&upstream, 80),
+        (&album, 80),
+        (&other, 80),
+    ] {
+        scanned.get(id, Some(size)).await.expect("a cover");
+    }
+    let cache = scanned.data_dir.covers_cache_dir();
+    // Files that an earlier version of the server left: a size that is no
+    // step for a track that has its row, and for a track and an album that
+    // have none.
+    let gone_track = "tr-00000000000000000000000000000001";
+    let gone_album = "al-00000000000000000000000000000001";
+    let left = [
+        format!("{upstream}-300-1000.jpg"),
+        format!("{gone_track}-300-1000.jpg"),
+        format!("{gone_track}-64-1000.jpg"),
+        format!("{gone_album}-300-1000.jpg"),
+    ];
+    for name in &left {
+        fs::write(cache.join(name), b"a resized cover").expect("write the file");
+    }
+    let before = scanned.cache_files();
+    assert_eq!(before.len(), 9, "{before:?}");
+    let of = |id: &str| -> Vec<String> {
+        let prefix = format!("{id}-");
+        scanned
+            .cache_files()
+            .into_iter()
+            .filter(|name| name.starts_with(&prefix))
+            .collect()
+    };
+    assert_eq!(of(&delta).len(), 2);
+
+    // The file of the track is gone, and the scan deletes its row.
+    fs::remove_file(&delta_file).expect("remove the audio file");
+    scanned.scan().await;
+    assert_eq!(scanned.get(&delta, None).await, None);
+
+    // The files of the deleted track and of the track without a row are
+    // removed. The files of the track that has its row stay, and so does
+    // every file of an album.
+    assert_eq!(of(&delta), [""; 0]);
+    assert_eq!(of(gone_track), [""; 0]);
+    let mut expected: Vec<String> = before
+        .into_iter()
+        .filter(|name| !name.starts_with(&delta) && !name.starts_with(gone_track))
+        .collect();
+    expected.sort();
+    assert_eq!(scanned.cache_files(), expected);
+    assert_eq!(expected.len(), 5);
+    assert_eq!(of(&upstream).len(), 2);
+    assert_eq!(of(&album).len(), 1);
+    assert_eq!(of(&other).len(), 1);
+    assert_eq!(of(gone_album).len(), 1);
+
+    // The music folder holds the files that it held, less the one that the
+    // test removed.
+    let slow_rivers = delta_file.parent().expect("the directory of the album");
+    let names: Vec<_> = fs::read_dir(slow_rivers)
+        .expect("read the directory")
+        .map(|entry| entry.expect("a directory entry").file_name())
+        .collect();
+    assert_eq!(names, ["01 Upstream.m4a"]);
+}
+
+#[tokio::test]
+async fn a_source_that_cannot_be_read_is_logged_at_info_and_a_source_that_is_gone_at_debug() {
+    let log = captured_log();
+    let scanned = Scanned::standard().await;
+    let cover_file = scanned.file("Aurora Field", "Glass Harbour", "cover.jpg");
+    let album = scanned.album("Glass Harbour").await;
+    let lines = |text: &str| -> Vec<String> {
+        log.lines_with(&album)
+            .into_iter()
+            .filter(|line| line.contains(text))
+            .collect()
+    };
+    let unreadable = "the source of the cover cannot be read";
+    let gone = "the source of the cover is gone";
+
+    // A directory has the path of the cover file, so the source cannot be
+    // read. Each request writes one line, with and without a size.
+    fs::remove_file(&cover_file).expect("remove the cover file");
+    fs::create_dir(&cover_file).expect("create a directory");
+    for (requests, size) in [(1, None), (2, Some(64))] {
+        assert_eq!(scanned.get(&album, size).await, None);
+        let found = lines(unreadable);
+        assert_eq!(found.len(), requests, "{found:?}");
+        for line in &found {
+            assert!(line.contains("INFO"), "{line}");
+            assert!(line.contains("cover.jpg"), "{line}");
+        }
+    }
+
+    // Nothing has the path of the cover file.
+    fs::remove_dir(&cover_file).expect("remove the directory");
+    assert_eq!(scanned.get(&album, None).await, None);
+    let found = lines(gone);
+    assert_eq!(found.len(), 1, "{found:?}");
+    assert!(found[0].contains("DEBUG"), "{}", found[0]);
+
+    // No line about the cover is a warning.
+    let warnings: Vec<String> = log
+        .lines_with(&album)
+        .into_iter()
+        .filter(|line| line.contains("WARN") || line.contains("ERROR"))
+        .collect();
+    assert_eq!(warnings, [""; 0]);
+    assert_eq!(scanned.cache_files(), [""; 0]);
 }
 
 #[tokio::test]
@@ -595,4 +774,101 @@ async fn an_audio_file_that_is_a_symbolic_link_gives_its_embedded_picture() {
     let cover = scanned.get(&track, None).await.expect("a cover");
     assert_eq!(cover.bytes, &PICTURE_PNG[..]);
     assert_eq!(cover.content_type, "image/png");
+}
+
+/// Moves the directory `dir` of a music folder to `outside` and puts a
+/// symbolic link to its new place at its path, as a link does that changed
+/// after the scan. The files below `dir` keep their paths in the library.
+#[cfg(unix)] // Creating a symbolic link on Windows needs a privilege.
+fn link_out_of_the_folder(dir: &Path, outside: &Path) {
+    use std::os::unix::fs::symlink;
+
+    let moved = outside.join(dir.file_name().expect("the name of the directory"));
+    fs::rename(dir, &moved).expect("move the directory");
+    symlink(&moved, dir).expect("create the link");
+}
+
+#[cfg(unix)] // Creating a symbolic link on Windows needs a privilege.
+#[tokio::test]
+async fn a_cover_file_below_a_directory_link_out_of_the_folder_is_not_served() {
+    let log = captured_log();
+    let outside = tempfile::tempdir().expect("create a directory");
+    let library = LibraryBuilder::standard().build();
+    let cover_file = file(&library, "Aurora Field", "Glass Harbour", "cover.jpg");
+    write_image(&cover_file, 160, 80);
+    let scanned = Scanned::of(library).await;
+    let album = scanned.album("Glass Harbour").await;
+    let stored = fs::read(&cover_file).expect("read the cover");
+
+    // The cover is served while its file is in the music folder, and the
+    // cache holds the cover of one step.
+    let original = scanned.get(&album, None).await.expect("a cover");
+    assert_eq!(original.bytes, stored);
+    let resized = scanned
+        .get(&album, Some(80))
+        .await
+        .expect("a resized cover");
+    assert_eq!(jpeg_dimensions(&resized), (80, 40));
+    let cached = scanned.cache_files();
+    assert_eq!(cached.len(), 1, "{cached:?}");
+
+    // The directory of the album becomes a link to a directory outside the
+    // music folder. The stored source names the same path, and the file at
+    // that path is the same regular file.
+    let album_dir = cover_file.parent().expect("the directory of the album");
+    link_out_of_the_folder(album_dir, outside.path());
+    assert_eq!(
+        fs::read(&cover_file).expect("read through the link"),
+        stored
+    );
+    let state = fs::symlink_metadata(&cover_file).expect("the state of the cover file");
+    assert!(state.is_file());
+
+    // The cover is not served: not the file, not a cover of a step that the
+    // cache does not hold, and not the cover that the cache holds.
+    for size in [None, Some(0), Some(320), Some(80), Some(64), Some(5000)] {
+        assert_eq!(scanned.get(&album, size).await, None, "{size:?}");
+    }
+    // No cache file was written.
+    assert_eq!(scanned.cache_files(), cached);
+
+    // Each request wrote one line at the level `info`, as `stream` does.
+    let lines: Vec<String> = log
+        .lines_with(&album)
+        .into_iter()
+        .filter(|line| line.contains("is outside the music folders"))
+        .collect();
+    assert_eq!(lines.len(), 6, "{lines:?}");
+    for line in &lines {
+        assert!(line.contains("INFO"), "{line}");
+    }
+}
+
+#[cfg(unix)] // Creating a symbolic link on Windows needs a privilege.
+#[tokio::test]
+async fn an_embedded_picture_below_a_directory_link_out_of_the_folder_is_not_served() {
+    let outside = tempfile::tempdir().expect("create a directory");
+    let scanned = Scanned::standard().await;
+    let album = scanned.album("Slow Rivers").await;
+    let track = scanned.track("Delta").await;
+    for id in [&album, &track] {
+        let cover = scanned.get(id, None).await.expect("a cover");
+        assert_eq!(cover.bytes, &PICTURE_PNG[..]);
+    }
+
+    // The audio files of the album are regular files below a link that
+    // leaves the music folder.
+    let audio = scanned.file("Marlow Quartet", "Slow Rivers", "02 Delta.m4a");
+    let album_dir = audio.parent().expect("the directory of the album");
+    link_out_of_the_folder(album_dir, outside.path());
+    assert!(audio.is_file());
+
+    // The picture of the track is not read, for the ID of the track and as
+    // the cover of the album.
+    for id in [&album, &track] {
+        for size in [None, Some(80)] {
+            assert_eq!(scanned.get(id, size).await, None, "{id} {size:?}");
+        }
+    }
+    assert_eq!(scanned.cache_files(), [""; 0]);
 }

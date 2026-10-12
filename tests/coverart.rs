@@ -2,7 +2,8 @@
 //!
 //! The cover file and the embedded picture of the standard library are 2 × 2
 //! pixels. No cover is enlarged, so a test of scaling builds a library with a
-//! larger cover file.
+//! larger cover file. A size is served at its step: the smallest of 80, 160,
+//! 320, 640, 1280 and 2000 pixels that is not smaller than the size.
 //!
 //! The tests of the cover service are in `tests/covers.rs` and in
 //! `src/library/covers.rs`. This file covers what the method adds: the
@@ -198,7 +199,8 @@ async fn conditional(server: &TestServer, params: &[(&str, &str)], value: &str) 
 }
 
 /// The entity tag of the cover `id` at `size` whose source has the
-/// modification time `mtime`, with its quotes.
+/// modification time `mtime`, with its quotes. `size` is 0 for the image as
+/// it is stored, and otherwise the step that a size is served at.
 fn etag(id: &str, size: u32, mtime: i64) -> String {
     format!("\"{id}-{size}-{mtime}\"")
 }
@@ -313,7 +315,7 @@ async fn advance<F: Future>(mut request: Pin<&mut F>, waits: usize) -> Option<F:
 }
 
 #[tokio::test]
-async fn album_with_a_cover_file_returns_the_file_and_a_jpeg_of_at_most_the_size() {
+async fn album_with_a_cover_file_returns_the_file_and_a_jpeg_of_at_most_the_step() {
     let (server, album, cover_file) = server_with_cover("cover.jpg", 128, 64).await;
     let id = album.as_str();
     let stored = fs::read(&cover_file).expect("read the cover file");
@@ -325,23 +327,56 @@ async fn album_with_a_cover_file_returns_the_file_and_a_jpeg_of_at_most_the_size
         original.assert_cover("image/jpeg", &etag(id, 0, time), name);
         assert_eq!(original.body, stored, "{name}");
 
-        // With a size the body is a JPEG whose longer side has that size.
+        // With a size the body is a JPEG whose longer side has the step of
+        // that size, which is 80 for 64.
         let params = [("id", id), ("size", "64")];
         let resized = Answer::of(server.get_raw(name, &params).await).await;
-        resized.assert_cover("image/jpeg", &etag(id, 64, time), name);
-        assert_eq!(jpeg_dimensions(&resized.body), (64, 32), "{name}");
+        resized.assert_cover("image/jpeg", &etag(id, 80, time), name);
+        assert_eq!(jpeg_dimensions(&resized.body), (80, 40), "{name}");
         assert_ne!(resized.body, stored, "{name}");
 
         // The second request returns the same cover.
         let again = Answer::of(server.get_raw(name, &params).await).await;
-        again.assert_cover("image/jpeg", &etag(id, 64, time), name);
+        again.assert_cover("image/jpeg", &etag(id, 80, time), name);
         assert_eq!(again.body, resized.body, "{name}");
     }
 
-    // A cover within the size keeps its size and is encoded as a JPEG.
+    // A cover within the step keeps its size and is encoded as a JPEG.
     let larger = cover(&server, &[("id", id), ("size", "500")]).await;
-    larger.assert_cover("image/jpeg", &etag(id, 500, time), "size=500");
+    larger.assert_cover("image/jpeg", &etag(id, 640, time), "size=500");
     assert_eq!(jpeg_dimensions(&larger.body), (128, 64));
+}
+
+#[tokio::test]
+async fn sizes_of_one_step_get_one_cover_with_one_entity_tag() {
+    let (server, album, cover_file) = server_with_cover("cover.jpg", 640, 320).await;
+    let id = album.as_str();
+    let tag = etag(id, 320, mtime(&cover_file));
+
+    // 290, 300 and 310 are sizes of the step 320. The cover is 320 pixels
+    // wide, which is more than each of them asks for.
+    let first = cover(&server, &[("id", id), ("size", "290")]).await;
+    first.assert_cover("image/jpeg", &tag, "290");
+    assert_eq!(jpeg_dimensions(&first.body), (320, 160));
+    for size in ["300", "310", "161", "320"] {
+        let answer = cover(&server, &[("id", id), ("size", size)]).await;
+        answer.assert_cover("image/jpeg", &tag, size);
+        assert_eq!(answer.body, first.body, "{size}");
+
+        // A client that holds the cover of one size holds the cover of
+        // every size of the step.
+        let answer = conditional(&server, &[("id", id), ("size", size)], &tag).await;
+        answer.assert_not_modified(&tag, size);
+    }
+
+    // The sizes next to the step get other covers.
+    for (size, step, width) in [("160", 160, 160), ("321", 640, 640), ("1000", 1280, 640)] {
+        let answer = cover(&server, &[("id", id), ("size", size)]).await;
+        answer.assert_cover("image/jpeg", &etag(id, step, mtime(&cover_file)), size);
+        assert_eq!(jpeg_dimensions(&answer.body), (width, width / 2), "{size}");
+        let answer = conditional(&server, &[("id", id), ("size", size)], &tag).await;
+        assert_eq!(answer.status, StatusCode::OK, "{size}");
+    }
 }
 
 #[tokio::test]
@@ -363,7 +398,7 @@ async fn standard_library_covers_have_the_content_type_of_their_format() {
         fs::read(&cover_file).expect("read the cover")
     );
     let resized = cover(&server, &[("id", id), ("size", "64")]).await;
-    resized.assert_cover("image/jpeg", &etag(id, 64, time), "cover.jpg at 64");
+    resized.assert_cover("image/jpeg", &etag(id, 80, time), "cover.jpg at 64");
     assert_eq!(jpeg_dimensions(&resized.body), (2, 2));
 
     // "Slow Rivers" has no image file. Its cover is the PNG picture of its
@@ -376,7 +411,7 @@ async fn standard_library_covers_have_the_content_type_of_their_format() {
     original.assert_cover("image/png", &etag(id, 0, time), "embedded");
     assert_eq!(original.body, PICTURE_PNG);
     let resized = cover(&server, &[("id", id), ("size", "64")]).await;
-    resized.assert_cover("image/jpeg", &etag(id, 64, time), "embedded at 64");
+    resized.assert_cover("image/jpeg", &etag(id, 80, time), "embedded at 64");
     assert_eq!(jpeg_dimensions(&resized.body), (2, 2));
 
     // The ID of a track is the ID of the picture in its own file.
@@ -388,9 +423,11 @@ async fn standard_library_covers_have_the_content_type_of_their_format() {
         let original = cover(&server, &[("id", id)]).await;
         original.assert_cover("image/png", &etag(id, 0, time), name);
         assert_eq!(original.body, PICTURE_PNG, "{name}");
+        // The size 1 is served at the smallest step, and the picture of
+        // 2 × 2 pixels is not made smaller for it.
         let resized = cover(&server, &[("id", id), ("size", "1")]).await;
-        resized.assert_cover("image/jpeg", &etag(id, 1, time), name);
-        assert_eq!(jpeg_dimensions(&resized.body), (1, 1), "{name}");
+        resized.assert_cover("image/jpeg", &etag(id, 80, time), name);
+        assert_eq!(jpeg_dimensions(&resized.body), (2, 2), "{name}");
     }
 }
 
@@ -636,7 +673,8 @@ async fn if_none_match_with_the_etag_of_the_cover_is_http_304() {
         let first = cover(&server, &params).await;
         assert_eq!(first.status, StatusCode::OK);
         let tag = first.etag().to_owned();
-        let served = size.map_or(0, |size| size.parse().expect("a size"));
+        // The size 64 is served at the step 80.
+        let served = size.map_or(0, |_| 80);
         assert_eq!(tag, etag(id, served, time));
 
         // The tag as it was sent, in the weak form, in a list, and `*`.
@@ -673,7 +711,7 @@ async fn if_none_match_with_the_etag_of_the_cover_is_http_304() {
     }
 
     // The tag of the resized cover is not the tag of the file.
-    let answer = conditional(&server, &[("id", id)], &etag(id, 64, time)).await;
+    let answer = conditional(&server, &[("id", id)], &etag(id, 80, time)).await;
     assert_eq!(answer.status, StatusCode::OK);
     assert_eq!(answer.body, fs::read(&cover_file).expect("read the cover"));
 }
@@ -716,8 +754,8 @@ async fn etag_changes_when_a_scan_stores_a_new_cover() {
     // The same holds for a resized cover.
     let params = [("id", id), ("size", "8")];
     let sized = cover(&server, &params).await;
-    sized.assert_cover("image/jpeg", &etag(id, 8, later), "the new cover at 8");
-    assert_eq!(jpeg_dimensions(&sized.body), (8, 4));
+    sized.assert_cover("image/jpeg", &etag(id, 80, later), "the new cover at 8");
+    assert_eq!(jpeg_dimensions(&sized.body), (16, 8));
     let answer = conditional(&server, &params, old_sized.etag()).await;
     assert_eq!(answer.status, StatusCode::OK);
     assert_eq!(answer.body, sized.body);
@@ -762,8 +800,8 @@ async fn album_in_disc_directories_returns_the_cover_file_of_their_parent_direct
     );
     let params = [("id", id), ("size", "8")];
     let resized = cover(&server, &params).await;
-    resized.assert_cover("image/jpeg", &etag(id, 8, time), "the file at 8");
-    assert_eq!(jpeg_dimensions(&resized.body), (8, 4));
+    resized.assert_cover("image/jpeg", &etag(id, 80, time), "the file at 8");
+    assert_eq!(jpeg_dimensions(&resized.body), (16, 8));
 
     // Without the file the album has no cover after the next scan.
     fs::remove_file(&cover_file).expect("remove the cover file");
@@ -930,13 +968,24 @@ async fn size_selects_the_stored_image_or_a_jpeg_of_at_most_2000_pixels() {
         assert_eq!(answer.body, stored, "{params:?}");
     }
 
-    // A size is the longer side of the JPEG.
-    for (size, width) in [("1", 1), ("64", 64), ("1999", 1999), ("2000", 2000)] {
+    // The step of a size is the longer side of the JPEG: the smallest step
+    // that is not smaller than the size.
+    for (size, step) in [
+        ("1", 80),
+        ("64", 80),
+        ("80", 80),
+        ("81", 160),
+        ("300", 320),
+        ("640", 640),
+        ("641", 1280),
+        ("1281", 2000),
+        ("1999", 2000),
+        ("2000", 2000),
+    ] {
         let answer = cover(&server, &[("id", id), ("size", size)]).await;
-        let served: u32 = size.parse().expect("a size");
-        answer.assert_cover("image/jpeg", &etag(id, served, time), size);
-        let (found, height) = jpeg_dimensions(&answer.body);
-        assert_eq!(found, width, "{size}");
+        answer.assert_cover("image/jpeg", &etag(id, step, time), size);
+        let (width, height) = jpeg_dimensions(&answer.body);
+        assert_eq!(width, step, "{size}");
         assert!((1..=2).contains(&height), "{size}: {height}");
     }
 
@@ -967,6 +1016,12 @@ async fn size_selects_the_stored_image_or_a_jpeg_of_at_most_2000_pixels() {
         "1e3",
         "4294967296",
         "99999999999999999999",
+        // Values that would leave a directory if they were part of a path.
+        "../x",
+        "64/../../x",
+        "..\\x",
+        "/etc/passwd",
+        "64\0",
     ] {
         for id in [id, "al-ffffffffffffffffffffffffffffffff", "../x"] {
             let params = [("id", id), ("size", size)];
@@ -1023,12 +1078,9 @@ async fn head_request_gets_the_headers_of_the_cover_without_the_body() {
         );
         answer.assert_cors(&case);
 
-        // A conditional HEAD request is answered as a conditional GET.
-        let tag = etag(
-            id,
-            size.map_or(0, |size| size.parse().expect("a size")),
-            time,
-        );
+        // A conditional HEAD request is answered as a conditional GET. The
+        // size 64 is served at the step 80.
+        let tag = etag(id, size.map_or(0, |_| 80), time);
         let request = head(&params, Some(&tag));
         let answer = Answer::of(server.request(request).await).await;
         answer.assert_not_modified(&tag, &case);
@@ -1060,8 +1112,8 @@ async fn post_with_a_form_body_is_answered_as_a_get() {
 
         let form = [("id", id), ("size", "64")];
         let answer = Answer::of(server.post_form(name, &form).await).await;
-        answer.assert_cover("image/jpeg", &etag(id, 64, time), name);
-        assert_eq!(jpeg_dimensions(&answer.body), (64, 32), "{name}");
+        answer.assert_cover("image/jpeg", &etag(id, 80, time), name);
+        assert_eq!(jpeg_dimensions(&answer.body), (80, 40), "{name}");
         let get = cover(&server, &form).await;
         assert_eq!(answer.body, get.body, "{name}");
 
@@ -1082,7 +1134,7 @@ async fn post_with_a_form_body_is_answered_as_a_get() {
     }
 
     // A conditional POST is answered as a conditional GET.
-    let tag = etag(id, 64, time);
+    let tag = etag(id, 80, time);
     let form = as_owner(&[("id", id), ("size", "64")]);
     let mut request = form_request("/rest/getCoverArt", &form);
     let value = tag.parse().expect("a header value");
@@ -1162,7 +1214,7 @@ async fn request_without_a_user_gets_the_authentication_error_and_no_cover() {
 /// that makes the cover, and no request of this test would be answered.
 #[tokio::test]
 async fn requests_at_the_same_time_are_all_answered() {
-    let (server, album, cover_file) = server_with_cover("cover.jpg", 128, 64).await;
+    let (server, album, cover_file) = server_with_cover("cover.jpg", 640, 320).await;
     let id = album.as_str();
     let stored = fs::read(&cover_file).expect("read the cover file");
     let get = |size: &'static str| {
@@ -1176,25 +1228,26 @@ async fn requests_at_the_same_time_are_all_answered() {
         }
     };
 
+    // Three steps, and two sizes of the step 80.
     let answers = tokio::join!(
-        get("16"),
-        get("32"),
+        get("80"),
+        get("160"),
         get(""),
-        get("16"),
+        get("80"),
+        get("320"),
+        get("160"),
+        get(""),
         get("64"),
-        get("32"),
-        get(""),
-        get("16"),
     );
-    let (a16, a32, a0, b16, a64, b32, b0, c16) = answers;
-    for (answer, width) in [(&a16, 16), (&a32, 32), (&a64, 64)] {
+    let (a80, a160, a0, b80, a320, b160, b0, c80) = answers;
+    for (answer, width) in [(&a80, 80), (&a160, 160), (&a320, 320)] {
         assert_eq!(answer.status, StatusCode::OK, "{width}");
         assert_eq!(jpeg_dimensions(&answer.body), (width, width / 2));
     }
-    // The requests for one size get one cover.
-    assert_eq!(b16.body, a16.body);
-    assert_eq!(c16.body, a16.body);
-    assert_eq!(b32.body, a32.body);
+    // The requests for one step get one cover.
+    assert_eq!(b80.body, a80.body);
+    assert_eq!(c80.body, a80.body);
+    assert_eq!(b160.body, a160.body);
     for answer in [&a0, &b0] {
         assert_eq!(answer.status, StatusCode::OK);
         assert_eq!(answer.body, stored);
@@ -1224,8 +1277,10 @@ async fn request_that_ends_early_does_not_keep_the_next_request_waiting() {
     for sized in [false, true] {
         let mut ended = 0;
         for waits in 1.. {
-            // A resized cover of a size of its own, which the cache does not
-            // hold, or the image as it is stored.
+            // A resized cover, or the image as it is stored. The sizes are
+            // sizes of the step 160, so the requests ask for one cover. The
+            // cache does not hold it while every request for it was dropped
+            // before its cover was made.
             let size = (100 + waits).to_string();
             let mut params = vec![("id", id)];
             if sized {
@@ -1237,7 +1292,8 @@ async fn request_that_ends_early_does_not_keep_the_next_request_waiting() {
             drop(pending);
 
             // The next requests are answered: the stored image, which waits
-            // for the one place of the service itself, and a resized cover.
+            // for the one place of the service itself, and a resized cover
+            // of another step, which the first of these requests makes.
             let original = cover(&server, &[("id", id)]).await;
             assert_eq!(original.status, StatusCode::OK, "{sized} {waits}");
             assert_eq!(original.body, stored, "{sized} {waits}");
@@ -1258,4 +1314,55 @@ async fn request_that_ends_early_does_not_keep_the_next_request_waiting() {
             assert!(ended >= 1, "no request was dropped while it waited");
         }
     }
+}
+
+/// A link that changed after the scan leads the stored path of a cover out
+/// of the music folder. `stream` refuses the file of a track behind such a
+/// link, and `getCoverArt` refuses the cover (`docs/design.md` section 3.11).
+#[cfg(unix)] // Creating a symbolic link on Windows needs a privilege.
+#[tokio::test]
+async fn cover_below_a_directory_link_out_of_the_music_folder_is_error_70() {
+    use std::os::unix::fs::symlink;
+
+    let outside = tempfile::tempdir().expect("create a directory");
+    let (server, album, cover_file) = server_with_cover("cover.jpg", 160, 80).await;
+    let id = album.as_str();
+    let stored = fs::read(&cover_file).expect("read the cover file");
+
+    // The cover is served while its file is in the music folder. The cache
+    // of the server holds the cover of the step 80 after that.
+    let original = cover(&server, &[("id", id)]).await;
+    assert_eq!(original.body, stored);
+    let resized = cover(&server, &[("id", id), ("size", "80")]).await;
+    assert_eq!(jpeg_dimensions(&resized.body), (80, 40));
+
+    // The directory of the album becomes a link to a directory outside the
+    // music folder. The cover file has its path, and it is a regular file.
+    let album_dir = cover_file.parent().expect("the directory of the album");
+    let moved = outside.path().join("Glass Harbour");
+    fs::rename(album_dir, &moved).expect("move the directory");
+    symlink(&moved, album_dir).expect("create the link");
+    assert_eq!(
+        fs::read(&cover_file).expect("read through the link"),
+        stored
+    );
+
+    // The file, a cover that the cache holds and a cover that it does not
+    // hold are all error 70.
+    for size in [None, Some("0"), Some("80"), Some("64"), Some("320")] {
+        let mut params = vec![("id", id), ("f", "json")];
+        params.extend(size.map(|size| ("size", size)));
+        let answer = cover(&server, &params).await;
+        answer.assert_error(70, NOT_FOUND, &format!("{size:?}"));
+
+        // A client that holds the cover gets the error and not HTTP 304.
+        let answer = conditional(&server, &params, resized.etag()).await;
+        answer.assert_error(70, NOT_FOUND, &format!("conditional {size:?}"));
+    }
+
+    // The cover is served again when the directory is back in the folder.
+    fs::remove_file(album_dir).expect("remove the link");
+    fs::rename(&moved, album_dir).expect("move the directory back");
+    let again = cover(&server, &[("id", id), ("size", "80")]).await;
+    assert_eq!(again.body, resized.body);
 }
