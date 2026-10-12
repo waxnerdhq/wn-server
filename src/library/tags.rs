@@ -1059,6 +1059,120 @@ mod tests {
         }
     }
 
+    /// Returns a zlib stream that inflates to `prefix` followed by
+    /// `runs` × 258 copies of the last byte of `prefix`, and the number of
+    /// bytes that it inflates to. The stream is one Deflate block with the
+    /// fixed Huffman codes: a literal for each byte of `prefix`, then `runs`
+    /// matches of the length 258 at the distance 1, which take 13 bits each.
+    fn zlib_of_a_run(prefix: &[u8], runs: usize) -> (Vec<u8>, usize) {
+        /// Writes the codes of a Deflate block, which start at the lowest
+        /// bit of each byte. A Huffman code is written from its highest bit.
+        #[derive(Default)]
+        struct Bits {
+            bytes: Vec<u8>,
+            current: u8,
+            used: u8,
+        }
+        impl Bits {
+            fn bit(&mut self, bit: bool) {
+                self.current |= u8::from(bit) << self.used;
+                self.used += 1;
+                if self.used == 8 {
+                    self.bytes.push(self.current);
+                    (self.current, self.used) = (0, 0);
+                }
+            }
+            fn code(&mut self, code: u32, len: u32) {
+                for shift in (0..len).rev() {
+                    self.bit((code >> shift) & 1 == 1);
+                }
+            }
+        }
+
+        let last = *prefix.last().expect("a byte to repeat");
+        let mut inflated = prefix.to_vec();
+        let mut bits = Bits::default();
+        // The last block of the stream, with the fixed codes.
+        bits.bit(true);
+        bits.bit(true);
+        bits.bit(false);
+        for &literal in prefix {
+            match literal {
+                0..=143 => bits.code(0x30 + u32::from(literal), 8),
+                _ => bits.code(0x190 + u32::from(literal) - 144, 9),
+            }
+        }
+        for _ in 0..runs {
+            bits.code(0xc5, 8); // The length 258.
+            bits.code(0, 5); // The distance 1.
+            inflated.resize(inflated.len() + 258, last);
+        }
+        bits.code(0, 7); // The end of the block.
+        while bits.used != 0 {
+            bits.bit(false);
+        }
+        // The Adler-32 checksum of the inflated bytes ends a zlib stream.
+        let (mut a, mut b) = (1u32, 0u32);
+        for &byte in &inflated {
+            a = (a + u32::from(byte)) % 65521;
+            b = (b + a) % 65521;
+        }
+        let mut stream = vec![0x78, 0x9c];
+        stream.extend(bits.bytes);
+        stream.extend(((b << 16) | a).to_be_bytes());
+        (stream, inflated.len())
+    }
+
+    /// Returns the MP3 fixture behind an ID3v2.4 tag with one `APIC` frame
+    /// whose content is `content`. `flags` are the two flag bytes of the
+    /// frame, and `inflated` is the length that the frame declares for its
+    /// content after decompression.
+    fn mp3_with_picture_frame(content: &[u8], flags: [u8; 2], inflated: usize) -> Vec<u8> {
+        let seven_bits = |number: usize| {
+            [21, 14, 7, 0].map(|shift| u8::try_from((number >> shift) & 0x7f).expect("7 bits"))
+        };
+        let mut frame = b"APIC".to_vec();
+        frame.extend(seven_bits(content.len() + 4));
+        frame.extend(flags);
+        frame.extend(seven_bits(inflated));
+        frame.extend(content);
+        let mut bytes = b"ID3\x04\0\0".to_vec();
+        bytes.extend(seven_bits(frame.len()));
+        bytes.extend(frame);
+        let fixture = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/audio/a.mp3");
+        bytes.extend(fs::read(fixture).expect("read the fixture"));
+        bytes
+    }
+
+    /// A present limit of the tag bound (`docs/design.md` section 3.10): the
+    /// bound limits the bytes that lofty reads and not what lofty makes of
+    /// them, and lofty inflates a compressed ID3v2 frame without a limit.
+    /// The test holds the figures that the design states. It fails when
+    /// lofty no longer inflates such a frame; the design then changes with
+    /// it.
+    #[test]
+    fn a_compressed_id3v2_frame_is_inflated_past_the_limit_of_the_read() {
+        // The content of a picture frame: Latin-1, the type `image/png`, a
+        // front cover, no description, and a picture of one byte that the
+        // stream repeats.
+        let mut prefix = vec![0];
+        prefix.extend(b"image/png\0");
+        prefix.extend([3, 0, 0x5a]);
+        let (stream, inflated) = zlib_of_a_run(&prefix, 40_000);
+        // The flags of the frame: compressed, with a data length indicator.
+        let bytes = mp3_with_picture_frame(&stream, [0, 0x09], inflated);
+        assert_eq!(bytes.len(), 67_547);
+
+        let limit = 64 * 1024;
+        let (parsed, reader) = parse_counted(&bytes, "mp3", limit);
+        let parsed = parsed.expect("the read stays within the limit");
+        assert!(reader.bytes < limit, "{} bytes read", reader.bytes);
+        let picture = front_picture(main_tag(&parsed.file)).expect("the inflated picture");
+        // 158 times the limit of the read.
+        assert_eq!(picture.data().len(), 10_320_001);
+        assert!(picture.data().iter().all(|byte| *byte == 0x5a));
+    }
+
     #[test]
     fn garbage_flac_is_an_error() {
         let garbage: Vec<u8> = (0..100u8)
