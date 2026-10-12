@@ -15,8 +15,11 @@ use axum::http::{Method, Request, StatusCode, header};
 use axum::response::Response;
 use http_body_util::BodyExt;
 use rusqlite::params;
+use wn_server::api::params::Params;
+use wn_server::config::Transcoding;
 use wn_server::db::Db;
 use wn_server::db::queries::tracks::{self, Track};
+use wn_server::media::stream::{StreamPlan, StreamRequest, decide};
 
 use common::{
     API_VERSION, CLIENT, LibraryBuilder, OWNER, OWNER_PASSWORD, ScannedServer, TestServer,
@@ -28,9 +31,6 @@ type Pairs<'a> = &'a [(&'a str, &'a str)];
 
 /// The message of error 70.
 const NOT_FOUND: &str = "not found";
-
-/// The message of the error for a request that selects a transcode.
-const TRANSCODING_UNAVAILABLE: &str = "transcoding not available yet";
 
 /// The value of `Access-Control-Expose-Headers` of the API route.
 const EXPOSED: &str = "Content-Range, Accept-Ranges, Content-Length";
@@ -673,42 +673,144 @@ async fn request_that_selects_the_original_file_gets_it_whatever_the_other_param
     assert_eq!(body_bytes(response).await, &mp3_file[100..200]);
 }
 
+/// The plan of `decide` for the track `id` and a request with `params`,
+/// with the transcoding settings of a test server.
+async fn plan(server: &TestServer, id: &str, params: Pairs<'_>) -> StreamPlan {
+    let track = row(server.db(), id).await;
+    let request = StreamRequest::from_params(&Params::from_query(&urlencode(params)))
+        .expect("the parameters of a stream request");
+    decide(&track, &request, &Transcoding::default()).expect("a plan")
+}
+
 #[tokio::test]
-async fn request_that_selects_a_transcode_is_error_0() {
+async fn request_that_selects_a_transcode_gets_the_original_file() {
     let server = TestServer::standard().await;
     let flac = server.track.low_tide.as_str();
     let mp3 = server.track.meridian.as_str();
-    set_bitrate(server.db(), mp3, 128).await;
+    let (flac_row, flac_file) = row_and_file(&server, flac).await;
+    let (mp3_row, mp3_file) = row_and_file(&server, mp3).await;
+    // A limit of 1 kbps below the bitrate that the scan read from the file.
+    let below = |row: &Track| (row.bitrate_kbps.expect("a bitrate") - 1).to_string();
+    let (below_flac, below_mp3) = (below(&flac_row), below(&mp3_row));
 
-    let cases: [(&str, Pairs); 6] = [
-        (flac, &[("format", "opus")]),
-        (flac, &[("format", "mp3")]),
-        (flac, &[("maxBitRate", "128")]),
-        (flac, &[("maxBitRate", "8")]),
-        (mp3, &[("maxBitRate", "64")]),
-        (mp3, &[("format", "opus"), ("maxBitRate", "320")]),
+    let cases: [(&str, &[u8], &str, Pairs); 9] = [
+        (flac, &flac_file, "audio/flac", &[("format", "opus")]),
+        (flac, &flac_file, "audio/flac", &[("format", "mp3")]),
+        (
+            flac,
+            &flac_file,
+            "audio/flac",
+            &[("maxBitRate", &below_flac)],
+        ),
+        // A lossless file with a limit above its bitrate.
+        (flac, &flac_file, "audio/flac", &[("maxBitRate", "320")]),
+        (
+            flac,
+            &flac_file,
+            "audio/flac",
+            &[("format", "mp3"), ("maxBitRate", &below_flac)],
+        ),
+        (
+            flac,
+            &flac_file,
+            "audio/flac",
+            &[
+                ("format", "opus"),
+                ("maxBitRate", "128"),
+                ("timeOffset", "30"),
+                ("estimateContentLength", "true"),
+            ],
+        ),
+        (mp3, &mp3_file, "audio/mpeg", &[("maxBitRate", &below_mp3)]),
+        (mp3, &mp3_file, "audio/mpeg", &[("format", "opus")]),
+        (mp3, &mp3_file, "audio/mpeg", &[("format", "mp3")]),
     ];
-    for (id, params) in cases {
-        assert_eq!(
-            stream_error(&server, id, params, &[]).await,
-            (0, TRANSCODING_UNAVAILABLE.to_owned()),
-            "{params:?}"
+    for (id, file, mime, params) in cases {
+        let case = format!("{mime} {params:?}");
+        let size = file.len();
+        // The rules select a transcode for the request, and the response
+        // is the original file with its own content type.
+        let selected = plan(&server, id, params).await;
+        assert!(
+            matches!(selected, StreamPlan::Transcode { .. }),
+            "{case}: {selected:?}"
         );
-        // A range does not turn the request into one for the original file.
+        for method in [Method::GET, Method::POST] {
+            let response = stream_as(&server, method, id, params, &[]).await;
+            assert!(
+                header_of(&response, &header::CONTENT_DISPOSITION).is_some(),
+                "{case}"
+            );
+            assert_whole_file(response, file, mime, &case).await;
+        }
+
+        // A range of such a request is a range of the original file.
+        for (range, first, last) in [
+            ("bytes=100-199", 100, 199),
+            ("bytes=100-", 100, size - 1),
+            ("bytes=-100", size - 100, size - 1),
+        ] {
+            for method in [Method::GET, Method::POST] {
+                let headers = [("range", range)];
+                let response = stream_as(&server, method, id, params, &headers).await;
+                assert_eq!(
+                    response.status(),
+                    StatusCode::PARTIAL_CONTENT,
+                    "{case} {range}"
+                );
+                assert_eq!(content_type(&response), mime, "{case} {range}");
+                assert_eq!(
+                    header_of(&response, &header::CONTENT_RANGE),
+                    Some(format!("bytes {first}-{last}/{size}").as_str()),
+                    "{case} {range}"
+                );
+                assert_eq!(
+                    header_of(&response, &header::ACCEPT_RANGES),
+                    Some("bytes"),
+                    "{case} {range}"
+                );
+                assert_eq!(
+                    body_bytes(response).await,
+                    &file[first..=last],
+                    "{case} {range}"
+                );
+            }
+        }
+        let unsatisfiable = format!("bytes={size}-");
+        let headers = [("range", unsatisfiable.as_str())];
+        let response = stream(&server, id, params, &headers).await;
         assert_eq!(
-            stream_error(&server, id, params, &[("range", "bytes=0-99")]).await,
-            (0, TRANSCODING_UNAVAILABLE.to_owned()),
-            "{params:?}"
+            response.status(),
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "{case}"
+        );
+
+        // A HEAD request describes the original file.
+        let head = stream_as(&server, Method::HEAD, id, params, &[]).await;
+        assert_eq!(head.status(), StatusCode::OK, "{case}");
+        assert_eq!(content_type(&head), mime, "{case}");
+        assert_eq!(
+            header_of(&head, &header::CONTENT_LENGTH),
+            Some(size.to_string().as_str()),
+            "{case}"
         );
     }
 
-    let xml = server
-        .get_xml("stream", &[("id", flac), ("format", "opus")])
-        .await;
-    assert!(
-        xml.contains(r#"<error code="0" message="transcoding not available yet"/>"#),
-        "{xml}"
-    );
+    // The validators of such a response are those of the file: a part is
+    // continued with `If-Range`, and a copy is confirmed with
+    // `If-None-Match`.
+    let params = [("format", "opus"), ("maxBitRate", "128")];
+    let first = stream(&server, flac, &params, &[]).await;
+    let tag = header_of(&first, &header::ETAG).expect("a tag").to_owned();
+    let headers = [("range", "bytes=100-199"), ("if-range", tag.as_str())];
+    let response = stream(&server, flac, &params, &headers).await;
+    assert_eq!(response.status(), StatusCode::PARTIAL_CONTENT);
+    assert_eq!(body_bytes(response).await, &flac_file[100..200]);
+    let headers = [("range", "bytes=100-199"), ("if-range", "\"0.00000000-0\"")];
+    let response = stream(&server, flac, &params, &headers).await;
+    assert_whole_file(response, &flac_file, "audio/flac", "another version").await;
+    let response = stream(&server, flac, &params, &[("if-none-match", tag.as_str())]).await;
+    assert_eq!(response.status(), StatusCode::NOT_MODIFIED);
 }
 
 #[tokio::test]
@@ -1257,12 +1359,13 @@ async fn response_that_the_client_drops_leaves_no_open_file_and_no_task() {
     assert_eq!(response.status(), StatusCode::OK);
     assert_eq!(open_descriptors(&path), 1);
     drop(response);
-    // A HEAD request and a request that is an error open no file.
+    // A HEAD request and a request that is an error open no file. The
+    // format names no target, which is error 0.
     let head = stream_as(&server, Method::HEAD, &id, &[], &[]).await;
     assert_eq!(head.status(), StatusCode::OK);
     assert_eq!(open_descriptors(&path), 0);
     assert_eq!(
-        stream_error(&server, &id, &[("format", "opus")], &[])
+        stream_error(&server, &id, &[("format", "flac")], &[])
             .await
             .0,
         0

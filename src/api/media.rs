@@ -19,10 +19,6 @@ use crate::db::queries::tracks::Track;
 use crate::ids::{self, Kind};
 use crate::media::stream::{self, StreamPlan, StreamRequest};
 
-/// The message of the error for a request that the rules select a transcode
-/// for. The server has no transcoder.
-const TRANSCODING_UNAVAILABLE: &str = "transcoding not available yet";
-
 /// `stream`: the original file of the track `id`, unchanged, with the
 /// content type of the track.
 ///
@@ -31,11 +27,13 @@ const TRANSCODING_UNAVAILABLE: &str = "transcoding not available yet";
 /// `stream::raw` does not serve: one that is gone, one outside the music
 /// folders, and one that was replaced since the scan.
 ///
-/// `format`, `maxBitRate` and `timeOffset` select between the original file
-/// and a transcode (`stream::decide`). A request for which the rules select
-/// a transcode gets error 0, because the server has no transcoder. A request
-/// for which they select the original file gets it whatever these
-/// parameters and `estimateContentLength` hold.
+/// `format` and `maxBitRate` select between the original file and a
+/// transcode (`stream::decide`). The server has no transcoder, so a request
+/// for which the rules select a transcode gets the original file as well,
+/// with the content type of the file and with ranges. WAX-869 builds the
+/// transcoder and replaces that answer. `timeOffset` and
+/// `estimateContentLength` are read and have no effect on the original
+/// file. A `format` that names no target is error 0.
 ///
 /// The request is a GET, a HEAD or a POST with a form body. `Range`,
 /// `If-Range`, `If-None-Match` and `If-Modified-Since` are the request
@@ -50,12 +48,13 @@ pub async fn stream(
     let id = params.req_str("id")?;
     let request = StreamRequest::from_params(&params)?;
     let (track, path) = file_of_track(&state.db, id).await?;
+    let folders = &state.config.library.folders;
     match stream::decide(&track, &request, &state.config.transcoding)? {
-        StreamPlan::Raw => {
-            let folders = &state.config.library.folders;
-            stream::raw(&track, path, folders, &method, &headers).await
-        }
-        StreamPlan::Transcode { .. } => Err(ApiError::Other(TRANSCODING_UNAVAILABLE.to_owned())),
+        StreamPlan::Raw => stream::raw(&track, path, folders, &method, &headers).await,
+        // The server has no transcoder. Until WAX-869 builds it, the answer
+        // to a request that selects a transcode is the original file. This
+        // arm is the one place that WAX-869 changes.
+        StreamPlan::Transcode { .. } => stream::raw(&track, path, folders, &method, &headers).await,
     }
 }
 

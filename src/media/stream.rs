@@ -285,7 +285,7 @@ fn refused(track: &Track, refusal: &Refusal) -> ApiError {
             %error,
             "the file of the track cannot be read; it is not served"
         ),
-        Refusal::Outside(real) => tracing::warn!(
+        Refusal::Outside(real) => tracing::info!(
             track = %track.id,
             path = %track.rel_path,
             resolved = %real.display(),
@@ -306,7 +306,9 @@ fn refused(track: &Track, refusal: &Refusal) -> ApiError {
 /// `fs::canonicalize` resolves every symbolic link of the path, so the
 /// result names the file itself. That file must be inside the resolved path
 /// of one of `folders`. A folder may itself be reached through a link. A
-/// folder that cannot be resolved holds no file.
+/// folder that cannot be resolved holds no file. The folders are resolved
+/// for every call and no result is kept, so a folder link that changes is
+/// followed from the next request on.
 ///
 /// The file must be a regular file with the size `size` and the modification
 /// time `mtime`, in whole Unix seconds as the scanner stores it. This is the
