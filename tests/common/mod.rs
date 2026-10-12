@@ -868,7 +868,7 @@ impl TestServer {
 
             scan: scan.clone(),
 
-            // cancel
+            cancel: CancellationToken::new(),
 
             started_at: Instant::now(),
         };

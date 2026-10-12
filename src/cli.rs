@@ -7,13 +7,17 @@
 use std::env;
 use std::fmt;
 use std::fs::{self, DirBuilder, OpenOptions};
+use std::future::Future;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
+use std::pin::pin;
 use std::process::ExitCode;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use clap::builder::NonEmptyStringValueParser;
 use clap::{Args, Parser, Subcommand};
 use thiserror::Error;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -24,7 +28,7 @@ use crate::db::{Db, DbError};
 use crate::discovery;
 use crate::library::scan_controller::{ScanLock, ScanLockError};
 use crate::library::scanner::{self, ScanOptions, ScanSummary};
-use crate::server::{self, ServerError};
+use crate::server::{self, ServerError, ServerOptions, StopStep};
 
 /// The environment variable that supplies the password to `init` and
 /// `user set-password`.
@@ -161,6 +165,8 @@ enum CliError {
     ServerRuntime(io::Error),
     #[error(transparent)]
     Server(#[from] ServerError),
+    #[error("{0} ended the server before its stop had finished")]
+    StopCutShort(&'static str),
     #[error("cannot create the data directory {}: {source}", path.display())]
     CreateDataDir { path: PathBuf, source: io::Error },
     #[error("{} already exists; init does not overwrite it", .0.display())]
@@ -323,8 +329,13 @@ fn execute(cli: &Cli, input: &mut dyn BufRead, out: &mut dyn Write) -> Result<()
 /// Loads the config, starts logging to stderr and runs the server in the
 /// foreground on the database of `data_dir`. A missing `instance.id` is
 /// written first. The server is advertised over mDNS while it runs, when
-/// `discovery.mdns` is on. Ctrl-C stops the server, and the command then
-/// succeeds.
+/// `discovery.mdns` is on.
+///
+/// A stop signal ([`forward_stop_signals`]) stops the server in the order of
+/// `docs/design.md` section 3.13, and the command then succeeds. A second
+/// signal during the stop ends the command with an error
+/// ([`run_until_stopped`]). The mDNS advertisement is withdrawn before the
+/// command returns in every case.
 fn serve(data_dir: &DataDir) -> Result<(), CliError> {
     let config = Config::load(&data_dir.config_path())?;
     init_tracing(&config.server.log_level)?;
@@ -342,17 +353,201 @@ fn serve(data_dir: &DataDir) -> Result<(), CliError> {
         // advertises, and discovery reports that it cannot read it.
         Err(error) => tracing::warn!("{error}"),
     }
-    // The advertisement lasts until this value is dropped, which is when
-    // `serve` returns, with or without an error. It starts before
-    // `run_server` binds the listener. When the bind fails, the value is
-    // dropped before the mDNS daemon has announced anything.
-    let _advertiser = discovery::advertise(&config, &data_dir.instance_id_path());
-    runtime.block_on(async {
+    // The advertisement starts before `run_server` binds the listener. When
+    // the bind fails, it is withdrawn before the mDNS daemon has announced
+    // anything.
+    let advertiser = discovery::advertise(&config, &data_dir.instance_id_path());
+    let withdraw = RunOnce::new(move || {
+        if let Some(advertiser) = advertiser {
+            // The call returns when the goodbye packet is sent.
+            advertiser.stop();
+            tracing::info!("the mDNS advertisement is withdrawn");
+        }
+    });
+    let options = ServerOptions {
+        withdraw: Some(Box::new({
+            let withdraw = withdraw.clone();
+            move || withdraw.run()
+        })),
+        ..ServerOptions::default()
+    };
+    let outcome = runtime.block_on(async {
         let cancel = CancellationToken::new();
-        tokio::spawn(cancel_on_ctrl_c(cancel.clone()));
-        server::run_server(config, data_dir, cancel).await
-    })?;
-    Ok(())
+        let (signals, received) = mpsc::channel(1);
+        tokio::spawn(async move {
+            if let Err(error) = forward_stop_signals(signals).await {
+                tracing::warn!("cannot wait for a stop signal: {error}");
+            }
+        });
+        let server = server::run_server(config, data_dir, cancel.clone(), options);
+        run_until_stopped(server, &cancel, received).await
+    });
+    // The stop of the server withdraws the advertisement. A server that did
+    // not start and a server that a second signal ended have not done so.
+    // The step runs here for them, so the process never exits before the
+    // goodbye packet is sent.
+    withdraw.run();
+    // Nothing that still runs on the runtime is waited for. After a stop in
+    // order nothing runs. After a second signal a scan may run: it ends with
+    // the process, as the scan of a process that is killed does.
+    runtime.shutdown_background();
+    outcome
+}
+
+/// A step that blocks, that several places ask for, and that runs once.
+#[derive(Clone)]
+struct RunOnce(Arc<Mutex<Option<StopStep>>>);
+
+impl RunOnce {
+    fn new(step: impl FnOnce() + Send + 'static) -> Self {
+        Self(Arc::new(Mutex::new(Some(Box::new(step)))))
+    }
+
+    /// Runs the step when no call has run it, and returns when the step has
+    /// ended. A call that finds the step running waits for its end. The
+    /// call blocks the thread, so async code calls it on a blocking thread.
+    fn run(&self) {
+        // A step that panicked is gone from the slot, so the lock is usable.
+        let mut slot = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        // The lock is held while the step runs.
+        if let Some(step) = slot.take() {
+            step();
+        }
+    }
+}
+
+/// Runs `server` to its end and returns its result. `signals` yields the
+/// name of each stop signal that the process receives.
+///
+/// The first signal cancels `cancel`, which asks the server to stop, and the
+/// function keeps waiting for the server. A second signal before the server
+/// has ended is an error: the function returns at once and drops `server`,
+/// so the steps of the stop that have not run are skipped.
+async fn run_until_stopped(
+    server: impl Future<Output = Result<(), ServerError>>,
+    cancel: &CancellationToken,
+    mut signals: mpsc::Receiver<&'static str>,
+) -> Result<(), CliError> {
+    let mut server = pin!(server);
+    tokio::select! {
+        result = &mut server => return Ok(result?),
+        signal = signals.recv() => match signal {
+            Some(signal) => tracing::info!(
+                "received {signal}: the server stops. A second signal ends it at once"
+            ),
+            // No signal can arrive. The server runs until it ends by itself.
+            None => return Ok(server.await?),
+        },
+    }
+    cancel.cancel();
+    tokio::select! {
+        result = &mut server => Ok(result?),
+        Some(signal) = signals.recv() => {
+            tracing::warn!("received {signal} during the stop: the server ends now");
+            Err(CliError::StopCutShort(signal))
+        }
+    }
+}
+
+/// Sends the name of each stop signal that the process receives to
+/// `signals`, until the receiver is gone. Ctrl-C is a stop signal on every
+/// OS. [`OtherStopSignals`] holds the ones that differ.
+///
+/// # Errors
+///
+/// Returns the error of a signal that the process cannot listen for.
+async fn forward_stop_signals(signals: mpsc::Sender<&'static str>) -> io::Result<()> {
+    let mut others = OtherStopSignals::new()?;
+    // One future listens for Ctrl-C while the other signals arrive, so a
+    // Ctrl-C that comes together with another signal is not lost. A new
+    // future takes its place after each Ctrl-C.
+    let mut ctrl_c = pin!(tokio::signal::ctrl_c());
+    loop {
+        let signal = tokio::select! {
+            result = &mut ctrl_c => {
+                result?;
+                ctrl_c.set(tokio::signal::ctrl_c());
+                "Ctrl-C"
+            }
+            signal = others.recv() => signal,
+        };
+        if signals.send(signal).await.is_err() {
+            return Ok(());
+        }
+    }
+}
+
+/// The stop signals other than Ctrl-C.
+///
+/// Unix: SIGTERM. `kill`, systemd, launchd and `docker stop` send it to stop
+/// a process. Windows has no such signal, so this type differs there.
+#[cfg(unix)]
+struct OtherStopSignals {
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl OtherStopSignals {
+    fn new() -> io::Result<Self> {
+        use tokio::signal::unix::{SignalKind, signal};
+
+        Ok(Self {
+            terminate: signal(SignalKind::terminate())?,
+        })
+    }
+
+    /// Waits for the next signal and returns its name.
+    async fn recv(&mut self) -> &'static str {
+        match self.terminate.recv().await {
+            Some(()) => "SIGTERM",
+            // The listener has ended and yields no signal.
+            None => std::future::pending().await,
+        }
+    }
+}
+
+/// The stop signals other than Ctrl-C.
+///
+/// Windows: the console events Ctrl-Break, close and shutdown. The system
+/// sends the close event when the user closes the console window and the
+/// shutdown event when the system shuts down. After one of these two it
+/// ends the process when the process has not exited within 5 seconds, a
+/// system parameter with that default. The stop of the server can take
+/// longer, and the system then ends it before its last steps
+/// (`docs/design.md` section 3.13). Unix has no console events, so this
+/// type differs there.
+#[cfg(windows)]
+struct OtherStopSignals {
+    ctrl_break: tokio::signal::windows::CtrlBreak,
+    close: tokio::signal::windows::CtrlClose,
+    shutdown: tokio::signal::windows::CtrlShutdown,
+}
+
+#[cfg(windows)]
+impl OtherStopSignals {
+    fn new() -> io::Result<Self> {
+        use tokio::signal::windows::{ctrl_break, ctrl_close, ctrl_shutdown};
+
+        Ok(Self {
+            ctrl_break: ctrl_break()?,
+            close: ctrl_close()?,
+            shutdown: ctrl_shutdown()?,
+        })
+    }
+
+    /// Waits for the next event and returns its name.
+    async fn recv(&mut self) -> &'static str {
+        let event = tokio::select! {
+            event = self.ctrl_break.recv() => event.map(|()| "Ctrl-Break"),
+            event = self.close.recv() => event.map(|()| "the close of the console"),
+            event = self.shutdown.recv() => event.map(|()| "the shutdown of the system"),
+        };
+        match event {
+            Some(name) => name,
+            // The listener has ended and yields no event.
+            None => std::future::pending().await,
+        }
+    }
 }
 
 /// Runs one scan of the music folders of `config` into the database of
@@ -436,17 +631,6 @@ fn write_missing_instance_id(data_dir: &DataDir) -> Result<bool, CliError> {
         &data_dir.instance_id_path(),
         &format!("{}\n", new_instance_id()),
     )
-}
-
-/// Cancels `cancel` when the process receives Ctrl-C.
-async fn cancel_on_ctrl_c(cancel: CancellationToken) {
-    match tokio::signal::ctrl_c().await {
-        Ok(()) => {
-            tracing::info!("received Ctrl-C, stopping");
-            cancel.cancel();
-        }
-        Err(error) => tracing::warn!("cannot wait for Ctrl-C: {error}"),
-    }
 }
 
 /// The log filter: the value of `RUST_LOG` when it is set and not empty,
@@ -1375,6 +1559,183 @@ mod tests {
 
         assert!(!write_missing_instance_id(&data_dir).expect("start"));
         assert!(!data_dir.instance_id_path().exists());
+    }
+
+    /// The longest time a test of the stop waits for an event. The limit
+    /// ends a test that does not get there. It does not delay a passing run.
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(1);
+
+    /// A time in which a call that must wait does not return.
+    const SHORT: std::time::Duration = std::time::Duration::from_millis(50);
+
+    /// A server that runs until `cancel` is cancelled and then returns
+    /// `result`.
+    async fn server_until(
+        cancel: CancellationToken,
+        result: Result<(), ServerError>,
+    ) -> Result<(), ServerError> {
+        cancel.cancelled().await;
+        result
+    }
+
+    /// Sets its flag when it is dropped.
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn first_signal_asks_the_server_to_stop_and_the_command_succeeds() {
+        let cancel = CancellationToken::new();
+        let (signals, received) = mpsc::channel(1);
+        let run = run_until_stopped(server_until(cancel.clone(), Ok(())), &cancel, received);
+        let run = tokio::time::timeout(WAIT, run);
+
+        signals.send("SIGTERM").await.expect("the run listens");
+        run.await
+            .expect("the run ends")
+            .expect("the command succeeds");
+        assert!(cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn no_signal_leaves_the_server_running_and_its_error_is_the_error_of_the_command() {
+        let cancel = CancellationToken::new();
+        let (_signals, received) = mpsc::channel(1);
+        let server = server_until(CancellationToken::new(), Ok(()));
+
+        // The server runs and no signal arrives.
+        let run = run_until_stopped(server, &cancel, received);
+        let waited = tokio::time::timeout(SHORT, run).await;
+        assert!(waited.is_err(), "the run ended without a signal");
+        assert!(!cancel.is_cancelled());
+
+        // A server that ends by itself ends the run with its result.
+        let (_signals, received) = mpsc::channel(1);
+        let ended = CancellationToken::new();
+        ended.cancel();
+        let failed = Err(ServerError::NoOwner(PathBuf::from("library.db")));
+        let error = run_until_stopped(server_until(ended, failed), &cancel, received)
+            .await
+            .expect_err("the server failed");
+        assert!(
+            matches!(error, CliError::Server(ServerError::NoOwner(_))),
+            "{error}"
+        );
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn second_signal_during_the_stop_drops_the_server_and_is_an_error() {
+        let cancel = CancellationToken::new();
+        let (signals, received) = mpsc::channel(1);
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // A server whose stop does not end.
+        let server = {
+            let flag = DropFlag(Arc::clone(&dropped));
+            async move {
+                let _flag = flag;
+                std::future::pending::<Result<(), ServerError>>().await
+            }
+        };
+        let mut run = pin!(run_until_stopped(server, &cancel, received));
+
+        // The first signal starts the stop, and the run waits for the server.
+        signals.send("SIGTERM").await.expect("the run listens");
+        let waited = tokio::time::timeout(SHORT, &mut run).await;
+        assert!(waited.is_err(), "the run ended after one signal");
+        assert!(cancel.is_cancelled());
+        assert!(!dropped.load(std::sync::atomic::Ordering::SeqCst));
+
+        signals.send("Ctrl-C").await.expect("the run listens");
+        let error = tokio::time::timeout(WAIT, &mut run)
+            .await
+            .expect("the run ends at the second signal")
+            .expect_err("the stop was cut short");
+        assert!(matches!(error, CliError::StopCutShort("Ctrl-C")), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "Ctrl-C ended the server before its stop had finished"
+        );
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn run_without_a_signal_source_waits_for_the_server() {
+        let cancel = CancellationToken::new();
+        let (signals, received) = mpsc::channel::<&'static str>(1);
+        // The process cannot listen for a signal.
+        drop(signals);
+        let ended = CancellationToken::new();
+        let server = server_until(ended.clone(), Ok(()));
+        let mut run = pin!(run_until_stopped(server, &cancel, received));
+
+        let waited = tokio::time::timeout(SHORT, &mut run).await;
+        assert!(waited.is_err(), "the run ended while the server runs");
+        ended.cancel();
+        tokio::time::timeout(WAIT, &mut run)
+            .await
+            .expect("the run ends with the server")
+            .expect("the command succeeds");
+        assert!(!cancel.is_cancelled());
+    }
+
+    #[test]
+    fn run_once_runs_its_step_once() {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let step = RunOnce::new({
+            let runs = Arc::clone(&runs);
+            move || {
+                runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        let clone = step.clone();
+
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 0);
+        step.run();
+        clone.run();
+        step.run();
+        assert_eq!(runs.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn run_once_makes_a_second_caller_wait_for_the_running_step() {
+        use std::sync::mpsc::channel;
+
+        let (entered, step_entered) = channel();
+        let (release, released) = channel::<()>();
+        let step = RunOnce::new(move || {
+            entered.send(()).expect("the test listens");
+            // The step runs until the test drops the sender.
+            let _ = released.recv();
+        });
+
+        // The stop of the server runs the step.
+        let first = std::thread::spawn({
+            let step = step.clone();
+            move || step.run()
+        });
+        step_entered.recv_timeout(WAIT).expect("the step starts");
+
+        // The exit after a second signal asks for the step as well. It
+        // returns only when the step has ended, so the process does not exit
+        // during it.
+        let (returned, second_returned) = channel();
+        let second = std::thread::spawn(move || {
+            step.run();
+            returned.send(()).expect("the test listens");
+        });
+        assert!(second_returned.recv_timeout(SHORT).is_err());
+
+        drop(release);
+        second_returned
+            .recv_timeout(WAIT)
+            .expect("the second call returns when the step has ended");
+        first.join().expect("the first call does not panic");
+        second.join().expect("the second call does not panic");
     }
 
     #[test]
