@@ -1184,6 +1184,49 @@ async fn each_user_has_a_queue_of_its_own() {
 }
 
 #[tokio::test]
+async fn a_save_without_current_of_one_user_leaves_the_queue_of_another_user() {
+    let server = TestServer::standard().await;
+    let a = server.track.low_tide.as_str();
+    let b = server.track.breakwater.as_str();
+    let c = server.track.night_ferry.as_str();
+    add_user(&server, "guest", "secret").await;
+    /// `request` as a request of the guest.
+    fn guest<'a>(request: &[(&'a str, &'a str)]) -> Vec<(&'a str, &'a str)> {
+        as_user("guest", "secret", request)
+    }
+    /// The answer of `getPlayQueue` to the guest.
+    async fn document_of_guest(server: &TestServer) -> Value {
+        server.get_json_noauth("getPlayQueue", &guest(&[])).await
+    }
+
+    // The queue of the owner has songs, a current song and a position.
+    save(&server, &[a, b], b, &[("position", "9000")]).await;
+    set_changed(&server).await;
+    let of_owner = state(&server).await;
+
+    // The guest saves songs without `current`: the queue of the guest holds
+    // them, and the queue of the owner is the one from before.
+    let request = guest(&[("id", c), ("id", a)]);
+    let saved = server.get_json_noauth("savePlayQueue", &request).await;
+    assert_eq!(saved, ok_empty());
+    assert_eq!(stored(&server, "guest").await, [c, a]);
+    let of_guest = document_of_guest(&server).await;
+    assert_eq!(of_guest["playQueue"]["username"], "guest");
+    assert_eq!(entry_ids(&of_guest["playQueue"]), [c, a]);
+    assert_eq!(of_guest["playQueue"]["current"], c);
+    assert_eq!(of_guest["playQueue"]["position"], 0);
+    assert_eq!(state(&server).await, of_owner);
+
+    // The owner saves songs without `current` while the queue of the guest
+    // holds songs: the queue of the guest is the one from before.
+    save_without_current(&server, &[b, c, a], &[]).await;
+    assert_eq!(stored(&server, OWNER).await, [b, c, a]);
+    assert_eq!(queue_current(&server).await, b);
+    assert_eq!(stored(&server, "guest").await, [c, a]);
+    assert_eq!(document_of_guest(&server).await, of_guest);
+}
+
+#[tokio::test]
 async fn play_queue_with_authentication_off_is_the_queue_of_the_owner() {
     let mut config = Config::default();
     config.auth.disabled_unsafe = true;

@@ -36,8 +36,14 @@
 //! deleted track in `current_id`, and [`get`] reports the entry that followed
 //! the deleted one. The second has no value there, and [`get`] reports its
 //! first entry, which after a deletion is the first of the entries that are
-//! left. [`get`] reads the column before the positions, so two queues with
-//! the same entries can have two current songs.
+//! left. [`get`] reads the column before the positions.
+//!
+//! The two states differ in the stored positions as well. The entries of the
+//! first lie around position 0, the place of the deleted track, and the
+//! entries of the second are at 1 and above. Two queues with the same tracks
+//! in the same order can therefore have two current songs. On the positions
+//! that [`replace_without_current`] stores, the first entry is also the
+//! first entry above position 0.
 //!
 //! # Writes
 //!
@@ -1131,6 +1137,82 @@ mod tests {
         assert_eq!(
             library.head(owner),
             Some((None, 0, NOW, "Tuner".to_owned()))
+        );
+    }
+
+    #[test]
+    fn replace_without_current_writes_the_queue_of_its_user_only() {
+        let library = library();
+        let Library { owner, guest, .. } = library;
+        // The queue of the owner has entries, a current song and a position.
+        let stored = library
+            .db
+            .with_writer(|conn| replace(conn, owner, &[T1, T2, T3], T2, 777, "Phone", NOW))
+            .unwrap();
+        assert_eq!(stored, Ok(()));
+        let head_of_owner = format!("{owner}|'{T2}'|777|{NOW}|Phone");
+        let entries_of_owner = [
+            format!("{owner}|-1|{T1}"),
+            format!("{owner}|0|{T2}"),
+            format!("{owner}|1|{T3}"),
+        ];
+        let of_owner = library.get(owner);
+
+        // The guest has no row yet. The request writes the row and the
+        // entries of the guest, and no row of the owner.
+        assert_eq!(
+            library.save_without_current(guest, &[T4, T1], "Tablet"),
+            Ok(())
+        );
+        let mut rows = vec![
+            head_of_owner.clone(),
+            format!("{guest}|NULL|0|{NOW}|Tablet"),
+        ];
+        rows.extend(entries_of_owner.iter().cloned());
+        rows.extend([format!("{guest}|1|{T4}"), format!("{guest}|2|{T1}")]);
+        assert_eq!(library.everything(), rows);
+        // Each user reads the queue that this user stored.
+        assert_eq!(library.get(owner), of_owner);
+        let of_guest = library.get(guest);
+        assert_eq!(of_guest.username, "guest");
+        assert_eq!(of_guest.track_ids, [T4, T1]);
+        assert_eq!(of_guest.current.as_deref(), Some(T4));
+
+        // The guest has a row and entries now. A second request replaces
+        // them, and a refused request changes nothing. Both leave the rows
+        // of the owner.
+        let stored = library
+            .db
+            .with_writer(|conn| replace_without_current(conn, guest, &[T3], "Tablet", LATER))
+            .unwrap();
+        assert_eq!(stored, Ok(()));
+        assert_eq!(
+            library.save_without_current(guest, &[T2, UNKNOWN_TRACK], "Tablet"),
+            Err(Refusal::NoTrack)
+        );
+        let mut rows = vec![head_of_owner, format!("{guest}|NULL|0|{LATER}|Tablet")];
+        rows.extend(entries_of_owner);
+        rows.push(format!("{guest}|1|{T3}"));
+        assert_eq!(library.everything(), rows);
+        assert_eq!(library.get(owner), of_owner);
+
+        // The owner stores a queue without a current song while the queue
+        // of the guest has entries: the rows of the guest stay.
+        let rows_of_guest = (library.head(guest), library.entries(guest));
+        let of_guest = library.get(guest);
+        assert_eq!(
+            library.save_without_current(owner, &[T2, T4], "Phone"),
+            Ok(())
+        );
+        assert_eq!((library.head(guest), library.entries(guest)), rows_of_guest);
+        assert_eq!(library.get(guest), of_guest);
+        assert_eq!(
+            library.entries(owner),
+            [(1, T2.to_owned()), (2, T4.to_owned())]
+        );
+        assert_eq!(
+            library.head(owner),
+            Some((None, 0, NOW, "Phone".to_owned()))
         );
     }
 
