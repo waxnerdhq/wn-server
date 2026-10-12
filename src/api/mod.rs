@@ -111,7 +111,8 @@ pub struct AppState {
     /// The library database. It holds the user accounts.
     pub db: Db,
 
-    // covers
+    /// The cover art service: it resolves, resizes and caches covers.
+    pub covers: crate::library::covers::Covers,
 
     // transcoder
 

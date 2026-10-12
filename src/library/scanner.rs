@@ -743,6 +743,18 @@ impl Scanner<'_> {
                 continue;
             }
             if let Some(rank) = cover_rank(file_name(&rel_path)) {
+                // `library::covers` reads an image file only when its path
+                // names a regular file, so a symbolic link with the name of
+                // a cover image is no cover. A link could name any file that
+                // the server can read. The directory of the image can be a
+                // link.
+                if entry.path_is_symlink() {
+                    tracing::debug!(
+                        path = %entry.path().display(),
+                        "the cover image is a symbolic link; the image is skipped"
+                    );
+                    continue;
+                }
                 match file_state(&entry) {
                     Ok((mtime, _)) => walk.see_cover(&rel_path, rank, mtime),
                     // An image file is the file of no track, so it holds no
@@ -1490,8 +1502,8 @@ enum Cover {
 }
 
 /// The start of the `cover_source` of an embedded picture. The ID of the
-/// track follows it.
-const EMBEDDED: &str = "embedded:";
+/// track follows it. `library::covers` reads the value.
+pub(super) const EMBEDDED: &str = "embedded:";
 
 /// Returns the cover of an album from its tracks and from what the walk saw
 /// (`docs/design.md` section 1.3).
