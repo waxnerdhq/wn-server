@@ -58,7 +58,7 @@ pub mod stubs;
 
 // media
 
-// covers
+pub mod covers;
 
 pub mod scan;
 
@@ -304,7 +304,7 @@ pub const METHODS: &[(&str, Handler)] = &[
 
     ("getCaptions", not_implemented),
 
-    ("getCoverArt", not_implemented),
+    ("getCoverArt", handler!(covers::get_cover_art)),
 
     ("getLyrics", not_implemented),
 

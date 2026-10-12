@@ -222,7 +222,9 @@ The server answers OpenSubsonic requests at `/rest/<method>` and `/rest/<method>
 
 <!-- api/media.rs -->
 
-<!-- api/covers.rs -->
+- `getCoverArt` returns the cover whose ID the `coverArt` of an album or of a song holds. The cover of an album is the image file `cover`, `folder`, `front` or `album` with the extension `jpg`, `jpeg`, `png` or `webp` in the directory of the album, or else the embedded picture of its first track that has one. Without `size`, and with `size=0`, the body is the image as it is stored, as `image/jpeg`, `image/png` or `image/webp`. With `size=N` the body is a JPEG whose longer side is at most N pixels; an N over 2000 counts as 2000, and no image is enlarged.
+- `getCoverArt` needs `id`: an absent `id` returns error 10. A `size` that is no integer from 0 to 4294967295 returns error 0. An `id` without a cover returns error 70: an ID that the server does not have, the ID of an album without a cover, the ID of a song whose file holds no picture, and the ID of an artist. An item without `coverArt` has no cover, and the server sends no placeholder image. An error is the usual response in XML or JSON.
+- A cover comes with `Content-Length`, `Cache-Control: public, max-age=86400` and an `ETag`. A request that sends that entity tag in `If-None-Match` gets HTTP 304 without a body. The entity tag changes when a scan finds the cover file, or the audio file with the picture, with another modification time. A HEAD request gets the headers without the body. `Range` is not read: the answer is the whole image.
 
 - `download` is disabled. A request with a user gets error 50 with the message `download is disabled on this server`, whatever its parameters. No request gets the bytes of a file. `getUser` and `getUsers` report `downloadRole` as `false`.
 - `getUser` needs `username`. The value must be the name of the user of the request, in any letter case; another name returns error 50. With authentication off, every name returns the owner. `getUsers` lists the owner. The user has `scrobblingEnabled`, `adminRole`, `playlistRole` and `streamRole` as `true`, and every other role is `false`. `folder` holds the IDs of the music folders.
