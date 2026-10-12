@@ -4,6 +4,16 @@
 //! A client saves its queue, the current song and the position within that
 //! song, and a client on another device reads them to go on from there.
 //!
+//! # Current song
+//!
+//! A request with `id` values and without `current` saves a queue with those
+//! songs and without a current song. Supersonic sends that request while no
+//! song is loaded. `getPlayQueue` returns such a queue with its first song
+//! as `current` and with the position 0: the OpenSubsonic API requires a
+//! `current` that is one of the songs when the queue has songs, and
+//! Navidrome answers in the same way. A queue with songs therefore always
+//! has a `current`.
+//!
 //! # Ownership
 //!
 //! A user has one play queue. Both methods read and write the queue of the
@@ -90,6 +100,9 @@ enum Save {
         /// The position within the current song in milliseconds.
         position_ms: u64,
     },
+    /// A queue with the songs `track_ids`, in that order, and without a
+    /// current song. `track_ids` holds one ID or more.
+    WithoutCurrent { track_ids: Vec<String> },
 }
 
 /// `getPlayQueue`: the play queue of the user of the request. The method
@@ -104,7 +117,8 @@ enum Save {
 ///   annotation of the user. A song with two entries is listed twice.
 /// - `current` is the ID of the current song, and `position` the position
 ///   within it in milliseconds. A queue without a song has no `current` and
-///   the position 0.
+///   the position 0. A queue that was saved without `current` has its first
+///   song as `current` and the position 0.
 /// - `changed` is the time of the last request that saved the queue, and
 ///   `changedBy` the name of its client. For a user that saved no queue,
 ///   `changed` is the creation time of the account and `changedBy` is empty.
@@ -124,12 +138,15 @@ pub async fn get_play_queue(State(state): State<AppState>, Authed(user): Authed)
 /// - A request without `id` and without `current` stores a queue without a
 ///   song, as the OpenSubsonic API defines it. The Subsonic API 1.16.1
 ///   requires `id`.
-/// - `current` is required when the request has an `id`; the error has
-///   code 10. An empty value counts as absent. It must be one of the `id`
-///   values. Another value is error 0, also in a request without `id`.
+/// - `current` must be one of the `id` values. Another value is error 0,
+///   also in a request without `id`. An empty value counts as absent.
+/// - A request with an `id` and without `current` stores a queue with the
+///   songs and without a current song, and `getPlayQueue` returns its first
+///   song as `current`. The OpenSubsonic API requires `current` in that
+///   request, and Supersonic sends none while no song is loaded.
 /// - `position` is the position within the current song in milliseconds, and
 ///   0 without a value. A value that is no integer of 0 or more is error 0.
-///   A request without `id` stores the position 0.
+///   A request without `current` stores the position 0.
 /// - A value of `id` that is the ID of no song is error 70. More than
 ///   [`MAX_ENTRIES`] values are error 0.
 ///
@@ -161,6 +178,9 @@ pub async fn save_play_queue(
             &client,
             now,
         ),
+        Save::WithoutCurrent { track_ids } => {
+            play_queue::replace_without_current(conn, user.id, &track_ids, &client, now)
+        }
     })
     .await?;
     Ok(Payload::empty())
@@ -168,25 +188,22 @@ pub async fn save_play_queue(
 
 /// Returns what the request `params` stores. The checks run in this order:
 ///
-/// 1. A request with an `id` and without `current` is error 10. An empty
-///    `current` counts as absent.
-/// 2. More than [`MAX_ENTRIES`] values of `id` are error 0. The values are
+/// 1. More than [`MAX_ENTRIES`] values of `id` are error 0. The values are
 ///    counted before they are read, so a request cannot make the server
 ///    check more of them.
-/// 3. A value of `id` without the shape of a track ID, an empty one
+/// 2. A value of `id` without the shape of a track ID, an empty one
 ///    included, is the ID of no song and is error 70.
-/// 4. A `current` that is none of the `id` values is error 0. That includes
-///    a `current` in a request without `id`.
-/// 5. A `position` that is no integer from 0 to `i64::MAX` is error 0.
+/// 3. A `current` that is none of the `id` values is error 0. That includes
+///    a `current` in a request without `id`. An empty `current` counts as
+///    absent.
+/// 4. A `position` that is no integer from 0 to `i64::MAX` is error 0.
 ///
-/// A request without `id` and without `current` stores a queue without a
-/// song. Its `position` is checked and not stored.
+/// A request without `current` stores a queue without a current song: one
+/// without a song when the request has no `id`, and one with the songs of
+/// the `id` values otherwise. Its `position` is checked and not stored.
 fn save_request(params: &Params) -> Result<Save, ApiError> {
     let values = params.all("id");
     let current = params.opt_str("current").filter(|id| !id.is_empty());
-    if !values.is_empty() && current.is_none() {
-        return Err(ApiError::MissingParam("current".to_owned()));
-    }
     if values.len() > MAX_ENTRIES {
         return Err(refused(Refusal::TooLong));
     }
@@ -209,7 +226,8 @@ fn save_request(params: &Params) -> Result<Save, ApiError> {
             current: current.to_owned(),
             position_ms,
         },
-        None => Save::Clear,
+        None if track_ids.is_empty() => Save::Clear,
+        None => Save::WithoutCurrent { track_ids },
     })
 }
 
@@ -345,8 +363,10 @@ mod tests {
         })
     }
 
-    fn missing_current() -> Result<Save, ApiError> {
-        Err(ApiError::MissingParam("current".to_owned()))
+    fn without_current(track_ids: &[&str]) -> Result<Save, ApiError> {
+        Ok(Save::WithoutCurrent {
+            track_ids: track_ids.iter().map(|id| (*id).to_owned()).collect(),
+        })
     }
 
     fn no_current() -> Result<Save, ApiError> {
@@ -412,14 +432,36 @@ mod tests {
     }
 
     #[test]
-    fn current_is_required_with_an_id_and_must_be_one_of_the_id_values() {
-        assert_eq!(save(&format!("id={TRACK}")), missing_current());
-        assert_eq!(save(&format!("id={TRACK}&current=")), missing_current());
+    fn a_request_with_an_id_and_without_current_stores_a_queue_without_a_current_song() {
+        assert_eq!(save(&format!("id={TRACK}")), without_current(&[TRACK]));
+        // The songs have the order of the `id` values, and a song that is
+        // named twice is in the queue twice.
+        let query = format!("id={OTHER_TRACK}&id={TRACK}&id={OTHER_TRACK}");
+        assert_eq!(
+            save(&query),
+            without_current(&[OTHER_TRACK, TRACK, OTHER_TRACK])
+        );
+        // An empty `current` counts as absent.
+        assert_eq!(
+            save(&format!("id={TRACK}&current=")),
+            without_current(&[TRACK])
+        );
+        // The position is checked and not stored.
         assert_eq!(
             save(&format!("id={TRACK}&id={OTHER_TRACK}&position=5")),
-            missing_current()
+            without_current(&[TRACK, OTHER_TRACK])
         );
+        assert_eq!(save(&format!("id={TRACK}&position=x")), no_position());
 
+        // An `id` that is no track ID is error 70 without `current` as well.
+        for value in other_shapes() {
+            let query = format!("id={TRACK}&id={value}");
+            assert_eq!(save(&query), Err(ApiError::NotFound), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn current_must_be_one_of_the_id_values() {
         let mut values = other_shapes();
         values.retain(|value| !value.is_empty());
         values.push(OTHER_TRACK.to_owned());
@@ -491,9 +533,19 @@ mod tests {
 
     #[test]
     fn the_checks_of_a_request_run_in_one_order() {
-        // An absent `current` is reported before the number of the values.
-        let too_many = format!("id={TRACK}&").repeat(MAX_ENTRIES + 1);
-        assert_eq!(save(&too_many), missing_current());
+        // The number of the values is reported before an `id` that is no
+        // track ID, also in a request without `current`.
+        let too_many = format!("id={TRACK}&").repeat(MAX_ENTRIES);
+        let too_long = Err(ApiError::Other(
+            "a play queue holds at most 100000 songs".to_owned(),
+        ));
+        assert_eq!(save(&format!("{too_many}id=x")), too_long);
+        // An `id` that is no track ID is reported before a `position` that
+        // is no integer, in a request without `current`.
+        assert_eq!(
+            save(&format!("id={TRACK}&id=x&position=x")),
+            Err(ApiError::NotFound)
+        );
         // An `id` that is no track ID is reported before a `current` that is
         // none of the values, and that before a `position` that is no
         // integer.

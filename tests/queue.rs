@@ -30,9 +30,6 @@ use common::{
 /// The message of error 70.
 const NOT_FOUND: &str = "not found";
 
-/// The message of the error for a request with `id` and without `current`.
-const MISSING_CURRENT: &str = "required parameter is missing: current";
-
 /// The message of the error for a `current` that is none of the `id` values.
 const NO_CURRENT: &str = "parameter current must be one of the values of id";
 
@@ -134,6 +131,15 @@ fn save_request<'a>(
 /// succeeds.
 async fn save(server: &TestServer, songs: &[&str], current: &str, extra: &[(&str, &str)]) {
     let request = save_request(songs, current, extra);
+    let response = server.get_json("savePlayQueue", &request).await;
+    assert_eq!(response, ok_empty(), "{request:?}");
+}
+
+/// Saves a queue of `songs` without a current song and with the parameters
+/// `extra` through `savePlayQueue`, and checks that the request succeeds.
+async fn save_without_current(server: &TestServer, songs: &[&str], extra: &[(&str, &str)]) {
+    let mut request: Vec<(&str, &str)> = songs.iter().map(|id| ("id", *id)).collect();
+    request.extend_from_slice(extra);
     let response = server.get_json("savePlayQueue", &request).await;
     assert_eq!(response, ok_empty(), "{request:?}");
 }
@@ -428,11 +434,13 @@ async fn save_play_queue_answers_in_xml_with_the_empty_response() {
     );
     assert_eq!(entry_ids(&read_queue(&server).await), [track]);
 
-    // An error is the error element.
+    // A request without `current` answers with the empty response as well.
     assert_eq!(
         server.get_xml("savePlayQueue", &[("id", track)]).await,
-        xml_failed(10, MISSING_CURRENT)
+        xml_ok_empty()
     );
+
+    // An error is the error element.
     let request = save_request(&[track], UNKNOWN_TRACK, &[]);
     assert_eq!(
         server.get_xml("savePlayQueue", &request).await,
@@ -542,28 +550,261 @@ async fn save_without_id_empties_the_queue() {
 }
 
 #[tokio::test]
-async fn save_with_id_and_without_current_is_error_10() {
+async fn save_with_ids_and_without_current_is_read_with_the_first_song_as_current() {
     let server = TestServer::standard().await;
     let a = server.track.low_tide.as_str();
     let b = server.track.breakwater.as_str();
-    save(&server, &[a, b], b, &[("position", "9000")]).await;
+    // The queue before the request has `b` as its current song, and a
+    // position.
+    save(&server, &[b, a], b, &[("position", "9000")]).await;
+    set_changed(&server).await;
+
+    let before = unix_now();
+    let request = [("id", a), ("id", b), ("c", "Supersonic")];
+    let saved = server.get_json("savePlayQueue", &request).await;
+    let after = unix_now();
+    // The request answers with the empty response.
+    assert_eq!(saved, ok_empty());
+
+    // The row has no current song and the position 0, and it holds the time
+    // and the client of the request. The entries have the order of the
+    // request.
+    let (current, position_ms, changed_at, changed_by) =
+        head(&server).await.expect("the owner has a queue row");
+    assert_eq!((current, position_ms), (None, 0));
+    assert!((before..=after).contains(&changed_at), "{changed_at}");
+    assert_eq!(changed_by, "Supersonic");
+    assert_eq!(stored(&server, OWNER).await, [a, b]);
+
+    // The document has the two songs in the order of the request, the first
+    // of them as `current` and the position 0. The current song and the
+    // position of the queue before the request are not kept.
+    let changed = model::iso8601(changed_at);
+    let element = json!({
+        "current": a,
+        "position": 0,
+        "username": OWNER,
+        "changed": changed,
+        "changedBy": "Supersonic",
+        "entry": [song(&server, a).await, song(&server, b).await],
+    });
+    assert_eq!(
+        server.get_json("getPlayQueue", &[]).await,
+        ok("playQueue", element)
+    );
+    let expected = format!(
+        concat!(
+            r#"<playQueue changed="{changed}" changedBy="Supersonic" current="{current}""#,
+            r#" position="0" username="owner">{first}{second}</playQueue>"#
+        ),
+        changed = changed,
+        current = a,
+        first = entry_xml(&server, a).await,
+        second = entry_xml(&server, b).await,
+    );
+    assert_eq!(server.get_xml("getPlayQueue", &[]).await, xml_ok(&expected));
+    // The read stores no current song.
+    let (current, ..) = head(&server).await.expect("the owner has a queue row");
+    assert_eq!(current, None);
+}
+
+#[tokio::test]
+async fn save_without_current_checks_the_songs_and_the_position_and_stores_no_position() {
+    let server = TestServer::standard().await;
+    let a = server.track.low_tide.as_str();
+    let b = server.track.breakwater.as_str();
+
+    // An empty `current` counts as absent. The position is the position
+    // within the current song, and a queue without one stores 0. A song that
+    // is named twice is in the queue twice.
+    let request = [
+        ("id", a),
+        ("id", b),
+        ("id", a),
+        ("current", ""),
+        ("position", "5000"),
+    ];
+    assert_eq!(server.get_json("savePlayQueue", &request).await, ok_empty());
+    let (current, position_ms, ..) = head(&server).await.expect("the owner has a queue row");
+    assert_eq!((current, position_ms), (None, 0));
+    let queue = read_queue(&server).await;
+    assert_eq!(entry_ids(&queue), [a, b, a]);
+    assert_eq!(queue["position"], 0);
+    assert_eq!(queue["current"], a);
+
+    // The songs and the position are checked as in a request with
+    // `current`, and a refused request leaves the queue.
+    set_changed(&server).await;
+    let before = state(&server).await;
+    for (request, error) in [
+        (vec![("id", UNKNOWN_TRACK)], failed(70, NOT_FOUND)),
+        (vec![("id", b), ("id", "x")], failed(70, NOT_FOUND)),
+        (vec![("id", ""), ("id", b)], failed(70, NOT_FOUND)),
+        (
+            vec![("id", b), ("position", "soon")],
+            failed(0, NO_POSITION),
+        ),
+        (vec![("id", b), ("position", "-1")], failed(0, NO_POSITION)),
+    ] {
+        let response = server.get_json("savePlayQueue", &request).await;
+        assert_eq!(response, error, "{request:?}");
+    }
+    assert_eq!(state(&server).await, before);
+
+    // A form body saves the queue as a query string does.
+    let form = [("id", b), ("id", a), ("f", "json")];
+    let response = server.post_form("savePlayQueue", &form).await;
+    assert_eq!(content_type(&response), "application/json");
+    assert_eq!(subsonic_response(&body_string(response).await), ok_empty());
+    assert_eq!(stored(&server, OWNER).await, [b, a]);
+    assert_eq!(queue_current(&server).await, b);
+}
+
+#[tokio::test]
+async fn a_save_with_current_replaces_a_queue_that_was_saved_without_current() {
+    let server = TestServer::standard().await;
+    let a = server.track.low_tide.as_str();
+    let b = server.track.breakwater.as_str();
+    let c = server.track.night_ferry.as_str();
+    save_without_current(&server, &[a, b], &[]).await;
+    assert_eq!(queue_current(&server).await, a);
+
+    save(&server, &[b, c], c, &[("position", "40")]).await;
+
+    // The row has a current song again. The document has the `current` and
+    // the position of the request, and no song of the first queue that the
+    // request did not name.
+    let (current, position_ms, changed_at, _) =
+        head(&server).await.expect("the owner has a queue row");
+    assert_eq!((current.as_deref(), position_ms), (Some(c), 40));
+    assert_eq!(stored(&server, OWNER).await, [b, c]);
+    let changed = model::iso8601(changed_at);
+    let element = json!({
+        "current": c,
+        "position": 40,
+        "username": OWNER,
+        "changed": changed,
+        "changedBy": CLIENT,
+        "entry": [song(&server, b).await, song(&server, c).await],
+    });
+    assert_eq!(
+        server.get_json("getPlayQueue", &[]).await,
+        ok("playQueue", element)
+    );
+    let expected = format!(
+        concat!(
+            r#"<playQueue changed="{changed}" changedBy="{client}" current="{current}""#,
+            r#" position="40" username="owner">{first}{second}</playQueue>"#
+        ),
+        changed = changed,
+        client = CLIENT,
+        current = c,
+        first = entry_xml(&server, b).await,
+        second = entry_xml(&server, c).await,
+    );
+    assert_eq!(server.get_xml("getPlayQueue", &[]).await, xml_ok(&expected));
+
+    // A request without `current` replaces that queue in turn: the current
+    // song and the position of the queue before it are not kept.
+    save_without_current(&server, &[a, c], &[]).await;
+    let queue = read_queue(&server).await;
+    assert_eq!(entry_ids(&queue), [a, c]);
+    assert_eq!(queue["current"], a);
+    assert_eq!(queue["position"], 0);
+    let (current, position_ms, ..) = head(&server).await.expect("the owner has a queue row");
+    assert_eq!((current, position_ms), (None, 0));
+}
+
+#[tokio::test]
+async fn save_without_id_empties_a_queue_that_was_saved_without_current() {
+    let server = TestServer::standard().await;
+    let a = server.track.low_tide.as_str();
+    let b = server.track.breakwater.as_str();
+    save_without_current(&server, &[a, b], &[]).await;
+    set_changed(&server).await;
+
+    let before = unix_now();
+    let cleared = server
+        .get_json("savePlayQueue", &[("c", "Desk Player")])
+        .await;
+    let after = unix_now();
+    assert_eq!(cleared, ok_empty());
+
+    // The queue has no song. The request that emptied it is its last change.
+    assert_eq!(stored(&server, OWNER).await, [] as [&str; 0]);
+    let (current, position_ms, changed_at, changed_by) =
+        head(&server).await.expect("the owner has a queue row");
+    assert_eq!((current, position_ms), (None, 0));
+    assert!((before..=after).contains(&changed_at), "{changed_at}");
+    assert_eq!(changed_by, "Desk Player");
+    let changed = model::iso8601(changed_at);
+    let element = json!({
+        "position": 0,
+        "username": OWNER,
+        "changed": changed,
+        "changedBy": "Desk Player",
+        "entry": [],
+    });
+    assert_eq!(
+        server.get_json("getPlayQueue", &[]).await,
+        ok("playQueue", element)
+    );
+    assert_eq!(
+        server.get_xml("getPlayQueue", &[]).await,
+        xml_ok(&format!(
+            concat!(
+                r#"<playQueue changed="{changed}" changedBy="Desk Player""#,
+                r#" position="0" username="owner"/>"#
+            ),
+            changed = changed
+        ))
+    );
+}
+
+#[tokio::test]
+async fn a_current_that_is_none_of_the_ids_leaves_a_queue_that_was_saved_without_current() {
+    let server = TestServer::standard().await;
+    let a = server.track.low_tide.as_str();
+    let b = server.track.breakwater.as_str();
+    let c = server.track.night_ferry.as_str();
+    save_without_current(&server, &[a, b], &[]).await;
     set_changed(&server).await;
     let before = state(&server).await;
 
-    for request in [
-        vec![("id", a)],
-        vec![("id", b), ("id", a), ("position", "1")],
-        // An empty value counts as absent.
-        vec![("id", a), ("current", "")],
-        // The song is checked after the parameter.
-        vec![("id", UNKNOWN_TRACK)],
-    ] {
-        let response = server.get_json("savePlayQueue", &request).await;
-        assert_eq!(response, failed(10, MISSING_CURRENT), "{request:?}");
+    // A song of the library that the request does not queue, and the ID of
+    // no song. The server does not take the first song in its place.
+    for current in [c, UNKNOWN_TRACK] {
+        let request = save_request(&[a, b], current, &[]);
+        assert_eq!(
+            server.get_json("savePlayQueue", &request).await,
+            failed(0, NO_CURRENT),
+            "{current}"
+        );
+        assert_eq!(
+            server.get_xml("savePlayQueue", &request).await,
+            xml_failed(0, NO_CURRENT),
+            "{current}"
+        );
+        // A request without `id` queues no song that `current` can name.
+        let request = [("current", current)];
+        assert_eq!(
+            server.get_json("savePlayQueue", &request).await,
+            failed(0, NO_CURRENT),
+            "{current}"
+        );
+        assert_eq!(
+            server.get_xml("savePlayQueue", &request).await,
+            xml_failed(0, NO_CURRENT),
+            "{current}"
+        );
     }
 
-    // The queue is the one from before the requests.
+    // The queue is the one from before the requests: its row has no current
+    // song, and its first song is read as `current`.
     assert_eq!(state(&server).await, before);
+    let (current, ..) = head(&server).await.expect("the owner has a queue row");
+    assert_eq!(current, None);
+    assert_eq!(queue_current(&server).await, a);
 }
 
 #[tokio::test]
@@ -1149,6 +1390,87 @@ async fn a_queue_whose_songs_a_scan_deleted_has_no_current_song() {
         ok("playQueue", element)
     );
     assert_eq!(stored(&server, OWNER).await, [] as [&str; 0]);
+}
+
+#[tokio::test]
+async fn a_scan_tells_a_queue_saved_without_current_from_one_whose_current_song_it_deleted() {
+    let server = TestServer::standard_with_own_files().await;
+    let a = server.track.low_tide.as_str();
+    let b = server.track.breakwater.as_str();
+    let c = server.track.meridian.as_str();
+    let d = server.track.contour.as_str();
+    add_user(&server, "guest", "secret").await;
+    /// The `playQueue` element that the guest reads.
+    async fn queue_of_guest(server: &TestServer) -> Value {
+        let request = as_user("guest", "secret", &[]);
+        let mut response = server.get_json_noauth("getPlayQueue", &request).await;
+        assert_eq!(response["status"], "ok", "{response}");
+        response["playQueue"].take()
+    }
+
+    // The owner saves four songs without `current`. The guest saves the same
+    // songs with `c` as the current song.
+    let songs = [a, b, c, d];
+    save_without_current(&server, &songs, &[]).await;
+    set_changed(&server).await;
+    let row = head(&server).await;
+    let request = as_user(
+        "guest",
+        "secret",
+        &save_request(&songs, c, &[("position", "9000")]),
+    );
+    let saved = server.get_json_noauth("savePlayQueue", &request).await;
+    assert_eq!(saved, ok_empty());
+
+    // The file of `c` is deleted, and the scan deletes the track row.
+    delete_song(&server, c).await;
+
+    // Both queues hold the same three songs, and their current songs differ.
+    // The queue of the owner was saved without `current`, and its first song
+    // is the current one.
+    assert_eq!(stored(&server, OWNER).await, [a, b, d]);
+    let element = json!({
+        "current": a,
+        "position": 0,
+        "username": OWNER,
+        "changed": "2023-03-14T17:51:22Z",
+        "changedBy": CLIENT,
+        "entry": [
+            song(&server, a).await,
+            song(&server, b).await,
+            song(&server, d).await,
+        ],
+    });
+    assert_eq!(
+        server.get_json("getPlayQueue", &[]).await,
+        ok("playQueue", element)
+    );
+    let body = server.get_xml("getPlayQueue", &[]).await;
+    let attributes = format!(
+        r#"<playQueue changed="2023-03-14T17:51:22Z" changedBy="{CLIENT}" current="{a}" position="0" username="owner">"#
+    );
+    assert!(body.contains(&attributes), "{body}");
+    assert_eq!(body.matches("<entry ").count(), 3);
+    // The scan is no change of the queue, and it stores no current song.
+    assert_eq!(head(&server).await, row);
+    // The scan deleted the current song of the queue of the guest: the song
+    // that followed it is the current one.
+    let of_guest = queue_of_guest(&server).await;
+    assert_eq!(entry_ids(&of_guest), [a, b, d]);
+    assert_eq!(of_guest["current"], d);
+    assert_eq!(of_guest["position"], 0);
+
+    // The first song is deleted. The queue of the owner has the first song
+    // that is left as the current one, and the queue of the guest keeps the
+    // song that followed its deleted current song.
+    delete_song(&server, a).await;
+    let queue = read_queue(&server).await;
+    assert_eq!(entry_ids(&queue), [b, d]);
+    assert_eq!(queue["current"], b);
+    assert_eq!(queue["position"], 0);
+    let of_guest = queue_of_guest(&server).await;
+    assert_eq!(entry_ids(&of_guest), [b, d]);
+    assert_eq!(of_guest["current"], d);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
