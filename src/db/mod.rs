@@ -2,11 +2,11 @@
 //! (`docs/design.md` section 3.4).
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use std::sync::{Arc, Condvar, PoisonError};
+use std::time::{Duration, Instant};
 
-use rusqlite::{Connection, OpenFlags, TransactionBehavior};
+use rusqlite::{Connection, ErrorCode, InterruptHandle, OpenFlags, TransactionBehavior};
 use tokio::sync::{Mutex, MutexGuard, OwnedMutexGuard};
 
 // The list of the query modules is in `queries/mod.rs`, which holds nothing
@@ -31,6 +31,23 @@ const READERS: usize = 4;
 /// How long a connection waits for a lock that another connection holds.
 const BUSY_TIMEOUT: Duration = Duration::from_millis(5000);
 
+/// The time limit of a read of [`Db::read`] (`docs/design.md` section 3.4).
+///
+/// The slowest statement that was found within the bounds of the request
+/// parameters is the track statement of a search with 32 terms, 31 of which
+/// every track matches. It takes 1.4 s on a library of 100 000 tracks. A
+/// search of one to three terms takes 50 to 110 ms there. The limit is 3.6
+/// times the first value, so a machine that is three times slower answers
+/// that request.
+pub const READ_LIMIT: Duration = Duration::from_secs(5);
+
+/// How long the timer thread waits before it interrupts the connection of a
+/// read that has passed its limit again.
+const INTERRUPT_REPEAT: Duration = Duration::from_millis(50);
+
+/// The reads of [`Db::read`] that run now, of every handle of the process.
+static READ_TIMERS: ReadTimers = ReadTimers::new();
+
 /// An error from the database layer.
 #[derive(Debug, thiserror::Error)]
 pub enum DbError {
@@ -49,6 +66,8 @@ pub enum DbError {
     CheckpointBusy,
     #[error("the runtime shut down before the database task ran")]
     Cancelled,
+    #[error("a statement of a read was interrupted at the time limit of {limit:?}")]
+    ReadLimit { limit: Duration },
     #[error("the path is not valid Unicode: {}", .0.display())]
     NonUnicodePath(PathBuf),
 }
@@ -75,6 +94,8 @@ struct Inner {
     readers: Vec<Arc<Mutex<Connection>>>,
     /// The reader at which the next read starts to look for a free connection.
     next_reader: AtomicUsize,
+    /// The time limit of a read of [`Db::read`], in nanoseconds.
+    read_limit_nanos: AtomicU64,
 }
 
 impl Db {
@@ -139,25 +160,61 @@ impl Db {
                 writer: Arc::new(Mutex::new(writer)),
                 readers,
                 next_reader: AtomicUsize::new(0),
+                read_limit_nanos: AtomicU64::new(nanos(READ_LIMIT)),
             }),
         }
     }
 
+    /// Sets the time limit of the reads of [`Db::read`] that start after the
+    /// call, for this handle and its clones. A handle starts with
+    /// [`READ_LIMIT`], and the server does not change it. A test sets a
+    /// limit of milliseconds.
+    pub fn set_read_limit(&self, limit: Duration) {
+        self.inner
+            .read_limit_nanos
+            .store(nanos(limit), Ordering::Relaxed);
+    }
+
     /// Runs `f` with a read connection on a blocking thread.
     ///
-    /// `f` runs to completion even when the returned future is dropped. A
-    /// panic in `f` resumes in the caller.
+    /// The read has a time limit, which is [`READ_LIMIT`] unless
+    /// [`Db::set_read_limit`] changed it. The time counts from the moment
+    /// `f` starts, so the wait for a free connection is no part of it. When
+    /// the time ends, the statement that `f` runs is interrupted, and so is
+    /// every statement that `f` starts after it. The read returns
+    /// [`DbError::ReadLimit`] when `f` returns the error of such a
+    /// statement. The connection then serves the next read.
+    ///
+    /// `f` runs to completion even when the returned future is dropped, and
+    /// the limit holds for it then as well. A panic in `f` resumes in the
+    /// caller.
     pub async fn read<T, F>(&self, f: F) -> Result<T>
     where
         F: FnOnce(&Connection) -> Result<T> + Send + 'static,
         T: Send + 'static,
     {
         let connection = self.lock_reader().await;
-        run_blocking(move || f(&connection)).await
+        let limit = Duration::from_nanos(self.inner.read_limit_nanos.load(Ordering::Relaxed));
+        run_blocking(move || {
+            // The connection is a local that is declared before the timer.
+            // Locals are dropped in the reverse order, also when `f` panics,
+            // so the timer has ended when the connection is released.
+            let connection = connection;
+            let mut timer = ReadTimer::start(&connection, limit);
+            let result = f(&connection);
+            let interrupted = timer.end();
+            match result {
+                Err(DbError::Sqlite(error)) if interrupted && is_interrupt(&error) => {
+                    Err(DbError::ReadLimit { limit })
+                }
+                result => result,
+            }
+        })
+        .await
     }
 
     /// Runs `f` with the write connection on a blocking thread. Writes run
-    /// one at a time.
+    /// one at a time. A write has no time limit.
     ///
     /// `f` runs to completion even when the returned future is dropped. A
     /// panic in `f` resumes in the caller.
@@ -171,7 +228,8 @@ impl Db {
     }
 
     /// Runs `f` with a read connection on the calling thread and blocks the
-    /// thread while it waits for the connection.
+    /// thread while it waits for the connection. The read has no time limit:
+    /// the commands of the CLI use this method, and no request does.
     ///
     /// # Panics
     ///
@@ -183,7 +241,8 @@ impl Db {
     }
 
     /// Runs `f` with the write connection on the calling thread and blocks
-    /// the thread while it waits for the connection.
+    /// the thread while it waits for the connection. A write has no time
+    /// limit.
     ///
     /// # Panics
     ///
@@ -246,6 +305,224 @@ impl Db {
         }
         readers[start].blocking_lock()
     }
+}
+
+/// The time limits of the reads of [`Db::read`]: the reads that run now and
+/// the thread that interrupts the connection of a read when the read has run
+/// for its limit, and again every [`INTERRUPT_REPEAT`] until the read ends.
+///
+/// The thread starts with the first read of the process and serves every
+/// handle. It is no part of the runtime, so it keeps the limit of a read
+/// whose future was dropped and of a read that runs while the runtime shuts
+/// down.
+///
+/// SQLite applies an interrupt to the statements that run when it arrives,
+/// whichever closure started them. The thread therefore interrupts under the
+/// lock of the list of the reads, and a read takes that lock to leave the
+/// list. No interrupt is issued for a read after [`ReadTimers::remove`] has
+/// returned, so none reaches a statement of the next user of the connection.
+///
+/// An interrupt can arrive while the read runs no statement: between two
+/// statements, or after the last one. It stops nothing. SQLite keeps a flag
+/// on the connection and clears it when the next statement is prepared or
+/// started, so that statement runs; a test holds the bundled SQLite to
+/// this. The thread repeats the interrupt for this case: a read whose limit
+/// ends between two of its statements would otherwise run the later ones
+/// without a limit.
+struct ReadTimers {
+    state: std::sync::Mutex<TimersState>,
+    /// Wakes the thread before the time it set for itself.
+    wake: Condvar,
+}
+
+struct TimersState {
+    reads: Vec<TimedRead>,
+    /// The ID of the read that is added next.
+    next_id: u64,
+    /// Whether the thread was started.
+    started: bool,
+    /// The time at which the thread wakes without a signal. `None` while it
+    /// waits for a signal only.
+    wakes_at: Option<Instant>,
+}
+
+/// A read that runs and the time of its next interrupt.
+struct TimedRead {
+    id: u64,
+    due: Instant,
+    interrupt: InterruptHandle,
+    /// The thread has interrupted the connection of the read.
+    interrupted: bool,
+}
+
+impl ReadTimers {
+    const fn new() -> Self {
+        ReadTimers {
+            state: std::sync::Mutex::new(TimersState {
+                reads: Vec::new(),
+                next_id: 0,
+                started: false,
+                wakes_at: None,
+            }),
+            wake: Condvar::new(),
+        }
+    }
+
+    /// Adds a read that starts now on the connection of `interrupt` and
+    /// returns its ID. Returns `None` for a read that gets no limit: its
+    /// limit ends at no time that the clock can hold, or the thread cannot
+    /// be started.
+    fn add(&'static self, interrupt: InterruptHandle, limit: Duration) -> Option<u64> {
+        let due = Instant::now().checked_add(limit)?;
+        let mut state = self.lock();
+        if !state.started {
+            let thread = std::thread::Builder::new().name("db-read-limit".to_owned());
+            let run = move || {
+                let _ended = ThreadEnd(self);
+                self.run();
+            };
+            match thread.spawn(run) {
+                Ok(_) => state.started = true,
+                Err(error) => {
+                    drop(state);
+                    tracing::error!(%error, "cannot start the thread of the read limit");
+                    return None;
+                }
+            }
+        }
+        let id = state.next_id;
+        state.next_id += 1;
+        state.reads.push(TimedRead {
+            id,
+            due,
+            interrupt,
+            interrupted: false,
+        });
+        // The thread looks at the list again at `wakes_at`. A read whose
+        // limit ends before that needs the signal.
+        if state.wakes_at.is_none_or(|wakes_at| due < wakes_at) {
+            self.wake.notify_one();
+        }
+        Some(id)
+    }
+
+    /// Removes the read `id` and returns whether its connection was
+    /// interrupted.
+    fn remove(&self, id: u64) -> bool {
+        let mut state = self.lock();
+        match state.reads.iter().position(|read| read.id == id) {
+            Some(index) => state.reads.swap_remove(index).interrupted,
+            None => false,
+        }
+    }
+
+    /// The thread: interrupts the reads whose time has come and sleeps until
+    /// the time of the next one. It returns only by a panic.
+    fn run(&self) {
+        let mut state = self.lock();
+        loop {
+            let now = Instant::now();
+            let mut next: Option<Instant> = None;
+            for read in &mut state.reads {
+                if read.due <= now {
+                    read.interrupt.interrupt();
+                    read.interrupted = true;
+                    read.due = now + INTERRUPT_REPEAT;
+                }
+                next = Some(next.map_or(read.due, |next| next.min(read.due)));
+            }
+            state.wakes_at = next;
+            // A wait releases the lock, and it returns early for a signal
+            // and at times for no reason. The list is read again after it.
+            state = match next {
+                Some(next) => {
+                    let (state, _) = self
+                        .wake
+                        .wait_timeout(state, next.saturating_duration_since(now))
+                        .unwrap_or_else(PoisonError::into_inner);
+                    state
+                }
+                None => self
+                    .wake
+                    .wait(state)
+                    .unwrap_or_else(PoisonError::into_inner),
+            };
+        }
+    }
+
+    /// Locks the list. A poisoned lock is taken as it is, so that the end of
+    /// a read never panics.
+    fn lock(&self) -> std::sync::MutexGuard<'_, TimersState> {
+        self.state.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Records that the thread of a [`ReadTimers`] has ended. The thread drops
+/// this value when a panic ends it. The reads in the list then have no
+/// limit until the next read starts a new thread, which keeps the limits of
+/// all of them.
+struct ThreadEnd(&'static ReadTimers);
+
+impl Drop for ThreadEnd {
+    fn drop(&mut self) {
+        self.0.lock().started = false;
+        tracing::error!("the thread of the read limit ended; the next read starts it again");
+    }
+}
+
+/// The time limit of one read of [`Db::read`]: the read is in the list of
+/// [`READ_TIMERS`] while this value lives.
+struct ReadTimer<'c> {
+    connection: &'c Connection,
+    /// The ID of the read in the list. `None` when the read has no limit and
+    /// when it has ended.
+    id: Option<u64>,
+}
+
+impl<'c> ReadTimer<'c> {
+    /// Starts the time of a read that is about to run on `connection`. The
+    /// caller holds the connection until the timer has ended.
+    fn start(connection: &'c Connection, limit: Duration) -> Self {
+        let id = READ_TIMERS.add(connection.get_interrupt_handle(), limit);
+        ReadTimer { connection, id }
+    }
+
+    /// Ends the timer and returns whether the connection was interrupted.
+    /// After an interrupt it also ends a transaction that the read left
+    /// open.
+    fn end(&mut self) -> bool {
+        let interrupted = self.id.take().is_some_and(|id| READ_TIMERS.remove(id));
+        // A handler reads inside a transaction, which rusqlite rolls back
+        // when the handler drops it. An interrupt can stop that `ROLLBACK`,
+        // and rusqlite ignores the error. The transaction would stay open on
+        // the connection: the next handler could start none, and a
+        // checkpoint could not truncate the write-ahead log. No interrupt
+        // arrives from here on, so this `ROLLBACK` runs.
+        if interrupted
+            && !self.connection.is_autocommit()
+            && let Err(error) = self.connection.execute_batch("ROLLBACK")
+        {
+            tracing::error!(%error, "cannot end the transaction of an interrupted read");
+        }
+        interrupted
+    }
+}
+
+impl Drop for ReadTimer<'_> {
+    /// Ends the timer of a read whose closure panicked.
+    fn drop(&mut self) {
+        self.end();
+    }
+}
+
+/// Whether `error` is the error of a statement that an interrupt stopped.
+fn is_interrupt(error: &rusqlite::Error) -> bool {
+    error.sqlite_error_code() == Some(ErrorCode::OperationInterrupted)
+}
+
+/// The whole nanoseconds of `duration`, or the largest number that fits.
+fn nanos(duration: Duration) -> u64 {
+    u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX)
 }
 
 /// Runs `f` on a blocking thread and returns its result.
@@ -352,9 +629,10 @@ fn checkpoint(connection: &Connection) -> Result<()> {
 mod tests {
     use std::collections::BTreeMap;
     use std::sync::mpsc;
+    use std::time::Instant;
 
+    use rusqlite::params;
     use rusqlite::types::Value;
-    use rusqlite::{ErrorCode, params};
     use tempfile::TempDir;
     use tokio::sync::oneshot;
 
@@ -413,6 +691,56 @@ mod tests {
         let mut name = path.as_os_str().to_owned();
         name.push(suffix);
         PathBuf::from(name)
+    }
+
+    /// A limit that a statement of [`MANY_ROWS`] rows passes on every machine.
+    const SHORT_LIMIT: Duration = Duration::from_millis(20);
+
+    /// The rows of a statement that a test expects to be interrupted. The
+    /// statement runs for seconds, which no test waits for: a read that is
+    /// not interrupted fails its test with the count.
+    const MANY_ROWS: i64 = 50_000_000;
+
+    /// Counts the numbers from 1 to `rows` with one statement and returns
+    /// their number. The statement reads no table and holds one row in
+    /// memory.
+    fn count_to(connection: &Connection, rows: i64) -> Result<i64> {
+        Ok(connection.query_row(
+            "WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < ?1)
+             SELECT count(*) FROM n",
+            [rows],
+            |row| row.get(0),
+        )?)
+    }
+
+    /// Runs statements on `connection` one after the other for `time` at
+    /// least. An interrupt that arrives in that time stops the statement
+    /// that runs then.
+    fn count_for(connection: &Connection, time: Duration) -> Result<()> {
+        let started = Instant::now();
+        while started.elapsed() < time {
+            assert_eq!(count_to(connection, 20_000)?, 20_000);
+        }
+        Ok(())
+    }
+
+    /// Locks every read connection of `db` but the first, so that every read
+    /// of the handle runs on one connection while the guards live. A memory
+    /// database has one connection and gives no guard.
+    fn hold_all_readers_but_one(db: &Db) -> Vec<MutexGuard<'_, Connection>> {
+        db.inner
+            .readers
+            .iter()
+            .skip(1)
+            .map(|reader| reader.try_lock().expect("a free reader"))
+            .collect()
+    }
+
+    fn assert_read_limit(error: &DbError, expected: Duration) {
+        assert!(
+            matches!(error, DbError::ReadLimit { limit } if *limit == expected),
+            "{error}"
+        );
     }
 
     fn assert_send_and_sync<T: Send + Sync>() {}
@@ -1096,6 +1424,349 @@ mod tests {
 
         let error = db.close().await.unwrap_err();
         assert!(matches!(error, DbError::CheckpointBusy), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_read_that_runs_past_its_limit_is_interrupted() {
+        let (_dir, dbs) = both_dbs();
+        for db in dbs {
+            db.set_read_limit(SHORT_LIMIT);
+            let error = db.read(|c| count_to(c, MANY_ROWS)).await.unwrap_err();
+            assert_read_limit(&error, SHORT_LIMIT);
+            assert_eq!(
+                error.to_string(),
+                "a statement of a read was interrupted at the time limit of 20ms"
+            );
+        }
+    }
+
+    #[test]
+    fn a_handle_starts_with_the_limit_of_five_seconds() {
+        let (_dir, dbs) = both_dbs();
+        for db in dbs {
+            assert_eq!(READ_LIMIT, Duration::from_secs(5));
+            assert_eq!(
+                db.inner.read_limit_nanos.load(Ordering::Relaxed),
+                5_000_000_000
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_connection_of_an_interrupted_read_serves_the_next_read() {
+        let (_dir, dbs) = both_dbs();
+        for db in dbs {
+            db.write(|c| insert_folder(c, "/music")).await.unwrap();
+            let _held = hold_all_readers_but_one(&db);
+
+            db.set_read_limit(SHORT_LIMIT);
+            let error = db.read(|c| count_to(c, MANY_ROWS)).await.unwrap_err();
+            assert_read_limit(&error, SHORT_LIMIT);
+
+            db.set_read_limit(READ_LIMIT);
+            assert_eq!(db.read(count_folders).await.unwrap(), 1);
+            assert_eq!(db.read(|c| count_to(c, 1000)).await.unwrap(), 1000);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_timer_of_an_ended_read_interrupts_no_later_statement() {
+        let (_dir, dbs) = both_dbs();
+        for db in dbs {
+            let _held = hold_all_readers_but_one(&db);
+            db.set_read_limit(SHORT_LIMIT);
+            let error = db.read(|c| count_to(c, MANY_ROWS)).await.unwrap_err();
+            assert_read_limit(&error, SHORT_LIMIT);
+
+            // A timer that outlived its read would interrupt the connection
+            // again within `INTERRUPT_REPEAT`.
+            db.set_read_limit(READ_LIMIT);
+            db.read(|c| count_for(c, 3 * INTERRUPT_REPEAT))
+                .await
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_statement_that_starts_after_the_limit_of_its_read_is_interrupted() {
+        let (_dir, dbs) = both_dbs();
+        for db in dbs {
+            db.set_read_limit(SHORT_LIMIT);
+
+            // The limit ends while the read runs no statement, so the first
+            // interrupt stops nothing.
+            let error = db
+                .read(|c| {
+                    assert_eq!(count_to(c, 1000)?, 1000);
+                    std::thread::sleep(3 * SHORT_LIMIT);
+                    count_to(c, MANY_ROWS)
+                })
+                .await
+                .unwrap_err();
+            assert_read_limit(&error, SHORT_LIMIT);
+
+            // The read goes on after the statement that was interrupted.
+            let error = db
+                .read(|c| {
+                    assert!(count_to(c, MANY_ROWS).is_err());
+                    count_to(c, MANY_ROWS)
+                })
+                .await
+                .unwrap_err();
+            assert_read_limit(&error, SHORT_LIMIT);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panic_in_a_read_ends_its_timer() {
+        let (_dir, dbs) = both_dbs();
+        for db in dbs {
+            let _held = hold_all_readers_but_one(&db);
+            db.set_read_limit(SHORT_LIMIT);
+            let panicking = db.clone();
+            let outcome = tokio::spawn(async move {
+                panicking
+                    .read(|_| -> Result<()> { panic!("closure panic") })
+                    .await
+            })
+            .await;
+            assert!(outcome.unwrap_err().is_panic());
+
+            // The limit of the read that panicked ends while these
+            // statements run on its connection.
+            db.set_read_limit(READ_LIMIT);
+            db.read(|c| count_for(c, SHORT_LIMIT + 3 * INTERRUPT_REPEAT))
+                .await
+                .unwrap();
+        }
+    }
+
+    /// The state of a connection after an interrupt that arrived late: the
+    /// flag of the interrupt is set and no statement runs. The timer of a
+    /// read leaves a connection so when its interrupt arrives between two
+    /// statements of the read or after the last one.
+    #[test]
+    fn an_interrupt_that_finds_no_statement_running_stops_no_later_statement() {
+        const CACHED: &str = "SELECT count(*) + 0 FROM folders";
+
+        let (_dir, dbs) = both_dbs();
+        for db in dbs {
+            db.with_writer(|c| {
+                insert_folder(c, "/music")?;
+                drop(c.prepare_cached(CACHED)?);
+                let interrupt = c.get_interrupt_handle();
+
+                // A statement that is prepared after the interrupt.
+                interrupt.interrupt();
+                assert!(c.is_interrupted());
+                assert_eq!(count_folders(c)?, 1);
+                assert!(!c.is_interrupted());
+
+                // A statement of the statement cache, which is not prepared
+                // again.
+                interrupt.interrupt();
+                assert!(c.is_interrupted());
+                let count: i64 = c.prepare_cached(CACHED)?.query_row([], |row| row.get(0))?;
+                assert_eq!(count, 1);
+                assert!(!c.is_interrupted());
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_read_leaves_no_transaction_open() {
+        let (_dir, dbs) = both_dbs();
+        for db in dbs {
+            let _held = hold_all_readers_but_one(&db);
+            db.set_read_limit(SHORT_LIMIT);
+            let error = db
+                .read(|c| {
+                    // No guard rolls this transaction back. The read ends as
+                    // a read does whose `ROLLBACK` an interrupt stopped.
+                    c.execute_batch("BEGIN")?;
+                    count_to(c, MANY_ROWS)
+                })
+                .await
+                .unwrap_err();
+            assert_read_limit(&error, SHORT_LIMIT);
+
+            db.set_read_limit(READ_LIMIT);
+            let (autocommit, folders) = db
+                .read(|c| {
+                    let autocommit = c.is_autocommit();
+                    // A handler reads inside a transaction of its own.
+                    let snapshot = c.unchecked_transaction()?;
+                    Ok((autocommit, count_folders(&snapshot)?))
+                })
+                .await
+                .unwrap();
+            assert!(autocommit);
+            assert_eq!(folders, 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_whose_caller_is_gone_is_interrupted_at_its_limit() {
+        let (_dir, dbs) = both_dbs();
+        for db in dbs {
+            db.set_read_limit(SHORT_LIMIT);
+            let (started_tx, started_rx) = oneshot::channel();
+            let (ended_tx, ended_rx) = oneshot::channel();
+            let reader = db.clone();
+            let read = tokio::spawn(async move {
+                reader
+                    .read(move |c| {
+                        started_tx.send(()).unwrap();
+                        let counted = count_to(c, MANY_ROWS);
+                        let interrupted = matches!(
+                            &counted,
+                            Err(DbError::Sqlite(error)) if is_interrupt(error)
+                        );
+                        ended_tx
+                            .send((interrupted, format!("{counted:?}")))
+                            .unwrap();
+                        counted
+                    })
+                    .await
+            });
+            started_rx.await.unwrap();
+            // The task is cancelled at its await, which drops the future of
+            // the read while the statement runs. On a machine that stalls
+            // the test for the limit, the read ends first with its error.
+            read.abort();
+            match read.await {
+                Err(cancelled) => assert!(cancelled.is_cancelled()),
+                Ok(result) => assert_read_limit(&result.unwrap_err(), SHORT_LIMIT),
+            }
+
+            let (interrupted, counted) = ended_rx.await.unwrap();
+            assert!(interrupted, "{counted}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_write_that_runs_longer_than_the_read_limit_completes() {
+        const LIMIT: Duration = Duration::from_millis(5);
+
+        let (_dir, dbs) = both_dbs();
+        for db in dbs {
+            db.set_read_limit(LIMIT);
+            db.write(|c| count_for(c, 10 * LIMIT)).await.unwrap();
+
+            // The scanner writes with `with_writer` on a blocking thread.
+            let scanner = db.clone();
+            tokio::task::spawn_blocking(move || scanner.with_writer(|c| count_for(c, 10 * LIMIT)))
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn a_read_that_waits_for_its_connection_interrupts_no_write() {
+        const LIMIT: Duration = Duration::from_millis(400);
+        // The write holds the connection for longer than the limit.
+        const WRITE: Duration = Duration::from_millis(500);
+        // How long the read runs statements once it holds the connection.
+        // The time does not depend on the speed of the machine. An
+        // interrupt that arrives before the first statement stops nothing,
+        // so the time holds the repetition of that interrupt.
+        const READ: Duration = Duration::from_millis(100);
+        assert!(READ >= 2 * INTERRUPT_REPEAT);
+
+        // A memory database has one connection, so the read waits for the
+        // write.
+        let db = Db::open_memory().unwrap();
+        db.set_read_limit(LIMIT);
+        let (started_tx, started_rx) = oneshot::channel();
+        let writer = db.clone();
+        let write = tokio::spawn(async move {
+            writer
+                .write(move |c| {
+                    insert_folder(c, "/music")?;
+                    started_tx.send(()).unwrap();
+                    count_for(c, WRITE)
+                })
+                .await
+        });
+        started_rx.await.unwrap();
+
+        // The read waits for longer than its limit. Its time starts when it
+        // holds the connection: a read whose wait counted would be
+        // interrupted while it runs its statements.
+        let folders = db
+            .read(|c| {
+                count_for(c, READ)?;
+                count_folders(c)
+            })
+            .await
+            .unwrap();
+        assert_eq!(folders, 1);
+        write.await.unwrap().unwrap();
+    }
+
+    /// The thread ends only by a panic, which a test cannot cause. This test
+    /// drops the value that the thread drops when it ends. The list has its
+    /// own thread, so the test ends no thread of another test.
+    #[test]
+    fn a_thread_that_has_ended_is_started_again_by_the_next_read() {
+        let timers: &'static ReadTimers = Box::leak(Box::new(ReadTimers::new()));
+        let connection = Connection::open_in_memory().unwrap();
+
+        assert!(!timers.lock().started);
+        let id = timers
+            .add(connection.get_interrupt_handle(), READ_LIMIT)
+            .unwrap();
+        assert!(timers.lock().started);
+        assert!(!timers.remove(id));
+
+        drop(ThreadEnd(timers));
+        assert!(!timers.lock().started);
+
+        let id = timers
+            .add(connection.get_interrupt_handle(), SHORT_LIMIT)
+            .unwrap();
+        assert!(timers.lock().started);
+        let error = count_to(&connection, MANY_ROWS).unwrap_err();
+        assert!(
+            matches!(&error, DbError::Sqlite(error) if is_interrupt(error)),
+            "{error}"
+        );
+        assert!(timers.remove(id));
+    }
+
+    /// `Db::open` runs `migrate` on the write connection before the handle
+    /// exists, and `migrate` applies each migration with `apply_migration`.
+    /// This test applies one more migration with `apply_migration` on the
+    /// write connection of a handle, after the migrations of the build. A
+    /// limit that reached that connection would stop it.
+    #[test]
+    fn a_migration_that_runs_longer_than_the_read_limit_completes() {
+        const LIMIT: Duration = Duration::from_millis(5);
+        const SLOW_MIGRATION: &str = "CREATE TABLE counted AS
+             WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 400000)
+             SELECT count(*) AS numbers FROM n;";
+
+        let (_dir, dbs) = both_dbs();
+        for db in dbs {
+            db.set_read_limit(LIMIT);
+            let started = Instant::now();
+            db.with_writer(|c| Ok(apply_migration(c, latest(), SLOW_MIGRATION)?))
+                .unwrap();
+            assert!(started.elapsed() > LIMIT);
+
+            let (version, numbers) = db
+                .with_reader(|c| {
+                    let numbers: i64 =
+                        c.query_row("SELECT numbers FROM counted", [], |row| row.get(0))?;
+                    Ok((user_version(c)?, numbers))
+                })
+                .unwrap();
+            assert_eq!(version, latest() + 1);
+            assert_eq!(numbers, 400_000);
+        }
     }
 
     // File modes exist on Unix only.

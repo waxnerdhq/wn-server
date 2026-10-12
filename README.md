@@ -205,6 +205,7 @@ The server answers OpenSubsonic requests at `/rest/<method>` and `/rest/<method>
 - An API error is an HTTP 200 response with the status `failed` and an `error` element that holds the Subsonic error code and a message.
 - The check of the user comes before the method. A request without a user gets the authentication error from every method except `getOpenSubsonicExtensions`, also from a method that the server does not serve.
 - A method of the OpenSubsonic API that the server does not serve returns error 0 with the message `not supported`. A name that is not an OpenSubsonic method returns error 0 with the message `unknown endpoint`.
+- A request that makes the server read its database for more than 5 seconds returns error 0. The server stops the read after that time. The message is the one the method has for a database that it cannot read, such as `the server cannot read its library`, and the log holds the cause.
 
 <!-- The comment lines below hold the places of the methods that have no text in this section yet. A change that adds a handler module replaces the line of the module with its text and keeps the blank lines (docs/design.md section 3.8). -->
 
