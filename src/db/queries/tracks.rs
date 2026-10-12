@@ -106,11 +106,13 @@ pub struct TrackContent<'a> {
     pub album_id: &'a str,
 }
 
-/// The columns of [`Track`] in the order [`track_from_row`] reads them.
-const TRACK_COLUMNS: &str = "id, folder_id, rel_path, fingerprint, title, album_id, artist_id, \
-     artist_name, album_name, track_no, disc_no, year, genre, duration_ms, bitrate_kbps, \
-     sample_rate, bit_depth, channels, size, suffix, content_type, lossless, has_picture, \
-     has_lyrics, mtime, created_at, updated_at";
+/// The columns of [`Track`] in the order [`track_from_row`] reads them. The
+/// names carry no table name, so the text serves a statement whose `FROM`
+/// clause names `tracks` and no other table.
+pub(super) const TRACK_COLUMNS: &str = "id, folder_id, rel_path, fingerprint, title, album_id, \
+     artist_id, artist_name, album_name, track_no, disc_no, year, genre, duration_ms, \
+     bitrate_kbps, sample_rate, bit_depth, channels, size, suffix, content_type, lossless, \
+     has_picture, has_lyrics, mtime, created_at, updated_at";
 
 /// Returns the index entry of every track, in no particular order.
 pub fn load_index(conn: &Connection) -> Result<Vec<IndexEntry>> {
@@ -284,7 +286,9 @@ pub fn count_tracks_in_folder(conn: &Connection, folder_id: i64) -> Result<u64> 
     )?)
 }
 
-fn track_from_row(row: &Row<'_>) -> rusqlite::Result<Track> {
+/// Reads a [`Track`] from the first columns of `row`, which are
+/// [`TRACK_COLUMNS`].
+pub(super) fn track_from_row(row: &Row<'_>) -> rusqlite::Result<Track> {
     Ok(Track {
         id: row.get(0)?,
         folder_id: row.get(1)?,

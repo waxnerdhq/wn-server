@@ -180,6 +180,29 @@ The server answers OpenSubsonic requests at `/rest/<method>` and `/rest/<method>
 - An API error is an HTTP 200 response with the status `failed` and an `error` element that holds the Subsonic error code and a message.
 - The check of the user comes before the method. A request without a user gets the authentication error from every method except `getOpenSubsonicExtensions`, also from a method that the server does not serve.
 - A method of the OpenSubsonic API that the server does not serve returns error 0 with the message `not supported`. A name that is not an OpenSubsonic method returns error 0 with the message `unknown endpoint`.
+
+<!-- The comment lines below hold the places of the methods that have no text in this section yet. A change that adds a handler module replaces the line of the module with its text and keeps the blank lines (docs/design.md section 3.8). -->
+
+<!-- api/browse.rs -->
+
+<!-- api/folders.rs -->
+
+<!-- api/lists.rs -->
+
+<!-- api/search.rs -->
+
+<!-- api/annotate.rs -->
+
+<!-- api/playlists.rs -->
+
+<!-- api/queue.rs -->
+
+<!-- api/lyrics.rs -->
+
+<!-- api/media.rs -->
+
+<!-- api/covers.rs -->
+
 - `download` is disabled. A request with a user gets error 50 with the message `download is disabled on this server`, whatever its parameters. No request gets the bytes of a file. `getUser` and `getUsers` report `downloadRole` as `false`.
 - `getUser` needs `username`. The value must be the name of the user of the request, in any letter case; another name returns error 50. With authentication off, every name returns the owner. `getUsers` lists the owner. The user has `scrobblingEnabled`, `adminRole`, `playlistRole` and `streamRole` as `true`, and every other role is `false`. `folder` holds the IDs of the music folders.
 - `startScan` starts a scan in the background and returns `scanStatus` with `scanning` and `count`, the number of audio files the scan has finished with. `getScanStatus` returns the same for the scan of the server that runs or ran last, and adds `lastScan`, the end time of the latest scan in UTC (`2026-10-11T08:15:30Z`). `lastScan` is not part of OpenSubsonic and is absent until a scan has ended. `scanning` is `true` only for a scan of the server itself, not for one that `wn-server scan` runs. A scan that recorded errors is not an API error: the errors are in the log. See [Scanning](#scanning).

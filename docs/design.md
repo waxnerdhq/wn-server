@@ -98,7 +98,7 @@ wn-server/
   scripts/make-fixtures.sh    maintainer tool, regenerates tests/fixtures/audio/*
   migrations/0001_init.sql    embedded with include_str!
   tests/fixtures/audio/       five tiny audio files
-  tests/common/mod.rs         LibraryBuilder, TestServer
+  tests/common/mod.rs         LibraryBuilder, TestServer, the servers over a scanned library
   tests/*.rs                  router-level integration tests
   examples/e2e.rs             end-to-end session against a running server
   examples/make-library.rs    writes the standard test library to a directory
@@ -108,7 +108,8 @@ wn-server/
     cli.rs                    init, run, scan, user, config
     config.rs                 Config, defaults, validation, DataDir
     db/mod.rs                 Db handle, migrations, pragmas
-    db/queries/*.rs           tracks, albums, artists, annotations, playlists, play_queue, users, scans, folders
+    db/queries/mod.rs         the list of the query modules and nothing else
+    db/queries/*.rs           tracks, albums, artists, annotations, browse, lists, search, playlists, play_queue, lyrics, users, scans, folders
     ids.rs                    ID prefixes, parse, new_id, natural keys, fingerprint
     library/tags.rs           lofty wrapper -> TrackMeta, pictures, lyrics
     library/scanner.rs        walk, diff, move detection, upsert, delete, aggregate
@@ -121,13 +122,13 @@ wn-server/
     api/params.rs             Params multimap and typed getters
     api/envelope.rs           SubsonicResponse, Format, ApiError
     api/xml.rs                serde_json::Value -> Subsonic XML
-    api/model.rs              Child, AlbumID3, ArtistID3, constructors
+    api/model.rs              Child, AlbumID3, ArtistID3, Artist, Directory, Index, Genre, MusicFolder, constructors
     api/system.rs             ping, getLicense, getOpenSubsonicExtensions
     api/browse.rs             getArtists, getArtist, getAlbum, getSong, getMusicFolders, getGenres
     api/folders.rs            getIndexes, getMusicDirectory
-    api/lists.rs              getAlbumList(2), getRandomSongs, getSongsByGenre, getStarred(2)
+    api/lists.rs              getAlbumList(2), getRandomSongs, getSongsByGenre
     api/search.rs             search2, search3
-    api/annotate.rs           star, unstar, setRating, scrobble
+    api/annotate.rs           star, unstar, setRating, getStarred(2), scrobble
     api/playlists.rs
     api/queue.rs              getPlayQueue, savePlayQueue
     api/lyrics.rs             getLyrics, getLyricsBySongId
@@ -346,6 +347,8 @@ CREATE TABLE scans (
 
 Readers of `tracks`: a row whose `rel_path` starts with `/` has no file. The value is the placeholder path of §3.3. `db::queries::tracks::has_file(rel_path)` is the one test for it, and `Track::has_file` calls it; no reader tests the value itself. Code never joins such a `rel_path` to a folder path, because `Path::join` replaces the folder with a root path. `stream`, `getCoverArt` for the ID of the track, and the lyrics endpoints answer error 70 for such a track. `getIndexes` and `getMusicDirectory` leave it out of the folder tree. `getSong`, `getAlbum`, search and playlist results may list it; it keeps its tags, its ID and its annotations. Aggregation (§3.10 step 6) treats it as a track of its album: the album row and the artist row stay while it refers to them, and `song_count`, `duration_ms`, `year` and `genre` count it, so the counts of an album agree with the rows that `getAlbum` may list. The names of the two rows count the spellings it carries (§3.3). Aggregation never takes such a row as the track that gives the album its directory or as the source of embedded cover art; an album whose tracks all have no file has no cover. SQL that needs files filters with `rel_path NOT LIKE '/%'`.
 
+The library queries and the response models follow the rule (§3.8). `browse::tracks_of_album`, `browse::track` and `browse::tracks_by_ids` return such a row as every other row, and `browse::genres` counts it. `browse::list_artists` with a music folder counts only the tracks that have a file, because a track without a file is in no folder. `browse::file_path` returns no path for it. `model::child` leaves `path` out, and never gives the ID of the track as `coverArt`, because `getCoverArt` has no picture for it. The other fields of the element are those of the file the track had.
+
 Genres are derived with `GROUP BY genre`. Cascades from `tracks` to `playlist_tracks` and `play_queue_tracks` are correct because a track row is deleted only when its file is gone and no new file carries its fingerprint, and never while a path or a file that the scan could not read may hold it, nor for a folder that is newly empty. Both child tables index `track_id`, so the deletion of a track does not scan them.
 
 Multi-user readiness: every per-user table carries `user_id`; `users.role` separates the owner from future guests and has no default, so every insert names the role; the CLI finds the owner with `WHERE role = 'owner'`.
@@ -482,9 +485,63 @@ Remote-mode seam: `users.role` and `auth::extract::authenticate` are the only pl
 - Errors: HTTP 200, `status: "failed"`, `error: {code, message}`. `ApiError` variants: `MissingParam` 10, `BadCredentials` 40, `AuthUnsupported` 42, `AuthConflict` 43, `Forbidden` 50, `NotFound` 70, `Other(msg)` 0.
 - `EXTENSIONS: &[(&str, &[u32])]` holds the advertised extensions, one entry per line.
 - The method table, `EXTENSIONS`, the fields of `AppState` (in its definition and where it is built) and the list of handler modules in `src/api/mod.rs` hold one line for each entry that this document names, and a blank line follows every entry. An entry that is not built is a comment line with its name, or a method table line that maps to `not_implemented`. A change that builds an entry replaces that line and keeps the blank lines, so two changes never touch neighbouring lines and git merges them without a conflict. The arrays, the struct and the statements that build the struct carry `#[rustfmt::skip]`, because rustfmt removes the blank lines inside an array and the blank line between a comment and the struct field after it.
+- The list of the query modules is `src/db/queries/mod.rs`, which holds that list and nothing else. It follows the same rule: one line for each module that §3.1 names, in that order, a blank line after every entry, and a comment line with the name for a module that is not built. Its `mod` lines carry no `#[rustfmt::skip]`, because rustfmt orders only `mod` lines that follow each other without a blank line. A query module of a group of methods adds no function to another query module (see Library queries below).
+- The texts that the change of one handler module adds to this document and to `README.md` follow the rule as well. A comment line `<!-- api/<module>.rs -->` holds the place of the module in §4 and in the API section of `README.md`, and a comment line `<!-- tests/<file>.rs -->` holds the place of its test file in §5. A blank line follows every comment line. A change replaces its comment line with its text and keeps the blank lines.
 - Request log: method name, `c`, `u`, status, duration; never the query string. The method name, `c` and `u` are cut to 64 characters, because the client chooses them. `stream` and `getCoverArt` log at `debug`.
 - Binary endpoints (`stream`, `getCoverArt`) bypass the envelope on success and use it on error.
-- Model constructors `model::child(&Track, Option<&Annotation>)`, `model::album(..)`, `model::artist(..)` are the only way a handler builds a response object; the caller passes the user's annotations from `annotations::get_many(user, ids)`.
+- Model constructors `model::child(&Song, Option<&Annotation>)`, `model::album(..)`, `model::artist(..)` and the others of `api/model.rs` are the only way a handler builds an element that several methods share; the caller passes the user's annotations from `annotations::get_many(conn, user_id, ids)`. An element that one method alone returns, such as the `searchResult3` that holds three lists of these elements, is a private type in the module of its handler.
+
+#### Library queries
+
+`db::queries::browse` reads the library for the API. Its rows are what the response models are built from: `Artist` and `Album` (rows of their tables), `Song` (a `tracks::Track` row and whether its album has a cover), `Genre`, and the `Folder` of `db::queries::folders`.
+
+| Function | Result |
+|---|---|
+| `list_artists(folder_id)` | Every artist, in the order of the natural keys. With a music folder: the artists that have a track with a file in it. |
+| `artist(id)`, `album(id)`, `track(id)` | One row, or none for an ID that no row has. |
+| `albums_of_artist(id)` | The albums of one artist by year, where an album without a year follows the others, then by the natural key of the title. |
+| `tracks_of_album(id)` | Every track row of one album in the track order of §1.3: disc, track, path. |
+| `genres()` | Each genre tag of the tracks with the number of tracks that have it and the number of albums whose `genre` it is, in the order of the names without regard to ASCII case. |
+| `folders()` | The music folder rows in ID order. |
+| `artists_by_ids(ids)`, `albums_by_ids(ids)`, `tracks_by_ids(ids)` | The rows of the IDs, in the order of the IDs. An ID that no row has adds nothing. An ID that the list holds twice adds its row twice. |
+| `file_path(track)` | The absolute path of the file of a track, or none for a track without a file (§3.4). |
+| `last_scan_finished_at()` | The end time of the scan that finished last, in Unix seconds, or none. `getIndexes` reports it as `lastModified`. |
+
+- A query module of a group of methods (`lists`, `search`, `playlists`, `play_queue`, `lyrics`) selects the IDs of its result with its own SQL, in the order of the result, and reads the rows with the `_by_ids` functions. It needs no column list and no row reader, and it adds no function to `browse` or to the module of a table.
+- A list of IDs is one parameter of a statement: a JSON array that the statement reads with `json_each`. A list of any length is one statement, and no ID is part of the SQL text. `annotations::get_many` takes its IDs the same way.
+- `album_count` of an artist and `song_count` and `duration_ms` of an album are the values that the last scan stored (§3.10 step 6). A music folder filter does not change them.
+- The tracks are grouped by the genre tag as it is stored, so two spellings that differ by case are two genres. The album count of a genre is the number of albums whose `genre` column holds it. That column is the genre of most tracks of the album (§3.10 step 6), so an album counts for one genre.
+
+`annotations::get_many(conn, user_id, item_ids)` returns a map from item ID to `Annotation { starred_at, rating, play_count, last_played_at }`. The map holds an entry for each ID that has a row of the user. The IDs can be of tracks, albums and artists at once. The two times are Unix seconds. An item without a row has no entry, and its annotation is `Annotation::default()`: no star, no rating, a play count of 0 and no play.
+
+#### Response models
+
+`api/model.rs` holds these elements. The names are those of the OpenSubsonic API. Every constructor of an item that a user can star, rate or play takes `Option<&Annotation>`, the entry of the item in the map of `get_many`.
+
+| Element | Constructor | Fields |
+|---|---|---|
+| `Child`, a song | `child(&Song, ..)` | `id`, `parent` (the album ID), `isDir: false`, `title`, `album`, `artist`, `track`, `year`, `genre`, `coverArt`, `size`, `contentType`, `suffix`, `duration`, `bitRate`, `bitDepth`, `samplingRate`, `channelCount`, `path`, `discNumber`, `created`, `albumId`, `artistId`, `type: music`, `mediaType: song`, `starred`, `userRating`, `playCount`, `played` |
+| `Child`, an album as a directory | `child_dir_for_album(&Album, ..)` | `id`, `parent` (the artist ID), `isDir: true`, `title`, `album`, `artist`, `year`, `genre`, `coverArt`, `duration`, `created`, `artistId`, `mediaType: album`, `starred`, `userRating`, `playCount`, `played` |
+| `AlbumID3` | `album(&Album, ..)`, `album_with_songs(&Album, .., songs)` | `id`, `name`, `artist`, `artistId`, `coverArt`, `songCount`, `duration`, `created`, `year`, `genre`, `starred`, `userRating`, `playCount`; with songs also `song` |
+| `ArtistID3` | `artist(&Artist, ..)`, `artist_with_albums(&Artist, .., albums)` | `id`, `name`, `albumCount`, `starred`; with albums also `album`. No `coverArt`: artists have no image (§1.3) |
+| `Artist` of the folder methods | `artist_dir(&Artist, ..)` | `id`, `name`, `starred`, `userRating` |
+| `Directory` | `directory_for_artist(&Artist, .., children)`, `directory_for_album(&Album, .., children)` | `id`, `name`, `starred`, `userRating`, `child`; for an album also `parent` (the artist ID) and `playCount` |
+| `Index` | `index(artists, constructor)` | `name`, `artist` |
+| `Genre` | `genre(&Genre)` | `value`, `songCount`, `albumCount` |
+| `MusicFolder` | `music_folder(&Folder)` | `id`, `name` |
+
+- `getAlbumList`, `search2`, `getStarred` and `getMusicDirectory` list an album as a directory. `getIndexes`, `search2` and `getStarred` list an artist as the `Artist` of the folder methods.
+- A time (`created`, `starred`, `played`) is ISO 8601 in UTC with whole seconds, as in `2023-03-14T17:51:22Z` (`model::iso8601`). `created` is the time of the first scan that saw the track or the album.
+- `duration` is whole seconds, rounded to the nearest second, and half a second is rounded up (`model::seconds`). The duration of an album is its stored sum in milliseconds, rounded once, so it can differ from the sum of the rounded durations of its songs.
+- `path` is `tracks.rel_path`: the path below the music folder, with `/` between the components.
+- `artist` of a song is the track artist tag. `artistId` is the ID of the album artist, because a track artist has no row (§1.3).
+- `discNumber` is 1 for a track without a disc number, as in the track order (§1.3).
+- `bitDepth`, `samplingRate` and `channelCount` are 0 for a song whose file gave none. The OpenSubsonic API asks a server to send an added field that it supports with a default value. `track`, `year`, `genre` and `bitRate` are absent when the track has no such value.
+- `playCount` is 0 for an item without a play. `starred`, `userRating` and `played` are absent for an item without a star, a rating or a play; the Subsonic schema allows no `userRating` below 1.
+- `coverArt` of an album is its own ID when `cover_source` is set, and absent otherwise. `coverArt` of a song is the ID of its album when the album has a cover, else the ID of the track when `has_picture` is set and the track has a file, else absent (`model::album_cover_art`, `model::song_cover_art`).
+- `model::index_letter(name)` is the index of an artist name: its first letter in upper case when that is a letter from A to Z, and `#` otherwise. A leading article is not part of the name for this: `The`, `El`, `La`, `Los`, `Las`, `Le` or `Les`, without regard to ASCII case, as a whole word that another word follows. "The Beatles" is in `B`, and "Them" and "The" are in `T`. A letter with a diacritic counts as its base letter, so "Édith Piaf" is in `E`. `model::ignored_articles()` is the value of `ignoredArticles`: `The El La Los Las Le Les`.
+- `model::index` groups artists by that letter. The indexes are in the order of their names, so `#` is the first. The artists of an index are in the order of their names without the leading article, without diacritics and in lower case.
+- `AlbumID3` has no `played` and no `isCompilation`, and no element has a multi-artist field, a sort name or a MusicBrainz ID (§1.2).
 
 ### 3.9 Streaming and transcoding
 
@@ -713,6 +770,28 @@ Amperfy calls `ping, getOpenSubsonicExtensions, getMusicFolders, getIndexes, get
 | getTranscodeDecision, getTranscodeStream | deferred: `not supported` |
 | Extensions advertised | `formPost` [1], `transcodeOffset` [1], `songLyrics` [1] |
 
+<!-- The comment lines below hold the places of the handler modules that have no text in this section yet. A change replaces the line of its module with its text and keeps the blank lines (section 3.8). -->
+
+<!-- api/browse.rs -->
+
+<!-- api/folders.rs -->
+
+<!-- api/lists.rs -->
+
+<!-- api/search.rs -->
+
+<!-- api/annotate.rs -->
+
+<!-- api/playlists.rs -->
+
+<!-- api/queue.rs -->
+
+<!-- api/lyrics.rs -->
+
+<!-- api/media.rs -->
+
+<!-- api/covers.rs -->
+
 User methods (`api/users.rs`): the server has one account, so `getUser` and `getUsers` return the user of the request. `getUser` requires `username`, and an absent one is error 10. The value is compared with the name of the user of the request without regard to ASCII case, as the lookup of an account is (§3.7). Another name is error 50 with the message `username must be the name of the user of the request`, whether an account has that name or not. With `auth.disabled_unsafe = true` every name returns the owner. `getUsers` returns `users`, whose `user` list holds that one user. The `user` element holds `username` (the stored name); `scrobblingEnabled`, `adminRole`, `playlistRole` and `streamRole` as `true`; `settingsRole`, `downloadRole`, `uploadRole`, `coverArtRole`, `commentRole`, `podcastRole`, `jukeboxRole`, `shareRole` and `videoConversionRole` as `false`; and `folder`, the IDs of the rows of the `folders` table in ID order. It has no `email`.
 
 Scan methods (`api/scan.rs`): `startScan` and `getScanStatus` return the `scanStatus` element with `scanning` and `count` (https://opensubsonic.netlify.app/docs/responses/scanstatus/). Both describe the scans of the server process (§3.10).
@@ -734,9 +813,34 @@ Scan methods (`api/scan.rs`): `startScan` and `getScanStatus` return the `scanSt
 
 - `cargo xtask check` runs `cargo fmt --all -- --check`, `cargo clippy --locked --workspace --all-targets -- -D warnings` and `cargo test --locked --workspace`. The default suite finishes in under 30 s after compiling, in a debug build, on every OS. No network, no audio hardware, no ffmpeg, real SQLite (memory or temp file), no mocks of the database. No test sleeps or polls for more than 1 s; timing values are fields of config structs that tests set to tens of milliseconds.
 - Fixtures: `tests/fixtures/audio/` holds `a.flac`, `a.mp3`, `a.m4a`, `a.ogg`, `a.opus`, generated by `scripts/make-fixtures.sh` from a 0.5 s mono 440 Hz sine. The sample rate is 22.05 kHz, except for `a.opus`, which is 24 kHz because libopus does not accept 22.05 kHz. The files total about 24 KB and each is under 16 KB; a test enforces a 64 KB budget. They carry no tag fields.
-- `tests/common/mod.rs`: `LibraryBuilder` copies fixtures into a temp directory as `<Artist>/<Album>/<nn> <Title>.<ext>` and writes tags with lofty; `LibraryBuilder::standard()` builds 3 artists, 4 albums, 10 tracks (one compilation, one album with `cover.jpg`, one with embedded art, one track with a lyrics tag, one album with tracks on two discs). Names are valid on Windows and differ by more than case. `TestServer` builds the router over a scanned standard library and offers `get_json(method, params)`, `get_xml`, `get_raw`, `post_form`. Its database is in memory and holds the owner `owner` with the password `sesame`; `db()` returns it, so a test writes the rows that its requests read. The four helpers add the auth defaults to the parameters of the caller: `u`, a token `t` with a new salt `s` for each request, `v` and `c`; a default whose name the caller passes is left out. `get_json_noauth` and `get_raw_noauth` send the parameters of the caller and no other.
-- Unit tests sit next to the code: IDs and fingerprints, tag mapping, `decide`, envelope and XML rendering, config, auth verification, LRC parsing, cover resize, argv builders.
+- `tests/common/mod.rs`: `LibraryBuilder` copies fixtures into a temp directory as `<Artist>/<Album>/<nn> <Title>.<ext>` and writes tags with lofty; `LibraryBuilder::standard()` builds 3 artists, 4 albums, 10 tracks (one compilation, one album with `cover.jpg`, one with embedded art, one track with a lyrics tag, one album with tracks on two discs). Names are valid on Windows and differ by more than case. `TestServer` builds the router and offers `get_json(method, params)`, `get_xml`, `get_raw`, `post_form` and `get_with_headers(method, params, headers)`; `body_string` and `body_bytes` read the body of a response. Its database is in memory and holds the owner `owner` with the password `sesame`; `db()` returns it, so a test writes the rows that its requests read. The five helpers add the auth defaults to the parameters of the caller: `u`, a token `t` with a new salt `s` for each request, `v` and `c`; a default whose name the caller passes is left out. `get_json_noauth` and `get_raw_noauth` send the parameters of the caller and no other.
+- `TestServer` has four constructors, and every server has a database of its own. `TestServer::bare(config)` has the owner account and no library; it reads no music folder. `TestServer::standard().await` scans the standard library and returns a `StandardServer`, which exposes the ID of each artist, album and track of the library as a field (`server.artist.aurora_field`, `server.album.glass_harbour`, `server.track.low_tide`) and the ID of the music folder as `folder_id`. `TestServer::standard_with_own_files().await` returns the same over files that no other test reads; a test that renames, changes or deletes a file uses it and calls `rescan()`. `TestServer::scanned(library).await` scans a library that the test built with `LibraryBuilder` and returns a `ScannedServer`; `catalogue()` reads its rows, and a test finds a row by its name. The config of a scanned server names the directory of the library as its one music folder, and `root()` and `path(rel_path)` return paths in it. The servers of `standard()` that exist at the same time in one test binary share the files of one library: it is written when no server holds it and deleted when the last one is dropped. The tests of a binary run on several threads and overlap, so most runs write the library once; a run with one test thread writes it for every test. No directory stays behind when the process ends. A test does not change these files. A test checks that a standard server is ready in under 1 s.
+- Unit tests sit next to the code: IDs and fingerprints, tag mapping, `decide`, envelope and XML rendering, the response models, the library queries and the annotation lookup, config, auth verification, LRC parsing, cover resize, argv builders. The tests of the response models compare the whole JSON document and the whole XML document of each element with the expected text, for a row that has every value and for a row that has few.
+- `tests/model.rs` builds the response models from the rows of a scanned standard library: the properties of a file of each of the five formats, the cover art IDs that follow the covers the scan found, the order of the library queries, the annotation lookup, and a track that is given a placeholder path. It also tests the constructors of `TestServer` over a scanned library.
 - Router tests in `tests/` call the router in-process with `tower::ServiceExt::oneshot`. Every endpoint has a JSON test; the envelope has XML tests.
+
+<!-- The comment lines below hold the places of the test files that have no text in this section yet. A change replaces the line of its test file with its text and keeps the blank lines (section 3.8). -->
+
+<!-- tests/browse.rs -->
+
+<!-- tests/folders.rs -->
+
+<!-- tests/lists.rs -->
+
+<!-- tests/search.rs -->
+
+<!-- tests/annotations.rs -->
+
+<!-- tests/playlists.rs -->
+
+<!-- tests/queue.rs -->
+
+<!-- tests/lyrics.rs -->
+
+<!-- tests/stream.rs -->
+
+<!-- tests/coverart.rs -->
+
 - `tests/users.rs` covers `getUser` and `getUsers` in JSON and XML, with authentication on and off. `tests/stubs.rs` holds a table of every stub with its key or its error, and a test compares the table with the rows of §4. It sends `download` in both path forms by GET and by POST, with a user, without one and with authentication off, for the ID of a track whose file is on disk, and checks that each body equals the error document byte for byte.
 - `tests/auth.rs` covers every rule of §3.7. For every method of the table that is not public it checks that a request without a user gets the authentication error and does not reach the handler. A unit test in `api/mod.rs` adds a method whose handler takes no `Authed` to a table and checks the same. The log of the failed attempts is captured and holds no password, token or salt.
 - `tests/cli.rs` runs the binary with `std::process::Command` for `init`, `scan`, `user show`, `user set-password`, `config path` and `config show`. Every run that writes names a temp data directory. The password tests read the stored password from the database and check it with `auth::verify_password`. The `scan` tests run the command on the standard library, with a missing folder, after the files of the folder are gone, while the test holds the scan lock as a scan of the server does, and while the test holds the database open as a server does.
