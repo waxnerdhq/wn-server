@@ -8,19 +8,18 @@ wn-server is a headless music server for OpenSubsonic clients. The design is des
 |---|---|
 | `wn-server init [--folder PATH]... [--port N] [--username NAME] [--password-stdin]` | Creates the data directory, `config.toml`, `instance.id`, the database and the owner account. With a `config.toml` and no owner account, keeps `config.toml` and creates what is missing. |
 | `wn-server run` | Runs the server in the foreground until Ctrl-C. |
+| `wn-server scan [--full]` | Runs one scan of the music folders and prints its summary. `--full` reads the tags of every file again. See [Scanning](#scanning). |
 | `wn-server user show` | Prints the name, the role and the creation date of the owner account. |
 | `wn-server user set-password [--username NAME] [--password-stdin]` | Stores a new password for the owner account, or for the account `--username` names. |
 | `wn-server config path` | Prints the path of the config file. |
 | `wn-server config show` | Prints the effective config: the values of the file and the default of every key the file omits. |
 | `wn-server --version` | Prints the version. |
 
-`scan` prints `not implemented yet` and exits with status 2.
-
 Every command accepts `--data-dir DIR` before or after the subcommand. A command that fails prints `wn-server: <error>` to stderr and exits with status 1. A usage error exits with status 2.
 
 ## Data directory
 
-The data directory holds `config.toml`, the database `library.db` and `instance.id`. The first of these that is present names it:
+The data directory holds `config.toml`, the database `library.db`, `instance.id` and the empty file `scan.lock` (see [Scanning](#scanning)). The first of these that is present names it:
 
 1. The `--data-dir` option.
 2. The `WN_SERVER_DATA_DIR` environment variable. An empty value counts as unset.
@@ -116,7 +115,42 @@ wn-server run
 
 `run` opens `library.db` and needs the owner account in it. `run` creates neither and fails at startup when one is missing. `wn-server init` then creates what is missing and keeps `config.toml` (see [Owner account](#owner-account)).
 
+`run` stores the music folders of `config.toml` in the database before it answers the first request, and then scans them in the background (see [Scanning](#scanning)). The server answers requests while it scans.
+
 Logs go to stderr. `server.log_level` is the log filter, for example `info` or `warn,wn_server=debug`. The `RUST_LOG` environment variable replaces it when it is set and not empty. The log names the method, the client (`c`) and the user (`u`) of a request, each cut to 64 characters. It never holds the query string or the form body.
+
+## Scanning
+
+A scan reads the music folders into the database. It reads the files that are new or have changed. A full scan reads the tags of every file again. Four things start a scan:
+
+- `wn-server run` at startup, unless `library.scan_on_start = false`.
+- `wn-server run` every `library.rescan_interval_minutes`, when that key is not 0. The default is 0, so there are no periodic scans. The first one starts one interval after the server started.
+- The API method `startScan`. `fullScan=true` asks for a full scan.
+- The command `wn-server scan`. `--full` asks for a full scan.
+
+One scan of a library runs at a time. Whatever asks for a scan while one runs gets none, and no scan is queued:
+
+- The server skips a periodic scan while it scans. The next one starts one interval later.
+- `startScan` during a scan of the server starts no second scan and answers with the status of the running one. A `fullScan=true` that arrives then has no effect; send it again after the scan.
+- `wn-server scan` prints an error and exits with status 1 while the server scans, and while another `wn-server scan` runs. It scans nothing and does not wait.
+- While `wn-server scan` scans, the server starts no scan: it skips the scan at startup and the periodic scans with a warning in the log, and `startScan` returns error 0 with the message `another process is scanning the library`.
+
+`wn-server scan` works with and without a running server. It needs `config.toml` and `library.db`, and scans in its own process. A server that runs and does not scan keeps answering requests during the scan and shows the new tracks as the scan stores them. The process that scans holds a lock on the file `scan.lock` in the data directory. The file is empty, and the lock ends with the process.
+
+`wn-server scan` prints the summary of its scan and then exits:
+
+```
+seen: 10
+added: 10
+changed: 0
+moved: 0
+removed: 0
+albums: 4
+artists: 3
+errors: 0
+```
+
+`seen` is the number of supported audio files. `added`, `changed`, `moved` and `removed` count tracks. `albums` and `artists` are the numbers in the library after the scan. Each error of the scan follows as a line `error: <message>` that names the folder, the path or the file. The command exits with status 0, or with status 1 when the scan recorded an error. Warnings about files that the scan leaves for the next scan go to stderr with the log. A music folder of `config.toml` that does not exist is an error of the config: the command names the folder and exits with status 1 before it scans.
 
 ## Authentication
 
@@ -148,6 +182,7 @@ The server answers OpenSubsonic requests at `/rest/<method>` and `/rest/<method>
 - A method of the OpenSubsonic API that the server does not serve returns error 0 with the message `not supported`. A name that is not an OpenSubsonic method returns error 0 with the message `unknown endpoint`.
 - `download` is disabled. A request with a user gets error 50 with the message `download is disabled on this server`, whatever its parameters. No request gets the bytes of a file. `getUser` and `getUsers` report `downloadRole` as `false`.
 - `getUser` needs `username`. The value must be the name of the user of the request, in any letter case; another name returns error 50. With authentication off, every name returns the owner. `getUsers` lists the owner. The user has `scrobblingEnabled`, `adminRole`, `playlistRole` and `streamRole` as `true`, and every other role is `false`. `folder` holds the IDs of the music folders.
+- `startScan` starts a scan in the background and returns `scanStatus` with `scanning` and `count`, the number of audio files the scan has finished with. `getScanStatus` returns the same for the scan of the server that runs or ran last, and adds `lastScan`, the end time of the latest scan in UTC (`2026-10-11T08:15:30Z`). `lastScan` is not part of OpenSubsonic and is absent until a scan has ended. `scanning` is `true` only for a scan of the server itself, not for one that `wn-server scan` runs. A scan that recorded errors is not an API error: the errors are in the log. See [Scanning](#scanning).
 - The server has no artist or album information from other services, no similar or top songs, no list of what is playing, and no shares, podcasts, internet radio stations or bookmarks. `getArtistInfo`, `getArtistInfo2`, `getAlbumInfo`, `getAlbumInfo2`, `getSimilarSongs`, `getSimilarSongs2`, `getTopSongs`, `getNowPlaying`, `getShares`, `getPodcasts`, `getNewestPodcasts`, `getInternetRadioStations` and `getBookmarks` return an empty result. `getAvatar` returns error 70.
 - `createUser`, `updateUser`, `deleteUser` and `changePassword` return error 50. The `wn-server user` commands manage the owner account.
 

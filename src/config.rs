@@ -463,8 +463,8 @@ fn check_bitrate(key: &'static str, kbps: u32) -> Result<(), ConfigError> {
     }
 }
 
-/// The directory that holds the config file, the database, the instance ID
-/// and the cover cache.
+/// The directory that holds the config file, the database, the instance ID,
+/// the scan lock and the cover cache.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DataDir {
     root: PathBuf,
@@ -521,6 +521,12 @@ impl DataDir {
     /// The directory of resized covers, `cache/covers`.
     pub fn covers_cache_dir(&self) -> PathBuf {
         self.root.join("cache").join("covers")
+    }
+
+    /// The file that a process locks while it scans the library, `scan.lock`.
+    /// The file has no content.
+    pub fn scan_lock_path(&self) -> PathBuf {
+        self.root.join("scan.lock")
     }
 }
 
@@ -1096,6 +1102,7 @@ mdns = true
             data_dir.covers_cache_dir(),
             dir.path().join("cache").join("covers")
         );
+        assert_eq!(data_dir.scan_lock_path(), dir.path().join("scan.lock"));
     }
 
     #[test]

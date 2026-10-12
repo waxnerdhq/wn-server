@@ -1,6 +1,8 @@
 //! Runs the `wn-server` binary for the commands that work without a socket:
-//! `init`, `user show`, `user set-password`, `config path`, `config show`, and
-//! `run` up to the point where it loads the config.
+//! `init`, `scan`, `user show`, `user set-password`, `config path`,
+//! `config show`, and `run` up to the point where it loads the config.
+
+mod common;
 
 use std::fs;
 use std::io::Write;
@@ -14,7 +16,12 @@ use wn_server::cli::PASSWORD_ENV;
 use wn_server::config::{Config, DATA_DIR_ENV};
 use wn_server::db::Db;
 use wn_server::db::queries::folders::{self, Folder};
+use wn_server::db::queries::scans::{self, Scan};
+use wn_server::db::queries::tracks;
 use wn_server::db::queries::users::{self, UserRow};
+use wn_server::library::scan_controller::ScanLock;
+
+use common::{LibraryBuilder, TestLibrary};
 
 /// The line `init` and `user set-password` print after they store a password.
 const NOTICE: &str =
@@ -1466,12 +1473,236 @@ fn platform_default_is_roaming_app_data_on_windows() {
     assert_eq!(stdout(&output), config_path_line(&data_dir));
 }
 
+/// The summary that `scan` prints for the standard library when the scan
+/// recorded no error.
+fn standard_summary(added: u64, changed: u64) -> String {
+    format!(
+        "seen: 10\nadded: {added}\nchanged: {changed}\nmoved: 0\nremoved: 0\nalbums: 4\n\
+         artists: 3\nerrors: 0\n"
+    )
+}
+
+/// The standard library and a data directory that `init` set up with the
+/// library as its one music folder.
+fn initialised_library() -> (TestLibrary, TempDir) {
+    let library = LibraryBuilder::standard().build();
+    let dir = temp_dir();
+    let output = init(dir.path(), library.root.path());
+    assert!(output.status.success(), "{}", stderr(&output));
+    (library, dir)
+}
+
+/// Runs `scan` for the data directory `data_dir` with `args`.
+fn scan(data_dir: &Path, args: &[&str]) -> Output {
+    run(binary()
+        .arg("scan")
+        .args(args)
+        .arg("--data-dir")
+        .arg(data_dir))
+}
+
+/// The rows of the `scans` table in the database of `data_dir`.
+fn scan_rows(data_dir: &Path) -> Vec<Scan> {
+    let db = Db::open(data_dir.join("library.db")).expect("open the database");
+    db.with_reader(scans::list).expect("read the scans")
+}
+
+/// The number of track rows in the database of `data_dir`.
+fn track_count(data_dir: &Path) -> u64 {
+    let db = Db::open(data_dir.join("library.db")).expect("open the database");
+    db.with_reader(tracks::count_tracks)
+        .expect("count the tracks")
+}
+
 #[test]
-fn scan_prints_not_implemented_and_exits_2() {
-    let output = run(binary().arg("scan"));
-    assert_eq!(output.status.code(), Some(2));
-    assert_eq!(stderr(&output), "not implemented yet\n");
+fn scan_of_the_standard_library_prints_10_seen_and_exits_0() {
+    let (library, dir) = initialised_library();
+
+    let output = scan(dir.path(), &[]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output), standard_summary(10, 0));
+    assert!(
+        !stderr(&output).contains("wn-server: "),
+        "{}",
+        stderr(&output)
+    );
+
+    // The command moved the write-ahead log into the database file. The log
+    // file is empty, or SQLite has removed it.
+    let log = fs::metadata(dir.path().join("library.db-wal"));
+    assert_eq!(log.map_or(0, |log| log.len()), 0);
+
+    // The scan stored the folder and the tracks, and its row is closed.
+    let rows = folder_rows(dir.path());
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].path, library.root.path());
+    assert_eq!(track_count(dir.path()), 10);
+    let scans = scan_rows(dir.path());
+    assert_eq!(scans.len(), 1);
+    assert!(scans[0].finished_at.is_some());
+    assert_eq!(scans[0].counts.seen, 10);
+    assert_eq!(scans[0].error, None);
+
+    // A second scan finds nothing to do. `--full` reads every tag again.
+    let output = scan(dir.path(), &[]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output), standard_summary(0, 0));
+    let output = scan(dir.path(), &["--full"]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output), standard_summary(0, 10));
+    assert_eq!(scan_rows(dir.path()).len(), 3);
+    assert_eq!(track_count(dir.path()), 10);
+}
+
+#[test]
+fn scan_names_a_missing_folder_and_exits_1() {
+    let (library, dir) = initialised_library();
+    let folder = library.root.path().to_path_buf();
+    drop(library);
+    assert!(!folder.exists());
+
+    let output = scan(dir.path(), &[]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    assert_eq!(
+        stderr(&output),
+        format!(
+            "wn-server: music folder {} does not exist\n",
+            folder.display()
+        )
+    );
+    // The command stopped when it loaded the config. No scan ran.
+    assert_eq!(scan_rows(dir.path()), []);
+    assert!(!dir.path().join("scan.lock").exists());
+}
+
+#[test]
+fn scan_prints_the_errors_of_the_scan_and_exits_1() {
+    let (library, dir) = initialised_library();
+    let output = scan(dir.path(), &[]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+
+    // The folder had tracks and holds no supported file now. The scan
+    // records that as an error and deletes no track.
+    for file in &library.files {
+        fs::remove_file(file).expect("remove the file");
+    }
+    let output = scan(dir.path(), &[]);
+
+    assert_eq!(output.status.code(), Some(1));
+    let root = library.root.path();
+    let name = root.file_name().expect("a name").to_str().expect("UTF-8");
+    let message = format!(
+        "music folder \"{name}\" ({}) has no supported file; none of its tracks was deleted",
+        root.display()
+    );
+    assert_eq!(
+        stdout(&output),
+        format!(
+            "seen: 0\nadded: 0\nchanged: 0\nmoved: 0\nremoved: 0\nalbums: 4\nartists: 3\n\
+             errors: 1\nerror: {message}\n"
+        )
+    );
+    let log = stderr(&output);
+    assert!(
+        log.ends_with("wn-server: the scan recorded 1 error\n"),
+        "{log}"
+    );
+    assert_eq!(track_count(dir.path()), 10);
+    let scans = scan_rows(dir.path());
+    assert_eq!(scans[1].error.as_deref(), Some(message.as_str()));
+}
+
+#[test]
+fn scan_while_another_process_scans_the_library_exits_1_and_scans_nothing() {
+    let (_library, dir) = initialised_library();
+    // The lock that a scan of the running server holds from its start to
+    // its end.
+    let server_scan = ScanLock::try_acquire(&dir.path().join("scan.lock"))
+        .expect("lock the file")
+        .expect("the lock is free");
+
+    for args in [&[][..], &["--full"]] {
+        let output = scan(dir.path(), args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+        let message = stderr(&output);
+        assert!(
+            message.contains("wn-server: another process is scanning this library"),
+            "{message}"
+        );
+        assert!(message.contains("Nothing was scanned"), "{message}");
+    }
+    assert_eq!(scan_rows(dir.path()), []);
+    assert_eq!(track_count(dir.path()), 0);
+
+    // The scan of the server has ended.
+    drop(server_scan);
+    let output = scan(dir.path(), &[]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output), standard_summary(10, 0));
+}
+
+#[test]
+fn scan_next_to_a_server_that_holds_the_database_stores_the_tracks() {
+    let (_library, dir) = initialised_library();
+    // The connections that a running server holds on the database: one that
+    // writes and four that read. The server has read and written through
+    // them, and it scans nothing, so the scan lock is free.
+    let server = Db::open(dir.path().join("library.db")).expect("open the database");
+    assert_eq!(server.with_reader(tracks::count_tracks).expect("read"), 0);
+    let stored = server
+        .with_writer(|conn| folders::sync_folders(conn, &[]))
+        .expect("write");
+    assert_eq!(stored, []);
+
+    let output = scan(dir.path(), &[]);
+    assert_eq!(output.status.code(), Some(0), "{}", stderr(&output));
+    assert_eq!(stdout(&output), standard_summary(10, 0));
+
+    // The server reads the tracks through the connections it had open, and
+    // it writes to the database after the scan.
+    assert_eq!(server.with_reader(tracks::count_tracks).expect("read"), 10);
+    assert_eq!(server.with_reader(scans::list).expect("read").len(), 1);
+    let id = server
+        .with_writer(|conn| scans::insert(conn))
+        .expect("write");
+    assert_eq!(id, 2);
+}
+
+#[test]
+fn scan_without_a_database_names_init_and_creates_none() {
+    let (_library, dir) = initialised_library();
+    let db_path = dir.path().join("library.db");
+    for suffix in ["", "-wal", "-shm"] {
+        let _ = fs::remove_file(dir.path().join(format!("library.db{suffix}")));
+    }
+
+    let output = scan(dir.path(), &[]);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(stdout(&output).is_empty(), "{}", stdout(&output));
+    let message = stderr(&output);
+    assert!(
+        message.contains(&db_path.display().to_string()),
+        "{message}"
+    );
+    assert!(message.contains("wn-server init"), "{message}");
+    assert!(!db_path.exists());
+}
+
+#[test]
+fn scan_without_a_config_names_the_config_path_and_exits_1() {
+    let dir = temp_dir();
+
+    let output = scan(dir.path(), &[]);
+    assert_eq!(output.status.code(), Some(1));
     assert!(stdout(&output).is_empty());
+    let message = stderr(&output);
+    assert!(message.starts_with("wn-server: "), "{message}");
+    assert!(
+        message.contains(&dir.path().join("config.toml").display().to_string()),
+        "{message}"
+    );
 }
 
 #[test]
