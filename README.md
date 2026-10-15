@@ -77,11 +77,19 @@ One owner per server. The owner invites up to 12 listeners. wn-server enforces t
 
 Invites are records in wn-cloud: server id, user id, role. Revoking an invite ends access at the membership check. Navidrome is not involved.
 
+### Web UI
+
+wn-server serves its own web UI. The owner sees status, invites, and match review. Invited listeners get a reduced view. The UI signs in through the same PKCE flow as the CLI, with the redirect pointing at wn-server's own URL instead of loopback, and keeps a cookie session. wn-cloud's redirect allowlist must therefore cover wn-server URLs on the LAN and on the relay.
+
+Later, waxnerd relay (a paid wn-cloud feature) lets authorized users reach a wn-server from the public internet. wn-cloud redirects the user to the server, and the server's own web UI takes over. The web UI is built so that this needs no change on the server beyond being reachable.
+
 ### Ratings and favorites
 
 wn-cloud is the source of truth. Ratings use waxnerd's 10-point scale (5 stars with half stars). Releases and tracks also carry a favorite mark. Likes and comments may follow on the same model.
 
-Navidrome's own rating is an integer from 0 to 5 and cannot hold half stars, so it is not used as storage. wn-server intercepts the Subsonic `setRating`, `star`, and `unstar` calls at the proxy and writes them to wn-cloud. First-party clients read ratings from wn-server's own API. A rounded star value may be mirrored into Navidrome so its smart playlists can use it; that is a later decision.
+Navidrome's own rating is an integer from 0 to 5 and cannot hold half stars, so it is not the source of truth. wn-server intercepts the Subsonic `setRating`, `star`, and `unstar` calls at the proxy, writes the full value to wn-cloud, and forwards a rounded value to Navidrome: half stars round up, favorite maps to starred. Navidrome's smart playlists and third-party clients see the rounded stars. First-party clients read the full values from wn-server's own API.
+
+Later direction, not in v1: smart playlists defined in wn-server on the 10-point scale, evaluated against wn-server's rating store and Navidrome's library data, and written into Navidrome as ordinary playlists so every client can play them.
 
 Sync only applies to MusicBrainz-matched music. Items are keyed by MusicBrainz release and recording ids, which Navidrome reads from file tags into its `mbz_*` columns.
 
