@@ -48,28 +48,32 @@ clients (wn-mobile, wn-desktop, web UI)
 
 The full flow is in [docs/auth-flow.svg](docs/auth-flow.svg).
 
+wn-cloud is the v2 rewrite of waxnerd (`../v2`): an Express server with GoTrue for sign-in. GoTrue signs access tokens with a shared HS256 secret, so wn-server cannot verify a token on its own. wn-cloud also issues opaque, non-expiring CLI tokens (`wn_…`) through its CLI sign-in flow. wn-server therefore verifies every token by calling wn-cloud's `GET /me` with it, and caches the answer.
+
 Only wn-server talks to Navidrome. Clients authenticate with wn-cloud and never hold a Navidrome credential.
 
-Owner setup, once, on the server machine (`wn-server login`):
+Owner setup, once, on the server machine (`wn-server login`). This is wn-cloud's existing CLI sign-in flow:
 
-1. wn-server opens the browser at wn-cloud's login page with a PKCE challenge and a redirect to `http://127.0.0.1:<port>/callback`.
-2. The owner signs in with their waxnerd account.
-3. wn-cloud redirects the browser to the local callback with a code.
-4. wn-server exchanges the code for the owner's access and refresh tokens.
-5. wn-server registers this server under the owner and receives a server id and server credential.
+1. wn-server listens on a free loopback port and opens the browser at `<wn-cloud>/cli/auth` with a state, a PKCE challenge, the port, and a label naming the server.
+2. The owner signs in with their waxnerd account and approves.
+3. wn-cloud redirects the browser to `http://127.0.0.1:<port>/callback` with a code.
+4. wn-server posts the code and the PKCE verifier to `POST /cli/token` and receives a CLI token. That token is the server credential.
+5. wn-server registers this server under the owner and receives a server id.
 6. wn-server sends one request to Navidrome with `Remote-User: <owner id>`. Navidrome creates the user. The first user is admin.
 7. Optional: wn-server mints a Navidrome API key for its own background jobs.
 
 Every client request:
 
-1. The client signs in with wn-cloud once and holds a waxnerd JWT.
-2. The client sends the request to wn-server with `Authorization: Bearer <JWT>`.
-3. wn-server verifies the signature against the Supabase JWKS, cached locally.
-4. wn-server checks with wn-cloud that the user is the owner or an invited listener of this server. The membership list is cached.
+1. The client signs in with wn-cloud once and holds a wn-cloud token (a GoTrue access token or a CLI token).
+2. The client sends the request to wn-server with `Authorization: Bearer <token>`.
+3. wn-server resolves the token to a user with wn-cloud's `GET /me`. The result is cached until the token's expiry, or for a bounded time for a CLI token.
+4. wn-server checks that the user is the owner or an invited listener of this server. The membership list comes from wn-cloud and is cached.
 5. wn-server forwards the request to Navidrome on loopback with `Remote-User: <waxnerd user id>`. Navidrome's trusted proxy settings (`ExtAuth.UserHeader`, `ExtAuth.TrustedSources`) accept the header.
 6. The response passes back through wn-server.
 
 Navidrome's Subsonic endpoint looks the header user up but does not create it. wn-server creates an invited listener's Navidrome user, non-admin, the first time it sees them. Non-admin Navidrome users cannot change the library.
+
+Navidrome's own web UI is blocked at the proxy. Only its Subsonic API passes through. wn-server's web UI is the only UI.
 
 ### Users and invites
 
@@ -79,7 +83,7 @@ Invites are records in wn-cloud: server id, user id, role. Revoking an invite en
 
 ### Web UI
 
-wn-server serves its own web UI. The owner sees status, invites, and match review. Invited listeners get a reduced view. The UI signs in through the same PKCE flow as the CLI, with the redirect pointing at wn-server's own URL instead of loopback, and keeps a cookie session. wn-cloud's redirect allowlist must therefore cover wn-server URLs on the LAN and on the relay.
+wn-server serves its own web UI. The owner sees status, invites, and match review. Invited listeners get a reduced view. The UI signs in through a variant of wn-cloud's CLI sign-in flow in which the redirect goes to wn-server's own URL instead of a loopback port. wn-server exchanges the code, receives a token for that browser, and keeps it in a cookie session. wn-cloud must accept the registered URLs of a server as redirect targets, on the LAN and on the relay.
 
 Later, waxnerd relay (a paid wn-cloud feature) lets authorized users reach a wn-server from the public internet. wn-cloud redirects the user to the server, and the server's own web UI takes over. The web UI is built so that this needs no change on the server beyond being reachable.
 
@@ -91,7 +95,7 @@ Navidrome's own rating is an integer from 0 to 5 and cannot hold half stars, so 
 
 Later direction, not in v1: smart playlists defined in wn-server on the 10-point scale, evaluated against wn-server's rating store and Navidrome's library data, and written into Navidrome as ordinary playlists so every client can play them.
 
-Sync only applies to MusicBrainz-matched music. Items are keyed by MusicBrainz release and recording ids, which Navidrome reads from file tags into its `mbz_*` columns.
+Sync only applies to MusicBrainz-matched music. wn-cloud's rating model (`ratings` in `../v2`) keys a rating by subject kind and MBID: `release_group`, `release`, `track`, or `artist`. A rating holds `half_stars` from 1 to 10 and a `like_level` of like or love. Navidrome albums map to `release` subjects through `mbz_album_id`. Navidrome songs map to `track` subjects through `mbz_release_track_id`, which is the MusicBrainz track id, not the recording id. A Navidrome star maps to `love`. wn-cloud has the tables but no JSON routes for ratings yet; those are a wn-cloud item.
 
 ### MusicBrainz matching
 
