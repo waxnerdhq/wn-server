@@ -5,7 +5,7 @@
 //! cargo run --example e2e -- <base url> <user> <password> <library directory>
 //! ```
 //!
-//! `<base url>` is the address of the server, such as `http://127.0.0.1:4200`.
+//! `<base url>` is the address of the server, such as `http://127.0.0.1:4533`.
 //! `<user>` and `<password>` are those of the owner account. `<library
 //! directory>` is the directory that `examples/make-library.rs` wrote and that
 //! the server has as its one music folder: the session compares the bytes

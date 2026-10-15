@@ -51,7 +51,7 @@ Owner upload, multiple users, waxnerd-cloud registration, relay, guests, billing
 - The owner password is stored as plain text in the database. Token auth (`t = md5(password + s)`) requires a recoverable password. Anyone who can read the data directory can read the password, so it must not be reused anywhere else. On Unix, `init` creates the data directory with mode 0700 and the database with mode 0600; on Windows, the user-profile ACL protects the directory.
 - `init` and `user set-password` generate the password by default and print it once: four groups of five characters separated by hyphens (`xxxxx-xxxxx-xxxxx-xxxxx`), drawn from the operating system's random generator (`rand::rngs::SysRng`) from the 31-character alphabet `abcdefghjkmnpqrstuvwxyz23456789` (no `i`, `l`, `o`, `0`, `1`), which gives 99 bits of entropy and types easily on a phone. Random bytes of 248 and above are discarded, so every character is equally likely. The owner may supply a password instead through `--password-stdin` (the first line of stdin, without its line ending; an empty line is an error) or the `WN_SERVER_PASSWORD` environment variable (an empty value counts as unset); the flag wins over the variable. A supplied password is not printed. There is no interactive prompt.
 - A password is never logged and never part of an error message or of a `Debug` output. The types that hold one (`cli::PasswordSource`, `users::UserRow`, `api::params::Params` and the credential types of `auth::extract`) leave it out of their `Debug` output. `Params` holds every parameter of a request, so its `Debug` output writes the name of every field and writes `[redacted]` in place of the value of `p`, `t`, `s`, `apiKey` and `password`, whatever the letter case of the name.
-- Default port 4200, bind `0.0.0.0`.
+- Default port 4533, bind `0.0.0.0`.
 - Search is a substring match with SQL `LIKE` and `ESCAPE '\'`. A query is split at white space into terms, and every term must be part of a name of the item. The names are compared in their normalised form (§3.3) through the columns `artists.key`, `albums.key` and `tracks.title_lc`, so the letter case and the Unicode form of a name and of a query have no meaning. The track artist has no normalised column: it is compared as the tag spells it, and `LIKE` ignores the case of ASCII letters only. A letter with a diacritic is not its base letter. An empty query returns everything, paged (§4).
 - API errors use HTTP 200 and the Subsonic error envelope. Unknown `/rest/*` methods return error 0 with message `unknown endpoint`. Paths outside `/rest/` return 404.
 - `v` and `c` are required by every method except the public `getOpenSubsonicExtensions` (error 10 when absent), also when authentication is disabled. The value of `v` is not compared; errors 20 and 30 are never produced.
@@ -437,7 +437,7 @@ Data directory, in order: `--data-dir`, `WN_SERVER_DATA_DIR`, then `directories:
 ```toml
 [server]
 bind = "0.0.0.0"
-port = 4200
+port = 4533
 name = "wn-server"              # instance name shown by discovery
 log_level = "info"              # RUST_LOG overrides when set
 
@@ -989,7 +989,7 @@ A client browses the service type `_waxnerd._tcp` in the domain `local.`. The se
 |---|---|---|
 | `txtvers` | `1`. A decimal number: the version of this table. | Ignores an instance whose `txtvers` it does not know. |
 | `api` | `opensubsonic`. | Ignores an instance with another value. |
-| `path` | `/rest`. A URL path that starts with `/` and does not end with `/`. | Builds the URL of an API method as `http://<address>:<port><path>/<method>`, for example `http://192.168.1.5:4200/rest/ping`. The scheme is `http` because `tls` is `0`. An IPv6 address is in brackets. |
+| `path` | `/rest`. A URL path that starts with `/` and does not end with `/`. | Builds the URL of an API method as `http://<address>:<port><path>/<method>`, for example `http://192.168.1.5:4533/rest/ping`. The scheme is `http` because `tls` is `0`. An IPv6 address is in brackets. |
 | `id` | The UUID in `instance.id`: 36 characters, lower-case hex digits in groups of 8, 4, 4, 4 and 12, separated by hyphens. | Stores the server under this key. Two instances with one `id` are one server: the client keeps the instance whose SRV and TXT records it received last, with the port and the addresses of that instance, and drops the other. |
 | `name` | `server.name`: 1 to 63 bytes of UTF-8. | Shows it as the name of the server. |
 | `auth` | `password`, or `none` when `auth.disabled_unsafe` is set. | `password`: sends `u` with `p`, or with `t` and `s` (§3.7). `none`: sends none of them. Ignores an instance with another value. |
@@ -1025,7 +1025,7 @@ A client browses the service type `_waxnerd._tcp` in the domain `local.`. The se
 - The server runs without the advertisement when the advertisement cannot start. `run` logs one warning when `instance.id` cannot be read or is not a UUID, or when `mdns-sd` returns an error. No host name is built from a text that is not a UUID. `discovery` checks the length of `server.name` as well and reports it the same way. `run` does not reach that check with a name outside 1 to 63 bytes, because the validation at load fails first (§3.5). `mdns-sd` opens its multicast sockets on the daemon thread and reports a socket it cannot open in its debug log only, so a second thread waits for the first announcement: it logs the announced name at `info`, or one warning when nothing was announced within 10 s.
 - Withdrawal: `unregister` sends a goodbye packet on every interface, the daemon repeats it after 120 ms, and `shutdown` ends the daemon thread. A client then sees the instance removed. `Advertiser::stop` returns when these steps are done: it waits for the reply to `unregister`, which the daemon sends after the first packet, then 200 ms for the repeat, then for the reply to `shutdown`. It waits 1 s at most for each reply, so it returns after 200 ms when the daemon answers and after 2.2 s at most. A stop before the first announcement sends no goodbye packet, because nothing was announced. The thread that waits for the first announcement records it; a stop after the 10 s of that thread always sends the packet. A goodbye packet for an instance that was not announced would remove the records of another running server with the same instance name from the clients, for example when `run` is started twice and the second server cannot bind its port.
 - A server that ends without the goodbye packet stays in the caches of clients until its records expire. `mdns-sd` sets 120 s for the SRV and address records and 4500 s for the PTR and TXT records. These times are not part of the contract, and a client does not depend on them.
-- Windows Firewall prompts on first start for TCP 4200 and UDP 5353.
+- Windows Firewall prompts on first start for TCP 4533 and UDP 5353.
 
 ### 3.13 Logging and shutdown
 

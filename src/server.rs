@@ -1736,8 +1736,8 @@ mod tests {
     }
 
     #[test]
-    fn default_config_binds_every_ipv4_address_on_port_4200() {
-        assert_eq!(bind_addr(&Config::default()).to_string(), "0.0.0.0:4200");
+    fn default_config_binds_every_ipv4_address_on_port_4533() {
+        assert_eq!(bind_addr(&Config::default()).to_string(), "0.0.0.0:4533");
     }
 
     #[test]
@@ -1751,13 +1751,13 @@ mod tests {
     #[test]
     fn bind_error_names_the_address() {
         let error = ServerError::Bind {
-            addr: "127.0.0.1:4200".parse().expect("an address"),
+            addr: "127.0.0.1:4533".parse().expect("an address"),
             source: io::Error::from(io::ErrorKind::AddrInUse),
         };
         assert!(
             error
                 .to_string()
-                .starts_with("cannot listen on 127.0.0.1:4200: "),
+                .starts_with("cannot listen on 127.0.0.1:4533: "),
             "{error}"
         );
     }

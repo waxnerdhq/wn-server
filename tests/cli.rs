@@ -1231,7 +1231,7 @@ fn config_show_prints_the_effective_config_with_defaults() {
     for line in [
         "[server]",
         "bind = \"0.0.0.0\"",
-        "port = 4200",
+        "port = 4533",
         "log_level = \"info\"",
         "disabled_unsafe = false",
         "scan_on_start = true",
@@ -1288,7 +1288,7 @@ fn config_show_shows_the_values_of_the_file() {
 fn config_show_names_an_unknown_key() {
     let dir = temp_dir();
     let config_path = dir.path().join("config.toml");
-    fs::write(&config_path, "[server]\nprot = 4200\n").expect("write config");
+    fs::write(&config_path, "[server]\nprot = 4533\n").expect("write config");
 
     let output = run(binary()
         .args(["config", "show", "--data-dir"])

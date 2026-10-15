@@ -15,7 +15,7 @@ use serde::Deserialize;
 use thiserror::Error;
 
 /// The port of a config that does not set `server.port`.
-pub const DEFAULT_PORT: u16 = 4200;
+pub const DEFAULT_PORT: u16 = 4533;
 
 /// The environment variable that names the data directory.
 pub const DATA_DIR_ENV: &str = "WN_SERVER_DATA_DIR";
@@ -40,7 +40,7 @@ pub const DEFAULT_NAME: &str = "wn-server";
 pub struct Key {
     /// The table and the key, joined with a dot: `server.port`.
     pub name: &'static str,
-    /// The default as `config.toml` holds it: `4200`, `"info"`, `[]`.
+    /// The default as `config.toml` holds it: `4533`, `"info"`, `[]`.
     pub default: &'static str,
 }
 
@@ -59,7 +59,7 @@ pub const KEYS: &[Key] = &[
     },
     Key {
         name: "server.port",
-        default: "4200",
+        default: "4533",
     },
     Key {
         name: "server.name",
@@ -786,7 +786,7 @@ mod tests {
     fn defaults_match_the_design() {
         let config = Config::default();
         assert_eq!(config.server.bind.to_string(), "0.0.0.0");
-        assert_eq!(config.server.port, 4200);
+        assert_eq!(config.server.port, 4533);
         assert_eq!(config.server.name, "wn-server");
         assert_eq!(config.server.log_level, "info");
         assert_eq!(config.server.shutdown_grace_ms, 10_000);
@@ -894,7 +894,7 @@ mod tests {
         config.library.folders = vec![PathBuf::from("/Users/adnan/Music")];
         let expected = r#"[server]
 bind = "0.0.0.0"
-port = 4200
+port = 4533
 name = "studio"                 # instance name shown by discovery
 log_level = "info"              # RUST_LOG overrides when set
 
@@ -1157,7 +1157,7 @@ mdns = true
 
     #[test]
     fn unknown_key_fails_and_is_named() {
-        let (_dir, path) = config_file("[server]\nprot = 4200\n");
+        let (_dir, path) = config_file("[server]\nprot = 4533\n");
         let error = Config::load(&path).expect_err("unknown key");
         assert!(matches!(error, ConfigError::Parse { .. }), "{error}");
         assert!(error.to_string().contains("prot"), "{error}");

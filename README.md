@@ -77,14 +77,14 @@ wn-server init --folder /path/to/music --password-stdin < password-file
 wn-server run
 ```
 
-`run` listens on port 4200 of every IPv4 address of the machine. It scans the music folders in the background and answers requests while it scans. It runs in the foreground and logs to stderr. Ctrl-C stops it (see [Running](#running)). On Windows, Windows Firewall prompts on the first start.
+`run` listens on port 4533 of every IPv4 address of the machine. It scans the music folders in the background and answers requests while it scans. It runs in the foreground and logs to stderr. Ctrl-C stops it (see [Running](#running)). On Windows, Windows Firewall prompts on the first start.
 
 ### 3. Check that the server answers
 
 Put the password in the place of `PASSWORD`:
 
 ```
-curl "http://localhost:4200/rest/ping?u=owner&p=PASSWORD&v=1.16.1&c=curl&f=json"
+curl "http://localhost:4533/rest/ping?u=owner&p=PASSWORD&v=1.16.1&c=curl&f=json"
 ```
 
 ```
@@ -94,7 +94,7 @@ curl "http://localhost:4200/rest/ping?u=owner&p=PASSWORD&v=1.16.1&c=curl&f=json"
 `getScanStatus` shows the scan of the music folders:
 
 ```
-curl "http://localhost:4200/rest/getScanStatus?u=owner&p=PASSWORD&v=1.16.1&c=curl&f=json"
+curl "http://localhost:4533/rest/getScanStatus?u=owner&p=PASSWORD&v=1.16.1&c=curl&f=json"
 ```
 
 ```
@@ -105,7 +105,7 @@ curl "http://localhost:4200/rest/getScanStatus?u=owner&p=PASSWORD&v=1.16.1&c=cur
 
 ### 4. Connect a client
 
-Enter three values in an OpenSubsonic client: the address `http://<address of the machine>:4200`, the user name `owner` and the password. [Connecting a client](#connecting-a-client) describes what the client finds.
+Enter three values in an OpenSubsonic client: the address `http://<address of the machine>:4533`, the user name `owner` and the password. [Connecting a client](#connecting-a-client) describes what the client finds.
 
 ## Configuration
 
@@ -118,7 +118,7 @@ The name of a key in this table is its table in the file, a dot, and its name th
 | Key | Default | Meaning |
 |---|---|---|
 | `server.bind` | `"0.0.0.0"` | IP address the server listens on; `"0.0.0.0"` is every IPv4 address of the machine |
-| `server.port` | `4200` | TCP port; 1 to 65535 |
+| `server.port` | `4533` | TCP port; 1 to 65535 |
 | `server.name` | `"wn-server"` | instance name shown by discovery; 1 to 63 bytes (see [Server name](#server-name)) |
 | `server.log_level` | `"info"` | log filter; `RUST_LOG` replaces it when set (see [Logs](#logs)) |
 | `auth.disabled_unsafe` | `false` | `true` turns authentication off; unsafe, see [Authentication](#authentication) |
@@ -136,7 +136,7 @@ The name of a key in this table is its table in the file, a dot, and its name th
 ```toml
 [server]
 bind = "0.0.0.0"
-port = 4200
+port = 4533
 name = "wn-server"              # instance name shown by discovery
 log_level = "info"              # RUST_LOG overrides when set
 
@@ -363,7 +363,7 @@ An album is known by its album artist and its title, and an artist by its name. 
 wn-server run
 ```
 
-`run` loads `config.toml`, listens on `server.bind` and `server.port` (`0.0.0.0:4200` by default) and logs one line with the address, the version, the data directory, the number of music folders and whether authentication is on.
+`run` loads `config.toml`, listens on `server.bind` and `server.port` (`0.0.0.0:4533` by default) and logs one line with the address, the version, the data directory, the number of music folders and whether authentication is on.
 
 `run` opens `library.db` and needs the owner account in it. `run` creates neither and fails at startup when one is missing. `wn-server init` then creates what is missing and keeps `config.toml` (see [Owner account](#owner-account)).
 
@@ -399,7 +399,7 @@ Windows ends a console program 5 seconds after its window is closed. The limit o
 
 A client needs three values:
 
-- The address of the server: `http://<address>:<port>`, for example `http://192.168.1.5:4200`. The API is below `/rest`, as in `http://192.168.1.5:4200/rest/ping`. The server uses plain HTTP and has no TLS.
+- The address of the server: `http://<address>:<port>`, for example `http://192.168.1.5:4533`. The API is below `/rest`, as in `http://192.168.1.5:4533/rest/ping`. The server uses plain HTTP and has no TLS.
 - The user name: `owner`, or the name that `init` got with `--username`.
 - The password of that account.
 
@@ -617,7 +617,7 @@ The server runs without the advertisement when the advertisement cannot start, a
 
 Stopping the server withdraws the advertisement (see [Running](#running)). On macOS, `dns-sd -B _waxnerd._tcp` lists the servers on the network.
 
-On Windows, Windows Firewall prompts on the first start. The server needs TCP port 4200 (`server.port`) for the API and UDP port 5353 for mDNS.
+On Windows, Windows Firewall prompts on the first start. The server needs TCP port 4533 (`server.port`) for the API and UDP port 5353 for mDNS.
 
 ## Running as a service
 
@@ -777,12 +777,12 @@ WN_SERVER_PASSWORD=PASSWORD cargo run -- --data-dir /path/to/e2e-data init --fol
 cargo run -- --data-dir /path/to/e2e-data run
 ```
 
-`WN_SERVER_PASSWORD=PASSWORD` in front of a command is the form of a Unix shell. In PowerShell, run `$env:WN_SERVER_PASSWORD = "PASSWORD"` before the `init` command. `--data-dir` keeps the session away from the data directory of an installed server. `init --port N` selects another port when port 4200 is in use, and the address of `e2e` then has that port. With the `config.toml` that `init` writes, the server listens on every IPv4 address of the machine and advertises itself (see [Discovery](#discovery)). To keep it on the machine, set `bind = "127.0.0.1"` in the `[server]` table and `mdns = false` in the `[discovery]` table of `/path/to/e2e-data/config.toml` before `run`.
+`WN_SERVER_PASSWORD=PASSWORD` in front of a command is the form of a Unix shell. In PowerShell, run `$env:WN_SERVER_PASSWORD = "PASSWORD"` before the `init` command. `--data-dir` keeps the session away from the data directory of an installed server. `init --port N` selects another port when port 4533 is in use, and the address of `e2e` then has that port. With the `config.toml` that `init` writes, the server listens on every IPv4 address of the machine and advertises itself (see [Discovery](#discovery)). To keep it on the machine, set `bind = "127.0.0.1"` in the `[server]` table and `mdns = false` in the `[discovery]` table of `/path/to/e2e-data/config.toml` before `run`.
 
 `run` stays in the foreground. In a second terminal:
 
 ```
-cargo run --example e2e -- http://127.0.0.1:4200 owner PASSWORD /path/to/e2e-library
+cargo run --example e2e -- http://127.0.0.1:4533 owner PASSWORD /path/to/e2e-library
 ```
 
 The four arguments are the address of the server, the name of the owner, the password and the directory of the library. Each step prints `PASS`, or `FAIL` with one line of detail, and the last line holds the number of steps, the number of failed steps and the time. The exit status is 0 when every step passed and 1 when a step failed. The session ends within 60 seconds: a request that would be sent later fails its step, and so does a response that is not complete by then.

@@ -87,7 +87,7 @@ pub struct InitArgs {
     pub folders: Vec<PathBuf>,
 
     /// The TCP port the server listens on. Without this option the port is
-    /// 4200
+    /// 4533
     #[arg(
         long,
         value_name = "N",
