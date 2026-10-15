@@ -6,7 +6,7 @@ wn-server is the waxnerd music server. It runs [Navidrome](https://www.navidrome
 - MusicBrainz matching: beets matches albums to MusicBrainz releases. Confident matches apply silently. Others wait for review in the web UI or the CLI.
 - Rating sync: ratings and favorites are stored in wn-cloud on waxnerd's 10-point scale, not in Navidrome.
 
-wn-server is powered by Navidrome, which is licensed under GPL-3.0. Navidrome runs as a separate process and is not linked into this program.
+wn-server is licensed under GPL-3.0 (see `LICENSE`). It is powered by Navidrome, which is also GPL-3.0 and runs as a separate process.
 
 **Status:** scaffold. The commands exist and return "not implemented". This file describes the agreed design and is updated as the code lands.
 
@@ -16,7 +16,9 @@ wn-server is powered by Navidrome, which is licensed under GPL-3.0. Navidrome ru
 
 One `wn-server` binary. It supervises a pinned `navidrome` binary, writes its configuration, and sits in front of it as a reverse proxy. Navidrome listens on `127.0.0.1` only. Every request from the network goes through wn-server.
 
-beets runs as a subprocess (Python). It is the one external runtime requirement besides the Navidrome binary. ffmpeg is optional and only Navidrome uses it, for transcoding.
+beets runs as a subprocess. A pinned beets, with its Python interpreter, ships in the release bundle together with the pinned Navidrome binary, so a release works without any install step. ffmpeg is optional and only Navidrome uses it, for transcoding.
+
+The first and only release target for now is Linux on x86_64. Other platforms come later.
 
 ```
 clients (wn-mobile, wn-desktop, web UI)
@@ -71,7 +73,7 @@ Navidrome's Subsonic endpoint looks the header user up but does not create it. w
 
 ### Users and invites
 
-One owner per server. The owner invites a capped number of listeners. Listeners stream and browse. They cannot write to or upload into the library.
+One owner per server. The owner invites up to 12 listeners. wn-server enforces the cap. Listeners stream and browse. They cannot write to or upload into the library.
 
 Invites are records in wn-cloud: server id, user id, role. Revoking an invite ends access at the membership check. Navidrome is not involved.
 
@@ -93,7 +95,9 @@ In quiet mode beets applies confident matches and skips the rest. wn-server reco
 
 - Navidrome runs as a separate process, not as an imported Go library and not as a Navidrome Wasm plugin. A library would tie wn-server to Navidrome's internal wiring. A plugin cannot hook auth or run beets.
 - beets runs as a subprocess. It has no embedding story outside Python.
-- wn-server is written in Go and ships as one static binary.
+- wn-server is written in Go and ships as one static binary inside a release bundle that also carries Navidrome and beets.
+- wn-server is GPL-3.0. It is the free part of waxnerd. wn-cloud and the client apps are separate projects.
+- Work on wn-cloud is tracked in the same Linear project, labelled for wn-cloud, and implemented separately from this repository.
 - Alternatives considered and not chosen: gonic, Jellyfin, Funkwhale, Koel, Airsonic-Advanced for the server; MusicBrainz Picard and a hand-written matcher for matching.
 
 ## Build
