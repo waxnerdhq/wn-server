@@ -24,7 +24,7 @@ fn section(title: &str) -> Vec<&'static str> {
 }
 
 /// The table rows of `lines` whose first cell is code, as in
-/// `` | `server.port` | `4200` | the port | ``. Each row is the text between
+/// `` | `server.port` | `4533` | the port | ``. Each row is the text between
 /// the backticks of the first cell, and the rest of the line after that
 /// cell.
 fn code_rows(lines: &[&'static str]) -> Vec<(&'static str, &'static str)> {
