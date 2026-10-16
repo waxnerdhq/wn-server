@@ -16,6 +16,9 @@ type navidromeConfig struct {
 	MusicFolder string
 	DataFolder  string
 	ExtAuth     navidromeExtAuth
+
+	EnableInsightsCollector bool
+	EnableExternalServices  bool
 }
 
 type navidromeExtAuth struct {
@@ -51,6 +54,8 @@ func (c *Config) RenderNavidrome() ([]byte, error) {
 			UserHeader:     "Remote-User",
 			TrustedSources: "127.0.0.1/32",
 		},
+		EnableInsightsCollector: false,
+		EnableExternalServices:  c.ExternalServices(),
 	})
 	if err != nil {
 		return nil, err

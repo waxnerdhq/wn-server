@@ -37,6 +37,10 @@ type Config struct {
 	SortedDir      string   `toml:"sorted_dir,omitempty"`
 	AcoustIDAPIKey string   `toml:"acoustid_api_key,omitempty"`
 
+	// NavidromeExternalServices sets Navidrome's EnableExternalServices.
+	// Nil means true. Read it through ExternalServices.
+	NavidromeExternalServices *bool `toml:"navidrome_external_services,omitempty"`
+
 	// DataDir is the directory that holds config.toml. It is not a config key.
 	DataDir string `toml:"-"`
 }
@@ -101,6 +105,12 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("create sorted_dir: %w", err)
 	}
 	return &c, nil
+}
+
+// ExternalServices reports whether Navidrome may call external services. It is
+// true when navidrome_external_services is absent.
+func (c *Config) ExternalServices() bool {
+	return c.NavidromeExternalServices == nil || *c.NavidromeExternalServices
 }
 
 func (c *Config) applyDefaults() error {
