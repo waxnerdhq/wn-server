@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -35,15 +36,17 @@ func TestRender(t *testing.T) {
 		"statefile": "/data/wn-server/beets-state.pickle",
 		"paths":     map[string]any{"default": "$albumartist/$album%aunique{}/$track $title"},
 		"import": map[string]any{
-			"copy": true, "move": false, "write": true, "quiet": true, "autotag": true,
-			"resume": false, "incremental": true, "incremental_skip_later": true,
+			"copy": true, "move": false, "link": false, "hardlink": false, "reflink": false,
+			"delete": false, "write": true, "quiet": true, "quiet_fallback": "skip",
+			"duplicate_action": "skip", "autotag": true, "resume": false,
+			"incremental": true, "incremental_skip_later": true,
+			"fix_ext_inplace": false, "remux_mp3_in_wav": false,
 			"log": "/data/wn-server/beets-import.log",
 		},
 		"plugins":       []any{"musicbrainz", "chroma", "wn_candidates"},
 		"pluginpath":    []any{"/opt/wn-server/beets-plugins"},
 		"chroma":        map[string]any{"auto": true},
-		"acoustid":      map[string]any{"apikey": "k3y"},
-		"wn_candidates": map[string]any{"output": "/data/wn-server/beets-candidates.jsonl"},
+		"wn_candidates": map[string]any{"output": "/data/wn-server/beets-candidates.jsonl", "acoustid_app_key": "k3y"},
 		"musicbrainz":   map[string]any{"host": "musicbrainz.org", "ratelimit": 1},
 		"ui":            map[string]any{"color": false},
 	}
@@ -60,8 +63,8 @@ func TestRender(t *testing.T) {
 	if err := yaml.Unmarshal(body, &got); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := got["acoustid"]; ok {
-		t.Fatalf("acoustid section present without a key:\n%s", body)
+	if _, ok := got["wn_candidates"].(map[string]any)["acoustid_app_key"]; ok {
+		t.Fatalf("acoustid_app_key present without a key:\n%s", body)
 	}
 }
 
@@ -183,5 +186,68 @@ func TestImportWithFakeBeets(t *testing.T) {
 	cfg, _ := os.ReadFile(filepath.Join(data, "beets.yaml"))
 	if !strings.Contains(string(cfg), "wn_candidates") {
 		t.Errorf("beets.yaml has no wn_candidates:\n%s", cfg)
+	}
+}
+
+// TestWriteMarkersNested checks that an applied folder gets no marker when an
+// album below it was not applied, because the marker would hide that album.
+func TestWriteMarkersNested(t *testing.T) {
+	music := t.TempDir()
+	parent := filepath.Join(music, "Artist", "Album")
+	child := filepath.Join(parent, "Bonus")
+	if err := os.MkdirAll(child, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	r := &Runner{Log: slog.New(slog.NewTextHandler(io.Discard, nil))}
+	r.writeMarkers([]Album{
+		{Folder: parent, Decision: DecisionApplied},
+		{Folder: child, Decision: DecisionSkipped},
+	}, []string{music})
+	for _, d := range []string{parent, child} {
+		if _, err := os.Stat(filepath.Join(d, markerName)); !errors.Is(err, os.ErrNotExist) {
+			t.Errorf("unexpected marker in %s: %v", d, err)
+		}
+	}
+}
+
+// TestImportCancelled checks that a cancelled import still writes the marker
+// for an album that beets applied before the cancel.
+func TestImportCancelled(t *testing.T) {
+	tmp := t.TempDir()
+	music := filepath.Join(tmp, "music")
+	applied := filepath.Join(music, "A", "Album")
+	if err := os.MkdirAll(applied, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	data := filepath.Join(tmp, "data")
+	out := filepath.Join(data, "beets-candidates.jsonl")
+	line := `{"folder":"` + applied + `","tags":{},"decision":"applied","candidates":[],"copied_to":"/x"}`
+	script := filepath.Join(tmp, "beets")
+	body := "#!/bin/sh\necho '" + line + "' >> '" + out + "'\nexec sleep 30\n"
+	if err := os.WriteFile(script, []byte(body), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	scan := &fakeScanner{}
+	r := &Runner{
+		Config:    Config{DataDir: data, SortedDir: filepath.Join(data, "sorted"), PluginDir: "../../bundle/beets-plugins"},
+		BeetsBin:  script,
+		FpcalcBin: "fpcalc",
+		Scanner:   scan,
+		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	sum, err := r.Import(ctx, []string{music})
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Import error = %v, want deadline exceeded", err)
+	}
+	if sum.Applied != 1 {
+		t.Errorf("summary = %+v", sum)
+	}
+	if _, err := os.Stat(filepath.Join(applied, markerName)); err != nil {
+		t.Errorf("marker in applied folder: %v", err)
+	}
+	if scan.calls != 0 {
+		t.Errorf("scan calls = %d, want 0", scan.calls)
 	}
 }

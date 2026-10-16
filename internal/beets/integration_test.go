@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -24,9 +25,11 @@ import (
 //	                the temporary music folder, so the source is not touched.
 //	                With it the test expects at least one applied album.
 //
-// Without WN_BEETS_ALBUM the test generates one tagged MP3 with ffmpeg and
-// is skipped when ffmpeg is not on PATH. That track is unlikely to match
-// MusicBrainz, so the test then checks the skip path only.
+// Without WN_BEETS_ALBUM the test generates one album with ffmpeg and is
+// skipped when ffmpeg is not on PATH. The album has a tagged MP3, an MP3
+// without an extension, and an MP3 stream in a WAV container. beets rewrites
+// the last two in place unless wn-server turns that off. The album is
+// unlikely to match MusicBrainz, so the test then checks the skip path only.
 //
 // The test checks that the original files keep their bytes and mtimes, that
 // every applied copy in sorted_dir carries a MusicBrainz album id that is
@@ -52,12 +55,28 @@ func TestImportIntegration(t *testing.T) {
 		if err := os.MkdirAll(dir, 0o755); err != nil {
 			t.Fatal(err)
 		}
-		out, err := exec.Command(ffmpeg, "-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=5",
-			"-metadata", "artist=Test Artist", "-metadata", "album=Test Album",
-			"-metadata", "title=Test Track", "-metadata", "track=1", "-metadata", "date=2001",
-			filepath.Join(dir, "01 Test Track.mp3")).CombinedOutput()
-		if err != nil {
-			t.Fatalf("ffmpeg: %v\n%s", err, out)
+		// Track 2 is an MP3 without an extension. beets' fix_extension would
+		// copy it to "02 Test Track.mp3" next to the original. Track 3 is an
+		// MP3 stream in a WAV container. beets' remux_mp3_in_wav would write
+		// "03 Test Track.mp3" and delete the WAV.
+		tracks := []struct {
+			name   string
+			format []string
+		}{
+			{"01 Test Track.mp3", nil},
+			{"02 Test Track", []string{"-f", "mp3"}},
+			{"03 Test Track.wav", []string{"-c:a", "libmp3lame", "-f", "wav"}},
+		}
+		for i, tr := range tracks {
+			args := []string{"-v", "error", "-f", "lavfi", "-i", "sine=frequency=440:duration=5",
+				"-metadata", "artist=Test Artist", "-metadata", "album=Test Album",
+				"-metadata", "title=Test Track " + strconv.Itoa(i+1), "-metadata", "track=" + strconv.Itoa(i+1),
+				"-metadata", "date=2001"}
+			args = append(args, tr.format...)
+			out, err := exec.Command(ffmpeg, append(args, filepath.Join(dir, tr.name))...).CombinedOutput()
+			if err != nil {
+				t.Fatalf("ffmpeg %s: %v\n%s", tr.name, err, out)
+			}
 		}
 	}
 	// Give the originals an mtime in the past, so a rewrite would show.

@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -114,7 +115,10 @@ func NewRunner(c *config.Config, scanner Scanner, logger *slog.Logger) *Runner {
 //
 // A failed scan is logged as a warning and does not fail the import. When
 // beets exits non-zero, the summary of what it did write is returned with
-// the error.
+// the error. When ctx is cancelled, the candidates file is still read and the
+// markers are written, because beets has already recorded the applied albums
+// in its incremental history and will not offer them again. The summary is
+// then returned with ctx.Err() and no scan is started.
 func (r *Runner) Import(ctx context.Context, folders []string) (Summary, error) {
 	if len(folders) == 0 {
 		return Summary{}, errors.New("no folders to import")
@@ -141,18 +145,13 @@ func (r *Runner) Import(ctx context.Context, folders []string) (Summary, error) 
 	}
 
 	runErr := r.run(ctx, roots)
-	if ctx.Err() != nil {
-		return Summary{}, ctx.Err()
-	}
-
 	sum, err := r.readCandidates()
+	r.writeMarkers(sum.Albums, roots)
+	if ctx.Err() != nil {
+		return sum, ctx.Err()
+	}
 	if err != nil {
 		return sum, errors.Join(runErr, err)
-	}
-	for _, a := range sum.Albums {
-		if a.Decision == DecisionApplied {
-			r.writeMarker(a.Folder, roots)
-		}
 	}
 	if sum.Applied > 0 && r.Scanner != nil {
 		if err := r.Scanner.StartScan(ctx); err != nil {
@@ -167,8 +166,8 @@ func (r *Runner) run(ctx context.Context, folders []string) error {
 	args := append([]string{"--config", r.Config.Path(), "import", "-q"}, folders...)
 	cmd := exec.CommandContext(ctx, r.BeetsBin, args...)
 	cmd.Env = r.env()
-	stdout := &lineWriter{log: r.Log}
-	stderr := &lineWriter{log: r.Log}
+	stdout := &lineWriter{log: r.Log, level: slog.LevelDebug}
+	stderr := &lineWriter{log: r.Log, level: slog.LevelInfo}
 	cmd.Stdout, cmd.Stderr = stdout, stderr
 	// beets leads its own process group, so a cancel also stops fpcalc.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
@@ -292,16 +291,58 @@ func parseCandidates(r io.Reader) ([]Album, int, error) {
 	return albums, malformed, sc.Err()
 }
 
+// writeMarkers writes .ndignore into the original folder of every applied
+// album. An empty .ndignore hides its folder and everything below it from
+// Navidrome. So an applied folder gets no marker when another album of the
+// same run that was not applied has its folder strictly below it.
+func (r *Runner) writeMarkers(albums []Album, roots []string) {
+	resolved := make([]string, len(roots))
+	for i, root := range roots {
+		resolved[i] = resolvePath(root)
+	}
+	var notApplied []string
+	for _, a := range albums {
+		if a.Decision != DecisionApplied && filepath.IsAbs(a.Folder) {
+			notApplied = append(notApplied, resolvePath(a.Folder))
+		}
+	}
+	for _, a := range albums {
+		if a.Decision != DecisionApplied {
+			continue
+		}
+		if filepath.IsAbs(a.Folder) {
+			folder := resolvePath(a.Folder)
+			if i := slices.IndexFunc(notApplied, func(p string) bool { return inside(p, folder) }); i >= 0 {
+				r.Log.Warn("not writing .ndignore: it would hide an album below this folder that was not applied", "folder", a.Folder, "below", notApplied[i])
+				continue
+			}
+		}
+		r.writeMarker(a.Folder, resolved)
+	}
+}
+
+// resolvePath returns path cleaned and with symlinks resolved. When the path
+// cannot be resolved, it returns path cleaned.
+func resolvePath(path string) string {
+	path = filepath.Clean(path)
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		return real
+	}
+	return path
+}
+
 // writeMarker writes an empty .ndignore into folder, the original album
 // folder of an applied album. It never overwrites a file, and it refuses a
 // folder that is not strictly inside one of the import roots: a marker in a
-// root would hide the whole library from Navidrome.
+// root would hide the whole library from Navidrome. roots must already be
+// resolved with resolvePath. folder is resolved here, so a symlink cannot
+// point the marker outside the roots.
 func (r *Runner) writeMarker(folder string, roots []string) {
 	if !filepath.IsAbs(folder) {
 		r.Log.Warn("not writing .ndignore: folder is not absolute", "folder", folder)
 		return
 	}
-	folder = filepath.Clean(folder)
+	folder = resolvePath(folder)
 	if !insideAny(folder, roots) {
 		r.Log.Warn("not writing .ndignore: folder is a music folder itself or outside the music folders", "folder", folder)
 		return
@@ -321,23 +362,24 @@ func (r *Runner) writeMarker(folder string, roots []string) {
 
 // insideAny reports whether path is strictly below one of roots.
 func insideAny(path string, roots []string) bool {
-	for _, root := range roots {
-		rel, err := filepath.Rel(root, path)
-		if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-			continue
-		}
-		return true
-	}
-	return false
+	return slices.ContainsFunc(roots, func(root string) bool { return inside(path, root) })
 }
 
-// lineWriter logs each line of beets output at debug level and keeps the
-// last line for error messages.
+// inside reports whether path is strictly below dir.
+func inside(path, dir string) bool {
+	rel, err := filepath.Rel(dir, path)
+	return err == nil && rel != "." && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
+}
+
+// lineWriter logs each line of beets output at level and keeps the last
+// line for error messages. beets writes its warnings and errors to stderr,
+// which is logged at info. stdout is logged at debug.
 type lineWriter struct {
-	log  *slog.Logger
-	mu   sync.Mutex
-	buf  []byte
-	last string
+	log   *slog.Logger
+	level slog.Level
+	mu    sync.Mutex
+	buf   []byte
+	last  string
 }
 
 func (w *lineWriter) Write(p []byte) (int, error) {
@@ -368,7 +410,7 @@ func (w *lineWriter) emit(line []byte) {
 		return
 	}
 	w.last = string(line)
-	w.log.Debug("beets: " + w.last)
+	w.log.Log(context.Background(), w.level, "beets: "+w.last)
 }
 
 func (w *lineWriter) lastLine() string {

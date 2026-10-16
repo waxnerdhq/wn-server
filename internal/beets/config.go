@@ -40,8 +40,7 @@ type Config struct {
 	// beets-plugins next to the beets executable.
 	PluginDir string
 	// AcoustIDKey is empty when neither the config nor the build sets a key.
-	// The acoustid section is then omitted and the chroma plugin uses its
-	// own key.
+	// The chroma plugin then looks up with its own key.
 	AcoustIDKey string
 }
 
@@ -104,7 +103,6 @@ type beetsYAML struct {
 	Plugins      []string          `yaml:"plugins"`
 	Pluginpath   []string          `yaml:"pluginpath"`
 	Chroma       chromaYAML        `yaml:"chroma"`
-	AcoustID     *acoustIDYAML     `yaml:"acoustid,omitempty"`
 	WnCandidates wnCandidatesYAML  `yaml:"wn_candidates"`
 	MusicBrainz  musicBrainzYAML   `yaml:"musicbrainz"`
 	UI           uiYAML            `yaml:"ui"`
@@ -117,12 +115,20 @@ type uiYAML struct {
 type importYAML struct {
 	Copy                 bool   `yaml:"copy"`
 	Move                 bool   `yaml:"move"`
+	Link                 bool   `yaml:"link"`
+	Hardlink             bool   `yaml:"hardlink"`
+	Reflink              bool   `yaml:"reflink"`
+	Delete               bool   `yaml:"delete"`
 	Write                bool   `yaml:"write"`
 	Quiet                bool   `yaml:"quiet"`
+	QuietFallback        string `yaml:"quiet_fallback"`
+	DuplicateAction      string `yaml:"duplicate_action"`
 	Autotag              bool   `yaml:"autotag"`
 	Resume               bool   `yaml:"resume"`
 	Incremental          bool   `yaml:"incremental"`
 	IncrementalSkipLater bool   `yaml:"incremental_skip_later"`
+	FixExtInplace        bool   `yaml:"fix_ext_inplace"`
+	RemuxMP3InWAV        bool   `yaml:"remux_mp3_in_wav"`
 	Log                  string `yaml:"log"`
 }
 
@@ -130,12 +136,12 @@ type chromaYAML struct {
 	Auto bool `yaml:"auto"`
 }
 
-type acoustIDYAML struct {
-	APIKey string `yaml:"apikey"`
-}
-
 type wnCandidatesYAML struct {
 	Output string `yaml:"output"`
+	// AcoustIDAppKey replaces the chroma plugin's built-in application key.
+	// beets has no option for it: acoustid.apikey is the user key for
+	// `beet submit`.
+	AcoustIDAppKey string `yaml:"acoustid_app_key,omitempty"`
 }
 
 type musicBrainzYAML struct {
@@ -148,6 +154,13 @@ type musicBrainzYAML struct {
 // beets 2.14 loads MusicBrainz as a plugin. Its default plugin list is
 // [musicbrainz], and a plugins key replaces that list, so musicbrainz is
 // listed explicitly.
+//
+// The import options keep beets from writing to the original files. Copy is
+// the only file operation. remux_mp3_in_wav is off, because beets otherwise
+// writes an .mp3 next to an MP3-in-WAV original and deletes the WAV.
+// fix_ext_inplace is off. The wn_candidates plugin also turns off
+// fix_extension, which has no option and copies an extensionless original to
+// <name>.<ext> next to it.
 func (c Config) Render() ([]byte, error) {
 	doc := beetsYAML{
 		Library:   c.LibraryPath(),
@@ -157,25 +170,30 @@ func (c Config) Render() ([]byte, error) {
 		Import: importYAML{
 			Copy:                 true,
 			Move:                 false,
+			Link:                 false,
+			Hardlink:             false,
+			Reflink:              false,
+			Delete:               false,
 			Write:                true,
 			Quiet:                true,
+			QuietFallback:        "skip",
+			DuplicateAction:      "skip",
 			Autotag:              true,
 			Resume:               false,
 			Incremental:          true,
 			IncrementalSkipLater: true,
+			FixExtInplace:        false,
+			RemuxMP3InWAV:        false,
 			Log:                  c.ImportLogPath(),
 		},
 		Plugins:      []string{"musicbrainz", "chroma", "wn_candidates"},
 		Pluginpath:   []string{c.PluginDir},
 		Chroma:       chromaYAML{Auto: true},
-		WnCandidates: wnCandidatesYAML{Output: c.CandidatesPath()},
+		WnCandidates: wnCandidatesYAML{Output: c.CandidatesPath(), AcoustIDAppKey: c.AcoustIDKey},
 		MusicBrainz:  musicBrainzYAML{Host: "musicbrainz.org", Ratelimit: 1},
 		// beets colours its output even when it is not a terminal, and the
 		// output goes to wn-server's log.
 		UI: uiYAML{Color: false},
-	}
-	if c.AcoustIDKey != "" {
-		doc.AcoustID = &acoustIDYAML{APIKey: c.AcoustIDKey}
 	}
 	body, err := yaml.Marshal(doc)
 	if err != nil {

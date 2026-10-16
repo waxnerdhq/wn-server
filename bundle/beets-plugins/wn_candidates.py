@@ -31,6 +31,18 @@ Events used (beets 2.14):
 
 No hook raises. An internal error is written as a line with
 ``decision: "error"``.
+
+The plugin also changes two beets behaviours when it loads:
+
+- It replaces ``beets.util.extension.fix_extension`` with a function that
+  returns the path unchanged. beets 2.14 calls it on every file without an
+  extension. When ffprobe is on PATH, it copies the file to
+  ``<name>.<ext>`` in the original folder. beets has no option to turn this
+  off, and wn-server never writes to the original folders.
+- When the ``acoustid_app_key`` option is set, it replaces
+  ``beetsplug.chroma.API_KEY``. The chroma plugin looks up fingerprints with
+  that module constant. ``acoustid.apikey`` is the user key for
+  ``beet submit`` and does not change the lookup key.
 """
 
 import json
@@ -39,8 +51,20 @@ import threading
 from collections import Counter
 
 from beets.plugins import BeetsPlugin
+from beets.util import extension as _extension
 
 MAX_CANDIDATES = 10
+
+
+def _keep_path(path_bytes, logger=None):
+    """Replacement for beets.util.extension.fix_extension. It returns the
+    path unchanged and writes nothing."""
+    return path_bytes
+
+
+# beets.importer.tasks calls extension.fix_extension through the module, so
+# replacing the module attribute takes effect for every import task.
+_extension.fix_extension = _keep_path
 
 
 def _str(value):
@@ -111,7 +135,9 @@ def _flag_name(value):
 class WnCandidatesPlugin(BeetsPlugin):
     def __init__(self):
         super().__init__()
-        self.config.add({"output": ""})
+        self.config.add({"output": "", "acoustid_app_key": ""})
+        self.config["acoustid_app_key"].redact = True
+        self._set_acoustid_key()
         self._lock = threading.Lock()
         # id(task) -> (task, line) for tasks that chose a match and have no
         # final decision yet.
@@ -119,6 +145,17 @@ class WnCandidatesPlugin(BeetsPlugin):
         self.register_listener("import_task_choice", self.on_choice)
         self.register_listener("album_imported", self.on_album_imported)
         self.register_listener("import", self.on_import_end)
+
+    def _set_acoustid_key(self):
+        key = self.config["acoustid_app_key"].as_str()
+        if not key:
+            return
+        try:
+            import beetsplug.chroma as chroma
+
+            chroma.API_KEY = key
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("wn_candidates: cannot set the AcoustID key: {}", exc)
 
     def _write(self, line):
         path = self.config["output"].as_str()
