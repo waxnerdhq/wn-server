@@ -24,7 +24,7 @@ Each route is marked **existing** (it is in v2 today and is described as it beha
 
 ## Conventions
 
-- The base URL is wn-cloud's `SITE_URL`, for example `https://waxnerd.com`. wn-server reads it from `config.toml`.
+- The base URL is wn-cloud's `SITE_URL`, for example `https://waxnerd.com`. wn-server reads it from the `wn_cloud_url` key in `config.toml`.
 - Request and response bodies are JSON. Requests with a body send `Content-Type: application/json`.
 - Times are RFC 3339 strings in UTC.
 - IDs of users, servers, and ratings are UUIDs. MBIDs are UUIDs.
@@ -90,7 +90,7 @@ The approval page of the CLI sign-in. wn-server does not call it. `wn-server log
 | `label` | Optional. At most 100 characters, no control characters. Shown on the page and stored with the token. wn-server sends the server's name. |
 
 - Response: an HTML page with Approve and Cancel. Approve redirects the browser with 303 to `http://127.0.0.1:<port>/callback?code=<code>&state=<state>`. Cancel redirects to `http://127.0.0.1:<port>/callback?error=access_denied&state=<state>`. The host and the path are fixed. Only the port comes from the query.
-- Errors: a malformed query gets status 400 and an HTML page. No redirect happens.
+- Errors: a malformed query gets status 400 and an HTML page. No redirect happens. The approve form posts to `POST /cli/auth`, which v2's `sameOrigin` middleware (`web/src/session.ts`, near lines 73-86) guards. A POST whose `Origin` header names another site gets 403 with `{ "error": "Cross-origin request rejected" }`.
 - The code is 43 base64url characters, valid for 120 seconds and for one exchange. It is bound to the user, the challenge, the port, and the label.
 
 wn-server rule: wn-server checks `state` on the callback and stops the login on a mismatch or on `error`. It does not retry. The owner runs `wn-server login` again.
@@ -130,6 +130,7 @@ Errors:
 | 400 | `{ "error", "code": "invalid_request" }` | A field is missing or malformed. |
 | 400 | `{ "error", "code": "invalid_grant" }` | The code is unknown, expired, or used; the verifier does not hash to the challenge; or the port differs. A live code is consumed even when the exchange fails. |
 | 400 | Express's default error page | The body is not valid JSON. |
+| 403 | `{ "error": "Cross-origin request rejected" }` | The `Origin` header of the POST names another site. v2's `sameOrigin` middleware (`web/src/session.ts`, near lines 73-86) answers it. This can reach first-party apps that send an `Origin` header. |
 
 wn-server rule: one attempt. On any error, `wn-server login` stops and prints the error. A code cannot be retried, because a failed exchange consumes it.
 
@@ -174,6 +175,12 @@ Without `server_id`, `redirect_uri` must equal one entry of wn-cloud's first-par
 - Response: the same approval page. With `server_id`, the page also shows the server's name and the host of `redirect_uri`. Approve redirects with 303 to `<redirect_uri>?code=<code>&state=<state>`. Cancel redirects to `<redirect_uri>?error=access_denied&state=<state>`.
 - Errors: a malformed query, an unknown `server_id`, or a `redirect_uri` that is not registered gets status 400 and an HTML page. wn-cloud never redirects to a URI it has not matched.
 - The code is bound to the user, the challenge, the redirect URI, and the label. `cli_auth_codes` needs a `redirect_uri` column, and `redirect_port` becomes nullable.
+
+wn-cloud must make these changes for the variant, besides the `cli_auth_codes` column:
+
+- `returnPath` (`web/src/pages.ts`, near lines 107-112) and `authPath` (`web/src/cliAuth.ts`, near lines 75-79) rebuild the query from `state`, `challenge`, `port`, and `label` only. `redirect_uri` and `server_id` would be lost across `/login`. Both must carry the two new parameters.
+- `parseAuthRequest` (`web/src/cliAuth.ts`, near line 63) requires `port`. It must accept exactly one of `port` and `redirect_uri`, and validate `server_id`.
+- The approve form handler `POST /cli/auth` (`web/src/pages.ts`, near line 687) and the form in `web/views/cli-auth.eta` use `port`. They must pass `redirect_uri` and `server_id` through, and the redirect after the decision must go to the redirect URI.
 
 wn-server's web UI sign-in: the browser opens wn-server's `/login`. wn-server stores `state` and the verifier for that browser, then redirects it to `<wn-cloud>/cli/auth?state&challenge&redirect_uri=<its registered callback>&server_id=<id>`. The callback on wn-server checks `state` and calls `POST /cli/token` with `redirect_uri`.
 
@@ -398,7 +405,7 @@ Rating object. The field names are the column names of `subjects` and `ratings`:
 
 ### `PUT /ratings/:kind/:mbid` (new, WAX-942)
 
-Sets the caller's rating of a subject. The body replaces the whole value: a field that is `null` or absent is cleared. This matches `saveMark` in v2.
+Sets the caller's rating of a subject. The body replaces the whole value: a field that is `null` or absent is cleared. This matches `saveMark` in v2 (`web/src/marks.ts`, near lines 320-321), except that both fields `null` is a 400. `saveMark` deletes the rating in that case.
 
 - Authentication: bearer (the account's CLI token).
 - Query parameters: none.
@@ -510,6 +517,8 @@ Errors:
 
 v2 deletes a `ratings` row when a rating is cleared, so it cannot report deletions today. This route needs wn-cloud to record cleared ratings, for example in a table of deletions keyed by user and subject with the time of the clear. See [Open questions](#open-questions-for-the-operator).
 
+A deleted entry carries the `id` and `created_at` of the rating that was cleared, so the table of deletions stores both. Rating the subject again removes its deletion row, so the feed shows each subject once, either as a rating or as a deletion.
+
 wn-server rule: see [Rules](#rules-wn-server-applies), rating sync.
 
 ## Rules wn-server applies
@@ -562,7 +571,7 @@ These restate decisions in `README.md` in terms of the routes above.
 4. **Invite by email or by user id.** This document takes an email of an existing waxnerd user. It answers `user_not_found` otherwise, which tells the owner whether an email has an account. Recommendation: email for v1. Inviting people without an account (an invite link) is a later item.
 5. **Listener cap in wn-cloud.** The README says wn-server enforces the cap of 12. This document has wn-cloud enforce it as well, with `member_limit`. Recommendation: keep both checks, so a member list never exceeds what wn-server accepts.
 6. **Pagination of members.** None, since a server has at most 13 members. Recommendation: none.
-7. **Deletions in `GET /ratings?since=`.** v2 deletes a rating row on clear, so a delta cannot show clears. Recommendation: wn-cloud records clears in a `rating_deletions` table (user, subject, `deleted_at`) and merges it into the change feed. The alternative, a full re-pull on each tick, costs more as libraries grow.
+7. **Deletions in `GET /ratings?since=`.** v2 deletes a rating row on clear, so a delta cannot show clears. Recommendation: wn-cloud records clears in a `rating_deletions` table (user, subject, `deleted_at`, and the cleared rating's `id` and `created_at`) and merges it into the change feed. Rating the subject again removes its deletion row, so the feed shows each subject once. The alternative, a full re-pull on each tick, costs more as libraries grow.
 8. **Ordering of outbox writes against changes made elsewhere.** A queued `PUT` replayed after an outage overwrites a newer value set in wn-cloud's web pages meanwhile. Recommendation: accept this for v1. Later, `PUT` can take an optional `updated_at` from the client, and wn-cloud ignores a write older than the stored value.
 9. **Intervals.** The README says "every few minutes" for the member refresh and gives no `GET /me` cache time. This document uses 5 minutes for both, and ties the outbox drain and rating sync to the same tick. Recommendation: 5 minutes.
 10. **Redirect URI rules.** This document allows `http` only for loopback and private IP literals and `.local` hosts, and at most 10 entries. Recommendation: accept, since a LAN server usually has no certificate.
