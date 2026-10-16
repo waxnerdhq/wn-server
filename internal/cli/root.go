@@ -7,6 +7,8 @@ import (
 	"os"
 
 	"github.com/spf13/cobra"
+
+	"github.com/waxnerdhq/wn-server/internal/config"
 )
 
 // Version is set at build time with -ldflags "-X .../internal/cli.Version=...".
@@ -22,8 +24,34 @@ func newRootCmd() *cobra.Command {
 		SilenceErrors: true,
 	}
 	root.PersistentFlags().String("config", "", "path to config.toml (default: <data dir>/config.toml)")
-	root.AddCommand(newServeCmd(), newLoginCmd(), newMatchCmd(), newVersionCmd())
+	root.AddCommand(newInitCmd(), newServeCmd(), newLoginCmd(), newMatchCmd(), newVersionCmd())
 	return root
+}
+
+func newInitCmd() *cobra.Command {
+	var folders []string
+	cmd := &cobra.Command{
+		Use:   "init",
+		Short: "Create the data directory and a first config.toml",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			flag, _ := cmd.Flags().GetString("config")
+			_, path, err := config.Paths(flag)
+			if err != nil {
+				return err
+			}
+			c, err := config.Init(path, folders)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "wrote %s\n", path)
+			fmt.Fprintf(cmd.OutOrStdout(), "data directory: %s\n", c.DataDir)
+			return nil
+		},
+	}
+	cmd.Flags().StringArrayVar(&folders, "folder", nil, "music folder (repeatable, at least one)")
+	_ = cmd.MarkFlagRequired("folder")
+	return cmd
 }
 
 func newServeCmd() *cobra.Command {
