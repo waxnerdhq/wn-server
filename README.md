@@ -16,7 +16,7 @@ wn-server is licensed under GPL-3.0 (see `LICENSE`). It is powered by Navidrome,
 
 One `wn-server` binary. It supervises a pinned `navidrome` binary, writes its configuration, and sits in front of it as a reverse proxy. Navidrome listens on `127.0.0.1` only. Every request from the network goes through wn-server.
 
-beets runs as a subprocess and only writes into the sorted directory. A pinned beets, with its Python interpreter, ships in the release bundle together with the pinned Navidrome binary, so a release works without any install step. ffmpeg is optional and only Navidrome uses it, for transcoding.
+beets runs as a subprocess and only writes into the sorted directory. A pinned beets, with its Python interpreter, ships in the release bundle together with the pinned Navidrome binary and Chromaprint's `fpcalc`, so a release works without any install step. ffmpeg is optional and only Navidrome uses it, for transcoding.
 
 The first and only release target for now is Linux on x86_64. Other platforms come later.
 
@@ -160,7 +160,42 @@ make build    # bin/wn-server
 make test
 make lint     # go vet, plus golangci-lint when installed
 make check    # fmt, lint, test, build
+make bundle   # Linux only: release tarball in dist/
 ```
+
+### Release bundle
+
+A release is one tarball, `wn-server-<version>-linux-amd64.tar.gz`, for Linux on x86_64 with glibc. It holds one directory, `wn-server-<version>-linux-amd64/`, with these files:
+
+| File | Contents |
+|---|---|
+| `wn-server` | Static Go build (`CGO_ENABLED=0`), version set by the ldflag from the Makefile. |
+| `navidrome` | The Navidrome release binary, verified against the release's `navidrome_checksums.txt`. |
+| `beets` | beets as one executable that carries its own Python interpreter. Includes `pyacoustid` for the `chroma` plugin and `requests`. |
+| `beets-plugins/` | Directory for wn-server's beets plugins, read through `pluginpath`. The `wn_candidates` plugin goes here (WAX-938). |
+| `fpcalc` | Chromaprint's static `fpcalc` release binary, verified against the sha256 in `bundle/checksums`. |
+| `LICENSE`, `NOTICE` | wn-server's licence, and the bundled projects with their licences. |
+
+The config defaults for `navidrome_bin`, `beets_bin`, and `fpcalc_bin` point at these files, because they sit next to the `wn-server` executable.
+
+Pinned versions, all in `bundle/versions.env`:
+
+| Component | Version |
+|---|---|
+| Navidrome | 0.64.2 |
+| beets | 2.14.1 |
+| Chromaprint (`fpcalc`) | 1.6.2 |
+| Python inside `beets` | 3.13.16, python-build-standalone release 20261013 |
+| pex (build tool) | 2.103.4 |
+| uv (build tool) | 0.13.1 |
+
+A test in `internal/navidrome` fails when `NAVIDROME_VERSION` in `bundle/versions.env` differs from `navidrome.PinnedVersion`.
+
+beets is packaged with pex as a scie (`--scie eager`). The executable contains a python-build-standalone interpreter, so the target machine needs no Python. pex resolves the pinned packages once at build time, so the output does not depend on the build host's Python. PyInstaller was not chosen because it freezes the build host's interpreter and needs per-package hooks. On its first run the `beets` executable unpacks itself into `~/.cache/nce`, or into `$SCIE_BASE` when that is set.
+
+`bundle/build.sh <output dir>` builds the tarball and a `.sha256` file next to it. It runs on Linux and needs Go, curl, tar, sha256sum, and uv. uv supplies the Python that pex runs under. On Linux x86_64 the script runs each binary once to check its version, and checks that beets loads the `chroma` plugin. `make bundle` calls the script with `dist` as the output directory.
+
+The `release` workflow in `.github/workflows/release.yml` runs `make check` and `bundle/build.sh` on every pull request to `main` and on every push of a `v*` tag. Each run uploads the tarball as a workflow artifact. A tag run also creates a GitHub release for the tag and attaches the tarball. Pull request runs publish nothing.
 
 ## Configuration
 
@@ -200,6 +235,8 @@ The data directory is `$XDG_DATA_HOME/wn-server`, or `~/.local/share/wn-server` 
 cmd/wn-server/   main package
 internal/        one package per component (see Components)
 docs/            design documents and diagrams
+bundle/          release bundle script, pinned versions, checksums
+.github/         release workflow
 ```
 
 ## Reference

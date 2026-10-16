@@ -1,4 +1,5 @@
 /bin/
+/dist/
 /data/
 *.db
 *.db-wal
