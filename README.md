@@ -142,6 +142,7 @@ The `chroma` plugin (AcoustID fingerprints) raises match confidence. wn-server s
 - Accounts and a local-only mode are part of v1 so that the server is usable without wn-cloud and keeps working through an outage. (WAX-945, decisions 1 and 2)
 - First-party clients exchange a wn-cloud token once for a wn-server session, and wn-server verifies sessions itself. Without this, a GoTrue token would expire within an hour of an outage and the grace period would not exist. (WAX-945 decision 2, amended 2026-10-16)
 - Third-party Subsonic clients authenticate with per-account app passwords. First-party clients use wn-cloud tokens. (WAX-945, decision 1)
+- The listener cap is 12 and the outage cut-off for listener sessions is 30 days. Both confirmed by the owner on 2026-10-16.
 - Half stars are written through wn-server's own rating API, not through Subsonic. (WAX-945, decision 3)
 - beets candidates come from a shipped beets plugin that writes JSON, not from the import log. (WAX-945, decision 4)
 - One AcoustID application key is compiled in, with a config override. (WAX-945, decision 5)
