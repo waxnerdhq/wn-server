@@ -27,6 +27,11 @@ func New(target *url.URL, ready <-chan struct{}, logger *slog.Logger) http.Handl
 		// Flush after every write so audio and large bodies stream.
 		FlushInterval: -1,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			if r.Context().Err() != nil {
+				// The client went away, for example on an audio seek.
+				logger.Debug("proxy request canceled", "method", r.Method, "path", r.URL.Path, "error", err)
+				return
+			}
 			logger.Warn("proxy error", "method", r.Method, "path", r.URL.Path, "error", err)
 			w.WriteHeader(http.StatusBadGateway)
 		},

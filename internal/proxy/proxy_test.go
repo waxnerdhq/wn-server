@@ -6,9 +6,9 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
-	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 func newProxy(t *testing.T, backend http.Handler, ready bool) (*httptest.Server, *atomic.Int32) {
@@ -66,27 +66,51 @@ func TestNotReadyReturns503(t *testing.T) {
 }
 
 func TestStreamsChunks(t *testing.T) {
-	const chunks = 5
+	firstRead := make(chan struct{})
 	srv, _ := newProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		for i := 0; i < chunks; i++ {
-			_, _ = io.WriteString(w, "chunk\n")
-			w.(http.Flusher).Flush()
+		_, _ = io.WriteString(w, "one\n")
+		w.(http.Flusher).Flush()
+		// A buffering proxy never delivers the first chunk until the handler
+		// returns, so the client cannot signal and this wait times out.
+		select {
+		case <-firstRead:
+			_, _ = io.WriteString(w, "two\n")
+		case <-time.After(5 * time.Second):
+		case <-r.Context().Done():
 		}
 	}), true)
-	resp, err := http.Get(srv.URL + "/rest/stream")
+	client := &http.Client{Timeout: 10 * time.Second}
+	resp, err := client.Get(srv.URL + "/rest/stream")
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer resp.Body.Close()
-	sc := bufio.NewScanner(resp.Body)
-	n := 0
-	for sc.Scan() {
-		if strings.TrimSpace(sc.Text()) != "chunk" {
-			t.Fatalf("unexpected line %q", sc.Text())
+	br := bufio.NewReader(resp.Body)
+
+	type result struct {
+		line string
+		err  error
+	}
+	readLine := func() <-chan result {
+		ch := make(chan result, 1)
+		go func() {
+			l, err := br.ReadString('\n')
+			ch <- result{l, err}
+		}()
+		return ch
+	}
+	wait := func(ch <-chan result, want string) {
+		t.Helper()
+		select {
+		case r := <-ch:
+			if r.err != nil || r.line != want {
+				t.Fatalf("read %q, %v; want %q", r.line, r.err, want)
+			}
+		case <-time.After(3 * time.Second):
+			t.Fatalf("timed out waiting for %q: proxy is buffering", want)
 		}
-		n++
 	}
-	if n != chunks {
-		t.Fatalf("got %d chunks, want %d", n, chunks)
-	}
+	wait(readLine(), "one\n")
+	close(firstRead)
+	wait(readLine(), "two\n")
 }

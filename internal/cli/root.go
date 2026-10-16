@@ -91,7 +91,9 @@ func newServeCmd() *cobra.Command {
 const shutdownGrace = 5 * time.Second
 
 // serve runs the Navidrome supervisor and the proxy until ctx is cancelled
-// or one of them fails.
+// or one of them fails. The supervisor outlives the HTTP server: on a signal
+// the server drains first, then Navidrome is stopped, so in-flight streams
+// are not cut by an early SIGTERM to Navidrome.
 func serve(ctx context.Context, c *config.Config, logger *slog.Logger) error {
 	ln, err := net.Listen("tcp", c.Listen)
 	if err != nil {
@@ -104,38 +106,41 @@ func serve(ctx context.Context, c *config.Config, logger *slog.Logger) error {
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
-	runCtx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	supCtx, cancelSup := context.WithCancel(context.WithoutCancel(ctx))
+	defer cancelSup()
 	supDone := make(chan error, 1)
-	go func() { supDone <- sup.Run(runCtx) }()
+	go func() { supDone <- sup.Run(supCtx) }()
 	srvDone := make(chan error, 1)
 	go func() { srvDone <- srv.Serve(ln) }()
 	logger.Info("listening", "addr", ln.Addr().String())
 
-	var runErr error
-	supStopped := false
-	select {
-	case <-runCtx.Done():
-	case runErr = <-supDone:
-		supStopped = true
-	case runErr = <-srvDone:
-	}
-	cancel()
-
-	shutCtx, stop := context.WithTimeout(context.Background(), shutdownGrace)
-	defer stop()
-	if err := srv.Shutdown(shutCtx); err != nil {
-		_ = srv.Close()
-	}
-	if !supStopped {
-		if err := <-supDone; runErr == nil {
-			runErr = err
+	shutdownServer := func() {
+		shutCtx, stop := context.WithTimeout(context.Background(), shutdownGrace)
+		defer stop()
+		if err := srv.Shutdown(shutCtx); err != nil {
+			_ = srv.Close()
 		}
 	}
-	if errors.Is(runErr, http.ErrServerClosed) {
-		runErr = nil
+
+	select {
+	case <-ctx.Done():
+		shutdownServer()
+		cancelSup()
+		return <-supDone
+	case err := <-supDone:
+		shutdownServer()
+		if err == nil {
+			err = errors.New("navidrome supervisor stopped")
+		}
+		return err
+	case err := <-srvDone:
+		cancelSup()
+		<-supDone
+		if errors.Is(err, http.ErrServerClosed) {
+			err = errors.New("http server stopped")
+		}
+		return err
 	}
-	return runErr
 }
 
 func newLoginCmd() *cobra.Command {
