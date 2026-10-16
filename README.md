@@ -118,7 +118,7 @@ Navidrome's smart playlists and third-party clients see the rounded stars. First
 
 Later direction, not in v1: smart playlists defined in wn-server on the 10-point scale, evaluated against wn-server's rating store and Navidrome's library data, and written into Navidrome as ordinary playlists so every client can play them.
 
-Sync only applies to MusicBrainz-matched music. wn-cloud's rating model (`ratings` in `../v2`) keys a rating by subject kind and MBID: `release_group`, `release`, `track`, or `artist`. A rating holds `half_stars` from 1 to 10 and a `like_level` of like or love. Navidrome albums map to `release` subjects through `mbz_album_id`. Navidrome songs map to `track` subjects through `mbz_release_track_id`, which is the MusicBrainz track id, not the recording id. A Navidrome star maps to `love`. wn-cloud has the tables but no JSON routes for ratings yet; those are a wn-cloud item.
+Sync only applies to MusicBrainz-matched music. wn-cloud's rating model (`ratings` in `../v2`) keys a rating by subject kind and MBID: `release_group`, `release`, `track`, or `artist`. A rating holds `half_stars` from 1 to 10 and a `like_level` of like or love. Navidrome albums map to `release` subjects through `mbz_album_id`. Navidrome songs map to `track` subjects through `mbz_release_track_id`, which is the MusicBrainz track id, not the recording id. A Navidrome star maps to `love`. wn-cloud has the tables but no JSON routes for ratings yet; those are a wn-cloud item, specified in [docs/wn-cloud-api.md](docs/wn-cloud-api.md).
 
 ### MusicBrainz matching
 
@@ -137,7 +137,7 @@ The `chroma` plugin (AcoustID fingerprints) raises match confidence. wn-server s
 - beets copies into a sorted directory and never modifies or moves the original files. Originals that were copied are hidden from Navidrome with a `.ndignore` marker. (2026-10-16)
 - wn-server is written in Go and ships as one static binary inside a release bundle that also carries Navidrome and beets.
 - wn-server is GPL-3.0. It is the free part of waxnerd. wn-cloud and the client apps are separate projects. A managed hosting service running wn-server carries no GPL obligation, since GPL-3.0 has no network clause. A closed-source desktop app may ship wn-server as a separate executable and talk to it over HTTP or the CLI; it may not import its Go packages or link it statically. Outside contributions will need a contributor agreement to keep relicensing possible.
-- Every route wn-server calls on wn-cloud is written down first in `docs/wn-cloud-api.md`, and a stub server under `internal/wncloud` serves the same responses for tests. wn-cloud is implemented against the document. (WAX-946)
+- Every route wn-server calls on wn-cloud is written down first in [docs/wn-cloud-api.md](docs/wn-cloud-api.md), and the stub server in `internal/wncloud/stub` serves the same routes from memory for tests. wn-cloud is implemented against the document. The document ends with open questions for the operator. (WAX-946)
 - Accounts and a local-only mode are part of v1 so that the server is usable without wn-cloud and keeps working through an outage. (WAX-945, decisions 1 and 2)
 - First-party clients exchange a wn-cloud token once for a wn-server session, and wn-server verifies sessions itself. Without this, a GoTrue token would expire within an hour of an outage and the grace period would not exist. (WAX-945 decision 2, amended 2026-10-16)
 - Third-party Subsonic clients authenticate with per-account app passwords. First-party clients use wn-cloud tokens. (WAX-945, decision 1)
@@ -201,5 +201,6 @@ docs/            design documents and diagrams
 
 ## Reference
 
+- wn-cloud API contract: [docs/wn-cloud-api.md](docs/wn-cloud-api.md).
 - Navidrome source: a checkout at `../navidrome` tracks upstream `main`.
 - The earlier from-scratch server (Rust) lives at `../wn-server-vibecoded` and is reference only.
