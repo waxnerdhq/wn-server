@@ -63,14 +63,21 @@ Owner setup, once, on the server machine (`wn-server login`). This is wn-cloud's
 6. wn-server sends one request to Navidrome with `Remote-User: <owner id>`. Navidrome creates the user. The first user is admin.
 7. Optional: wn-server mints a Navidrome API key for its own background jobs.
 
-Every client request:
+First-party clients (wn-mobile, wn-desktop, the web UI), once per device:
 
-1. The client signs in with wn-cloud once and holds a wn-cloud token (a GoTrue access token or a CLI token).
-2. The client sends the request to wn-server with `Authorization: Bearer <token>`.
-3. wn-server resolves the token to a user with wn-cloud's `GET /me`. The result is cached until the token's expiry, or for a bounded time for a CLI token.
-4. wn-server checks that the user is the owner or an invited listener of this server. The membership list comes from wn-cloud and is cached.
-5. wn-server forwards the request to Navidrome on loopback with `Remote-User: <waxnerd user id>`. Navidrome's trusted proxy settings (`ExtAuth.UserHeader`, `ExtAuth.TrustedSources`) accept the header.
-6. The response passes back through wn-server.
+1. The client signs in with wn-cloud through the CLI sign-in flow and holds a non-expiring wn-cloud token (`wn_…`).
+2. The client calls `POST /api/v1/session` on wn-server with that token.
+3. wn-server resolves the token with wn-cloud's `GET /me`, checks that the user is the owner or an invited listener, and links or creates the account.
+4. wn-server returns a wn-server session token. It is long-lived, revocable by the owner, and valid only at this server. It grants nothing at wn-cloud. wn-server keeps the client's wn-cloud token with the account, for rating writes and membership refreshes on the user's behalf.
+
+Every request after that:
+
+1. The client sends `Authorization: Bearer <session>` (or the Subsonic `apiKey` parameter). Third-party clients send a name and app password instead.
+2. wn-server checks the session or password against its own store. No call to wn-cloud.
+3. wn-server forwards the request to Navidrome on loopback with `Remote-User: <account id>`. Navidrome's trusted proxy settings (`ExtAuth.UserHeader`, `ExtAuth.TrustedSources`) accept the header.
+4. The response passes back through wn-server.
+
+In the background, wn-server refreshes the member list from wn-cloud every few minutes. A revoked listener's sessions stop at the next refresh.
 
 Navidrome's Subsonic endpoint looks the header user up but does not create it. wn-server creates an invited listener's Navidrome user, non-admin, the first time it sees them. Non-admin Navidrome users cannot change the library.
 
@@ -87,7 +94,7 @@ wn-server runs in one of two modes:
 - **Local-only.** The state before `wn-server login` has ever run, and the state after 30 days without reaching wn-cloud. `wn-server init` creates the owner account. The owner adds listeners by name from the web UI or the CLI. Clients authenticate with the Subsonic scheme (`u` plus `t`/`s`, or `u` plus `p`) against the account's app password. The web UI has a name and password form. Ratings are stored locally and mirrored into Navidrome. Nothing syncs with wn-cloud.
 - **Cloud.** The state after `wn-server login`. Accounts gain waxnerd user ids. wn-cloud tokens are accepted alongside app passwords. Invites, membership, and rating sync go through wn-cloud.
 
-Between an outage and day 30, the proxy serves from caches persisted in the store: token lookups and the member list. Expired GoTrue tokens are still refused. A revocation made during the outage takes effect at the next successful refresh. After day 30 the server behaves as local-only until wn-cloud answers again.
+During an outage, sessions already issued keep working, because wn-server checks them itself. New sign-ins through wn-cloud fail until wn-cloud answers; people use their app password instead. A revocation made during the outage takes effect at the next successful member refresh. After 30 days without a successful refresh, listeners' sessions are refused with a distinct error code until a refresh succeeds, so a client can prompt for the app password. The owner's sessions are never refused for this reason. The web UI shows a banner with the outage start and the cut-off date.
 
 App passwords exist so that third-party Subsonic clients work in both modes. One is generated when an account is created: the owner's at `init` or `login`, a listener's when their membership first appears. The web UI shows it with copy and regenerate buttons. `wn-server password` prints the owner's and `--reset` regenerates it, for a headless machine. The Subsonic token scheme needs the password itself, so the store holds it as-is, in a file readable only by the server's user.
 
@@ -130,6 +137,7 @@ The `chroma` plugin (AcoustID fingerprints) raises match confidence. wn-server s
 - wn-server is GPL-3.0. It is the free part of waxnerd. wn-cloud and the client apps are separate projects. A managed hosting service running wn-server carries no GPL obligation, since GPL-3.0 has no network clause. A closed-source desktop app may ship wn-server as a separate executable and talk to it over HTTP or the CLI; it may not import its Go packages or link it statically. Outside contributions will need a contributor agreement to keep relicensing possible.
 - Every route wn-server calls on wn-cloud is written down first in `docs/wn-cloud-api.md`, and a stub server under `internal/wncloud` serves the same responses for tests. wn-cloud is implemented against the document. (WAX-946)
 - Accounts and a local-only mode are part of v1 so that the server is usable without wn-cloud and keeps working through an outage. (WAX-945, decisions 1 and 2)
+- First-party clients exchange a wn-cloud token once for a wn-server session, and wn-server verifies sessions itself. Without this, a GoTrue token would expire within an hour of an outage and the grace period would not exist. (WAX-945 decision 2, amended 2026-10-16)
 - Third-party Subsonic clients authenticate with per-account app passwords. First-party clients use wn-cloud tokens. (WAX-945, decision 1)
 - Half stars are written through wn-server's own rating API, not through Subsonic. (WAX-945, decision 3)
 - beets candidates come from a shipped beets plugin that writes JSON, not from the import log. (WAX-945, decision 4)

@@ -92,7 +92,7 @@
   <text x="90" y="612" class="notet">Navidrome never listens on the network; every request reaches it through wn-server's proxy on loopback. Navidrome's own web UI is blocked at the proxy.</text>
 
   <!-- ===================== Section B ===================== -->
-  <text x="40" y="680" class="h">B. Every client request  (wn-mobile, wn-desktop, the wn-server web UI)</text>
+  <text x="40" y="680" class="h">B. First-party clients  (wn-mobile, wn-desktop, the wn-server web UI). Third-party Subsonic clients use a name and app password instead.</text>
 
   <rect x="70" y="700" width="220" height="56" rx="6" class="lane"/>
   <text x="180" y="723" class="lt">Client app</text>
@@ -116,31 +116,34 @@
   <line x1="1200" y1="756" x2="1200" y2="1040" class="life"/>
 
   <!-- 1 client -> wn-cloud -->
-  <line x1="180" y1="800" x2="860" y2="800" class="msg"/>
-  <text x="520" y="790" class="lbl"><tspan class="num">1</tspan> sign in once with the waxnerd account → wn-cloud token (GoTrue access token or CLI token)</text>
+  <line x1="180" y1="790" x2="860" y2="790" class="msg"/>
+  <text x="520" y="780" class="lbl"><tspan class="num">1</tspan> sign in once with the waxnerd account → wn-cloud token (wn_…, non-expiring)</text>
 
-  <!-- 2 client -> wn-server -->
-  <line x1="180" y1="850" x2="520" y2="850" class="msgb"/>
-  <text x="350" y="840" class="lbl"><tspan class="num">2</tspan> request + Authorization: Bearer &lt;token&gt;</text>
+  <!-- 2 client -> wn-server: session exchange -->
+  <line x1="180" y1="830" x2="520" y2="830" class="msgb"/>
+  <text x="350" y="820" class="lbl"><tspan class="num">2</tspan> POST /api/v1/session, Bearer &lt;wn-cloud token&gt;</text>
 
-  <!-- 3 self: verify -->
-  <line x1="520" y1="890" x2="860" y2="890" class="msg"/>
-  <text x="690" y="880" class="lbl"><tspan class="num">3</tspan> GET /me with the client's token → user (cached)</text>
+  <!-- 3 wn-server -> wn-cloud -->
+  <line x1="520" y1="870" x2="860" y2="870" class="msg"/>
+  <text x="690" y="860" class="lbl"><tspan class="num">3</tspan> GET /me → user; GET /servers/:id/members → owner or listener? (persisted)</text>
 
-  <!-- 4 wn-server -> wn-cloud -->
-  <line x1="520" y1="935" x2="860" y2="935" class="msg"/>
-  <text x="690" y="925" class="lbl"><tspan class="num">4</tspan> is this user the owner or an invited listener of server id? (cached)</text>
+  <!-- 4 wn-server -> client: session -->
+  <line x1="520" y1="910" x2="180" y2="910" class="msgb"/>
+  <text x="350" y="900" class="lbl"><tspan class="num">4</tspan> wn-server session: long-lived, valid only here</text>
 
-  <!-- 5 wn-server -> navidrome -->
-  <line x1="520" y1="985" x2="1200" y2="985" class="msgb"/>
-  <text x="860" y="963" class="lbl"><tspan class="num">5</tspan> same request on loopback, header Remote-User: &lt;waxnerd user id&gt;</text>
-  <text x="860" y="978" class="lbl" font-size="11">listener users are created non-admin on first sight</text>
+  <!-- 5 client -> wn-server: requests -->
+  <line x1="180" y1="950" x2="520" y2="950" class="msgb"/>
+  <text x="350" y="940" class="lbl"><tspan class="num">5</tspan> every request: Bearer &lt;session&gt; (checked locally)</text>
 
-  <!-- 6 response -->
-  <line x1="1200" y1="1025" x2="180" y2="1025" class="msgb" stroke-dasharray="6 4"/>
-  <text x="690" y="1015" class="lbl"><tspan class="num">6</tspan> response passes back through wn-server to the client</text>
+  <!-- 6 wn-server -> navidrome -->
+  <line x1="520" y1="990" x2="1200" y2="990" class="msgb"/>
+  <text x="860" y="980" class="lbl"><tspan class="num">6</tspan> same request on loopback, header Remote-User: &lt;account id&gt;</text>
+
+  <!-- 7 response -->
+  <line x1="1200" y1="1030" x2="180" y2="1030" class="msgb" stroke-dasharray="6 4"/>
+  <text x="690" y="1020" class="lbl"><tspan class="num">7</tspan> response passes back through wn-server to the client</text>
 
   <rect x="70" y="1055" width="1240" height="46" rx="6" class="note"/>
-  <text x="90" y="1074" class="notet">Ratings, favorites, and later likes or comments do not reach Navidrome. wn-server intercepts those calls at step 2 and stores them in wn-cloud on waxnerd's 10-point scale.</text>
-  <text x="90" y="1092" class="notet">Invites are records in wn-cloud (server id, user id, role = listener). Revoking an invite ends access at step 4 without touching Navidrome.</text>
+  <text x="90" y="1074" class="notet">Sessions keep working when wn-cloud is unreachable. New waxnerd sign-ins fail then; app passwords always work. After 30 days without a member refresh, listener sessions are refused until one succeeds.</text>
+  <text x="90" y="1092" class="notet">Invites are records in wn-cloud (server id, user id, role = listener). Revoking one ends the listener's sessions at the next member refresh, without touching Navidrome.</text>
 </svg>
