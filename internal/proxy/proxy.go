@@ -1,20 +1,34 @@
 package proxy
 
 import (
+	"context"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"path"
+	"strings"
 	"time"
+
+	"github.com/waxnerdhq/wn-server/internal/store"
 )
 
 // userHeader is the header Navidrome trusts to name the signed-in user.
 const userHeader = "Remote-User"
 
-// New returns a handler that forwards requests to target. Until ready is
+// Accounts looks up an account by its Subsonic user name. It returns
+// store.ErrNotFound for an unknown name. *store.Store implements it.
+type Accounts interface {
+	AccountByName(ctx context.Context, name string) (store.Account, error)
+}
+
+type accountIDKey struct{}
+
+// New returns a handler that forwards /rest/* with authentication and
+// /share/* without it to target. Every other path answers 404. Until ready is
 // closed it answers 503 and forwards nothing, so that no client can become
 // Navidrome's first user. A nil logger selects slog.Default.
-func New(target *url.URL, ready <-chan struct{}, logger *slog.Logger) http.Handler {
+func New(target *url.URL, ready <-chan struct{}, accounts Accounts, logger *slog.Logger) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -23,6 +37,9 @@ func New(target *url.URL, ready <-chan struct{}, logger *slog.Logger) http.Handl
 			r.SetURL(target)
 			// A client must not choose its Navidrome identity.
 			r.Out.Header.Del(userHeader)
+			if id, ok := r.In.Context().Value(accountIDKey{}).(string); ok {
+				r.Out.Header.Set(userHeader, id)
+			}
 		},
 		// Flush after every write so audio and large bodies stream.
 		FlushInterval: -1,
@@ -36,7 +53,30 @@ func New(target *url.URL, ready <-chan struct{}, logger *slog.Logger) http.Handl
 			w.WriteHeader(http.StatusBadGateway)
 		},
 	}
-	return logRequests(logger, gateReady(ready, rp))
+	rest := gateReady(ready, subsonicAuth(accounts, logger, rp))
+	share := gateReady(ready, rp)
+	return logRequests(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch p := r.URL.Path; {
+		case !isClean(p):
+			http.NotFound(w, r)
+		case strings.HasPrefix(p, "/rest/"):
+			rest.ServeHTTP(w, r)
+		case strings.HasPrefix(p, "/share/"):
+			share.ServeHTTP(w, r)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+}
+
+// isClean reports whether p has no dot segments and no empty segments, so
+// that a prefix match on p is a match on the path Navidrome routes.
+func isClean(p string) bool {
+	c := path.Clean(p)
+	if strings.HasSuffix(p, "/") && c != "/" {
+		c += "/"
+	}
+	return c == p
 }
 
 // gateReady answers 503 until ready is closed.
@@ -54,7 +94,8 @@ func gateReady(ready <-chan struct{}, next http.Handler) http.Handler {
 	})
 }
 
-// logRequests logs one debug line per request.
+// logRequests logs one debug line per request. It logs the path only, never
+// the query string, which carries Subsonic credentials.
 func logRequests(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()

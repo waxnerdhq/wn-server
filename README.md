@@ -8,7 +8,7 @@ wn-server is the waxnerd music server. It runs [Navidrome](https://www.navidrome
 
 wn-server is licensed under GPL-3.0 (see `LICENSE`). It is powered by Navidrome, which is also GPL-3.0 and runs as a separate process.
 
-**Status:** scaffold, configuration, the Navidrome supervisor, and a plain reverse proxy. `wn-server init` writes `config.toml`. `wn-server serve` checks the Navidrome version, writes `navidrome.toml`, runs Navidrome as a child process, adds the configured libraries, and serves the proxy on `listen`. The proxy forwards every request to Navidrome without authentication and answers 503 until the supervisor reports ready. `login` and `match` return "not implemented". The wn-cloud API contract and an in-memory wn-cloud stub for tests are in place. v1 has one account, the owner. This file describes the agreed design and is updated as the code lands.
+**Status:** configuration, the Navidrome supervisor, the account store, and local-only mode. `wn-server init` writes `config.toml` and creates the owner account with an app password. `wn-server password` prints the app password and `--reset` replaces it. `wn-server serve` checks the Navidrome version, writes `navidrome.toml`, runs Navidrome as a child process, creates the owner's Navidrome user, adds the configured libraries, and serves the proxy on `listen`. The proxy checks Subsonic credentials against the owner's app password on `/rest/*`, passes `/share/*` without a check, answers 404 on every other path, and answers 503 until the supervisor reports ready. `login` and `match` return "not implemented". The wn-cloud API contract and an in-memory wn-cloud stub for tests are in place. v1 has one account, the owner. This file describes the agreed design and is updated as the code lands.
 
 ## Architecture
 
@@ -35,14 +35,14 @@ clients (wn-mobile, wn-desktop, web UI)
 
 | Package | Responsibility |
 |---|---|
-| `internal/cli` | cobra command line: `init`, `serve`, `login`, `match`, `version` |
+| `internal/cli` | cobra command line: `init`, `serve`, `password`, `login`, `match`, `version` |
 | `internal/config` | `config.toml` loading and defaults, data directory, rendered `navidrome.toml` |
-| `internal/navidrome` | child process supervisor, version pin, library sync, and wn-server's own Navidrome identity |
-| `internal/proxy` | reverse proxy to Navidrome. It answers 503 until the supervisor is ready, strips incoming `Remote-User`, and streams responses unbuffered. Session and app password checks, `Remote-User` forwarding, and rating intercepts are not built yet |
+| `internal/navidrome` | child process supervisor, version pin, library sync, wn-server's own Navidrome identity, and the owner's Navidrome user |
+| `internal/proxy` | reverse proxy to Navidrome. It forwards `/rest/*` after a Subsonic credential check against the app password, and `/share/*` without a check. Every other path answers 404. It answers 503 until the supervisor is ready, strips incoming `Remote-User`, sets `Remote-User` to the account id after a successful check, removes the credential parameters before forwarding, and streams responses unbuffered. Sessions and rating intercepts are not built yet |
 | `internal/wncloud` | wn-cloud client: login flow, server registration, device code verification, rating routes; `stub` serves the same routes from memory for tests |
 | `internal/beets` | beets subprocess, match queue |
 | `internal/ratings` | local store of ratings and favorites, rating API, reconcile loop |
-| `internal/store` | wn-server's SQLite database: the owner account and its sessions, match queue, ratings, outbox |
+| `internal/store` | wn-server's SQLite database, `<data dir>/wn-server.db`, mode 0600, with embedded migrations. It holds the owner account and app password. Sessions, the match queue, ratings, and the outbox are not built yet |
 | `internal/web` | web UI for the owner: app password sign-in, status, match review, account page |
 
 ### Authentication
@@ -53,7 +53,7 @@ wn-cloud is the v2 rewrite of waxnerd (`../v2`): an Express server with GoTrue f
 
 wn-server has one account, the owner. It holds one wn-cloud credential, the server credential, which is the owner's CLI token. Only wn-server talks to Navidrome. No client holds a Navidrome credential.
 
-Owner account. `wn-server init` creates the owner account with an app password (WAX-947). When `serve` starts, after the supervisor reports ready, wn-server creates the owner's Navidrome user through Navidrome's native API, with admin set, if the user does not exist yet. Navidrome does not create it from a header request. This also lands with WAX-947. wn-server's own identity (`wn-server`) is already Navidrome's first user and its admin, created by the supervisor at startup (see Navidrome supervisor). The proxy must not forward any request to Navidrome before the supervisor reports ready, so that no client can become Navidrome's first user.
+Owner account. `wn-server init` creates the owner account with an app password. When `serve` starts and Navidrome answers `/ping`, the supervisor creates the owner's Navidrome user through Navidrome's native API, with admin set, if the user does not exist yet. Navidrome does not create it from a header request. The supervisor reports ready only after the user exists. wn-server's own identity (`wn-server`) is already Navidrome's first user and its admin, created by the supervisor at startup (see Navidrome supervisor). The proxy must not forward any request to Navidrome before the supervisor reports ready, so that no client can become Navidrome's first user.
 
 Owner setup for cloud mode, once, on the server machine (`wn-server login`). This is the code display variant of wn-cloud's CLI sign-in flow. Nothing redirects to wn-server, so it works on a headless machine:
 
@@ -84,18 +84,18 @@ Navidrome's own web UI is blocked at the proxy. Only its Subsonic API passes thr
 
 ### Accounts and modes
 
-wn-server has one account, the owner. It lives in wn-server's own SQLite store: id, display name, app password, and an optional waxnerd user id. Navidrome's `Remote-User` header carries the account id. Linking to wn-cloud is a property of the account, not its identity.
+wn-server has one account, the owner. It lives in wn-server's own SQLite store: id (16 random hex characters), name, app password, an optional waxnerd user id, and the creation time. The name is the Subsonic user name. It defaults to `owner` and `init --name` sets it. Names compare without regard to case, as in Navidrome. Navidrome's `Remote-User` header carries the account id, and the owner's Navidrome user name is the account id. Linking to wn-cloud is a property of the account, not its identity.
 
 wn-server runs in one of two modes. The difference is whether `wn-server login` has run.
 
-- **Local-only.** The state before `wn-server login` has run. The owner account has no waxnerd user id. Clients authenticate with the Subsonic scheme (`u` plus `t`/`s`, or `u` plus `p`) against the app password. Ratings are stored locally and mirrored into Navidrome. Nothing syncs with wn-cloud.
+- **Local-only.** The state before `wn-server login` has run. The owner account has no waxnerd user id. Clients authenticate with the Subsonic scheme (`u` plus `t`/`s`, or `u` plus `p`, plain or `enc:` hex) against the app password. A wrong credential gets Subsonic error 40 and a missing one gets error 10, both with HTTP 200, as from Navidrome. Ratings are stored locally and mirrored into Navidrome (not built yet). Nothing syncs with wn-cloud.
 - **Cloud.** The state after `wn-server login`. The owner account carries the waxnerd user id, and wn-server holds the server credential. First-party clients exchange a device code for a session. The app password keeps working. Ratings sync with wn-cloud.
 
 Sessions are checked against wn-server's own store, so an outage of wn-cloud never refuses the owner. Sessions already issued and the app password keep working. New sessions through `POST /api/v1/session` fail until wn-cloud answers, because wn-cloud verifies the device code. Rating writes wait in the outbox. The web UI shows a banner "wn-cloud unreachable since <time>". There is no cut-off.
 
 Third-party Subsonic clients do not use the device code. They sign in with the owner's name and the app password through the Subsonic token scheme, and wn-server checks them locally. wn-cloud is not involved.
 
-The app password exists so that third-party Subsonic clients and the web UI work in both modes. `wn-server init` generates it. The web UI's account page shows it with copy and regenerate buttons. `wn-server password` prints it and `--reset` regenerates it, for a headless machine. The Subsonic token scheme needs the password itself, so the store holds it as-is, in a file readable only by the server's user.
+The app password exists so that third-party Subsonic clients and the web UI work in both modes. `wn-server init` generates it. The web UI's account page shows it with copy and regenerate buttons. `wn-server password` prints it and `--reset` regenerates it, for a headless machine. The Subsonic token scheme needs the password itself, so the store holds it as-is, in a file readable only by the server's user. An app password is 20 characters from `crypto/rand`, without the characters `0 O 1 l I`. A reset takes effect on the next request; `serve` does not need a restart.
 
 ### Web UI
 
@@ -163,6 +163,15 @@ make check    # fmt, lint, test, build
 make bundle   # Linux only: release tarball in dist/
 ```
 
+### Local-only quick start
+
+1. `wn-server init --folder /path/to/music`. It prints the owner name (`owner` unless `--name` is given) and the app password. Keep the password.
+2. `wn-server password` prints the password again. `wn-server password --reset` replaces it and prints the new one.
+3. `wn-server serve`. It runs in the foreground. Stop it with Ctrl-C or SIGTERM.
+4. In a Subsonic client, set the server to `http://<host>:4533`, the user name to the owner name, and the password to the app password.
+
+Navidrome's web UI is not reachable through wn-server. Only the Subsonic API (`/rest/*`) and public shares (`/share/*`) are.
+
 ### Release bundle
 
 A release is one tarball, `wn-server-<version>-linux-amd64.tar.gz`, for Linux on x86_64 with glibc. It holds one directory, `wn-server-<version>-linux-amd64/`, with these files:
@@ -203,7 +212,7 @@ The `release` workflow in `.github/workflows/release.yml` runs `make check` and 
 
 The data directory is `$XDG_DATA_HOME/wn-server`, or `~/.local/share/wn-server` when `XDG_DATA_HOME` is unset. The config file is `<data dir>/config.toml`. The `--config` flag sets another path. In that case the data directory is the directory that contains the file.
 
-`wn-server init --folder <path>` creates the data directory and a first `config.toml`. The flag repeats for more folders. `init` refuses to overwrite an existing config.
+`wn-server init --folder <path> [--name <owner name>]` creates the data directory, a first `config.toml`, and the store `wn-server.db` with the owner account. The folder flag repeats for more folders. `init` prints the owner name and the app password once. `init` refuses to run when the config exists or the store already has an owner, and then changes nothing.
 
 | Key | Default | Meaning |
 |---|---|---|
@@ -221,14 +230,15 @@ The data directory is `$XDG_DATA_HOME/wn-server`, or `~/.local/share/wn-server` 
 
 ## Navidrome supervisor
 
-`internal/navidrome` runs the child process. `wn-server serve` loads the config, runs the supervisor, and stops it on SIGINT or SIGTERM.
+`internal/navidrome` runs the child process. `wn-server serve` loads the config, opens the store, checks the Navidrome version, binds `listen`, runs the supervisor, and stops it on SIGINT or SIGTERM. It logs one line when the signal arrives and one when shutdown is complete.
 
-- **Version pin.** `navidrome.PinnedVersion` is `0.64.2`. When `serve` starts, the supervisor runs `<navidrome_bin> --version`, which prints the version without the `v` followed by the commit sha, for example `0.64.2 (101145742)`. If the version differs, `serve` exits with an error that names both versions.
+- **Version pin.** `navidrome.PinnedVersion` is `0.64.2`. When `serve` starts, before it binds `listen`, it runs `<navidrome_bin> --version`, which prints the version without the `v` followed by the commit sha, for example `0.64.2 (101145742)`. If the version differs, `serve` exits with an error that names both versions.
 - **Start.** The supervisor calls `Config.WriteNavidrome`, then runs `<navidrome_bin> -c <data dir>/navidrome.toml`. Each stdout and stderr line of the child goes to wn-server's log through `log/slog`, prefixed `navidrome:`.
 - **Ready.** The supervisor polls `http://127.0.0.1:<navidrome_port>/ping` every 250 ms until it answers 200. Navidrome runs database migrations before it answers, and a migration after a version bump can be slow. After 120 s without a 200 the supervisor stops the child and restarts it with backoff.
 - **Restart.** When the child exits unexpectedly, the supervisor restarts it after 1 s. The delay doubles on each further exit, up to 30 s, and resets after the child stayed up for 60 s. `RestartPolicy.Next` computes the delay.
 - **Stop.** The child runs in its own process group. On Linux the kernel also kills it when wn-server dies (`Pdeathsig`). On context cancellation the supervisor sends SIGTERM to the process group, waits up to 10 s, then sends SIGKILL.
 - **wn-server identity.** `navidrome.Identity` is `wn-server`. The first request after ready is `GET /app/` with `Remote-User: wn-server`. Navidrome creates a header user only on that route, and the first user it creates is admin. The supervisor reads `auth.isAdmin` from the config that response injects into the page and logs an error if wn-server's user is not admin. Later requests use the same header on the native API, which accepts it from the trusted source `127.0.0.1/32`.
+- **Owner's user.** After wn-server's identity exists, the supervisor lists `GET /api/user` and looks for a user whose `userName` is the owner's account id. If there is none, it calls `POST /api/user` with `userName` set to the account id, `name` set to the owner name, `isAdmin` true, and a random `password` that is not stored. A failure is logged and retried every 5 s; the proxy answers 503 until it succeeds.
 - **Library sync.** After ready, the supervisor lists `GET /api/library` and creates a library with `POST /api/library` (`{"name": ..., "path": ...}`) for each `music_folders` entry that has none. `sorted_dir` is expected to be library 1 already, because it is `MusicFolder`; the sync logs an error if it is not. A failed create does not stop the sync: every entry is attempted and the errors are reported together. Each library is named after the last path element, with a numeric suffix when the name is taken. Libraries that wn-server did not create are not changed or deleted.
 
 ## Repository layout

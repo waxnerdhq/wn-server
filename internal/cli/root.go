@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net"
 	"net/http"
@@ -20,6 +21,7 @@ import (
 	"github.com/waxnerdhq/wn-server/internal/config"
 	"github.com/waxnerdhq/wn-server/internal/navidrome"
 	"github.com/waxnerdhq/wn-server/internal/proxy"
+	"github.com/waxnerdhq/wn-server/internal/store"
 )
 
 // Version is set at build time with -ldflags "-X .../internal/cli.Version=...".
@@ -35,33 +37,129 @@ func newRootCmd() *cobra.Command {
 		SilenceErrors: true,
 	}
 	root.PersistentFlags().String("config", "", "path to config.toml (default: <data dir>/config.toml)")
-	root.AddCommand(newInitCmd(), newServeCmd(), newLoginCmd(), newMatchCmd(), newVersionCmd())
+	root.AddCommand(newInitCmd(), newServeCmd(), newPasswordCmd(), newLoginCmd(), newMatchCmd(), newVersionCmd())
 	return root
 }
 
 func newInitCmd() *cobra.Command {
-	var folders []string
+	var (
+		folders []string
+		name    string
+	)
 	cmd := &cobra.Command{
 		Use:   "init",
-		Short: "Create the data directory and a first config.toml",
+		Short: "Create the data directory, a first config.toml, and the owner account",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			flag, _ := cmd.Flags().GetString("config")
-			_, path, err := config.Paths(flag)
+			dataDir, path, err := config.Paths(flag)
 			if err != nil {
 				return err
+			}
+			ctx := cmd.Context()
+			dbPath := store.Path(dataDir)
+			// Refuse before writing anything when the owner already exists.
+			if _, err := os.Stat(dbPath); err == nil {
+				st, err := store.Open(ctx, dbPath)
+				if err != nil {
+					return err
+				}
+				_, err = st.Owner(ctx)
+				st.Close()
+				if err == nil {
+					return fmt.Errorf("%s already has an owner account; use `wn-server password` instead of running init again", dbPath)
+				}
+				if !errors.Is(err, store.ErrNotFound) {
+					return err
+				}
 			}
 			c, err := config.Init(path, folders)
 			if err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "wrote %s\n", path)
-			fmt.Fprintf(cmd.OutOrStdout(), "data directory: %s\n", c.DataDir)
+			st, err := store.Open(ctx, store.Path(c.DataDir))
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+			owner, err := st.CreateOwner(ctx, name)
+			if err != nil {
+				return err
+			}
+			out := cmd.OutOrStdout()
+			fmt.Fprintf(out, "wrote %s\n", path)
+			fmt.Fprintf(out, "data directory: %s\n", c.DataDir)
+			fmt.Fprintf(out, "owner name: %s\n", owner.Name)
+			fmt.Fprintf(out, "app password: %s\n", owner.AppPassword)
+			fmt.Fprintln(out, "Use this name and app password to sign in from Subsonic clients. `wn-server password` prints the password again.")
 			return nil
 		},
 	}
 	cmd.Flags().StringArrayVar(&folders, "folder", nil, "music folder (repeatable, at least one)")
+	cmd.Flags().StringVar(&name, "name", "owner", "owner account name, used as the Subsonic user name")
 	_ = cmd.MarkFlagRequired("folder")
+	return cmd
+}
+
+// openStore opens the store in dataDir. It does not create one: a missing
+// store means init has not run.
+func openStore(ctx context.Context, dataDir string) (*store.Store, error) {
+	path := store.Path(dataDir)
+	if _, err := os.Stat(path); errors.Is(err, fs.ErrNotExist) {
+		return nil, fmt.Errorf("%s not found; run `wn-server init --folder <music folder>`", path)
+	}
+	return store.Open(ctx, path)
+}
+
+// openOwner opens the store and returns it with the owner account.
+func openOwner(ctx context.Context, dataDir string) (*store.Store, store.Account, error) {
+	st, err := openStore(ctx, dataDir)
+	if err != nil {
+		return nil, store.Account{}, err
+	}
+	owner, err := st.Owner(ctx)
+	if err != nil {
+		st.Close()
+		if errors.Is(err, store.ErrNotFound) {
+			err = fmt.Errorf("%s has no owner account; move config.toml aside and run `wn-server init` again", store.Path(dataDir))
+		}
+		return nil, store.Account{}, err
+	}
+	return st, owner, nil
+}
+
+func newPasswordCmd() *cobra.Command {
+	var reset bool
+	cmd := &cobra.Command{
+		Use:   "password",
+		Short: "Print the owner's app password",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			flag, _ := cmd.Flags().GetString("config")
+			dataDir, _, err := config.Paths(flag)
+			if err != nil {
+				return err
+			}
+			ctx := cmd.Context()
+			st, owner, err := openOwner(ctx, dataDir)
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+			pw := owner.AppPassword
+			if reset {
+				if pw, err = store.NewAppPassword(); err != nil {
+					return err
+				}
+				if err := st.SetAppPassword(ctx, owner.ID, pw); err != nil {
+					return err
+				}
+			}
+			fmt.Fprintln(cmd.OutOrStdout(), pw)
+			return nil
+		},
+	}
+	cmd.Flags().BoolVar(&reset, "reset", false, "generate a new app password; the old one stops working")
 	return cmd
 }
 
@@ -82,7 +180,12 @@ func newServeCmd() *cobra.Command {
 			}
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
-			return serve(ctx, c, slog.Default())
+			st, owner, err := openOwner(ctx, c.DataDir)
+			if err != nil {
+				return err
+			}
+			defer st.Close()
+			return serve(ctx, c, st, owner, slog.Default())
 		},
 	}
 }
@@ -94,15 +197,19 @@ const shutdownGrace = 5 * time.Second
 // or one of them fails. The supervisor outlives the HTTP server: on a signal
 // the server drains first, then Navidrome is stopped, so in-flight streams
 // are not cut by an early SIGTERM to Navidrome.
-func serve(ctx context.Context, c *config.Config, logger *slog.Logger) error {
+func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.Account, logger *slog.Logger) error {
+	// Check the binary before binding, so a mismatch logs no listening line.
+	if err := navidrome.VerifyBinary(ctx, c.NavidromeBin); err != nil {
+		return err
+	}
 	ln, err := net.Listen("tcp", c.Listen)
 	if err != nil {
 		return err
 	}
-	sup := navidrome.NewSupervisor(c, logger)
+	sup := navidrome.NewSupervisor(c, navidrome.Account{ID: owner.ID, Name: owner.Name}, logger)
 	target := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(c.NavidromePort))}
 	srv := &http.Server{
-		Handler:           proxy.New(target, sup.Ready(), logger),
+		Handler:           proxy.New(target, sup.Ready(), st, logger),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -124,9 +231,12 @@ func serve(ctx context.Context, c *config.Config, logger *slog.Logger) error {
 
 	select {
 	case <-ctx.Done():
+		logger.Info("signal received; shutting down")
 		shutdownServer()
 		cancelSup()
-		return <-supDone
+		err := <-supDone
+		logger.Info("shutdown complete")
+		return err
 	case err := <-supDone:
 		shutdownServer()
 		if err == nil {
