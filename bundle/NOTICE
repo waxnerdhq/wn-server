@@ -1,0 +1,30 @@
+wn-server release bundle
+
+wn-server is licensed under the GNU General Public License version 3.
+See LICENSE.
+
+This bundle also contains the following programs, each as a separate
+executable under its own licence. Their source code is available from the
+listed projects at the version recorded in bundle/versions.env of the
+wn-server source.
+
+navidrome
+  Navidrome music server. GNU General Public License version 3.
+  https://github.com/navidrome/navidrome
+
+beets
+  beets music library manager, packaged with pex as a self-contained
+  executable. MIT License. https://github.com/beetbox/beets
+  The executable also contains:
+  - CPython from python-build-standalone. Python Software Foundation
+    License. https://github.com/astral-sh/python-build-standalone
+  - the Python dependencies of beets, pyacoustid (MIT), and requests
+    (Apache License 2.0), each under its own licence as recorded in its
+    package metadata.
+
+fpcalc
+  Chromaprint fingerprint calculator, statically linked with FFmpeg.
+  As a whole it is licensed under the GNU Lesser General Public
+  License version 2.1. Chromaprint's own code is MIT. FFmpeg is LGPL-2.1
+  or later.
+  https://github.com/acoustid/chromaprint

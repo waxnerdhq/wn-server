@@ -1,0 +1,2 @@
+beets plugins shipped with wn-server. The generated beets config lists this
+directory in pluginpath. The wn_candidates plugin (WAX-938) goes here.
