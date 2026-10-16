@@ -136,3 +136,28 @@ func TestLoadRejectsListenPortEqualToNavidromePort(t *testing.T) {
 		t.Fatalf("got %v, want a port-clash error", err)
 	}
 }
+
+func TestLoadRejectsSortedDirOverlap(t *testing.T) {
+	dir := t.TempDir()
+	music := t.TempDir()
+	// sorted_dir inside the music folder, through a symlink to it.
+	link := filepath.Join(dir, "link")
+	if err := os.Symlink(music, link); err != nil {
+		t.Fatal(err)
+	}
+	inside := filepath.Join(link, "sorted")
+	_, err := Load(writeConfig(t, dir, "music_folders = ['"+music+"']\nsorted_dir = '"+inside+"'\n"))
+	if err == nil || !strings.Contains(err.Error(), "is inside music folder") || !strings.Contains(err.Error(), inside) || !strings.Contains(err.Error(), music) {
+		t.Fatalf("got %v, want a sorted_dir inside error", err)
+	}
+	// sorted_dir that contains the music folder.
+	sorted := t.TempDir()
+	nested := filepath.Join(sorted, "music")
+	if err := os.Mkdir(nested, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err = Load(writeConfig(t, dir, "music_folders = ['"+nested+"']\nsorted_dir = '"+sorted+"'\n"))
+	if err == nil || !strings.Contains(err.Error(), "contains music folder") || !strings.Contains(err.Error(), nested) {
+		t.Fatalf("got %v, want a sorted_dir contains error", err)
+	}
+}

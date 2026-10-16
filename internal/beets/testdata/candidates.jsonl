@@ -1,0 +1,7 @@
+{"folder": "/music/Boards of Canada/Geogaddi", "tags": {"artist": "Boards of Canada", "album": "Geogaddi", "year": 2002, "track_count": 23}, "decision": "applied", "candidates": [{"release_id": "4b8a8d08-8d2d-4c8f-9a3e-1c2b3d4e5f60", "artist": "Boards of Canada", "album": "Geogaddi", "year": 2002, "label": "Warp Records", "distance": 0.012}, {"release_id": "9f1e2d3c-4b5a-6978-8a9b-0c1d2e3f4a5b", "artist": "Boards of Canada", "album": "Geogaddi", "year": 2002, "label": "Music70", "distance": 0.087}], "copied_to": "/data/sorted/Boards of Canada/Geogaddi"}
+{"folder": "/music/Unknown/Rip 2004", "tags": {"artist": "Various", "album": "Rip 2004", "year": 0, "track_count": 11}, "decision": "skipped", "candidates": [{"release_id": "1a2b3c4d-5e6f-7081-92a3-b4c5d6e7f809", "artist": "Various Artists", "album": "Rip It Up 2004", "year": 2004, "label": "", "distance": 0.41}]}
+
+{"folder": "/music/Sigur Rós/( )", "tags": {"artist": "Sigur Rós", "album": "( )", "year": 2002, "track_count": 8}, "decision": "duplicate", "candidates": [{"release_id": "7c6b5a49-3827-4161-a5b4-c3d2e1f0a9b8", "artist": "Sigur Rós", "album": "( )", "year": 2002, "label": "Fat Cat Records", "distance": 0.02}]}
+{"folder": "/music/Empty", "tags": {"artist": "", "album": "", "year": 0, "track_count": 2}, "decision": "skipped", "candidates": []}
+{"folder": "/music/Broken", "tags": {}, "decision": "error", "candidates": [], "error": "ValueError: empty album for album id 7"}
+{"folder": "/music/Truncated", "tags": {"artist": "Trunc

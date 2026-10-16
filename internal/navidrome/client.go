@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strconv"
 	"time"
@@ -135,4 +136,45 @@ func (c *Client) ListLibraries(ctx context.Context) ([]Library, error) {
 func (c *Client) CreateLibrary(ctx context.Context, name, path string) error {
 	_, err := c.do(ctx, http.MethodPost, "/api/library", map[string]string{"name": name, "path": path})
 	return err
+}
+
+// subsonicAPIVersion is the Subsonic API version wn-server sends on /rest.
+const subsonicAPIVersion = "1.16.1"
+
+// StartScan starts a scan of all libraries. Navidrome's native API has no
+// scan route, so this calls the Subsonic route /rest/startScan, which is
+// admin only. wn-server's identity is admin, and Navidrome accepts the
+// Remote-User header on /rest from the trusted source. Navidrome answers once
+// the scan has started and scans in the background.
+func (c *Client) StartScan(ctx context.Context) error {
+	q := url.Values{"v": {subsonicAPIVersion}, "c": {Identity}, "f": {"json"}}
+	data, err := c.do(ctx, http.MethodGet, "/rest/startScan?"+q.Encode(), nil)
+	if err != nil {
+		return err
+	}
+	return subsonicError(data)
+}
+
+// subsonicError returns the error in a Subsonic JSON response. Navidrome
+// sends Subsonic errors with HTTP status 200.
+func subsonicError(data []byte) error {
+	var resp struct {
+		R struct {
+			Status string `json:"status"`
+			Error  *struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			} `json:"error"`
+		} `json:"subsonic-response"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return fmt.Errorf("decode subsonic response: %w", err)
+	}
+	if resp.R.Status == "ok" {
+		return nil
+	}
+	if resp.R.Error != nil {
+		return fmt.Errorf("subsonic error %d: %s", resp.R.Error.Code, resp.R.Error.Message)
+	}
+	return fmt.Errorf("subsonic status %q", resp.R.Status)
 }

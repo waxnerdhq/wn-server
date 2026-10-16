@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 
 	"github.com/pelletier/go-toml/v2"
 )
@@ -175,7 +176,40 @@ func (c *Config) validate() error {
 	if !filepath.IsAbs(c.SortedDir) {
 		return fmt.Errorf("sorted_dir %q must be an absolute path", c.SortedDir)
 	}
+	// beets writes into sorted_dir and never into the music folders. The two
+	// must not overlap.
+	sorted := resolvePath(c.SortedDir)
+	for _, f := range c.MusicFolders {
+		music := resolvePath(f)
+		if within(sorted, music) {
+			return fmt.Errorf("sorted_dir %q is inside music folder %q", c.SortedDir, f)
+		}
+		if within(music, sorted) {
+			return fmt.Errorf("sorted_dir %q contains music folder %q", c.SortedDir, f)
+		}
+	}
 	return nil
+}
+
+// resolvePath returns the cleaned absolute path with symlinks resolved. A
+// path that does not exist yet is resolved through its nearest existing
+// parent.
+func resolvePath(path string) string {
+	path = filepath.Clean(path)
+	if real, err := filepath.EvalSymlinks(path); err == nil {
+		return real
+	}
+	parent := filepath.Dir(path)
+	if parent == path {
+		return path
+	}
+	return filepath.Join(resolvePath(parent), filepath.Base(path))
+}
+
+// within reports whether path is dir or below it.
+func within(path, dir string) bool {
+	rel, err := filepath.Rel(dir, path)
+	return err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 // ValidateMusicFolders checks that there is at least one folder and that each
