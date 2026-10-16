@@ -193,7 +193,9 @@ A test in `internal/navidrome` fails when `NAVIDROME_VERSION` in `bundle/version
 
 beets is packaged with pex as a scie (`--scie eager`). The executable contains a python-build-standalone interpreter, so the target machine needs no Python. pex resolves the pinned packages once at build time, so the output does not depend on the build host's Python. PyInstaller was not chosen because it freezes the build host's interpreter and needs per-package hooks. On its first run the `beets` executable unpacks itself into `~/.cache/nce`, or into `$SCIE_BASE` when that is set.
 
-`bundle/build.sh <output dir>` builds the tarball and a `.sha256` file next to it. It runs on Linux and needs Go, curl, tar, sha256sum, and uv. uv supplies the Python that pex runs under. On Linux x86_64 the script runs each binary once to check its version, and checks that beets loads the `chroma` plugin. `make bundle` calls the script with `dist` as the output directory.
+`bundle/build.sh <output dir>` builds the tarball and a `.sha256` file next to it. It runs on Linux and needs `bash`, GNU `tar`, `curl`, `sha256sum`, `install`, `grep`, `mktemp`, Go, and `uv`. uv supplies the Python that pex runs under. On Linux x86_64 the script runs each binary once to check its version, and checks that beets loads the `chroma` plugin. `make bundle` calls the script with `dist` as the output directory.
+
+On first run `beets` unpacks its interpreter into `~/.cache/nce`. On a machine where the service user has no writable home, set `SCIE_BASE` to a writable directory.
 
 The `release` workflow in `.github/workflows/release.yml` runs `make check` and `bundle/build.sh` on every pull request to `main` and on every push of a `v*` tag. Each run uploads the tarball as a workflow artifact. A tag run also creates a GitHub release for the tag and attaches the tarball. Pull request runs publish nothing.
 

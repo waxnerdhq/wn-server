@@ -6,14 +6,17 @@ on:
   push:
     tags: ['v*']
 
-permissions:
-  contents: read
+permissions: {}
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
 
 jobs:
   bundle:
     runs-on: ubuntu-latest
     permissions:
-      contents: write
+      contents: read
     steps:
       - uses: actions/checkout@v7
         with:
@@ -52,10 +55,24 @@ jobs:
             dist/wn-server-${{ env.VERSION }}-linux-amd64.tar.gz.sha256
           if-no-files-found: error
 
+  release:
+    needs: bundle
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ github.ref_name }}
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: wn-server-${{ github.ref_name }}-linux-amd64
+          path: dist
+
       - name: Publish release
-        if: github.ref_type == 'tag'
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: |
           gh release create "$VERSION" \
             --title "$VERSION" \

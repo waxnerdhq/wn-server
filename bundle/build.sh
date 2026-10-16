@@ -5,7 +5,7 @@
 #
 # Produces <output dir>/wn-server-<version>-linux-amd64.tar.gz. VERSION in the
 # environment sets <version>; otherwise it is `git describe`, as in the
-# Makefile. Requires bash, go, curl, tar, sha256sum, and uv. Runs on Linux.
+# Makefile. Requires bash, GNU tar, curl, sha256sum, install, grep, mktemp, go, and uv. Runs on Linux.
 set -euo pipefail
 
 if [[ $# -ne 1 ]]; then
