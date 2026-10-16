@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestStore(t *testing.T) {
@@ -74,5 +75,49 @@ func TestNewAppPassword(t *testing.T) {
 	}
 	if len(pw) != AppPasswordLength || strings.ContainsAny(pw, "0O1lI") {
 		t.Fatalf("password %q", pw)
+	}
+}
+
+func TestServerCredential(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	owner, err := s.CreateOwner(ctx, "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ServerCredential(ctx); !errors.Is(err, ErrNoServerCredential) {
+		t.Fatalf("ServerCredential on empty store = %v, want ErrNoServerCredential", err)
+	}
+	if _, _, found, err := s.ServerRegistration(ctx); err != nil || found {
+		t.Fatalf("ServerRegistration on empty store = %v, %v; want not found", found, err)
+	}
+	want := ServerCredential{Token: "wn_t", ServerID: "srv", WaxnerdUserID: "user", CreatedAt: time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)}
+	if err := s.Link(ctx, owner.ID, want); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.ServerCredential(ctx); err != nil || got != want {
+		t.Fatalf("ServerCredential = %+v, %v; want %+v", got, err, want)
+	}
+	if got, _ := s.Owner(ctx); got.WaxnerdUserID != "user" {
+		t.Fatalf("owner waxnerd user id = %q", got.WaxnerdUserID)
+	}
+	if err := s.Unlink(ctx, owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ServerCredential(ctx); !errors.Is(err, ErrNoServerCredential) {
+		t.Fatalf("ServerCredential after Unlink = %v", err)
+	}
+	if id, user, found, err := s.ServerRegistration(ctx); err != nil || !found || id != "srv" || user != "user" {
+		t.Fatalf("ServerRegistration after Unlink = %q, %q, %v, %v", id, user, found, err)
+	}
+	if got, _ := s.Owner(ctx); got.WaxnerdUserID != "" {
+		t.Fatalf("owner waxnerd user id after Unlink = %q", got.WaxnerdUserID)
+	}
+	if err := s.LinkOwner(ctx, "nobody", "user"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("LinkOwner(nobody) = %v, want ErrNotFound", err)
 	}
 }

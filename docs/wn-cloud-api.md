@@ -139,7 +139,13 @@ Errors:
 | 401 | `{ "error": "Invalid or expired token" }` | The token is unknown or already revoked. |
 | 400 | `{ "error": "Only a CLI token can be revoked here", "code": "invalid_request" }` | The bearer is a GoTrue access token. |
 
-wn-server rule: wn-server calls it in one case. When `wn-server login` replaces the server credential, it revokes the old one. A 401 counts as success. When wn-cloud is unreachable, wn-server forgets the token locally and does not retry.
+wn-server rule: wn-server calls it in three cases:
+
+- `wn-server logout` revokes the stored server credential.
+- `wn-server login` revokes the new token when `POST /servers` fails.
+- `wn-server login` revokes the new token when the local store write fails.
+
+A 401 or any other error, including an unreachable wn-cloud, is a warning on stderr. The command continues, and the credential is removed locally. wn-server does not retry.
 
 ## Sign-in with a displayed code (WAX-933)
 
@@ -232,7 +238,7 @@ Errors:
 |---|---|---|
 | 400 | `invalid_request` | `name` is missing or malformed. |
 
-wn-server rule: `wn-server login` calls it once, when the data directory has no server id. It stores the returned `id`. When a server id is already stored, `login` only replaces the server credential, after checking that `user.id` in the `POST /cli/token` answer equals the stored owner's waxnerd user id. On an unreachable wn-cloud, `login` stops and the owner runs it again. It does not retry on its own, so it does not register twice.
+wn-server rule: `wn-server login` calls it once, when the data directory has no server id. It stores the returned `id`. When a server id is already stored, `login` only replaces the server credential, after checking that `user.id` in the `POST /cli/token` answer equals the stored owner's waxnerd user id. On an unreachable wn-cloud, `login` stops and the owner runs it again. It does not retry on its own, so it does not register twice. `wn-server logout` removes the token and keeps the server id, so a later `login` by the same owner reuses it. When the waxnerd user differs from the stored one, `login` calls `POST /servers` and replaces the stored server id.
 
 ## Device codes (WAX-932)
 

@@ -37,7 +37,7 @@ func newRootCmd() *cobra.Command {
 		SilenceErrors: true,
 	}
 	root.PersistentFlags().String("config", "", "path to config.toml (default: <data dir>/config.toml)")
-	root.AddCommand(newInitCmd(), newServeCmd(), newPasswordCmd(), newLoginCmd(), newMatchCmd(), newVersionCmd())
+	root.AddCommand(newInitCmd(), newServeCmd(), newPasswordCmd(), newLoginCmd(), newLogoutCmd(), newStatusCmd(), newMatchCmd(), newVersionCmd())
 	return root
 }
 
@@ -268,16 +268,6 @@ func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.A
 			err = errors.New("http server stopped")
 		}
 		return err
-	}
-}
-
-func newLoginCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "login",
-		Short: "Sign in with a waxnerd account and register this server",
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return errNotImplemented
-		},
 	}
 }
 
