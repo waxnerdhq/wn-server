@@ -81,7 +81,7 @@ func TestRenderNavidrome(t *testing.T) {
 	for _, want := range []string{
 		"Address = '127.0.0.1'",
 		"Port = 5000",
-		"MusicFolder = '" + music + "'",
+		"MusicFolder = '" + c.SortedDir + "'",
 		"DataFolder = '" + filepath.Join(dir, "navidrome") + "'",
 		"[ExtAuth]",
 		"UserHeader = 'Remote-User'",
