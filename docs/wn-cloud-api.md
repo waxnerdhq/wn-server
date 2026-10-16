@@ -4,6 +4,8 @@ This document lists every wn-cloud route that wn-server calls, and the wn-cloud 
 
 **Scope.** v1 of wn-server has one account, the owner. wn-server holds one wn-cloud credential: the server credential, which is the owner's CLI token. Listeners, invites, and server membership are not in v1. Listener sign-in depends on waxnerd relay, which is not specified yet. The routes for listeners return after relay is specified.
 
+Third-party Subsonic clients do not use the device code. They sign in with the owner's name and app password through the Subsonic token scheme, checked by wn-server locally. wn-cloud is not involved.
+
 First-party clients (wn-mobile, wn-desktop) never hold or send a wn-cloud CLI token to wn-server. The owner gets a short device code from a page at wn-cloud, and the client posts it to wn-server. wn-server verifies the code with the server credential. See [Device codes](#device-codes-wax-932).
 
 Each route is marked **existing** (it is in v2 today and is described as it behaves now) or **new (WAX-nnn)** (wn-cloud does not have it yet).
@@ -284,6 +286,7 @@ Errors:
 | 400 | `invalid_request` | `:id` is not a UUID, the body is not valid JSON, or `code` is missing or does not have 8 characters of the alphabet after removing `-` and whitespace. |
 | 400 | `invalid_grant` | The code is unknown, expired, already used, or issued for another server. |
 | 403 | `forbidden` | The bearer's user does not own `:id`, or no server has that id. |
+| 429 | `rate_limited` | The server credential made more than 10 failed verify calls in 10 minutes. |
 
 The route also answers the 401 and 403 answers of the bearer check. Only a 200 answer spends a code.
 
@@ -292,6 +295,7 @@ wn-server rule: see [Rules](#rules-wn-server-applies), device code exchange.
 ### wn-cloud changes for WAX-932
 
 - A `device_codes` table: `id`, `server_id` (references `servers`, deleted with the server), `user_id` (references `users`), `code_hash` (unique), `created_at`, `expires_at` (`created_at` plus 10 minutes), and `used_at` (null until the code is spent).
+- The verify route allows at most 10 failed calls per server credential per 10 minutes, answers 429 beyond that, and logs the failures.
 - The verify route spends the code in one statement: `update device_codes set used_at = now() where code_hash = $1 and server_id = $2 and used_at is null and expires_at > now() returning user_id`. No row means `invalid_grant`.
 - The device code page described above, with a link to it from wn-cloud's account pages.
 
@@ -456,6 +460,8 @@ These restate decisions in `README.md` in terms of the routes above.
 - When wn-cloud is unreachable, the session request fails with an error that tells the client to try again later or to use the app password. The code is not spent unless wn-cloud answered 200, so the owner can retry with the same code while it is valid. If wn-cloud spent the code but the answer was lost, the owner gets a new code.
 - In local-only mode `POST /api/v1/session` is refused. There is no server credential to verify with.
 - Requests that carry a wn-server session or an app password never call wn-cloud.
+- Rate limits. wn-server allows at most 5 failed `POST /api/v1/session` attempts per client address per 10 minutes and at most 30 failed attempts in total per 10 minutes. It answers 429 beyond either limit, without calling wn-cloud. wn-cloud allows at most 10 failed verify calls per server credential per 10 minutes, answers 429, and logs them.
+- Code space. A code has 8 characters from a 32-symbol alphabet without ambiguous glyphs, about 40 bits, and lives 10 minutes. Guessing is infeasible under these limits.
 
 ### Background tick
 
@@ -489,6 +495,4 @@ These restate decisions in `README.md` in terms of the routes above.
 
 1. **Deletions in `GET /ratings?since=`.** v2 deletes a rating row on clear, so a delta cannot show clears. Recommendation: wn-cloud records clears in a `rating_deletions` table (user, subject, `deleted_at`, and the cleared rating's `id` and `created_at`) and merges it into the change feed. Rating the subject again removes its deletion row, so the feed shows each subject once. The alternative, a full re-pull on each tick, costs more as libraries grow.
 2. **Ordering of outbox writes against changes made elsewhere.** A queued `PUT` replayed after an outage overwrites a newer value set in wn-cloud's web pages meanwhile. Recommendation: accept this for v1. Later, `PUT` can take an optional `updated_at` from the client, and wn-cloud ignores a write older than the stored value.
-3. **Intervals.** The README gives no interval for the outbox drain and the rating sync. This document uses 5 minutes for the background tick that runs the drain and the sync. Recommendation: 5 minutes.
-4. **Rating write order.** The README (Ratings and favorites) writes wn-cloud first and then the local store. This document writes the local store first and then wn-cloud, with the outbox on failure. Recommendation: store first, then wn-cloud. Update the README.
-5. **Guessing device codes.** A code has 40 bits and lives 10 minutes, and `POST /api/v1/session` is reachable from the network. Recommendation: wn-server limits failed session requests, for example to 10 per minute per client address.
+3. **Intervals.** The README and this document both use 5 minutes for the background tick that runs the outbox drain and the rating sync. Recommendation: 5 minutes.

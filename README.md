@@ -68,7 +68,7 @@ Owner setup for cloud mode, once, on the server machine (`wn-server login`). Thi
 First-party clients (wn-mobile, wn-desktop), once per device, in cloud mode:
 
 1. The owner, signed in at wn-cloud in any browser, opens the device code page. It lists the owner's servers. The owner picks this server, and wn-cloud shows a short code. The code is bound to the server id, single use, and expires after 10 minutes. It carries no other rights.
-2. The owner enters the code in the client. The client posts it to `POST /api/v1/session` on wn-server.
+2. The owner enters the code in the client. The client posts it to `POST /api/v1/session` on wn-server. Failed attempts are rate limited.
 3. wn-server verifies the code with wn-cloud's `POST /servers/:id/device-codes/verify`, authenticated with the server credential. wn-cloud spends the code and answers with the id of the user who issued it.
 4. wn-server checks that the user id equals the owner's waxnerd user id. Any other user is refused.
 5. wn-server returns a wn-server session token. It is long-lived, revocable by the owner, and valid only at this server. It grants nothing at wn-cloud. Nothing from wn-cloud is stored for the device. No client holds a wn-cloud CLI token.
@@ -93,6 +93,8 @@ wn-server runs in one of two modes. The difference is whether `wn-server login` 
 
 Sessions are checked against wn-server's own store, so an outage of wn-cloud never refuses the owner. Sessions already issued and the app password keep working. New sessions through `POST /api/v1/session` fail until wn-cloud answers, because wn-cloud verifies the device code. Rating writes wait in the outbox. The web UI shows a banner "wn-cloud unreachable since <time>". There is no cut-off.
 
+Third-party Subsonic clients do not use the device code. They sign in with the owner's name and the app password through the Subsonic token scheme, and wn-server checks them locally. wn-cloud is not involved.
+
 The app password exists so that third-party Subsonic clients and the web UI work in both modes. `wn-server init` generates it. The web UI's account page shows it with copy and regenerate buttons. `wn-server password` prints it and `--reset` regenerates it, for a headless machine. The Subsonic token scheme needs the password itself, so the store holds it as-is, in a file readable only by the server's user.
 
 ### Web UI
@@ -107,8 +109,10 @@ wn-cloud is the source of truth for the owner's ratings. Ratings use waxnerd's 1
 
 Navidrome's own rating is an integer from 0 to 5 and cannot hold half stars, so it is not the source of truth. Two write paths share one code path in wn-server:
 
-- The proxy intercepts the Subsonic `setRating`, `star`, and `unstar` calls. It asks Navidrome for the item's MBID, writes the value to wn-cloud with the server credential (or to a local outbox when wn-cloud is unreachable), updates the local store, and forwards the original call to Navidrome so its stars mirror the value. Whole stars only, because Subsonic carries integers.
-- `PUT` and `DELETE` on `/api/v1/ratings/:subsonicId` take half stars and a like level from first-party clients. They write wn-cloud and the store, then send Navidrome a rounded `setRating`: half stars round up, love maps to starred. First-party clients never call wn-cloud's rating routes directly.
+- The proxy intercepts the Subsonic `setRating`, `star`, and `unstar` calls. It asks Navidrome for the item's MBID, writes the value to the local store, then to wn-cloud with the server credential (or to a local outbox when wn-cloud is unreachable), and forwards the original call to Navidrome so its stars mirror the value. Whole stars only, because Subsonic carries integers.
+- `PUT` and `DELETE` on `/api/v1/ratings/:subsonicId` take half stars and a like level from first-party clients. They write the local store, then wn-cloud (or the outbox when wn-cloud is unreachable), then send Navidrome a rounded `setRating`: half stars round up, love maps to starred. First-party clients never call wn-cloud's rating routes directly.
+
+Changes made at wn-cloud reach wn-server through the reconcile loop. On every background tick (every 5 minutes) wn-server calls `GET /ratings?since=` with its stored cursor, writes new values and deletions into the local store, and pushes rounded stars and the starred flag into Navidrome. A rating changed on waxnerd.com appears in every client after the next tick.
 
 Navidrome's smart playlists and third-party clients see the rounded stars. First-party clients read the full values from `GET /api/v1/ratings`.
 
@@ -140,6 +144,7 @@ The `chroma` plugin (AcoustID fingerprints) raises match confidence. wn-server s
 - Third-party Subsonic clients authenticate with the owner's app password. First-party clients use wn-server sessions. (WAX-945, decision 1, amended 2026-10-16)
 - First-party clients obtain a wn-server session with a short-lived single-use code that wn-cloud issues bound to the server. No client holds a wn-cloud CLI token. (2026-10-16)
 - Listeners, invites, and membership are deferred until waxnerd relay is specified, because listener sign-in depends on it. v1 has one account, the owner. (2026-10-16)
+- Device-code exchange is rate limited at wn-server and at wn-cloud. (2026-10-16)
 - Half stars are written through wn-server's own rating API, not through Subsonic. (WAX-945, decision 3)
 - beets candidates come from a shipped beets plugin that writes JSON, not from the import log. (WAX-945, decision 4)
 - One AcoustID application key is compiled in, with a config override. (WAX-945, decision 5)
