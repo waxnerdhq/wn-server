@@ -78,8 +78,8 @@
 
   <!-- 7 wn-server -> navidrome -->
   <line x1="520" y1="465" x2="1200" y2="465" class="msg"/>
-  <text x="860" y="443" class="lbl"><tspan class="num">7</tspan> first request with header Remote-User: &lt;owner id&gt;</text>
-  <text x="860" y="458" class="lbl" font-size="11">Navidrome creates the owner user; the first user is admin</text>
+  <text x="860" y="443" class="lbl"><tspan class="num">7</tspan> at serve start, after ready: native API POST /api/user</text>
+  <text x="860" y="458" class="lbl" font-size="11">creates the owner's Navidrome user with admin set; not created from a header request</text>
 
   <!-- 8 wn-server -> navidrome -->
   <line x1="520" y1="515" x2="1200" y2="515" class="msg"/>
@@ -117,15 +117,16 @@
 
   <!-- 1 client -> wn-cloud -->
   <line x1="180" y1="790" x2="860" y2="790" class="msg"/>
-  <text x="520" y="780" class="lbl"><tspan class="num">1</tspan> sign in once with the waxnerd account → wn-cloud token (wn_…, non-expiring)</text>
+  <text x="520" y="780" class="lbl"><tspan class="num">1</tspan> owner, signed in at wn-cloud in a browser, picks this server → device code (10 min, single use)</text>
 
   <!-- 2 client -> wn-server: session exchange -->
   <line x1="180" y1="830" x2="520" y2="830" class="msgb"/>
-  <text x="350" y="820" class="lbl"><tspan class="num">2</tspan> POST /api/v1/session, Bearer &lt;wn-cloud token&gt;</text>
+  <text x="350" y="820" class="lbl"><tspan class="num">2</tspan> POST /api/v1/session with the device code</text>
 
   <!-- 3 wn-server -> wn-cloud -->
   <line x1="520" y1="870" x2="860" y2="870" class="msg"/>
-  <text x="690" y="860" class="lbl"><tspan class="num">3</tspan> GET /me → user id; refused unless it is the owner's</text>
+  <text x="690" y="848" class="lbl"><tspan class="num">3</tspan> POST /servers/:id/device-codes/verify</text>
+  <text x="690" y="863" class="lbl" font-size="11">server credential; code spent → user id; refused unless the owner's</text>
 
   <!-- 4 wn-server -> client: session -->
   <line x1="520" y1="910" x2="180" y2="910" class="msgb"/>
@@ -144,6 +145,6 @@
   <text x="690" y="1020" class="lbl"><tspan class="num">7</tspan> response passes back through wn-server to the client</text>
 
   <rect x="70" y="1055" width="1240" height="46" rx="6" class="note"/>
-  <text x="90" y="1074" class="notet">Sessions keep working when wn-cloud is unreachable, and the owner is never refused. New sessions need GET /me and fail then; the app password always works.</text>
-  <text x="90" y="1092" class="notet">wn-server does not store the client's wn-cloud token. v1 has one account, the owner; listeners return after waxnerd relay is specified.</text>
+  <text x="90" y="1074" class="notet">Sessions keep working when wn-cloud is unreachable, and the owner is never refused. New sessions need wn-cloud to verify the code and fail then; the app password always works.</text>
+  <text x="90" y="1092" class="notet">No client holds a wn-cloud token, and nothing from wn-cloud is stored for the device. v1 has one account, the owner; listeners return after waxnerd relay is specified.</text>
 </svg>

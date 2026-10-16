@@ -16,6 +16,9 @@
 // error=access_denied. With display=code it answers 200 with the page that
 // shows the sign-in code, in an element with id "code", or a page without one
 // on cancel.
+//
+// The device code page is wn-cloud UI and has no route here. IssueDeviceCode
+// stands in for it.
 package stub
 
 import (
@@ -36,7 +39,13 @@ import (
 	"unicode"
 )
 
-const codeTTL = 120 * time.Second
+const (
+	codeTTL       = 120 * time.Second
+	deviceCodeTTL = 10 * time.Minute
+)
+
+// deviceAlphabet is the alphabet of device codes: no 0, O, 1, or I.
+const deviceAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 // cursorLayout is the time part of the GET /ratings cursor and of the rating
 // timestamps: RFC 3339 in UTC with microseconds, as Postgres stores them.
@@ -48,6 +57,7 @@ var (
 	codeRE      = regexp.MustCompile(`^[A-Za-z0-9_-]{43}$`)
 	verifierRE  = regexp.MustCompile(`^[A-Za-z0-9._~-]{43,128}$`)
 	portRE      = regexp.MustCompile(`^[0-9]{4,5}$`)
+	deviceRE    = regexp.MustCompile("^[" + deviceAlphabet + "]{8}$")
 	uuidRE      = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
 	kinds       = map[string]bool{"release_group": true, "release": true, "track": true, "artist": true}
 )
@@ -66,6 +76,12 @@ type authCode struct {
 type server struct {
 	id, ownerID, name string
 	createdAt         time.Time
+}
+
+type deviceCode struct {
+	serverID, userID string
+	expires          time.Time
+	used             bool
 }
 
 type ratingKey struct{ userID, kind, mbid string }
@@ -87,6 +103,7 @@ type Stub struct {
 	tokens   map[string]string // bearer to user id
 	codes    map[string]*authCode
 	servers  map[string]*server
+	devices  map[string]*deviceCode // SHA-256 of the normalized code
 	ratings  map[ratingKey]*rating
 	signedIn string
 	last     time.Time
@@ -100,13 +117,14 @@ func New() *Stub {
 		tokens:  map[string]string{},
 		codes:   map[string]*authCode{},
 		servers: map[string]*server{},
+		devices: map[string]*deviceCode{},
 		ratings: map[ratingKey]*rating{},
 	}
-	s.mux.HandleFunc("GET /me", s.me)
 	s.mux.HandleFunc("GET /cli/auth", s.cliAuth)
 	s.mux.HandleFunc("POST /cli/token", s.cliToken)
 	s.mux.HandleFunc("POST /cli/logout", s.cliLogout)
 	s.mux.HandleFunc("POST /servers", s.createServer)
+	s.mux.HandleFunc("POST /servers/{id}/device-codes/verify", s.verifyDeviceCode)
 	s.mux.HandleFunc("PUT /ratings/{kind}/{mbid}", s.putRating)
 	s.mux.HandleFunc("DELETE /ratings/{kind}/{mbid}", s.deleteRating)
 	s.mux.HandleFunc("GET /ratings/{kind}/{mbid}", s.getRating)
@@ -145,6 +163,32 @@ func (s *Stub) AddServer(id, ownerID, name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.servers[id] = &server{id: id, ownerID: ownerID, name: name, createdAt: s.now()}
+}
+
+// IssueDeviceCode issues a device code for the server as the user, as the
+// device code page does, and returns it in the displayed form XXXX-XXXX.
+func (s *Stub) IssueDeviceCode(serverID, userID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	b := make([]byte, 8)
+	_, _ = rand.Read(b)
+	for i := range b {
+		b[i] = deviceAlphabet[int(b[i])%len(deviceAlphabet)]
+	}
+	code := string(b[:4]) + "-" + string(b[4:])
+	s.devices[deviceHash(normalizeDeviceCode(code))] = &deviceCode{
+		serverID: serverID, userID: userID, expires: s.now().Add(deviceCodeTTL),
+	}
+	return code
+}
+
+// ExpireDeviceCode makes a code issued by IssueDeviceCode expired.
+func (s *Stub) ExpireDeviceCode(code string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if dc := s.devices[deviceHash(normalizeDeviceCode(code))]; dc != nil {
+		dc.expires = s.now().Add(-time.Second)
+	}
 }
 
 // AddRating sets a user's rating. halfStars 0 and likeLevel "" mean null.
@@ -250,14 +294,6 @@ func validLabel(label string) bool {
 }
 
 // Existing routes.
-
-func (s *Stub) me(w http.ResponseWriter, r *http.Request) {
-	u := s.authUser(w, r)
-	if u == nil {
-		return
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"id": u.id, "email": u.email, "createdAt": u.createdAt})
-}
 
 func (s *Stub) cliAuth(w http.ResponseWriter, r *http.Request) {
 	bad := func() {
@@ -417,6 +453,60 @@ func (s *Stub) createServer(w http.ResponseWriter, r *http.Request) {
 	srv := &server{id: newUUID(), ownerID: u.id, name: name, createdAt: s.now()}
 	s.servers[srv.id] = srv
 	writeJSON(w, http.StatusCreated, serverJSON(srv))
+}
+
+// Device codes.
+
+// normalizeDeviceCode removes "-" and whitespace and upper-cases the rest.
+func normalizeDeviceCode(code string) string {
+	return strings.ToUpper(strings.Map(func(c rune) rune {
+		if c == '-' || unicode.IsSpace(c) {
+			return -1
+		}
+		return c
+	}, code))
+}
+
+func deviceHash(normalized string) string {
+	sum := sha256.Sum256([]byte(normalized))
+	return base64.RawURLEncoding.EncodeToString(sum[:])
+}
+
+func (s *Stub) verifyDeviceCode(w http.ResponseWriter, r *http.Request) {
+	u := s.authUser(w, r)
+	if u == nil {
+		return
+	}
+	id := r.PathValue("id")
+	if !uuidRE.MatchString(id) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "id is not a UUID")
+		return
+	}
+	srv := s.servers[id]
+	if srv == nil || srv.ownerID != u.id {
+		writeError(w, http.StatusForbidden, "forbidden", "The caller does not own this server")
+		return
+	}
+	var body struct {
+		Code string `json:"code"`
+	}
+	if err := decode(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", "The body is not valid JSON")
+		return
+	}
+	code := normalizeDeviceCode(body.Code)
+	if !deviceRE.MatchString(code) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "code must be 8 characters of the device code alphabet")
+		return
+	}
+	dc := s.devices[deviceHash(code)]
+	if dc == nil || dc.used || dc.serverID != srv.id || s.now().After(dc.expires) || s.users[dc.userID] == nil {
+		writeError(w, http.StatusBadRequest, "invalid_grant", "The code is invalid, expired or already used")
+		return
+	}
+	dc.used = true
+	issuer := s.users[dc.userID]
+	writeJSON(w, http.StatusOK, map[string]string{"user_id": issuer.id, "email": issuer.email})
 }
 
 // Ratings.

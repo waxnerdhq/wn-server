@@ -1,24 +1,28 @@
 # wn-cloud API used by wn-server
 
-This document lists every wn-cloud route that wn-server calls, and the routes wn-cloud must offer so that first-party clients can sign in to a wn-server. wn-cloud is the v2 server in `../v2`. wn-cloud is implemented against this document. The package `internal/wncloud/stub` serves the same routes from memory for tests.
+This document lists every wn-cloud route that wn-server calls, and the wn-cloud page that issues device codes so that first-party clients can sign in to a wn-server. wn-cloud is the v2 server in `../v2`. wn-cloud is implemented against this document. The package `internal/wncloud/stub` serves the same routes from memory for tests.
 
 **Scope.** v1 of wn-server has one account, the owner. wn-server holds one wn-cloud credential: the server credential, which is the owner's CLI token. Listeners, invites, and server membership are not in v1. Listener sign-in depends on waxnerd relay, which is not specified yet. The routes for listeners return after relay is specified.
+
+First-party clients (wn-mobile, wn-desktop) never hold or send a wn-cloud CLI token to wn-server. The owner gets a short device code from a page at wn-cloud, and the client posts it to wn-server. wn-server verifies the code with the server credential. See [Device codes](#device-codes-wax-932).
 
 Each route is marked **existing** (it is in v2 today and is described as it behaves now) or **new (WAX-nnn)** (wn-cloud does not have it yet).
 
 | Route | Status | Called by |
 |---|---|---|
-| `GET /me` | existing | wn-server |
-| `GET /cli/auth` | existing | the browser, opened by `wn` and first-party apps. wn-server uses the variant below. |
+| `GET /cli/auth` | existing | the browser, opened by `wn`. wn-server uses the variant below. |
 | `POST /cli/token` | existing | wn-server |
 | `POST /cli/logout` | existing | wn-server |
 | `GET /cli/auth` with `display=code` | new (WAX-933) | the browser, opened by the owner at a URL that `wn-server login` prints |
 | `POST /cli/token` without `redirect_port` | new (WAX-933) | wn-server |
 | `POST /servers` | new (WAX-932) | wn-server |
+| `POST /servers/:id/device-codes/verify` | new (WAX-932) | wn-server |
 | `PUT /ratings/:kind/:mbid` | new (WAX-942) | wn-server |
 | `DELETE /ratings/:kind/:mbid` | new (WAX-942) | wn-server |
 | `GET /ratings/:kind/:mbid` | new (WAX-942) | wn-server |
 | `GET /ratings?since=` | new (WAX-942) | wn-server |
+
+wn-cloud also serves the device code page (WAX-932) in the browser. wn-server does not call it. `GET /me` exists in v2, and wn-server does not call it.
 
 wn-server calls the rating routes with the server credential, so the ratings are the owner's. Clients send ratings to wn-server, through the Subsonic `setRating`, `star`, and `unstar` calls or through wn-server's own `/api/v1/ratings` route. wn-server relays each write to wn-cloud. Clients never call wn-cloud's rating routes directly, so the local store and the Navidrome mirror stay on one code path (README, Ratings and favorites).
 
@@ -37,13 +41,13 @@ Every authenticated request sends `Authorization: Bearer <token>`. wn-cloud acce
 
 | Kind | Form | Where wn-server gets it |
 |---|---|---|
-| CLI token | `wn_` followed by 43 base64url characters. Opaque. Does not expire. Ends when revoked with `POST /cli/logout`. | `POST /cli/token`, in `wn-server login`. A first-party client also sends its own CLI token to wn-server in `POST /api/v1/session`. wn-server resolves that token with `GET /me` and does not store it. |
+| CLI token | `wn_` followed by 43 base64url characters. Opaque. Does not expire. Ends when revoked with `POST /cli/logout`. | `POST /cli/token`, in `wn-server login`. |
 | GoTrue access token | An HS256 JWT signed by GoTrue. Expires after the GoTrue lifetime (one hour by default). | wn-server does not obtain these. The existing routes accept them, so they are listed for completeness. |
-| Server credential | The owner's CLI token. It is the only credential wn-server holds at wn-cloud. `wn-server login` obtains it once, on the server machine, from `POST /cli/token`, with the server's name as its label. wn-server sends it on `POST /servers` and on the rating routes. | `wn-server login`. wn-server stores it in its data directory, readable only by the server's user. |
+| Server credential | The owner's CLI token. It is the only credential wn-server holds at wn-cloud. `wn-server login` obtains it once, on the server machine, from `POST /cli/token`, with the server's name as its label. wn-server sends it on `POST /servers`, on `POST /servers/:id/device-codes/verify`, and on the rating routes. | `wn-server login`. wn-server stores it in its data directory, readable only by the server's user. |
 
-A first-party client's token reaches wn-server only in `POST /api/v1/session`. wn-server calls `GET /me` with it once and does not keep it.
+No client sends a wn-cloud token to wn-server. A first-party client sends a device code instead.
 
-The server credential is an ordinary CLI token. wn-cloud does not tell it apart from other CLI tokens of the owner. Each route authenticates the bearer as a user. `POST /servers` makes that user the owner of the new server. The rating routes read and write that user's ratings.
+The server credential is an ordinary CLI token. wn-cloud does not tell it apart from other CLI tokens of the owner. Each route authenticates the bearer as a user. `POST /servers` makes that user the owner of the new server. The verify route checks that that user owns the server. The rating routes read and write that user's ratings.
 
 A bearer on the routes marked "bearer" below goes through v2's `requireUser` check:
 
@@ -55,31 +59,13 @@ A bearer on the routes marked "bearer" below goes through v2's `requireUser` che
 
 ## Existing routes
 
-### `GET /me` (existing)
+### `GET /me` (existing, not called by wn-server)
 
-Returns the user that the bearer belongs to. wn-server uses it to resolve a client's CLI token to a waxnerd user id.
-
-- Authentication: bearer (CLI token or GoTrue access token).
-- Query parameters: none.
-- Request body: none.
-
-Response 200. The body is the row of `users`. Note the camelCase `createdAt`.
-
-```json
-{
-  "id": "0192f1c4-3b7e-7d2a-9a10-5f4e2c1b8a70",
-  "email": "owner@example.com",
-  "createdAt": "2026-10-01T09:30:12.345Z"
-}
-```
-
-Errors: the 401 and 403 answers of the bearer check above.
-
-wn-server rule: see [Rules](#rules-wn-server-applies), `GET /me`.
+Returns the user that the bearer belongs to. wn-server does not call it. `POST /cli/token` returns the user together with the token, and device codes are checked with `POST /servers/:id/device-codes/verify`. The stub does not serve it.
 
 ### `GET /cli/auth` (existing)
 
-The approval page of the CLI sign-in. wn-server does not call it and does not use this form of it. `wn` and first-party apps use it. wn-server uses the code display variant in [Sign-in with a displayed code](#sign-in-with-a-displayed-code-wax-933), which builds on this page.
+The approval page of the CLI sign-in. wn-server does not call it and does not use this form of it. `wn` uses it. wn-server uses the code display variant in [Sign-in with a displayed code](#sign-in-with-a-displayed-code-wax-933), which builds on this page.
 
 - Authentication: a browser session at wn-cloud. A visitor without one is redirected to `/login` and returns to the page afterwards with the query intact.
 - Query parameters:
@@ -130,7 +116,7 @@ Errors:
 | 400 | `{ "error", "code": "invalid_request" }` | A field is missing or malformed. |
 | 400 | `{ "error", "code": "invalid_grant" }` | The code is unknown, expired, or used; the verifier does not hash to the challenge; or the port differs. A live code is consumed even when the exchange fails. |
 | 400 | Express's default error page | The body is not valid JSON. |
-| 403 | `{ "error": "Cross-origin request rejected" }` | The `Origin` header of the POST names another site. v2's `sameOrigin` middleware (`web/src/session.ts`, near lines 73-86) answers it. This can reach first-party apps that send an `Origin` header. |
+| 403 | `{ "error": "Cross-origin request rejected" }` | The `Origin` header of the POST names another site. v2's `sameOrigin` middleware (`web/src/session.ts`, near lines 73-86) answers it. This can reach programs that send an `Origin` header. |
 
 wn-server sends this route a code from the code display, without `redirect_port`. See [`POST /cli/token` without `redirect_port`](#post-clitoken-without-redirect_port-new-wax-933).
 
@@ -151,7 +137,7 @@ Errors:
 | 401 | `{ "error": "Invalid or expired token" }` | The token is unknown or already revoked. |
 | 400 | `{ "error": "Only a CLI token can be revoked here", "code": "invalid_request" }` | The bearer is a GoTrue access token. |
 
-wn-server rule: wn-server calls it in one case. When `wn-server login` replaces the server credential, it revokes the old one. It never revokes a token that a first-party client sent in `POST /api/v1/session`, because the client still uses that token. A 401 counts as success. When wn-cloud is unreachable, wn-server forgets the token locally and does not retry.
+wn-server rule: wn-server calls it in one case. When `wn-server login` replaces the server credential, it revokes the old one. A 401 counts as success. When wn-cloud is unreachable, wn-server forgets the token locally and does not retry.
 
 ## Sign-in with a displayed code (WAX-933)
 
@@ -244,7 +230,70 @@ Errors:
 |---|---|---|
 | 400 | `invalid_request` | `name` is missing or malformed. |
 
-wn-server rule: `wn-server login` calls it once, when the data directory has no server id. It stores the returned `id`. When a server id is already stored, `login` only replaces the server credential, after checking with `GET /me` that the new token belongs to the stored owner. On an unreachable wn-cloud, `login` stops and the owner runs it again. It does not retry on its own, so it does not register twice.
+wn-server rule: `wn-server login` calls it once, when the data directory has no server id. It stores the returned `id`. When a server id is already stored, `login` only replaces the server credential, after checking that `user.id` in the `POST /cli/token` answer equals the stored owner's waxnerd user id. On an unreachable wn-cloud, `login` stops and the owner runs it again. It does not retry on its own, so it does not register twice.
+
+## Device codes (WAX-932)
+
+First-party clients (wn-mobile, wn-desktop) obtain a wn-server session with a device code. wn-cloud issues the code for one server. The client never holds a wn-cloud token.
+
+1. The owner, signed in at wn-cloud in any browser, opens the device code page and picks a server.
+2. wn-cloud shows a code. The owner enters it in the client.
+3. The client posts the code to wn-server's `POST /api/v1/session`.
+4. wn-server calls `POST /servers/:id/device-codes/verify` with the server credential. wn-cloud spends the code and answers with the user who issued it.
+5. wn-server checks that the user id is the owner's and issues its own session. Nothing from wn-cloud is stored for the device.
+
+### The device code page (wn-cloud UI)
+
+The page is part of wn-cloud's web UI. wn-server does not call it. The suggested path is `/devices`.
+
+- Authentication: a browser session at wn-cloud. A visitor without one is redirected to `/login` and returns to the page afterwards.
+- The page lists the servers that the signed-in user owns, by name. The user picks one and presses a button. wn-cloud creates a code and shows it with a copy button and the time it expires.
+- The code is bound to the server id and to the user who issued it. It is valid for 10 minutes and for one verification. It carries no other rights.
+- The code is 8 characters from `ABCDEFGHJKLMNPQRSTUVWXYZ23456789`, shown as two groups of 4 joined by `-`, for example `K7QM-4XPA`. wn-cloud ignores case, `-`, and whitespace when it reads a code.
+- Issuing a code does not revoke earlier unused codes. Each expires on its own.
+- wn-cloud stores the SHA-256 hash of the code without `-` and in upper case, never the code itself.
+
+### `POST /servers/:id/device-codes/verify` (new, WAX-932)
+
+Checks a device code for a server and spends it.
+
+- Authentication: bearer (the server credential). The bearer's user must own `:id`.
+- Path parameters: `:id`, the server id from `POST /servers`, a UUID.
+- Query parameters: none.
+- Request body:
+
+```json
+{ "code": "K7QM-4XPA" }
+```
+
+- Response 200. The code is spent.
+
+```json
+{
+  "user_id": "0192f1c4-3b7e-7d2a-9a10-5f4e2c1b8a70",
+  "email": "owner@example.com"
+}
+```
+
+`user_id` and `email` belong to the user who issued the code.
+
+Errors:
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `invalid_request` | `:id` is not a UUID, the body is not valid JSON, or `code` is missing or does not have 8 characters of the alphabet after removing `-` and whitespace. |
+| 400 | `invalid_grant` | The code is unknown, expired, already used, or issued for another server. |
+| 403 | `forbidden` | The bearer's user does not own `:id`, or no server has that id. |
+
+The route also answers the 401 and 403 answers of the bearer check. Only a 200 answer spends a code.
+
+wn-server rule: see [Rules](#rules-wn-server-applies), device code exchange.
+
+### wn-cloud changes for WAX-932
+
+- A `device_codes` table: `id`, `server_id` (references `servers`, deleted with the server), `user_id` (references `users`), `code_hash` (unique), `created_at`, `expires_at` (`created_at` plus 10 minutes), and `used_at` (null until the code is spent).
+- The verify route spends the code in one statement: `update device_codes set used_at = now() where code_hash = $1 and server_id = $2 and used_at is null and expires_at > now() returning user_id`. No row means `invalid_grant`.
+- The device code page described above, with a link to it from wn-cloud's account pages.
 
 ## Ratings (WAX-942)
 
@@ -397,14 +446,16 @@ wn-server rule: see [Rules](#rules-wn-server-applies), rating sync.
 
 These restate decisions in `README.md` in terms of the routes above.
 
-### `GET /me`
+### Device code exchange
 
-- wn-server calls `GET /me` when a first-party client exchanges its CLI token for a session (`POST /api/v1/session`), and in `wn-server login` to confirm the owner.
-- At the exchange, wn-server compares the returned `id` with the owner's waxnerd user id. Any other user is refused. wn-server does not store the client's token.
-- wn-server caches a 200 answer in memory for 5 minutes, keyed by the SHA-256 hash of the token. Requests during that window do not call wn-cloud.
-- A 401 or 403 answer is not cached and not retried. The sign-in is refused.
-- When wn-cloud is unreachable, the exchange fails with an error that tells the client to use the app password. wn-server does not retry.
-- Requests that carry a wn-server session or an app password never call `GET /me`.
+- wn-server calls `POST /servers/:id/device-codes/verify` once for each `POST /api/v1/session`, with the stored server id and the server credential. It does not retry. Nothing is cached.
+- On 200, wn-server compares `user_id` with the owner's waxnerd user id. Any other user is refused. wn-server stores nothing from the answer.
+- On 400, the session request is refused. The client tells the owner to get a new code.
+- On 401, the session request is refused, and the web UI tells the owner to run `wn-server login` again.
+- On 403, the session request is refused and wn-server logs an error. The stored server id does not belong to the server credential's user.
+- When wn-cloud is unreachable, the session request fails with an error that tells the client to try again later or to use the app password. The code is not spent unless wn-cloud answered 200, so the owner can retry with the same code while it is valid. If wn-cloud spent the code but the answer was lost, the owner gets a new code.
+- In local-only mode `POST /api/v1/session` is refused. There is no server credential to verify with.
+- Requests that carry a wn-server session or an app password never call wn-cloud.
 
 ### Background tick
 
@@ -415,7 +466,7 @@ These restate decisions in `README.md` in terms of the routes above.
 
 - Sessions already issued keep working. wn-server checks them against its own store and does not call wn-cloud.
 - The owner is never refused because wn-cloud is unreachable. There is no cut-off.
-- `POST /api/v1/session` and `wn-server login` fail while wn-cloud is unreachable, because they need `GET /me` or `POST /cli/token`. The app password keeps working.
+- `POST /api/v1/session` and `wn-server login` fail while wn-cloud is unreachable, because they need `POST /servers/:id/device-codes/verify` or `POST /cli/token`. The app password keeps working.
 - Rating writes go to the outbox.
 - wn-server records the time of the first unreachable answer after a successful call. The web UI shows a banner "wn-cloud unreachable since <time>" until a call succeeds.
 
@@ -426,6 +477,7 @@ These restate decisions in `README.md` in terms of the routes above.
 - wn-server drains the outbox on each tick, oldest entry first. A 2xx answer removes the entry. An unreachable answer stops the drain until the next tick.
 - A 400 answer removes the entry and logs it. A 401 answer keeps the entry and stops the drain. The entry is sent once `wn-server login` has stored a working server credential.
 - In local-only mode wn-server writes to the local store only. Nothing is queued.
+- When `wn-server login` first runs, wn-server queues every rating in the local store in the outbox. The next drain sends them to wn-cloud with the server credential, so they become the owner's ratings.
 
 ### Rating sync
 
@@ -437,7 +489,6 @@ These restate decisions in `README.md` in terms of the routes above.
 
 1. **Deletions in `GET /ratings?since=`.** v2 deletes a rating row on clear, so a delta cannot show clears. Recommendation: wn-cloud records clears in a `rating_deletions` table (user, subject, `deleted_at`, and the cleared rating's `id` and `created_at`) and merges it into the change feed. Rating the subject again removes its deletion row, so the feed shows each subject once. The alternative, a full re-pull on each tick, costs more as libraries grow.
 2. **Ordering of outbox writes against changes made elsewhere.** A queued `PUT` replayed after an outage overwrites a newer value set in wn-cloud's web pages meanwhile. Recommendation: accept this for v1. Later, `PUT` can take an optional `updated_at` from the client, and wn-cloud ignores a write older than the stored value.
-3. **Intervals.** The README gives no `GET /me` cache time and no interval for the outbox drain and the rating sync. This document uses 5 minutes for the cache and for the background tick that runs the drain and the sync. Recommendation: 5 minutes.
+3. **Intervals.** The README gives no interval for the outbox drain and the rating sync. This document uses 5 minutes for the background tick that runs the drain and the sync. Recommendation: 5 minutes.
 4. **Rating write order.** The README (Ratings and favorites) writes wn-cloud first and then the local store. This document writes the local store first and then wn-cloud, with the outbox on failure. Recommendation: store first, then wn-cloud. Update the README.
-
-First-party apps obtain their tokens through wn-cloud's own flows (the loopback port or the code display), and this document does not constrain those.
+5. **Guessing device codes.** A code has 40 bits and lives 10 minutes, and `POST /api/v1/session` is reachable from the network. Recommendation: wn-server limits failed session requests, for example to 10 per minute per client address.

@@ -137,12 +137,6 @@ func TestRoutes(t *testing.T) {
 	}
 	owner := tok.Token
 
-	// GET /me.
-	var me map[string]any
-	if st := c.do("GET", "/me", owner, nil, &me); st != 200 || me["id"] != ownerID {
-		t.Fatalf("GET /me: %d %v", st, me)
-	}
-
 	// POST /servers.
 	var server struct {
 		ID string `json:"id"`
@@ -177,7 +171,58 @@ func TestRoutes(t *testing.T) {
 	if st := c.do("POST", "/cli/logout", owner, nil, nil); st != 204 {
 		t.Fatalf("POST /cli/logout: %d", st)
 	}
-	if st := c.do("GET", "/me", owner, nil, nil); st != 401 {
-		t.Fatalf("GET /me after logout: %d", st)
+	if st := c.do("GET", "/ratings", owner, nil, nil); st != 401 {
+		t.Fatalf("GET /ratings after logout: %d", st)
+	}
+}
+
+func TestDeviceCodes(t *testing.T) {
+	const (
+		otherID  = "0192f1c4-3b7e-7d2a-9a10-5f4e2c1b8a71"
+		serverID = "0193a0b2-77c1-7f00-8e21-3d9c5b6a4f10"
+		owner    = "wn_owner"
+		other    = "wn_other"
+	)
+	s := stub.New()
+	s.AddUser(ownerID, "owner@example.com")
+	s.AddUser(otherID, "other@example.com")
+	s.AddToken(owner, ownerID)
+	s.AddToken(other, otherID)
+	s.AddServer(serverID, ownerID, "living-room")
+	srv := httptest.NewServer(s)
+	defer srv.Close()
+	c := &client{t: t, base: srv.URL, http: srv.Client()}
+	path := "/servers/" + serverID + "/device-codes/verify"
+
+	// Success, then the spent code.
+	code := s.IssueDeviceCode(serverID, ownerID)
+	var got struct {
+		UserID string `json:"user_id"`
+		Email  string `json:"email"`
+	}
+	if st := c.do("POST", path, owner, map[string]string{"code": strings.ToLower(code)}, &got); st != 200 || got.UserID != ownerID || got.Email != "owner@example.com" {
+		t.Fatalf("verify: %d %+v", st, got)
+	}
+	var e struct {
+		Code string `json:"code"`
+	}
+	if st := c.do("POST", path, owner, map[string]string{"code": code}, &e); st != 400 || e.Code != "invalid_grant" {
+		t.Fatalf("verify spent code: %d %+v", st, e)
+	}
+
+	// An expired code.
+	code = s.IssueDeviceCode(serverID, ownerID)
+	s.ExpireDeviceCode(code)
+	if st := c.do("POST", path, owner, map[string]string{"code": code}, &e); st != 400 || e.Code != "invalid_grant" {
+		t.Fatalf("verify expired code: %d %+v", st, e)
+	}
+
+	// A credential that does not own the server. The code stays valid.
+	code = s.IssueDeviceCode(serverID, ownerID)
+	if st := c.do("POST", path, other, map[string]string{"code": code}, &e); st != 403 || e.Code != "forbidden" {
+		t.Fatalf("verify with another credential: %d %+v", st, e)
+	}
+	if st := c.do("POST", path, owner, map[string]string{"code": code}, nil); st != 200 {
+		t.Fatalf("verify after 403: %d", st)
 	}
 }
