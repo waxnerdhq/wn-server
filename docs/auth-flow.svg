@@ -31,7 +31,7 @@
   <!-- lane headers -->
   <rect x="70" y="60" width="220" height="56" rx="6" class="lane"/>
   <text x="180" y="83" class="lt">Owner's browser</text>
-  <text x="180" y="103" class="ls">on the same machine</text>
+  <text x="180" y="103" class="ls">on any device</text>
 
   <rect x="410" y="60" width="220" height="56" rx="6" class="lane-ws"/>
   <text x="520" y="83" class="lt">wn-server</text>
@@ -53,8 +53,8 @@
 
   <!-- 1 wn-server -> browser -->
   <line x1="520" y1="160" x2="180" y2="160" class="msg"/>
-  <text x="350" y="150" class="lbl"><tspan class="num">1</tspan> opens &lt;wn-cloud&gt;/cli/auth with state, PKCE challenge,</text>
-  <text x="350" y="176" class="lbl">port and label; redirect = http://127.0.0.1:PORT/callback</text>
+  <text x="350" y="150" class="lbl"><tspan class="num">1</tspan> prints &lt;wn-cloud&gt;/cli/auth with state, PKCE challenge,</text>
+  <text x="350" y="176" class="lbl">label and display=code; the owner opens it in a browser</text>
 
   <!-- 2 browser -> wn-cloud -->
   <line x1="180" y1="215" x2="860" y2="215" class="msg"/>
@@ -62,11 +62,11 @@
 
   <!-- 3 wn-cloud -> browser -->
   <line x1="860" y1="265" x2="180" y2="265" class="msg"/>
-  <text x="520" y="255" class="lbl"><tspan class="num">3</tspan> redirect to 127.0.0.1:PORT/callback?code=…</text>
+  <text x="520" y="255" class="lbl"><tspan class="num">3</tspan> page shows the sign-in code with a copy button</text>
 
   <!-- 4 browser -> wn-server -->
   <line x1="180" y1="315" x2="520" y2="315" class="msg"/>
-  <text x="350" y="305" class="lbl"><tspan class="num">4</tspan> GET /callback?code=…</text>
+  <text x="350" y="305" class="lbl"><tspan class="num">4</tspan> owner pastes the code at the login prompt</text>
 
   <!-- 5 wn-server -> wn-cloud -->
   <line x1="520" y1="365" x2="860" y2="365" class="msg"/>
@@ -78,8 +78,8 @@
 
   <!-- 7 wn-server -> navidrome -->
   <line x1="520" y1="465" x2="1200" y2="465" class="msg"/>
-  <text x="860" y="443" class="lbl"><tspan class="num">7</tspan> first request with header Remote-User: &lt;owner id&gt;</text>
-  <text x="860" y="458" class="lbl" font-size="11">Navidrome creates the owner user; the first user is admin</text>
+  <text x="860" y="443" class="lbl"><tspan class="num">7</tspan> at serve start, after ready: native API POST /api/user</text>
+  <text x="860" y="458" class="lbl" font-size="11">creates the owner's Navidrome user with admin set; not created from a header request</text>
 
   <!-- 8 wn-server -> navidrome -->
   <line x1="520" y1="515" x2="1200" y2="515" class="msg"/>
@@ -88,15 +88,15 @@
 
   <!-- note -->
   <rect x="70" y="575" width="1240" height="46" rx="6" class="note"/>
-  <text x="90" y="594" class="notet">Result: wn-server holds a wn-cloud CLI token as its server credential, and the only Navidrome API key. No browser, phone, or desktop app ever sees a Navidrome key or password.</text>
+  <text x="90" y="594" class="notet">Result: wn-server holds the owner's wn-cloud CLI token as its server credential, and the only Navidrome API key. No browser, phone, or desktop app ever sees a Navidrome key or password.</text>
   <text x="90" y="612" class="notet">Navidrome never listens on the network; every request reaches it through wn-server's proxy on loopback. Navidrome's own web UI is blocked at the proxy.</text>
 
   <!-- ===================== Section B ===================== -->
-  <text x="40" y="680" class="h">B. First-party clients  (wn-mobile, wn-desktop, the wn-server web UI). Third-party Subsonic clients use a name and app password instead.</text>
+  <text x="40" y="680" class="h">B. First-party clients  (wn-mobile, wn-desktop). The web UI and third-party Subsonic clients use the owner's name and app password instead.</text>
 
   <rect x="70" y="700" width="220" height="56" rx="6" class="lane"/>
   <text x="180" y="723" class="lt">Client app</text>
-  <text x="180" y="743" class="ls">owner or invited listener</text>
+  <text x="180" y="743" class="ls">the owner</text>
 
   <rect x="410" y="700" width="220" height="56" rx="6" class="lane-ws"/>
   <text x="520" y="723" class="lt">wn-server</text>
@@ -117,15 +117,16 @@
 
   <!-- 1 client -> wn-cloud -->
   <line x1="180" y1="790" x2="860" y2="790" class="msg"/>
-  <text x="520" y="780" class="lbl"><tspan class="num">1</tspan> sign in once with the waxnerd account → wn-cloud token (wn_…, non-expiring)</text>
+  <text x="520" y="780" class="lbl"><tspan class="num">1</tspan> owner, signed in at wn-cloud in a browser, picks this server → device code (10 min, single use)</text>
 
   <!-- 2 client -> wn-server: session exchange -->
   <line x1="180" y1="830" x2="520" y2="830" class="msgb"/>
-  <text x="350" y="820" class="lbl"><tspan class="num">2</tspan> POST /api/v1/session, Bearer &lt;wn-cloud token&gt;</text>
+  <text x="350" y="820" class="lbl"><tspan class="num">2</tspan> POST /api/v1/session with the device code</text>
 
   <!-- 3 wn-server -> wn-cloud -->
   <line x1="520" y1="870" x2="860" y2="870" class="msg"/>
-  <text x="690" y="860" class="lbl"><tspan class="num">3</tspan> GET /me → user; GET /servers/:id/members → owner or listener? (persisted)</text>
+  <text x="690" y="848" class="lbl"><tspan class="num">3</tspan> POST /servers/:id/device-codes/verify</text>
+  <text x="690" y="863" class="lbl" font-size="11">server credential; code spent → user id; refused unless the owner's</text>
 
   <!-- 4 wn-server -> client: session -->
   <line x1="520" y1="910" x2="180" y2="910" class="msgb"/>
@@ -144,6 +145,6 @@
   <text x="690" y="1020" class="lbl"><tspan class="num">7</tspan> response passes back through wn-server to the client</text>
 
   <rect x="70" y="1055" width="1240" height="46" rx="6" class="note"/>
-  <text x="90" y="1074" class="notet">Sessions keep working when wn-cloud is unreachable. New waxnerd sign-ins fail then; app passwords always work. After 30 days without a member refresh, listener sessions are refused until one succeeds.</text>
-  <text x="90" y="1092" class="notet">Invites are records in wn-cloud (server id, user id, role = listener). Revoking one ends the listener's sessions at the next member refresh, without touching Navidrome.</text>
+  <text x="90" y="1074" class="notet">Sessions keep working when wn-cloud is unreachable, and the owner is never refused. New sessions need wn-cloud to verify the code and fail then; the app password always works.</text>
+  <text x="90" y="1092" class="notet">No client holds a wn-cloud token, and nothing from wn-cloud is stored for the device. v1 has one account, the owner; listeners return after waxnerd relay is specified.</text>
 </svg>
