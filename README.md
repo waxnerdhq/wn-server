@@ -53,12 +53,12 @@ wn-cloud is the v2 rewrite of waxnerd (`../v2`): an Express server with GoTrue f
 
 Only wn-server talks to Navidrome. Clients authenticate with wn-cloud and never hold a Navidrome credential.
 
-Owner setup, once, on the server machine (`wn-server login`). This is wn-cloud's existing CLI sign-in flow:
+Owner setup, once, on the server machine (`wn-server login`). This is the code display variant of wn-cloud's CLI sign-in flow. Nothing redirects to wn-server, so it works on a headless machine:
 
-1. wn-server listens on a free loopback port and opens the browser at `<wn-cloud>/cli/auth` with a state, a PKCE challenge, the port, and a label naming the server.
-2. The owner signs in with their waxnerd account and approves.
-3. wn-cloud redirects the browser to `http://127.0.0.1:<port>/callback` with a code.
-4. wn-server posts the code and the PKCE verifier to `POST /cli/token` and receives a CLI token. That token is the server credential.
+1. wn-server prints a URL to `<wn-cloud>/cli/auth` with a state, a PKCE challenge, a label naming the server, and `display=code`.
+2. The owner opens the URL in a browser on any device, signs in with their waxnerd account, and approves.
+3. wn-cloud shows a sign-in code with a copy button. The owner pastes it at the `wn-server login` prompt.
+4. wn-server checks the state, posts the code and the PKCE verifier to `POST /cli/token`, and receives a CLI token. That token is the server credential.
 5. wn-server registers this server under the owner and receives a server id.
 6. wn-server creates the owner's Navidrome user through Navidrome's native API, with admin set explicitly. This lands with WAX-947. wn-server's own identity (`wn-server`) is already Navidrome's first user and its admin, created by the supervisor at startup (see Navidrome supervisor). The proxy must not forward any request to Navidrome before the supervisor reports ready, so that no client can become Navidrome's first user.
 
@@ -101,7 +101,7 @@ In cloud mode, invites are records in wn-cloud: server id, user id, role. Revoki
 
 ### Web UI
 
-wn-server serves its own web UI. The owner sees status, invites, and match review. Invited listeners get a reduced view. The UI signs in through a variant of wn-cloud's CLI sign-in flow in which the redirect goes to wn-server's own URL instead of a loopback port. wn-server exchanges the code, receives a token for that browser, and keeps it in a cookie session. wn-cloud must accept the registered URLs of a server as redirect targets, on the LAN and on the relay. In local-only mode, and as an alternative in cloud mode, the UI accepts the account name and app password.
+wn-server serves its own web UI. The owner sees status, invites, and match review. Invited listeners get a reduced view. The UI signs in through the code display variant of wn-cloud's CLI sign-in flow. It shows a link to wn-cloud's approval page and a form for the code. The user approves in any browser, copies the code that wn-cloud shows, and pastes it into the form. wn-server exchanges the code, receives a token for that browser, and keeps it in a cookie session. In local-only mode, and as an alternative in cloud mode, the UI accepts the account name and app password.
 
 Later, waxnerd relay (a paid wn-cloud feature) lets authorized users reach a wn-server from the public internet. wn-cloud redirects the user to the server, and the server's own web UI takes over. The web UI is built so that this needs no change on the server beyond being reachable.
 
@@ -135,6 +135,7 @@ The `chroma` plugin (AcoustID fingerprints) raises match confidence. wn-server s
 - Navidrome runs as a separate process, not as an imported Go library and not as a Navidrome Wasm plugin. A library would tie wn-server to Navidrome's internal wiring. A plugin cannot hook auth or run beets.
 - beets runs as a subprocess. It has no embedding story outside Python.
 - beets copies into a sorted directory and never modifies or moves the original files. Originals that were copied are hidden from Navidrome with a `.ndignore` marker. (2026-10-16)
+- Sign-in to a server uses a code that wn-cloud shows and the user pastes into wn-server, not a redirect to wn-server. A redirect fails for a headless server, for a browser on another device, and behind the relay. (2026-10-16)
 - wn-server is written in Go and ships as one static binary inside a release bundle that also carries Navidrome and beets.
 - wn-server is GPL-3.0. It is the free part of waxnerd. wn-cloud and the client apps are separate projects. A managed hosting service running wn-server carries no GPL obligation, since GPL-3.0 has no network clause. A closed-source desktop app may ship wn-server as a separate executable and talk to it over HTTP or the CLI; it may not import its Go packages or link it statically. Outside contributions will need a contributor agreement to keep relicensing possible.
 - Every route wn-server calls on wn-cloud is written down first in [docs/wn-cloud-api.md](docs/wn-cloud-api.md), and the stub server in `internal/wncloud/stub` serves the same routes from memory for tests. wn-cloud is implemented against the document. The document ends with open questions for the operator. (WAX-946)

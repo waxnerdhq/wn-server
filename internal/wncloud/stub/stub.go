@@ -11,8 +11,11 @@
 //	srv := httptest.NewServer(s)
 //
 // The approval page of the browser sign-in (GET /cli/auth) has no user
-// interface here. It redirects at once with a code for the user set by
-// SignInAs, or with error=access_denied when no user is set.
+// interface here. It approves at once as the user set by SignInAs, or cancels
+// when no user is set. With port it redirects with the code or with
+// error=access_denied. With display=code it answers 200 with the page that
+// shows the sign-in code, in an element with id "code", or a page without one
+// on cancel.
 package stub
 
 import (
@@ -21,8 +24,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"html"
 	"net/http"
-	"net/netip"
 	"net/url"
 	"regexp"
 	"sort"
@@ -58,14 +61,13 @@ type user struct {
 }
 
 type authCode struct {
-	userID, challenge, redirectURI, label string
-	port                                  int
-	expires                               time.Time
+	userID, challenge, label string
+	port                     int // 0 for a code-display code
+	expires                  time.Time
 }
 
 type server struct {
 	id, ownerID, name string
-	redirectURIs      []string
 	createdAt         time.Time
 	members           map[string]time.Time // listener user id to the time of the invite
 }
@@ -83,35 +85,32 @@ type rating struct {
 // Stub is an in-memory wn-cloud. It implements http.Handler. The zero value
 // is not usable; call New.
 type Stub struct {
-	mu           sync.Mutex
-	mux          *http.ServeMux
-	users        map[string]*user
-	tokens       map[string]string // bearer to user id
-	codes        map[string]*authCode
-	servers      map[string]*server
-	ratings      map[ratingKey]*rating
-	appRedirects map[string]bool
-	signedIn     string
-	last         time.Time
+	mu       sync.Mutex
+	mux      *http.ServeMux
+	users    map[string]*user
+	tokens   map[string]string // bearer to user id
+	codes    map[string]*authCode
+	servers  map[string]*server
+	ratings  map[ratingKey]*rating
+	signedIn string
+	last     time.Time
 }
 
 // New returns an empty stub.
 func New() *Stub {
 	s := &Stub{
-		mux:          http.NewServeMux(),
-		users:        map[string]*user{},
-		tokens:       map[string]string{},
-		codes:        map[string]*authCode{},
-		servers:      map[string]*server{},
-		ratings:      map[ratingKey]*rating{},
-		appRedirects: map[string]bool{},
+		mux:     http.NewServeMux(),
+		users:   map[string]*user{},
+		tokens:  map[string]string{},
+		codes:   map[string]*authCode{},
+		servers: map[string]*server{},
+		ratings: map[ratingKey]*rating{},
 	}
 	s.mux.HandleFunc("GET /me", s.me)
 	s.mux.HandleFunc("GET /cli/auth", s.cliAuth)
 	s.mux.HandleFunc("POST /cli/token", s.cliToken)
 	s.mux.HandleFunc("POST /cli/logout", s.cliLogout)
 	s.mux.HandleFunc("POST /servers", s.createServer)
-	s.mux.HandleFunc("PUT /servers/{id}/redirect-uris", s.putRedirectURIs)
 	s.mux.HandleFunc("GET /servers/{id}/members", s.listMembers)
 	s.mux.HandleFunc("POST /servers/{id}/invites", s.invite)
 	s.mux.HandleFunc("DELETE /servers/{id}/members/{userId}", s.removeMember)
@@ -150,15 +149,10 @@ func (s *Stub) AddToken(token, userID string) {
 }
 
 // AddServer registers a server under ownerID.
-func (s *Stub) AddServer(id, ownerID, name string, redirectURIs ...string) {
+func (s *Stub) AddServer(id, ownerID, name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.servers[id] = &server{
-		id: id, ownerID: ownerID, name: name,
-		redirectURIs: append([]string{}, redirectURIs...),
-		createdAt:    s.now(),
-		members:      map[string]time.Time{},
-	}
+	s.servers[id] = &server{id: id, ownerID: ownerID, name: name, createdAt: s.now(), members: map[string]time.Time{}}
 }
 
 // AddMember makes userID a listener of the server. It panics when the server
@@ -182,14 +176,6 @@ func (s *Stub) AddRating(userID, kind, mbid string, halfStars int, likeLevel str
 		ll = &likeLevel
 	}
 	s.setRating(userID, kind, strings.ToLower(mbid), hs, ll)
-}
-
-// AddAppRedirectURI adds a first-party app redirect URI that the browser
-// sign-in accepts without a server_id.
-func (s *Stub) AddAppRedirectURI(uri string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.appRedirects[uri] = true
 }
 
 // SignInAs sets the user that the approval page approves as. An empty id
@@ -293,24 +279,6 @@ func validLabel(label string) bool {
 	return true
 }
 
-func validRedirectURI(raw string) bool {
-	u, err := url.Parse(raw)
-	if err != nil || !u.IsAbs() || u.User != nil || u.RawQuery != "" || u.ForceQuery || u.Fragment != "" || u.Hostname() == "" {
-		return false
-	}
-	switch u.Scheme {
-	case "https":
-		return true
-	case "http":
-		host := u.Hostname()
-		if addr, err := netip.ParseAddr(host); err == nil {
-			return addr.IsLoopback() || addr.IsPrivate()
-		}
-		return strings.HasSuffix(host, ".local")
-	}
-	return false
-}
-
 // Existing routes.
 
 func (s *Stub) me(w http.ResponseWriter, r *http.Request) {
@@ -333,12 +301,11 @@ func (s *Stub) cliAuth(w http.ResponseWriter, r *http.Request) {
 		bad()
 		return
 	}
-	if q.Has("port") == q.Has("redirect_uri") {
+	if q.Has("port") == q.Has("display") {
 		bad()
 		return
 	}
 	code := &authCode{challenge: challenge, label: label}
-	var callback string
 	if q.Has("port") {
 		p := q.Get("port")
 		port, _ := strconv.Atoi(p)
@@ -347,46 +314,35 @@ func (s *Stub) cliAuth(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		code.port = port
-		callback = fmt.Sprintf("http://127.0.0.1:%d/callback", port)
-	} else {
-		uri := q.Get("redirect_uri")
-		if id := q.Get("server_id"); id != "" {
-			srv := s.servers[id]
-			if srv == nil || !contains(srv.redirectURIs, uri) {
-				bad()
-				return
-			}
-			if code.label == "" {
-				code.label = srv.name
-			}
-		} else if !s.appRedirects[uri] {
-			bad()
-			return
-		}
-		code.redirectURI = uri
-		callback = uri
+	} else if q.Get("display") != "code" {
+		bad()
+		return
 	}
 
-	result := url.Values{"state": {state}}
-	if s.signedIn == "" {
-		result.Set("error", "access_denied")
-	} else {
-		value := randomURLSafe()
+	var value string
+	if s.signedIn != "" {
+		value = randomURLSafe()
 		code.userID = s.signedIn
 		code.expires = s.now().Add(codeTTL)
 		s.codes[value] = code
+	}
+	if code.port == 0 {
+		w.Header().Set("Cache-Control", "no-store")
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		if value == "" {
+			_, _ = w.Write([]byte("<p>The sign-in was cancelled.</p>"))
+			return
+		}
+		_, _ = fmt.Fprintf(w, "<p>Your sign-in code:</p><output id=\"code\">%s</output>", html.EscapeString(value+"."+state))
+		return
+	}
+	result := url.Values{"state": {state}}
+	if value == "" {
+		result.Set("error", "access_denied")
+	} else {
 		result.Set("code", value)
 	}
-	http.Redirect(w, r, callback+"?"+result.Encode(), http.StatusSeeOther)
-}
-
-func contains(list []string, v string) bool {
-	for _, x := range list {
-		if x == v {
-			return true
-		}
-	}
-	return false
+	http.Redirect(w, r, fmt.Sprintf("http://127.0.0.1:%d/callback?", code.port)+result.Encode(), http.StatusSeeOther)
 }
 
 func (s *Stub) cliToken(w http.ResponseWriter, r *http.Request) {
@@ -407,26 +363,15 @@ func (s *Stub) cliToken(w http.ResponseWriter, r *http.Request) {
 		invalid("code_verifier must be 43 to 128 unreserved characters")
 		return
 	}
-	rawPort, hasPort := body["redirect_port"]
-	rawURI, hasURI := body["redirect_uri"]
-	if hasPort == hasURI {
-		invalid("send exactly one of redirect_port and redirect_uri")
-		return
-	}
-	port, uri := 0, ""
-	if hasPort {
+	// redirect_port is absent for a code-display code.
+	port := 0
+	if rawPort, ok := body["redirect_port"]; ok {
 		f, ok := rawPort.(float64)
 		if !ok || f != float64(int(f)) || f < 1024 || f > 65535 {
 			invalid("redirect_port must be an integer from 1024 to 65535")
 			return
 		}
 		port = int(f)
-	} else {
-		var ok bool
-		if uri, ok = rawURI.(string); !ok || uri == "" {
-			invalid("redirect_uri must be a URL")
-			return
-		}
 	}
 
 	code := s.codes[codeValue]
@@ -434,7 +379,7 @@ func (s *Stub) cliToken(w http.ResponseWriter, r *http.Request) {
 	sum := sha256.Sum256([]byte(verifier))
 	if code == nil || s.now().After(code.expires) ||
 		base64.RawURLEncoding.EncodeToString(sum[:]) != code.challenge ||
-		code.port != port || code.redirectURI != uri {
+		code.port != port {
 		writeError(w, http.StatusBadRequest, "invalid_grant", "The code is invalid, expired or already used")
 		return
 	}
@@ -475,11 +420,10 @@ func (s *Stub) cliLogout(w http.ResponseWriter, r *http.Request) {
 
 func serverJSON(srv *server) map[string]any {
 	return map[string]any{
-		"id":            srv.id,
-		"owner_id":      srv.ownerID,
-		"name":          srv.name,
-		"redirect_uris": append([]string{}, srv.redirectURIs...),
-		"created_at":    srv.createdAt,
+		"id":         srv.id,
+		"owner_id":   srv.ownerID,
+		"name":       srv.name,
+		"created_at": srv.createdAt,
 	}
 }
 
@@ -511,35 +455,9 @@ func (s *Stub) createServer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "name must be 1 to 100 characters")
 		return
 	}
-	srv := &server{id: newUUID(), ownerID: u.id, name: name, redirectURIs: []string{}, createdAt: s.now(), members: map[string]time.Time{}}
+	srv := &server{id: newUUID(), ownerID: u.id, name: name, createdAt: s.now(), members: map[string]time.Time{}}
 	s.servers[srv.id] = srv
 	writeJSON(w, http.StatusCreated, serverJSON(srv))
-}
-
-func (s *Stub) putRedirectURIs(w http.ResponseWriter, r *http.Request) {
-	u := s.authUser(w, r)
-	if u == nil {
-		return
-	}
-	srv := s.ownedServer(w, r, u)
-	if srv == nil {
-		return
-	}
-	var body struct {
-		RedirectURIs *[]string `json:"redirect_uris"`
-	}
-	if err := decode(r, &body); err != nil || body.RedirectURIs == nil || len(*body.RedirectURIs) > 10 {
-		writeError(w, http.StatusBadRequest, "invalid_request", "redirect_uris must be a list of at most 10 URLs")
-		return
-	}
-	for _, uri := range *body.RedirectURIs {
-		if !validRedirectURI(uri) {
-			writeError(w, http.StatusBadRequest, "invalid_request", "redirect URI not allowed: "+uri)
-			return
-		}
-	}
-	srv.redirectURIs = append([]string{}, *body.RedirectURIs...)
-	writeJSON(w, http.StatusOK, serverJSON(srv))
 }
 
 func (s *Stub) listMembers(w http.ResponseWriter, r *http.Request) {

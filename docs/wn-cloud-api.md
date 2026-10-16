@@ -7,13 +7,12 @@ Each route is marked **existing** (it is in v2 today and is described as it beha
 | Route | Status | Called by |
 |---|---|---|
 | `GET /me` | existing | wn-server |
-| `GET /cli/auth` | existing | the browser, opened by wn-server |
+| `GET /cli/auth` | existing | the browser, opened by `wn` and first-party apps. wn-server uses the variant below. |
 | `POST /cli/token` | existing | wn-server |
 | `POST /cli/logout` | existing | wn-server |
-| `GET /cli/auth` with `redirect_uri` | new (WAX-933) | the browser, opened by wn-server's web UI or a first-party app |
-| `POST /cli/token` with `redirect_uri` | new (WAX-933) | wn-server, first-party apps |
+| `GET /cli/auth` with `display=code` | new (WAX-933) | the browser, opened by the user at a URL that wn-server shows |
+| `POST /cli/token` without `redirect_port` | new (WAX-933) | wn-server |
 | `POST /servers` | new (WAX-932) | wn-server |
-| `PUT /servers/:id/redirect-uris` | new (WAX-932, needed by WAX-933) | wn-server |
 | `GET /servers/:id/members` | new (WAX-932) | wn-server |
 | `POST /servers/:id/invites` | new (WAX-932) | wn-server |
 | `DELETE /servers/:id/members/:userId` | new (WAX-932) | wn-server |
@@ -21,6 +20,8 @@ Each route is marked **existing** (it is in v2 today and is described as it beha
 | `DELETE /ratings/:kind/:mbid` | new (WAX-942) | wn-server |
 | `GET /ratings/:kind/:mbid` | new (WAX-942) | wn-server |
 | `GET /ratings?since=` | new (WAX-942) | wn-server |
+
+wn-server calls the rating routes on the user's behalf. Clients send ratings to wn-server, through the Subsonic `setRating`, `star`, and `unstar` calls or through wn-server's own `/api/v1/ratings` route. wn-server relays each write to wn-cloud with that user's stored token. Clients never call wn-cloud's rating routes directly, so the local store and the Navidrome mirror stay on one code path (README, Ratings and favorites).
 
 ## Conventions
 
@@ -39,7 +40,9 @@ Every authenticated request sends `Authorization: Bearer <token>`. wn-cloud acce
 |---|---|---|
 | CLI token | `wn_` followed by 43 base64url characters. Opaque. Does not expire. Ends when revoked with `POST /cli/logout`. | `POST /cli/token`. A first-party client hands its own CLI token to wn-server in `POST /api/v1/session`. wn-server keeps it with the account. |
 | GoTrue access token | An HS256 JWT signed by GoTrue. Expires after the GoTrue lifetime (one hour by default). | wn-server does not obtain these. The existing routes accept them, so they are listed for completeness. |
-| Server credential | A CLI token of the server's owner. It is the token that `wn-server login` receives from `POST /cli/token`, with the server's name as its label. | `wn-server login`. wn-server stores it in its data directory, readable only by the server's user. |
+| Server credential | The owner's CLI token only. `wn-server login` obtains it once, on the server machine, from `POST /cli/token`, with the server's name as its label. wn-server uses it for the server-level routes: `POST /servers`, members, and invites. | `wn-server login`. wn-server stores it in its data directory, readable only by the server's user. |
+
+Members' tokens are stored per account by `POST /api/v1/session` on wn-server. wn-server calls `GET /me` with such a token at the exchange. After that it uses the token only for the rating routes: rating writes and the rating sync.
 
 The server credential is an ordinary CLI token. wn-cloud does not tell it apart from other CLI tokens of the owner. A route that requires the server credential authenticates the bearer as a user and then checks that the user is the owner of the server in the path. Any bearer of the owner passes that check. wn-server always sends the server credential on those routes.
 
@@ -77,7 +80,7 @@ wn-server rule: see [Rules](#rules-wn-server-applies), `GET /me`.
 
 ### `GET /cli/auth` (existing)
 
-The approval page of the CLI sign-in. wn-server does not call it. `wn-server login` opens it in the owner's browser.
+The approval page of the CLI sign-in. wn-server does not call it and does not use this form of it. `wn` and first-party apps use it. wn-server uses the code display variant in [Sign-in with a displayed code](#sign-in-with-a-displayed-code-wax-933), which builds on this page.
 
 - Authentication: a browser session at wn-cloud. A visitor without one is redirected to `/login` and returns to the page afterwards with the query intact.
 - Query parameters:
@@ -92,8 +95,6 @@ The approval page of the CLI sign-in. wn-server does not call it. `wn-server log
 - Response: an HTML page with Approve and Cancel. Approve redirects the browser with 303 to `http://127.0.0.1:<port>/callback?code=<code>&state=<state>`. Cancel redirects to `http://127.0.0.1:<port>/callback?error=access_denied&state=<state>`. The host and the path are fixed. Only the port comes from the query.
 - Errors: a malformed query gets status 400 and an HTML page. No redirect happens. The approve form posts to `POST /cli/auth`, which v2's `sameOrigin` middleware (`web/src/session.ts`, near lines 73-86) guards. A POST whose `Origin` header names another site gets 403 with `{ "error": "Cross-origin request rejected" }`.
 - The code is 43 base64url characters, valid for 120 seconds and for one exchange. It is bound to the user, the challenge, the port, and the label.
-
-wn-server rule: wn-server checks `state` on the callback and stops the login on a mismatch or on `error`. It does not retry. The owner runs `wn-server login` again.
 
 ### `POST /cli/token` (existing)
 
@@ -132,7 +133,7 @@ Errors:
 | 400 | Express's default error page | The body is not valid JSON. |
 | 403 | `{ "error": "Cross-origin request rejected" }` | The `Origin` header of the POST names another site. v2's `sameOrigin` middleware (`web/src/session.ts`, near lines 73-86) answers it. This can reach first-party apps that send an `Origin` header. |
 
-wn-server rule: one attempt. On any error, `wn-server login` stops and prints the error. A code cannot be retried, because a failed exchange consumes it.
+wn-server sends this route a code from the code display, without `redirect_port`. See [`POST /cli/token` without `redirect_port`](#post-clitoken-without-redirect_port-new-wax-933).
 
 ### `POST /cli/logout` (existing)
 
@@ -153,54 +154,57 @@ Errors:
 
 wn-server rule: wn-server calls it in two cases. When a user signs out of the web UI, it revokes the token that the web UI sign-in obtained for that browser. When `wn-server login` replaces the server credential, it revokes the old one. It never revokes a token that a first-party app handed it, because the app still uses that token elsewhere. A 401 counts as success. When wn-cloud is unreachable, wn-server forgets the token locally and does not retry.
 
-## Browser sign-in to a server (WAX-933)
+## Sign-in with a displayed code (WAX-933)
 
-The existing flow can only redirect to `127.0.0.1`. wn-server's web UI runs on another machine than the browser, and first-party apps cannot always listen on a loopback port. The variant below adds a `redirect_uri` that replaces `port`. The page, the code, the PKCE check, and the token are otherwise unchanged.
+The existing flow redirects the browser to `127.0.0.1` on the machine that runs the browser. A redirect only works when the browser can reach the program that started the sign-in. It fails for a headless server, for a browser on another device, and behind the relay. In this variant wn-cloud shows the code on the page, and the user pastes it into wn-server. Nothing redirects to wn-server. `wn-server login` and the web UI sign-in both use it.
 
-### `GET /cli/auth` with `redirect_uri` (new, WAX-933)
+1. wn-server generates `state` and a PKCE verifier. It shows the user the URL `<wn-cloud>/cli/auth?state=…&challenge=…&label=…&display=code`. `wn-server login` prints it in the terminal. The web UI shows it as a link next to a form for the code.
+2. The user opens the URL in any browser, signs in, and approves.
+3. wn-cloud shows the sign-in code on the page, with a copy button.
+4. The user pastes the code into wn-server: at the terminal prompt of `wn-server login`, or into the form of the web UI.
+5. wn-server checks `state` and posts the code and the verifier to `POST /cli/token`. It receives a CLI token.
+
+### `GET /cli/auth` with `display=code` (new, WAX-933)
 
 - Authentication: a browser session at wn-cloud, as in the existing flow.
 - Query parameters:
 
 | Parameter | Value |
 |---|---|
-| `state` | As in the existing flow. |
+| `state` | As in the existing flow. Returned unchanged on the code page. |
 | `challenge` | As in the existing flow. |
-| `redirect_uri` | An absolute URL. Exactly one of `port` and `redirect_uri` is present. |
-| `server_id` | Optional. The id of a registered server. When present, `redirect_uri` must equal one of that server's registered redirect URIs, compared as exact strings. |
-| `label` | As in the existing flow. When absent and `server_id` is present, wn-cloud stores the server's name as the label. |
+| `display` | `code`. Exactly one of `port` and `display` is present. No other value is accepted. |
+| `label` | As in the existing flow. wn-server sends the server's name. |
 
-Without `server_id`, `redirect_uri` must equal one entry of wn-cloud's first-party redirect list, compared as exact strings. That list is configuration in wn-cloud, not data. It holds the redirect URIs of wn-mobile and wn-desktop. **The variant must accept those first-party app redirects**, because wn-mobile and wn-desktop obtain their CLI tokens through it and then hand them to wn-server in `POST /api/v1/session`.
+- Response: the same approval page, without the port. It shows the label and tells the user to paste the code only into the program that showed them the link. Approve answers with status 200, `Cache-Control: no-store`, and a page that shows the sign-in code and a copy button. Cancel answers with a page that says the sign-in was cancelled and shows no code. Neither redirects.
+- The sign-in code on the page is `<code>.<state>`: the 43 base64url characters of the code, a `.`, and `state` unchanged. base64url has no `.`, so the first `.` separates the two parts.
+- Errors: a malformed query, both or neither of `port` and `display`, or a `display` other than `code` gets status 400 and an HTML page.
+- The code is valid for 120 seconds and for one exchange, as in the existing flow. It is bound to the user, the challenge, and the label. It has no port.
 
-- Response: the same approval page. With `server_id`, the page also shows the server's name and the host of `redirect_uri`. Approve redirects with 303 to `<redirect_uri>?code=<code>&state=<state>`. Cancel redirects to `<redirect_uri>?error=access_denied&state=<state>`.
-- Errors: a malformed query, an unknown `server_id`, or a `redirect_uri` that is not registered gets status 400 and an HTML page. wn-cloud never redirects to a URI it has not matched.
-- The code is bound to the user, the challenge, the redirect URI, and the label. `cli_auth_codes` needs a `redirect_uri` column, and `redirect_port` becomes nullable.
+wn-server rule: wn-server trims whitespace from the pasted value and splits it at the first `.`. When the state part differs from the `state` it generated, it stops and tells the user to start again. It does not retry. Otherwise it calls `POST /cli/token` once. The web UI keeps `state` and the verifier with the pending sign-in of that browser.
 
-wn-cloud must make these changes for the variant, besides the `cli_auth_codes` column:
+### `POST /cli/token` without `redirect_port` (new, WAX-933)
 
-- `returnPath` (`web/src/pages.ts`, near lines 107-112) and `authPath` (`web/src/cliAuth.ts`, near lines 75-79) rebuild the query from `state`, `challenge`, `port`, and `label` only. `redirect_uri` and `server_id` would be lost across `/login`. Both must carry the two new parameters.
-- `parseAuthRequest` (`web/src/cliAuth.ts`, near line 63) requires `port`. It must accept exactly one of `port` and `redirect_uri`, and validate `server_id`.
-- The approve form handler `POST /cli/auth` (`web/src/pages.ts`, near line 687) and the form in `web/views/cli-auth.eta` use `port`. They must pass `redirect_uri` and `server_id` through, and the redirect after the decision must go to the redirect URI.
-
-wn-server's web UI sign-in: the browser opens wn-server's `/login`. wn-server stores `state` and the verifier for that browser, then redirects it to `<wn-cloud>/cli/auth?state&challenge&redirect_uri=<its registered callback>&server_id=<id>`. The callback on wn-server checks `state` and calls `POST /cli/token` with `redirect_uri`.
-
-### `POST /cli/token` with `redirect_uri` (new, WAX-933)
-
-- Authentication: none.
-- Request body: `redirect_uri` takes the place of `redirect_port`. Exactly one of the two is present.
+The route, the response, and the errors are those of the existing exchange. The body of a code from the code display has no `redirect_port`:
 
 ```json
 {
-  "code": "Jx3...",
-  "code_verifier": "...",
-  "redirect_uri": "http://192.168.1.20:4533/auth/callback"
+  "code": "Jx3...43 base64url characters",
+  "code_verifier": "43 to 128 unreserved characters"
 }
 ```
 
-- Response 200: the same body as the existing exchange.
-- Errors: as in the existing exchange. Both or neither of `redirect_port` and `redirect_uri` is `invalid_request`. A `redirect_uri` that differs from the one bound to the code is `invalid_grant`.
+- A body with `redirect_port` for a code-display code, or without `redirect_port` for a port code, is `invalid_grant`.
 
-wn-server rule: one attempt, as in the existing exchange. On failure the web UI shows the error and a link to start again.
+wn-server rule: one attempt. On any error, `wn-server login` stops and prints the error, and the web UI shows the error and a link to start again. A code cannot be retried, because a failed exchange consumes it.
+
+### wn-cloud changes for WAX-933
+
+- `returnPath` (`web/src/pages.ts`, near lines 107-112) and `authPath` (`web/src/cliAuth.ts`, near lines 75-79) rebuild the query from `state`, `challenge`, `port`, and `label` only. `display` would be lost across `/login`. Both must carry `display` and omit `port` when `display=code`.
+- `parseAuthRequest` (`web/src/cliAuth.ts`, near line 63) requires `port`. It must accept a request without `port` when `display=code`, and reject a request with both or neither.
+- The approve form handler `POST /cli/auth` (`web/src/pages.ts`, near line 687) redirects to `callbackUrl` after the decision. With `display=code` it must render the code page instead. The form in `web/views/cli-auth.eta` posts `port`. With `display=code` it posts `display` instead and shows no port.
+- `cli_auth_codes` needs no `redirect_uri` column. Its `redirect_port` is `not null` today (`web/migrations/1791212912000_cli-auth.sql`). It must become nullable, and a code-display code stores `null`.
+- `exchangeToken` (`web/src/cliAuth.ts`, near line 175) requires `redirect_port`, and `EXCHANGE_SQL` (near line 119) compares `redirect_port = $3`. It must accept a body without `redirect_port` and compare with `redirect_port is not distinct from $3`. A code-display code then matches only a body without a port, and a port code only its own port.
 
 ## Servers and members (WAX-932)
 
@@ -215,7 +219,6 @@ Server object:
   "id": "0193a0b2-77c1-7f00-8e21-3d9c5b6a4f10",
   "owner_id": "0192f1c4-3b7e-7d2a-9a10-5f4e2c1b8a70",
   "name": "living-room",
-  "redirect_uris": ["http://192.168.1.20:4533/auth/callback"],
   "created_at": "2026-10-16T12:00:00Z"
 }
 ```
@@ -248,7 +251,7 @@ Registers a server under the caller, who becomes its owner.
 
 `name` is 1 to 100 characters after trimming, with no control characters.
 
-- Response 201: the server object, with `redirect_uris` empty.
+- Response 201: the server object.
 
 Errors:
 
@@ -257,32 +260,6 @@ Errors:
 | 400 | `invalid_request` | `name` is missing or malformed. |
 
 wn-server rule: `wn-server login` calls it once, when the data directory has no server id. It stores the returned `id`. When a server id is already stored, `login` only replaces the server credential, after checking with `GET /me` that the new token belongs to the stored owner. On an unreachable wn-cloud, `login` stops and the owner runs it again. It does not retry on its own, so it does not register twice.
-
-### `PUT /servers/:id/redirect-uris` (new, WAX-932, needed by WAX-933)
-
-Replaces the set of redirect URIs that the browser sign-in may use for this server: the web UI callback on the LAN URL, and later on the relay URL.
-
-- Authentication: the server credential.
-- Query parameters: none.
-- Request body:
-
-```json
-{ "redirect_uris": ["http://192.168.1.20:4533/auth/callback", "https://living-room.relay.waxnerd.com/auth/callback"] }
-```
-
-Rules for each entry: an absolute URL with scheme `https`, or `http` when the host is a loopback or private IP literal or ends in `.local`; no user info, no query, no fragment. At most 10 entries. An empty list is allowed and disables the web UI sign-in for the server.
-
-- Response 200: the server object.
-
-Errors:
-
-| Status | Code | When |
-|---|---|---|
-| 400 | `invalid_request` | The body or an entry breaks the rules. |
-| 403 | `not_owner` | The bearer's user is not the owner of the server. |
-| 404 | `server_not_found` | No server has this id. |
-
-wn-server rule: wn-server computes its redirect URIs from its configured URLs at start. It sends them after `login` and at each start when they differ from the last set it sent. On an unreachable wn-cloud it retries on the member refresh tick until it succeeds.
 
 ### `GET /servers/:id/members` (new, WAX-932)
 
@@ -566,7 +543,7 @@ These restate decisions in `README.md` in terms of the routes above.
 ## Open questions for the operator
 
 1. **Shape of the server credential.** The README makes it the owner's CLI token, and this document follows that. That token has the owner's full rights at wn-cloud, and revoking it signs the server out. Recommendation: keep the owner's CLI token for v1. Consider a separate server secret, returned by `POST /servers`, when the relay lands.
-2. **Scope of tokens issued through the server variant.** A token issued with `server_id` reaches wn-server, which keeps it. A malicious server owner would then hold a listener's full wn-cloud token. Recommendation: wn-cloud marks tokens issued with `server_id` as scoped to `GET /me` and the rating routes, and refuses them elsewhere with 403 `insufficient_scope`.
+2. **Scope of tokens that reach wn-server.** A listener's token from the web UI sign-in, or from a first-party app in `POST /api/v1/session`, reaches wn-server, which keeps it. A malicious server owner would then hold a listener's full wn-cloud token. Recommendation: accept this for v1. Later, wn-cloud can issue tokens scoped to `GET /me` and the rating routes, and refuse them elsewhere with 403 `insufficient_scope`. The server credential stays unscoped, since it needs the server-level routes.
 3. **Invite acceptance step.** This document has none: `POST /servers/:id/invites` creates the membership at once, and the listener's first sign-in at the server is the effective acceptance. Recommendation: keep it that way for v1. Add a pending state only if wn-cloud gets a notifications page.
 4. **Invite by email or by user id.** This document takes an email of an existing waxnerd user. It answers `user_not_found` otherwise, which tells the owner whether an email has an account. Recommendation: email for v1. Inviting people without an account (an invite link) is a later item.
 5. **Listener cap in wn-cloud.** The README says wn-server enforces the cap of 12. This document has wn-cloud enforce it as well, with `member_limit`. Recommendation: keep both checks, so a member list never exceeds what wn-server accepts.
@@ -574,5 +551,7 @@ These restate decisions in `README.md` in terms of the routes above.
 7. **Deletions in `GET /ratings?since=`.** v2 deletes a rating row on clear, so a delta cannot show clears. Recommendation: wn-cloud records clears in a `rating_deletions` table (user, subject, `deleted_at`, and the cleared rating's `id` and `created_at`) and merges it into the change feed. Rating the subject again removes its deletion row, so the feed shows each subject once. The alternative, a full re-pull on each tick, costs more as libraries grow.
 8. **Ordering of outbox writes against changes made elsewhere.** A queued `PUT` replayed after an outage overwrites a newer value set in wn-cloud's web pages meanwhile. Recommendation: accept this for v1. Later, `PUT` can take an optional `updated_at` from the client, and wn-cloud ignores a write older than the stored value.
 9. **Intervals.** The README says "every few minutes" for the member refresh and gives no `GET /me` cache time. This document uses 5 minutes for both, and ties the outbox drain and rating sync to the same tick. Recommendation: 5 minutes.
-10. **Redirect URI rules.** This document allows `http` only for loopback and private IP literals and `.local` hosts, and at most 10 entries. Recommendation: accept, since a LAN server usually has no certificate.
-11. **First-party app redirects.** The list is configuration in wn-cloud. Recommendation: `waxnerd://auth/callback` for wn-mobile, and the existing loopback `port` flow for wn-desktop, so wn-desktop needs no entry.
+10. **Rating write order.** The README (Ratings and favorites) writes wn-cloud first and then the local store. This document writes the local store first and then wn-cloud, with the outbox on failure. Recommendation: store first, then wn-cloud. Update the README.
+11. **Credential for member refreshes.** The README (Authentication) keeps each user's wn-cloud token "for rating writes and membership refreshes". This document refreshes members with the server credential only. Recommendation: the server credential only. The user's token is for rating writes and the rating sync. Update the README.
+
+First-party apps obtain their tokens through wn-cloud's own flows (the loopback port or the code display), and this document does not constrain those.

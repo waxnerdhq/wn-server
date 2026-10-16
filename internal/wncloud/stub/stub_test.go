@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -19,8 +20,10 @@ const (
 	ownerID    = "0192f1c4-3b7e-7d2a-9a10-5f4e2c1b8a70"
 	listenerID = "0192f9aa-0c11-7b3e-8f42-6a5d1e2c3b40"
 	releaseID  = "6e12a11e-0ef9-49f3-b646-66929507d915"
-	webUIURI   = "http://192.168.1.20:4533/auth/callback"
+	state      = "state-0123456789abcdef"
 )
+
+var codeRE = regexp.MustCompile(`<output id="code">([^<]+)</output>`)
 
 type client struct {
 	t    *testing.T
@@ -56,28 +59,52 @@ func (c *client) do(method, path, token string, body, out any) int {
 	return res.StatusCode
 }
 
-// signIn runs the browser sign-in with the given query (port or redirect_uri)
-// and returns the code from the redirect.
-func (c *client) signIn(query url.Values, wantPrefix string) (code, verifier string) {
+// authorize opens GET /cli/auth with the given query plus state and challenge.
+func (c *client) authorize(query url.Values) (*http.Response, string) {
 	c.t.Helper()
-	verifier = strings.Repeat("v", 43)
+	verifier := strings.Repeat("v", 43)
 	sum := sha256.Sum256([]byte(verifier))
-	query.Set("state", "state-0123456789abcdef")
+	query.Set("state", state)
 	query.Set("challenge", base64.RawURLEncoding.EncodeToString(sum[:]))
 	res, err := c.http.Get(c.base + "/cli/auth?" + query.Encode())
 	if err != nil {
 		c.t.Fatal(err)
 	}
+	return res, verifier
+}
+
+// signInPort runs the loopback sign-in and returns the code from the redirect.
+func (c *client) signInPort(port string) (code, verifier string) {
+	c.t.Helper()
+	res, verifier := c.authorize(url.Values{"port": {port}, "label": {"living-room"}})
 	_ = res.Body.Close()
 	loc := res.Header.Get("Location")
-	if res.StatusCode != http.StatusSeeOther || !strings.HasPrefix(loc, wantPrefix+"?") {
+	if res.StatusCode != http.StatusSeeOther || !strings.HasPrefix(loc, "http://127.0.0.1:"+port+"/callback?") {
 		c.t.Fatalf("GET /cli/auth: %d %q", res.StatusCode, loc)
 	}
 	u, _ := url.Parse(loc)
-	if u.Query().Get("state") != "state-0123456789abcdef" {
+	if u.Query().Get("state") != state {
 		c.t.Fatalf("state not returned: %q", loc)
 	}
 	return u.Query().Get("code"), verifier
+}
+
+// signInDisplay runs the code-display sign-in and returns the code from the
+// displayed value <code>.<state>.
+func (c *client) signInDisplay() (code, verifier string) {
+	c.t.Helper()
+	res, verifier := c.authorize(url.Values{"display": {"code"}, "label": {"living-room"}})
+	page, _ := io.ReadAll(res.Body)
+	_ = res.Body.Close()
+	m := codeRE.FindSubmatch(page)
+	if res.StatusCode != http.StatusOK || m == nil {
+		c.t.Fatalf("GET /cli/auth display=code: %d %s", res.StatusCode, page)
+	}
+	code, gotState, _ := strings.Cut(string(m[1]), ".")
+	if gotState != state {
+		c.t.Fatalf("state not returned: %q", m[1])
+	}
+	return code, verifier
 }
 
 type tokenAnswer struct {
@@ -99,9 +126,15 @@ func TestRoutes(t *testing.T) {
 	}}
 
 	// GET /cli/auth with port, then POST /cli/token with redirect_port.
-	code, verifier := c.signIn(url.Values{"port": {"53122"}, "label": {"living-room"}}, "http://127.0.0.1:53122/callback")
+	code, verifier := c.signInPort("53122")
 	var tok tokenAnswer
-	if st := c.do("POST", "/cli/token", "", map[string]any{"code": code, "code_verifier": verifier, "redirect_port": 53122}, &tok); st != 200 || !strings.HasPrefix(tok.Token, "wn_") || tok.User.ID != ownerID {
+	if st := c.do("POST", "/cli/token", "", map[string]any{"code": code, "code_verifier": verifier, "redirect_port": 53122}, &tok); st != 200 || !strings.HasPrefix(tok.Token, "wn_") {
+		t.Fatalf("POST /cli/token with redirect_port: %d %+v", st, tok)
+	}
+
+	// GET /cli/auth with display=code, then POST /cli/token without redirect_port.
+	code, verifier = c.signInDisplay()
+	if st := c.do("POST", "/cli/token", "", map[string]any{"code": code, "code_verifier": verifier}, &tok); st != 200 || !strings.HasPrefix(tok.Token, "wn_") || tok.User.ID != ownerID {
 		t.Fatalf("POST /cli/token: %d %+v", st, tok)
 	}
 	owner := tok.Token
@@ -120,17 +153,6 @@ func TestRoutes(t *testing.T) {
 		t.Fatalf("POST /servers: %d", st)
 	}
 	base := "/servers/" + server.ID
-
-	// PUT /servers/:id/redirect-uris.
-	if st := c.do("PUT", base+"/redirect-uris", owner, map[string]any{"redirect_uris": []string{webUIURI}}, nil); st != 200 {
-		t.Fatalf("PUT redirect-uris: %d", st)
-	}
-
-	// GET /cli/auth with redirect_uri and server_id, then POST /cli/token with redirect_uri.
-	code, verifier = c.signIn(url.Values{"redirect_uri": {webUIURI}, "server_id": {server.ID}}, webUIURI)
-	if st := c.do("POST", "/cli/token", "", map[string]any{"code": code, "code_verifier": verifier, "redirect_uri": webUIURI}, &tok); st != 200 {
-		t.Fatalf("POST /cli/token with redirect_uri: %d", st)
-	}
 
 	// POST /servers/:id/invites.
 	var member map[string]any
