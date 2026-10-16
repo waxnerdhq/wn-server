@@ -8,7 +8,7 @@ wn-server is the waxnerd music server. It runs [Navidrome](https://www.navidrome
 
 wn-server is licensed under GPL-3.0 (see `LICENSE`). It is powered by Navidrome, which is also GPL-3.0 and runs as a separate process.
 
-**Status:** configuration, the Navidrome supervisor, the account store, and local-only mode. `wn-server init` writes `config.toml` and creates the owner account with an app password. `wn-server password` prints the app password and `--reset` replaces it. `wn-server serve` checks the Navidrome version, writes `navidrome.toml`, runs Navidrome as a child process, creates the owner's Navidrome user, adds the configured libraries, and serves the proxy on `listen`. The proxy checks Subsonic credentials against the owner's app password on `/rest/*`, passes `/share/*` without a check, answers 404 on every other path, and answers 503 until the supervisor reports ready. `login` and `match` return "not implemented". The wn-cloud API contract and an in-memory wn-cloud stub for tests are in place. v1 has one account, the owner. This file describes the agreed design and is updated as the code lands.
+**Status:** configuration, the Navidrome supervisor, the account store, and local-only mode. `wn-server init` writes `config.toml` and creates the owner account with an app password. `wn-server password` prints the app password and `--reset` replaces it. `wn-server serve` checks the Navidrome version, writes `navidrome.toml`, runs Navidrome as a child process, creates the owner's Navidrome user, adds the configured libraries, and serves the proxy on `listen`. The proxy checks Subsonic credentials against the owner's app password on `/rest/*`, passes `/share/*` without a check, answers 404 on every other path, and answers 503 until the supervisor reports ready. `wn-server login` links the owner account to a waxnerd user and stores the server credential. `wn-server logout` revokes and removes it. `wn-server status` prints the owner account and the link without calling wn-cloud. `match` returns "not implemented". The wn-cloud client covers sign-in, server registration, and device code verification. The wn-cloud API contract and an in-memory wn-cloud stub for tests are in place. v1 has one account, the owner. This file describes the agreed design and is updated as the code lands.
 
 ## Architecture
 
@@ -35,14 +35,14 @@ clients (wn-mobile, wn-desktop, web UI)
 
 | Package | Responsibility |
 |---|---|
-| `internal/cli` | cobra command line: `init`, `serve`, `password`, `login`, `match`, `version` |
+| `internal/cli` | cobra command line: `init`, `serve`, `password`, `login`, `logout`, `status`, `match`, `version` |
 | `internal/config` | `config.toml` loading and defaults, data directory, rendered `navidrome.toml` |
 | `internal/navidrome` | child process supervisor, version pin, library sync, wn-server's own Navidrome identity, and the owner's Navidrome user |
 | `internal/proxy` | reverse proxy to Navidrome. It forwards `/rest/*` after a Subsonic credential check against the app password, and `/share/*` without a check. Every other path answers 404. It answers 503 until the supervisor is ready, strips incoming `Remote-User`, sets `Remote-User` to the account id after a successful check, removes the credential parameters before forwarding, and streams responses unbuffered. Sessions and rating intercepts are not built yet |
-| `internal/wncloud` | wn-cloud client: login flow, server registration, device code verification, rating routes; `stub` serves the same routes from memory for tests |
+| `internal/wncloud` | wn-cloud client: PKCE and state, the code display sign-in, `POST /cli/token`, `POST /cli/logout`, server registration, and device code verification, with typed errors per error code. The rating routes are not built yet. `stub` serves the same routes from memory for tests |
 | `internal/beets` | beets subprocess, match queue |
 | `internal/ratings` | local store of ratings and favorites, rating API, reconcile loop |
-| `internal/store` | wn-server's SQLite database, `<data dir>/wn-server.db`, mode 0600, with embedded migrations. It holds the owner account and app password. Sessions, the match queue, ratings, and the outbox are not built yet |
+| `internal/store` | wn-server's SQLite database, `<data dir>/wn-server.db`, mode 0600, with embedded migrations. It holds the owner account, the app password, and the server credential. Sessions, the match queue, ratings, and the outbox are not built yet |
 | `internal/web` | web UI for the owner: app password sign-in, status, match review, account page |
 
 ### Authentication
@@ -59,11 +59,14 @@ Owner setup for cloud mode, once, on the server machine (`wn-server login`). Thi
 
 1. wn-server prints a URL to `<wn-cloud>/cli/auth` with a state, a PKCE challenge, a label naming the server, and `display=code`.
 2. The owner opens the URL in a browser on any device, signs in with their waxnerd account, and approves.
-3. wn-cloud shows a sign-in code with a copy button. The owner pastes it at the `wn-server login` prompt.
-4. wn-server checks the state, posts the code and the PKCE verifier to `POST /cli/token`, and receives a CLI token. That token is the server credential. It is the owner's token, and wn-server uses it for everything it does at wn-cloud.
-5. wn-server registers this server with `POST /servers` and receives a server id.
-6. wn-server links the owner account to the owner's waxnerd user id.
-7. On the first `login`, wn-server queues every rating in the local store in the outbox. The next drain sends them to wn-cloud with the server credential, so they become the owner's ratings at wn-cloud.
+3. wn-cloud shows a sign-in code with a copy button. The code has the form `<code>.<state>`. The owner pastes it at the `code: ` prompt of `wn-server login`.
+4. wn-server trims the pasted value and compares its state part with the state it generated. When they differ, it prints "the code does not belong to this login attempt" and exits without calling wn-cloud.
+5. wn-server posts the code and the PKCE verifier to `POST /cli/token` once and receives a CLI token. That token is the server credential. It is the owner's token, and wn-server uses it for everything it does at wn-cloud. A rejected code ends the login, because a failed exchange spends the code.
+6. wn-server registers this server with `POST /servers` and receives a server id. If the registration fails, wn-server revokes the new token with `POST /cli/logout` and exits.
+7. wn-server stores the server credential and links the owner account to the owner's waxnerd user id, in one transaction. It prints the waxnerd user id, the server id, and the app password.
+8. On the first `login`, wn-server queues every rating in the local store in the outbox. The next drain sends them to wn-cloud with the server credential, so they become the owner's ratings at wn-cloud. This step is not built yet.
+
+The server name is `login --name`, or the host name when the flag is absent. wn-server sends it as the label of `GET /cli/auth` and as the name of `POST /servers`. `login` refuses to run when a server credential is stored. `wn-server logout` revokes the server credential with `POST /cli/logout`, deletes it, and clears the owner's waxnerd user id. When wn-cloud is unreachable or answers 401, `logout` prints a warning and removes the credential locally. `wn-server status` reads only the local store and the config.
 
 First-party clients (wn-mobile, wn-desktop), once per device, in cloud mode:
 
@@ -84,12 +87,12 @@ Navidrome's own web UI is blocked at the proxy. Only its Subsonic API passes thr
 
 ### Accounts and modes
 
-wn-server has one account, the owner. It lives in wn-server's own SQLite store: id (16 random hex characters), name, app password, an optional waxnerd user id, and the creation time. The name is the Subsonic user name. It defaults to `owner` and `init --name` sets it. Names compare without regard to case, as in Navidrome. Navidrome's `Remote-User` header carries the account id, and the owner's Navidrome user name is the account id. Linking to wn-cloud is a property of the account, not its identity.
+wn-server has one account, the owner. It lives in wn-server's own SQLite store, in the `accounts` table: id (16 random hex characters), name, app password, an optional waxnerd user id, and the creation time. The name is the Subsonic user name. It defaults to `owner` and `init --name` sets it. Names compare without regard to case, as in Navidrome. Navidrome's `Remote-User` header carries the account id, and the owner's Navidrome user name is the account id. Linking to wn-cloud is a property of the account, not its identity.
 
 wn-server runs in one of two modes. The difference is whether `wn-server login` has run.
 
 - **Local-only.** The state before `wn-server login` has run. The owner account has no waxnerd user id. Clients authenticate with the Subsonic scheme (`u` plus `t`/`s`, or `u` plus `p`, plain or `enc:` hex) against the app password. A wrong credential gets Subsonic error 40 and a missing one gets error 10, both with HTTP 200, as from Navidrome. Ratings are stored locally and mirrored into Navidrome (not built yet). Nothing syncs with wn-cloud.
-- **Cloud.** The state after `wn-server login`. The owner account carries the waxnerd user id, and wn-server holds the server credential. First-party clients exchange a device code for a session. The app password keeps working. Ratings sync with wn-cloud.
+- **Cloud.** The state after `wn-server login`. The owner account carries the waxnerd user id, and wn-server holds the server credential. The credential is one row of the `server_credential` table: the CLI token, the server id, the waxnerd user id, and the creation time. The table holds at most one row. The token lives in the store file, which has mode 0600. There is no separate token file. First-party clients exchange a device code for a session. The app password keeps working. Ratings sync with wn-cloud.
 
 Sessions are checked against wn-server's own store, so an outage of wn-cloud never refuses the owner. Sessions already issued and the app password keep working. New sessions through `POST /api/v1/session` fail until wn-cloud answers, because wn-cloud verifies the device code. Rating writes wait in the outbox. The web UI shows a banner "wn-cloud unreachable since <time>". There is no cut-off.
 
@@ -145,6 +148,7 @@ The `chroma` plugin (AcoustID fingerprints) raises match confidence. wn-server s
 - First-party clients obtain a wn-server session with a short-lived single-use code that wn-cloud issues bound to the server. No client holds a wn-cloud CLI token. (2026-10-16)
 - Listeners, invites, and membership are deferred until waxnerd relay is specified, because listener sign-in depends on it. v1 has one account, the owner. (2026-10-16)
 - Device-code exchange is rate limited at wn-server and at wn-cloud. (2026-10-16)
+- The server credential is stored in the SQLite store, not in a separate token file. `wn-server login` refuses to replace a stored credential. The owner runs `wn-server logout` first. (WAX-934)
 - Half stars are written through wn-server's own rating API, not through Subsonic. (WAX-945, decision 3)
 - beets candidates come from a shipped beets plugin that writes JSON, not from the import log. (WAX-945, decision 4)
 - One AcoustID application key is compiled in, with a config override. (WAX-945, decision 5)
@@ -171,6 +175,12 @@ make bundle   # Linux only: release tarball in dist/
 4. In a Subsonic client, set the server to `http://<host>:4533`, the user name to the owner name, and the password to the app password.
 
 Navidrome's web UI is not reachable through wn-server. Only the Subsonic API (`/rest/*`) and public shares (`/share/*`) are.
+
+### Cloud mode
+
+1. `wn-server login [--name <server name>]`. It prints a URL. Open the URL in a browser on any device, sign in with a waxnerd account, and approve. Paste the code that wn-cloud shows at the `code: ` prompt. `login` reads `wn_cloud_url` from `config.toml`.
+2. `wn-server status` prints the owner name, the account id, the waxnerd user id, the server id, the time of the link, and the wn-cloud URL. It does not call wn-cloud.
+3. `wn-server logout` revokes the server credential at wn-cloud and returns the server to local-only mode. Run it before running `login` again.
 
 ### Release bundle
 
