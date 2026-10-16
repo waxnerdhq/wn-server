@@ -178,7 +178,7 @@ The data directory is `$XDG_DATA_HOME/wn-server`, or `~/.local/share/wn-server` 
 | `sorted_dir` | `<data dir>/sorted` | Directory beets copies matched albums into. Created on load. |
 | `acoustid_api_key` | empty | Overrides the compiled-in AcoustID key. |
 
-`Config.WriteNavidrome` renders `<data dir>/navidrome.toml`, and the supervisor calls it before starting Navidrome. The file has `Address = "127.0.0.1"`, the Navidrome port, the first music folder as `MusicFolder`, `DataFolder = <data dir>/navidrome`, and `ExtAuth.UserHeader` and `ExtAuth.TrustedSources` set for the proxy. Navidrome's config file takes one `MusicFolder` only. The remaining music folders and `sorted_dir` are added as libraries through Navidrome's API by the supervisor.
+`Config.WriteNavidrome` renders `<data dir>/navidrome.toml`. The file has `Address = '127.0.0.1'`, the Navidrome port, the first music folder as `MusicFolder`, `DataFolder = <data dir>/navidrome`, and `ExtAuth.UserHeader` and `ExtAuth.TrustedSources` set for the proxy. Navidrome's config file takes one `MusicFolder` only. The supervisor issue (WAX-929) will call `WriteNavidrome` before it starts Navidrome. It will also add the remaining music folders and `sorted_dir` as libraries through Navidrome's API.
 
 ## Repository layout
 

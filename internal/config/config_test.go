@@ -92,3 +92,12 @@ func TestRenderNavidrome(t *testing.T) {
 		}
 	}
 }
+
+func TestLoadRejectsListenPortEqualToNavidromePort(t *testing.T) {
+	dir := t.TempDir()
+	music := t.TempDir()
+	_, err := Load(writeConfig(t, dir, "music_folders = ['"+music+"']\nlisten = '0.0.0.0:5000'\nnavidrome_port = 5000\n"))
+	if err == nil || !strings.Contains(err.Error(), "navidrome_port") {
+		t.Fatalf("got %v, want a port-clash error", err)
+	}
+}

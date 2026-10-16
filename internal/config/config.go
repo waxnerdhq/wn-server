@@ -6,9 +6,11 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net"
 	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 
 	"github.com/pelletier/go-toml/v2"
 )
@@ -114,23 +116,29 @@ func (c *Config) applyDefaults() error {
 	if c.SortedDir == "" {
 		c.SortedDir = filepath.Join(c.DataDir, "sorted")
 	}
-	if c.NavidromeBin == "" || c.BeetsBin == "" || c.FpcalcBin == "" {
-		exe, err := os.Executable()
-		if err != nil {
-			return fmt.Errorf("find wn-server executable: %w", err)
-		}
-		dir := filepath.Dir(exe)
-		if c.NavidromeBin == "" {
-			c.NavidromeBin = filepath.Join(dir, "navidrome")
-		}
-		if c.BeetsBin == "" {
-			c.BeetsBin = filepath.Join(dir, "beets")
-		}
-		if c.FpcalcBin == "" {
-			c.FpcalcBin = filepath.Join(dir, "fpcalc")
-		}
+	// Bundled binaries sit next to the wn-server executable. When the
+	// executable path is unknown, the bare names resolve through PATH.
+	dir := ""
+	if exe, err := os.Executable(); err == nil {
+		dir = filepath.Dir(exe)
+	}
+	if c.NavidromeBin == "" {
+		c.NavidromeBin = defaultBin(dir, "navidrome")
+	}
+	if c.BeetsBin == "" {
+		c.BeetsBin = defaultBin(dir, "beets")
+	}
+	if c.FpcalcBin == "" {
+		c.FpcalcBin = defaultBin(dir, "fpcalc")
 	}
 	return nil
+}
+
+func defaultBin(dir, name string) string {
+	if dir == "" {
+		return name
+	}
+	return filepath.Join(dir, name)
 }
 
 func (c *Config) validate() error {
@@ -139,6 +147,17 @@ func (c *Config) validate() error {
 	}
 	if c.NavidromePort < 1 || c.NavidromePort > 65535 {
 		return fmt.Errorf("navidrome_port %d is out of range", c.NavidromePort)
+	}
+	_, portStr, err := net.SplitHostPort(c.Listen)
+	if err != nil {
+		return fmt.Errorf("listen %q is not a host:port address: %w", c.Listen, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("listen %q has an invalid port", c.Listen)
+	}
+	if port == c.NavidromePort {
+		return fmt.Errorf("listen port %d is the same as navidrome_port", port)
 	}
 	if u, err := url.Parse(c.WNCloudURL); err != nil || u.Scheme == "" || u.Host == "" {
 		return fmt.Errorf("wn_cloud_url %q is not a URL", c.WNCloudURL)
@@ -206,6 +225,16 @@ func Init(configPath string, folders []string) (*Config, error) {
 		WNCloudURL:    DefaultWNCloudURL,
 		NavidromePort: DefaultNavidromePort,
 	}
+	// Validate the in-memory config before writing, so a bad config does not
+	// leave a config.toml behind.
+	check := first
+	check.DataDir = filepath.Dir(configPath)
+	if err := check.applyDefaults(); err != nil {
+		return nil, err
+	}
+	if err := check.validate(); err != nil {
+		return nil, err
+	}
 	body, err := toml.Marshal(first)
 	if err != nil {
 		return nil, err
@@ -227,5 +256,10 @@ func Init(configPath string, folders []string) (*Config, error) {
 	if werr != nil {
 		return nil, fmt.Errorf("write config: %w", werr)
 	}
-	return Load(configPath)
+	c, err := Load(configPath)
+	if err != nil {
+		os.Remove(configPath)
+		return nil, err
+	}
+	return c, nil
 }
