@@ -8,7 +8,7 @@ wn-server is the waxnerd music server. It runs [Navidrome](https://www.navidrome
 
 wn-server is licensed under GPL-3.0 (see `LICENSE`). It is powered by Navidrome, which is also GPL-3.0 and runs as a separate process.
 
-**Status:** scaffold, configuration, and the Navidrome supervisor. `wn-server init` writes `config.toml`. `wn-server serve` checks the Navidrome version, writes `navidrome.toml`, runs Navidrome as a child process, and adds the configured libraries. There is no proxy yet. `login` and `match` return "not implemented". The wn-cloud API contract and an in-memory wn-cloud stub for tests are in place. v1 has one account, the owner. This file describes the agreed design and is updated as the code lands.
+**Status:** scaffold, configuration, the Navidrome supervisor, and a plain reverse proxy. `wn-server init` writes `config.toml`. `wn-server serve` checks the Navidrome version, writes `navidrome.toml`, runs Navidrome as a child process, adds the configured libraries, and serves the proxy on `listen`. The proxy forwards every request to Navidrome without authentication and answers 503 until the supervisor reports ready. `login` and `match` return "not implemented". The wn-cloud API contract and an in-memory wn-cloud stub for tests are in place. v1 has one account, the owner. This file describes the agreed design and is updated as the code lands.
 
 ## Architecture
 
@@ -38,7 +38,7 @@ clients (wn-mobile, wn-desktop, web UI)
 | `internal/cli` | cobra command line: `init`, `serve`, `login`, `match`, `version` |
 | `internal/config` | `config.toml` loading and defaults, data directory, rendered `navidrome.toml` |
 | `internal/navidrome` | child process supervisor, version pin, library sync, and wn-server's own Navidrome identity |
-| `internal/proxy` | session and app password checks, `Remote-User` forwarding, rating intercepts |
+| `internal/proxy` | reverse proxy to Navidrome. It answers 503 until the supervisor is ready, strips incoming `Remote-User`, and streams responses unbuffered. Session and app password checks, `Remote-User` forwarding, and rating intercepts are not built yet |
 | `internal/wncloud` | wn-cloud client: login flow, server registration, device code verification, rating routes; `stub` serves the same routes from memory for tests |
 | `internal/beets` | beets subprocess, match queue |
 | `internal/ratings` | local store of ratings and favorites, rating API, reconcile loop |
