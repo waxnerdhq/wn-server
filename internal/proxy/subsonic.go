@@ -83,8 +83,8 @@ func subsonicAuth(accounts Accounts, logger *slog.Logger, next http.Handler) htt
 		out.URL = new(url.URL)
 		*out.URL = *r.URL
 		out.URL.RawQuery = params.Encode()
-		if r.Method == http.MethodPost && isForm(r) {
-			// The form is now in the query. Navidrome merges a POSTed form
+		if hasFormBody(r) {
+			// The form is now in the query. Navidrome merges a POST, PUT, or PATCH form
 			// into the query the same way, so an empty body is equivalent.
 			out.Body = http.NoBody
 			out.ContentLength = 0
@@ -96,10 +96,11 @@ func subsonicAuth(accounts Accounts, logger *slog.Logger, next http.Handler) htt
 	})
 }
 
-// subsonicParams returns the query parameters merged with a POSTed form, as
+// subsonicParams returns the query parameters merged with a POSTed form (also
+// PUT and PATCH), as
 // Navidrome reads them.
 func subsonicParams(w http.ResponseWriter, r *http.Request) (url.Values, error) {
-	if r.Method != http.MethodPost || !isForm(r) {
+	if !hasFormBody(r) {
 		return r.URL.Query(), nil
 	}
 	r.Body = http.MaxBytesReader(w, r.Body, maxFormBytes)
@@ -107,6 +108,16 @@ func subsonicParams(w http.ResponseWriter, r *http.Request) (url.Values, error) 
 		return nil, fmt.Errorf("parse form: %w", err)
 	}
 	return r.Form, nil
+}
+
+// hasFormBody reports whether Navidrome's ParseForm reads a form from the
+// request body: POST, PUT, and PATCH with a urlencoded content type.
+func hasFormBody(r *http.Request) bool {
+	switch r.Method {
+	case http.MethodPost, http.MethodPut, http.MethodPatch:
+		return isForm(r)
+	}
+	return false
 }
 
 func isForm(r *http.Request) bool {

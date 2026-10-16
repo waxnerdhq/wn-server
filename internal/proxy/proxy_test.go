@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -180,7 +181,8 @@ func TestSubsonicAuth(t *testing.T) {
 
 func TestOtherPathsAre404(t *testing.T) {
 	srv, hits := newProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}), true)
-	for _, p := range []string{"/app/", "/api/user", "/auth/login", "/rest/../app/", "/"} {
+	for _, p := range []string{"/app/", "/api/user", "/auth/login", "/rest/../app/", "/",
+		"//rest/ping.view", "/rest/%2e%2e/app/", "/share/..%2f/app/", "/REST/ping.view"} {
 		resp, err := http.Get(srv.URL + p)
 		if err != nil {
 			t.Fatal(err)
@@ -192,6 +194,45 @@ func TestOtherPathsAre404(t *testing.T) {
 	}
 	if hits.Load() != 0 {
 		t.Fatalf("backend received %d requests", hits.Load())
+	}
+}
+
+func TestFormBodyMergedIntoQuery(t *testing.T) {
+	for _, method := range []string{http.MethodPost, http.MethodPut} {
+		t.Run(method, func(t *testing.T) {
+			var query url.Values
+			var body []byte
+			var contentType string
+			var contentLength int64
+			srv, hits := newProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				query = r.URL.Query()
+				body, _ = io.ReadAll(r.Body)
+				contentType = r.Header.Get("Content-Type")
+				contentLength = r.ContentLength
+			}), true)
+			req, _ := http.NewRequest(method, srv.URL+"/rest/ping.view?"+creds(), strings.NewReader("id=42&name=x"))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if hits.Load() != 1 {
+				t.Fatalf("%d backend hits, want 1", hits.Load())
+			}
+			if query.Get("id") != "42" || query.Get("name") != "x" || query.Get("c") != "test" {
+				t.Fatalf("backend query %v lacks the body parameters", query)
+			}
+			if query.Has("u") || query.Has("t") || query.Has("s") {
+				t.Fatalf("backend query %v has credentials", query)
+			}
+			if len(body) != 0 || contentLength > 0 {
+				t.Fatalf("backend body %q, content length %d; want empty", body, contentLength)
+			}
+			if contentType != "" {
+				t.Fatalf("backend Content-Type %q, want none", contentType)
+			}
+		})
 	}
 }
 

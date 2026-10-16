@@ -75,3 +75,21 @@ func TestInitWritesConfigAndRefusesSecondRun(t *testing.T) {
 		t.Fatal("init wrote config.toml although the owner exists")
 	}
 }
+
+func TestInitRejectsBadNameAndLeavesNoFiles(t *testing.T) {
+	for _, name := range []string{" ", "a\nb", strings.Repeat("x", 65)} {
+		data := t.TempDir()
+		music := t.TempDir()
+		cfg := filepath.Join(data, "wn", "config.toml")
+		root := newRootCmd()
+		root.SetOut(&bytes.Buffer{})
+		root.SetArgs([]string{"--config", cfg, "init", "--folder", music, "--name", name})
+		if err := root.Execute(); err == nil {
+			t.Fatalf("init --name %q succeeded", name)
+		}
+		entries, _ := os.ReadDir(filepath.Dir(cfg))
+		if len(entries) != 0 {
+			t.Fatalf("init --name %q left %d files in %s", name, len(entries), filepath.Dir(cfg))
+		}
+	}
+}

@@ -51,6 +51,9 @@ func newInitCmd() *cobra.Command {
 		Short: "Create the data directory, a first config.toml, and the owner account",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			if err := store.ValidateName(name); err != nil {
+				return err
+			}
 			flag, _ := cmd.Flags().GetString("config")
 			dataDir, path, err := config.Paths(flag)
 			if err != nil {
@@ -77,13 +80,10 @@ func newInitCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			st, err := store.Open(ctx, store.Path(c.DataDir))
+			owner, err := createOwner(ctx, store.Path(c.DataDir), name)
 			if err != nil {
-				return err
-			}
-			defer st.Close()
-			owner, err := st.CreateOwner(ctx, name)
-			if err != nil {
+				// Leave nothing behind, so the next init can run.
+				removeInitFiles(path, store.Path(c.DataDir))
 				return err
 			}
 			out := cmd.OutOrStdout()
@@ -99,6 +99,24 @@ func newInitCmd() *cobra.Command {
 	cmd.Flags().StringVar(&name, "name", "owner", "owner account name, used as the Subsonic user name")
 	_ = cmd.MarkFlagRequired("folder")
 	return cmd
+}
+
+// createOwner opens the store at dbPath, creates the owner, and closes it.
+func createOwner(ctx context.Context, dbPath, name string) (store.Account, error) {
+	st, err := store.Open(ctx, dbPath)
+	if err != nil {
+		return store.Account{}, err
+	}
+	defer st.Close()
+	return st.CreateOwner(ctx, name)
+}
+
+// removeInitFiles removes the config file and the database files that a
+// failed init wrote.
+func removeInitFiles(configPath, dbPath string) {
+	for _, p := range []string{configPath, dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		_ = os.Remove(p)
+	}
 }
 
 // openStore opens the store in dataDir. It does not create one: a missing

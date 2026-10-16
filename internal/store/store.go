@@ -19,6 +19,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	_ "modernc.org/sqlite" // registers the "sqlite" driver
 )
@@ -139,11 +141,31 @@ func (s *Store) apply(ctx context.Context, version int, body string) error {
 	return tx.Commit()
 }
 
+// MaxNameLength is the longest account name, in characters.
+const MaxNameLength = 64
+
+// ValidateName checks an account name: not empty after trimming space, no
+// control characters, and at most MaxNameLength characters.
+func ValidateName(name string) error {
+	if strings.TrimSpace(name) == "" {
+		return errors.New("owner name is empty")
+	}
+	if utf8.RuneCountInString(name) > MaxNameLength {
+		return fmt.Errorf("owner name is longer than %d characters", MaxNameLength)
+	}
+	for _, r := range name {
+		if unicode.IsControl(r) {
+			return errors.New("owner name contains a control character")
+		}
+	}
+	return nil
+}
+
 // CreateOwner creates the owner account with a new app password. It returns
 // ErrOwnerExists when the store already has an account.
 func (s *Store) CreateOwner(ctx context.Context, name string) (Account, error) {
-	if strings.TrimSpace(name) == "" {
-		return Account{}, errors.New("owner name is empty")
+	if err := ValidateName(name); err != nil {
+		return Account{}, err
 	}
 	id, err := newID()
 	if err != nil {
