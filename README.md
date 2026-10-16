@@ -8,7 +8,7 @@ wn-server is the waxnerd music server. It runs [Navidrome](https://www.navidrome
 
 wn-server is licensed under GPL-3.0 (see `LICENSE`). It is powered by Navidrome, which is also GPL-3.0 and runs as a separate process.
 
-**Status:** configuration, the Navidrome supervisor, the account store, and local-only mode. `wn-server init` writes `config.toml` and creates the owner account with an app password. `wn-server password` prints the app password and `--reset` replaces it. `wn-server serve` checks the Navidrome version, writes `navidrome.toml`, runs Navidrome as a child process, creates the owner's Navidrome user, adds the configured libraries, and serves the proxy on `listen`. The proxy checks Subsonic credentials against the owner's app password on `/rest/*`, passes `/share/*` without a check, answers 404 on every other path, and answers 503 until the supervisor reports ready. `wn-server login` links the owner account to a waxnerd user and stores the server credential. `wn-server logout` revokes and removes it. `wn-server status` prints the owner account and the link without calling wn-cloud. `match` returns "not implemented". The wn-cloud client covers sign-in, server registration, and device code verification. The wn-cloud API contract and an in-memory wn-cloud stub for tests are in place. v1 has one account, the owner. This file describes the agreed design and is updated as the code lands.
+**Status:** configuration, the Navidrome supervisor, the account store, and local-only mode. `wn-server init` writes `config.toml` and creates the owner account with an app password. `wn-server password` prints the app password and `--reset` replaces it. `wn-server serve` checks the Navidrome version, writes `navidrome.toml`, runs Navidrome as a child process, creates the owner's Navidrome user, adds the configured libraries, and serves the proxy on `listen`. The proxy checks Subsonic credentials against the owner's app password on `/rest/*`, passes `/share/*` without a check, answers 404 on every other path, and answers 503 until the supervisor reports ready. `wn-server login` links the owner account to a waxnerd user and stores the server credential. `wn-server logout` revokes and removes it. `wn-server status` prints the owner account and the link without calling wn-cloud. `wn-server match` runs a quiet beets import over the music folders, copies confident matches into `sorted_dir`, marks their original folders with `.ndignore`, and asks Navidrome to scan. The match queue and the `match` subcommands are not built yet. The wn-cloud client covers sign-in, server registration, and device code verification. The wn-cloud API contract and an in-memory wn-cloud stub for tests are in place. v1 has one account, the owner. This file describes the agreed design and is updated as the code lands.
 
 ## Architecture
 
@@ -40,7 +40,7 @@ clients (wn-mobile, wn-desktop, web UI)
 | `internal/navidrome` | child process supervisor, version pin, library sync, wn-server's own Navidrome identity, and the owner's Navidrome user |
 | `internal/proxy` | reverse proxy to Navidrome. It forwards `/rest/*` after a Subsonic credential check against the app password, and `/share/*` without a check. Every other path answers 404. It answers 503 until the supervisor is ready, strips incoming `Remote-User`, sets `Remote-User` to the account id after a successful check, removes the credential parameters before forwarding, and streams responses unbuffered. Sessions and rating intercepts are not built yet |
 | `internal/wncloud` | wn-cloud client: PKCE and state, the code display sign-in, `POST /cli/token`, `POST /cli/logout`, server registration, and device code verification, with typed errors per error code. The rating routes are not built yet. `stub` serves the same routes from memory for tests |
-| `internal/beets` | beets subprocess, match queue |
+| `internal/beets` | generated beets config, `beet import` subprocess, candidates file parser, `.ndignore` markers, scan trigger. The match queue is not built yet |
 | `internal/ratings` | local store of ratings and favorites, rating API, reconcile loop |
 | `internal/store` | wn-server's SQLite database, `<data dir>/wn-server.db`, mode 0600, with embedded migrations. It holds the owner account, the app password, and the server credential. Sessions, the match queue, ratings, and the outbox are not built yet |
 | `internal/web` | web UI for the owner: app password sign-in, status, match review, account page |
@@ -129,9 +129,31 @@ wn-server runs `beet import` in copy mode: `copy: yes`, `move: no`, `write: yes`
 
 Matched music therefore exists twice on disk. A move mode or a prune command can reclaim the space later, once the matching is trusted. Not in v1. There is no coupling to Navidrome's database.
 
-In quiet mode beets applies confident matches and skips the rest. A small beets plugin shipped in the bundle, `wn_candidates`, writes one JSON line per album it saw: folder, existing tags, and every candidate with release MBID, artist, album, year, label, and distance. wn-server reads that file into its match queue. There is no second beets pass and no parsing of the import log. The generated beets config sets `import.incremental` and `incremental_skip_later`, so repeated runs skip folders already imported and re-offer queued albums. The web UI shows the queue for review. The CLI drives the same queue.
+In quiet mode beets applies confident matches and skips the rest. A confident match is one below beets' default `match.strong_rec_thresh` of 0.04, which wn-server does not change. There is no second beets pass and no parsing of the import log. The generated beets config sets `import.incremental` and `incremental_skip_later`, so repeated runs skip folders already imported and re-offer skipped albums.
 
-The `chroma` plugin (AcoustID fingerprints) raises match confidence. wn-server ships with waxnerd's AcoustID application key compiled in. `acoustid_api_key` in `config.toml` overrides it.
+`wn-server match` runs one import over every `music_folders` entry in the foreground:
+
+1. It writes `<data dir>/beets.yaml` (mode 0600) and empties `<data dir>/beets-candidates.jsonl`.
+2. It runs `<beets_bin> --config <data dir>/beets.yaml import -q <music folders>`. The directory of `fpcalc_bin` goes first on `PATH`, `FPCALC` names `fpcalc_bin`, and `BEETSDIR` is the data directory, so a personal beets config in `~/.config/beets` is not read. `PYTHONDONTWRITEBYTECODE=1` keeps Python from writing `__pycache__` into `beets-plugins`. `HOME` is unchanged. beets output goes to wn-server's log at debug level. Ctrl-C kills beets and its process group.
+3. It reads the candidates file.
+4. It writes an empty `.ndignore` into the original folder of every applied album, with mode 0644, when the file does not exist. It writes no marker into a folder that is itself a `music_folders` entry, because that would hide the whole library. The marker is the only write to the originals tree.
+5. When at least one album was applied, it asks Navidrome to scan, as wn-server's identity, with `GET /rest/startScan`. Navidrome's native API has no scan route. When Navidrome is not running, wn-server logs a warning and the command still succeeds.
+6. It prints `applied N, skipped N, duplicates N, errors N`, then one line per skipped album with its folder and best candidate.
+
+The beets plugin `wn_candidates` ships in the bundle as `beets-plugins/wn_candidates.py`. It writes one JSON line per album task to `<data dir>/beets-candidates.jsonl`, with these keys:
+
+| Key | Contents |
+|---|---|
+| `folder` | Absolute path of the album folder. For an album that beets collapsed from several folders, such as `CD1` and `CD2`, it is their common parent. |
+| `tags` | The existing tags: `artist`, `album`, `year`, `track_count`. |
+| `decision` | `applied`, `skipped`, `duplicate` (the match is already in the beets library, and beets skips it in quiet mode), or `error`. |
+| `candidates` | Up to 10 candidates in beets' order, each with `release_id` (MusicBrainz release MBID), `artist`, `album`, `year`, `label`, and `distance`. |
+| `copied_to` | The album folder in `sorted_dir`. Only on `applied` lines. |
+| `error` | The message. Only on `error` lines. |
+
+The plugin records the candidates on the `import_task_choice` event, writes `applied` lines on `album_imported`, and writes the remaining tasks when the `import` event ends the session. beets 2.14 decides duplicates after `import_task_choice` and sends no event for an album it skips as a duplicate, so those lines are written at the end of the run. The plugin never raises out of a hook. An internal error becomes an `error` line. wn-server skips lines that do not parse and counts them as errors. The match queue that will read this file (WAX-940) is not built yet.
+
+The `chroma` plugin (AcoustID fingerprints) raises match confidence. The AcoustID application key is compiled in with `-ldflags "-X github.com/waxnerdhq/wn-server/internal/beets.DefaultAcoustIDKey=..."`. `make build`, `make bundle`, and `bundle/build.sh` take it from `WN_ACOUSTID_KEY` in the environment, which is empty by default. `acoustid_api_key` in `config.toml` overrides it. When both are empty, `beets.yaml` has no `acoustid` section and the chroma plugin uses its own key.
 
 ### Decisions
 
@@ -167,6 +189,13 @@ make check    # fmt, lint, test, build
 make bundle   # Linux only: release tarball in dist/
 ```
 
+`internal/beets` has an integration test that runs a real beets import against a temporary folder and needs network access to MusicBrainz. It is skipped unless `WN_BEETS_BIN` names a beets executable. `WN_FPCALC_BIN` names `fpcalc`. Without `WN_BEETS_ALBUM` the test generates one tagged MP3 with `ffmpeg`, which normally does not match, and checks the skip path. With `WN_BEETS_ALBUM` set to a folder that holds one real album, the test copies that folder into the temporary folder and expects it to be applied. In both cases it checks that the original files keep their bytes and mtimes, that every applied copy carries a MusicBrainz album id (read with `ffprobe`), and that only applied originals get `.ndignore`.
+
+```
+WN_BEETS_BIN=/opt/wn-server/beets WN_FPCALC_BIN=/opt/wn-server/fpcalc \
+WN_BEETS_ALBUM=/path/to/one/album go test ./internal/beets -run Integration -v
+```
+
 ### Local-only quick start
 
 1. `wn-server init --folder /path/to/music`. It prints the owner name (`owner` unless `--name` is given) and the app password. Keep the password.
@@ -191,7 +220,7 @@ A release is one tarball, `wn-server-<version>-linux-amd64.tar.gz`, for Linux on
 | `wn-server` | Static Go build (`CGO_ENABLED=0`), version set by the ldflag from the Makefile. |
 | `navidrome` | The Navidrome release binary, verified against the release's `navidrome_checksums.txt`. |
 | `beets` | beets as one executable that carries its own Python interpreter. Includes `pyacoustid` for the `chroma` plugin and `requests`. |
-| `beets-plugins/` | Directory for wn-server's beets plugins, read through `pluginpath`. The `wn_candidates` plugin goes here (WAX-938). |
+| `beets-plugins/` | `wn_candidates.py`, wn-server's beets plugin. The generated `beets.yaml` lists this directory in `pluginpath`. |
 | `fpcalc` | Chromaprint's static `fpcalc` release binary, verified against the sha256 in `bundle/checksums`. |
 | `LICENSE`, `NOTICE` | wn-server's licence, and the bundled projects with their licences. |
 
@@ -236,6 +265,20 @@ The data directory is `$XDG_DATA_HOME/wn-server`, or `~/.local/share/wn-server` 
 | `sorted_dir` | `<data dir>/sorted` | Directory beets copies matched albums into. Created on load. |
 | `acoustid_api_key` | empty | Overrides the compiled-in AcoustID key. |
 | `navidrome_external_services` | `true` | Sets Navidrome's `EnableExternalServices`. `false` turns off Navidrome's artist and album lookups (Deezer, Last.fm, Spotify agents). `init` does not write this key. |
+
+`wn-server match` writes these files into the data directory:
+
+| File | Contents |
+|---|---|
+| `beets.yaml` | Generated beets config, mode 0600. Rewritten on every run. |
+| `beets.db` | beets library database. |
+| `beets-state.pickle` | beets state file, which holds the incremental import history. |
+| `beets-import.log` | beets' import log. |
+| `beets-candidates.jsonl` | Output of the `wn_candidates` plugin for the last run. |
+
+beets also writes `beets.db-before-*.bak` files when it migrates its database, including on the first run.
+
+`beets.yaml` sets `library`, `directory` (`sorted_dir`), `statefile`, the path format `$albumartist/$album%aunique{}/$track $title`, `import` (`copy`, `write`, `quiet`, `autotag`, `incremental`, and `incremental_skip_later` on; `move` and `resume` off; `log`), `plugins` (`musicbrainz`, `chroma`, `wn_candidates`), `pluginpath` (`beets-plugins` next to the beets executable), `chroma.auto`, `acoustid.apikey` when a key is set, `wn_candidates.output`, `musicbrainz` (`host: musicbrainz.org`, `ratelimit: 1`), and `ui.color: no`. beets 2.14 loads MusicBrainz as a plugin, and a `plugins` key replaces its default list, so `musicbrainz` is listed explicitly.
 
 `Config.WriteNavidrome` renders `<data dir>/navidrome.toml`. The file has `Address = '127.0.0.1'`, the Navidrome port, `sorted_dir` as `MusicFolder`, `DataFolder = <data dir>/navidrome`, and `ExtAuth.UserHeader` and `ExtAuth.TrustedSources` set for the proxy. The file always has `EnableInsightsCollector = false`, so Navidrome Insights telemetry is off. It has `EnableExternalServices = true` unless `navidrome_external_services` is `false`, so external lookups are on by default. Navidrome's config file takes one `MusicFolder` only. Navidrome stores it as the path of library 1 on every start, and library paths are unique, so `MusicFolder` must never change. `sorted_dir` is created on load and never moves, which makes it the one stable choice. The supervisor calls `WriteNavidrome` before it starts Navidrome, and adds every `music_folders` entry as a library through Navidrome's API.
 

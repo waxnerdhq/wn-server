@@ -5,7 +5,8 @@
 #
 # Produces <output dir>/wn-server-<version>-linux-amd64.tar.gz. VERSION in the
 # environment sets <version>; otherwise it is `git describe`, as in the
-# Makefile. Requires bash, GNU tar, curl, sha256sum, install, grep, mktemp, go, and uv. Runs on Linux.
+# Makefile. WN_ACOUSTID_KEY in the environment sets the AcoustID key compiled
+# into wn-server; it is empty by default. Requires bash, GNU tar, curl, sha256sum, install, grep, mktemp, go, and uv. Runs on Linux.
 set -euo pipefail
 
 if [[ $# -ne 1 ]]; then
@@ -44,7 +45,7 @@ echo "==> wn-server $VERSION"
 (
 	cd "$repo"
 	CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath \
-		-ldflags "-X github.com/waxnerdhq/wn-server/internal/cli.Version=${VERSION}" \
+		-ldflags "-X github.com/waxnerdhq/wn-server/internal/cli.Version=${VERSION} -X github.com/waxnerdhq/wn-server/internal/beets.DefaultAcoustIDKey=${WN_ACOUSTID_KEY:-}" \
 		-o "$stage/wn-server" ./cmd/wn-server
 )
 
@@ -89,7 +90,7 @@ uvx --python "$PYTHON_VERSION" --python-preference only-managed \
 	-o "$dl/beets.pex"
 install -m 0755 "$dl/beets" "$stage/beets"
 mkdir "$stage/beets-plugins"
-cp "$repo/bundle/beets-plugins/README" "$stage/beets-plugins/README"
+cp "$repo/bundle/beets-plugins/wn_candidates.py" "$stage/beets-plugins/wn_candidates.py"
 
 cp "$repo/LICENSE" "$stage/LICENSE"
 cp "$repo/bundle/NOTICE" "$stage/NOTICE"

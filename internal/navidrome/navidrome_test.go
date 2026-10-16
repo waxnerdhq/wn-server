@@ -226,3 +226,25 @@ func TestEnsureAccountUser(t *testing.T) {
 		t.Fatalf("EnsureAccountUser with existing user = %v, %v, %d posts; want no create", created, err, len(posted))
 	}
 }
+
+func TestStartScan(t *testing.T) {
+	status := `{"subsonic-response":{"status":"ok","version":"1.16.1"}}`
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		q := r.URL.Query()
+		if r.URL.Path != "/rest/startScan" || r.Header.Get("Remote-User") != Identity ||
+			q.Get("f") != "json" || q.Get("c") != Identity || q.Get("v") == "" {
+			http.Error(w, "bad request", http.StatusBadRequest)
+			return
+		}
+		w.Write([]byte(status))
+	}))
+	defer srv.Close()
+	c := newClient(srv.URL, Identity)
+	if err := c.StartScan(context.Background()); err != nil {
+		t.Fatalf("StartScan: %v", err)
+	}
+	status = `{"subsonic-response":{"status":"failed","error":{"code":50,"message":"not authorized"}}}`
+	if err := c.StartScan(context.Background()); err == nil || !strings.Contains(err.Error(), "not authorized") {
+		t.Fatalf("StartScan with failed status = %v; want the Subsonic error", err)
+	}
+}
