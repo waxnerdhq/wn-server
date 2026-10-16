@@ -16,7 +16,7 @@ wn-server is licensed under GPL-3.0 (see `LICENSE`). It is powered by Navidrome,
 
 One `wn-server` binary. It supervises a pinned `navidrome` binary, writes its configuration, and sits in front of it as a reverse proxy. Navidrome listens on `127.0.0.1` only. Every request from the network goes through wn-server.
 
-beets runs as a subprocess. A pinned beets, with its Python interpreter, ships in the release bundle together with the pinned Navidrome binary, so a release works without any install step. ffmpeg is optional and only Navidrome uses it, for transcoding.
+beets runs as a subprocess and only writes into the sorted directory. A pinned beets, with its Python interpreter, ships in the release bundle together with the pinned Navidrome binary, so a release works without any install step. ffmpeg is optional and only Navidrome uses it, for transcoding.
 
 The first and only release target for now is Linux on x86_64. Other platforms come later.
 
@@ -123,7 +123,9 @@ Sync only applies to MusicBrainz-matched music. wn-cloud's rating model (`rating
 
 ### MusicBrainz matching
 
-wn-server runs `beet import` with copy and move off and tag writing on. beets tags the files in place with MusicBrainz ids. Navidrome's scanner picks the ids up on the next scan. There is no coupling to Navidrome's database.
+wn-server runs `beet import` in copy mode: `copy: yes`, `move: no`, `write: yes`. beets copies each matched album into the sorted directory (`sorted_dir` in the config) and writes the MusicBrainz ids into the copy. The original files are never modified or moved. Navidrome scans both the original folders and the sorted directory. After a confident copy, wn-server writes an empty `.ndignore` file into the original album folder, which Navidrome's scanner skips, so the album is not shown twice. Deleting the marker brings the original back. That marker is the only write to the originals tree.
+
+Matched music therefore exists twice on disk. A move mode or a prune command can reclaim the space later, once the matching is trusted. Not in v1. There is no coupling to Navidrome's database.
 
 In quiet mode beets applies confident matches and skips the rest. A small beets plugin shipped in the bundle, `wn_candidates`, writes one JSON line per album it saw: folder, existing tags, and every candidate with release MBID, artist, album, year, label, and distance. wn-server reads that file into its match queue. There is no second beets pass and no parsing of the import log. The generated beets config sets `import.incremental` and `incremental_skip_later`, so repeated runs skip folders already imported and re-offer queued albums. The web UI shows the queue for review. The CLI drives the same queue.
 
@@ -133,6 +135,7 @@ The `chroma` plugin (AcoustID fingerprints) raises match confidence. wn-server s
 
 - Navidrome runs as a separate process, not as an imported Go library and not as a Navidrome Wasm plugin. A library would tie wn-server to Navidrome's internal wiring. A plugin cannot hook auth or run beets.
 - beets runs as a subprocess. It has no embedding story outside Python.
+- beets copies into a sorted directory and never modifies or moves the original files. Originals that were copied are hidden from Navidrome with a `.ndignore` marker. (2026-10-16)
 - wn-server is written in Go and ships as one static binary inside a release bundle that also carries Navidrome and beets.
 - wn-server is GPL-3.0. It is the free part of waxnerd. wn-cloud and the client apps are separate projects. A managed hosting service running wn-server carries no GPL obligation, since GPL-3.0 has no network clause. A closed-source desktop app may ship wn-server as a separate executable and talk to it over HTTP or the CLI; it may not import its Go packages or link it statically. Outside contributions will need a contributor agreement to keep relicensing possible.
 - Every route wn-server calls on wn-cloud is written down first in `docs/wn-cloud-api.md`, and a stub server under `internal/wncloud` serves the same responses for tests. wn-cloud is implemented against the document. (WAX-946)
