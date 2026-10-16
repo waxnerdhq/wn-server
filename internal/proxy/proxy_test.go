@@ -2,14 +2,43 @@ package proxy
 
 import (
 	"bufio"
+	"context"
+	"crypto/md5"
+	"encoding/hex"
+	"encoding/json"
+	"encoding/xml"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/waxnerdhq/wn-server/internal/store"
 )
+
+const (
+	ownerID   = "0123456789abcdef"
+	ownerName = "owner"
+	ownerPass = "s3cretPassw0rd"
+)
+
+type fakeAccounts struct{}
+
+func (fakeAccounts) AccountByName(_ context.Context, name string) (store.Account, error) {
+	if name != ownerName {
+		return store.Account{}, store.ErrNotFound
+	}
+	return store.Account{ID: ownerID, Name: ownerName, AppPassword: ownerPass}, nil
+}
+
+// creds is a valid token-scheme query for the owner.
+func creds() string {
+	sum := md5.Sum([]byte(ownerPass + "abc123"))
+	return "u=" + ownerName + "&t=" + hex.EncodeToString(sum[:]) + "&s=abc123&v=1.16.1&c=test"
+}
 
 func newProxy(t *testing.T, backend http.Handler, ready bool) (*httptest.Server, *atomic.Int32) {
 	t.Helper()
@@ -27,17 +56,19 @@ func newProxy(t *testing.T, backend http.Handler, ready bool) (*httptest.Server,
 	if ready {
 		close(ch)
 	}
-	srv := httptest.NewServer(New(target, ch, nil))
+	srv := httptest.NewServer(New(target, ch, fakeAccounts{}, nil))
 	t.Cleanup(srv.Close)
 	return srv, &hits
 }
 
-func TestStripsRemoteUser(t *testing.T) {
+func TestRemoteUserIsAccountID(t *testing.T) {
 	var got []string
+	var query url.Values
 	srv, _ := newProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got = r.Header.Values("Remote-User")
+		query = r.URL.Query()
 	}), true)
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/rest/ping.view", nil)
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/rest/ping.view?"+creds(), nil)
 	req.Header.Set("Remote-User", "admin")
 	req.Header.Add("remote-user", "other")
 	resp, err := http.DefaultClient.Do(req)
@@ -45,8 +76,163 @@ func TestStripsRemoteUser(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
+	if len(got) != 1 || got[0] != ownerID {
+		t.Fatalf("backend received Remote-User %v, want [%s]", got, ownerID)
+	}
+	for _, k := range []string{"u", "t", "s"} {
+		if query.Has(k) {
+			t.Fatalf("backend received credential parameter %q", k)
+		}
+	}
+	if query.Get("c") != "test" || query.Get("v") != "1.16.1" {
+		t.Fatalf("backend query %v lost c or v", query)
+	}
+}
+
+func TestShareStripsRemoteUser(t *testing.T) {
+	var got []string
+	srv, hits := newProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Values("Remote-User")
+	}), true)
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/share/x", nil)
+	req.Header.Set("Remote-User", "admin")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK || hits.Load() != 1 {
+		t.Fatalf("status %d, %d backend hits; want 200 and 1", resp.StatusCode, hits.Load())
+	}
 	if len(got) != 0 {
 		t.Fatalf("backend received Remote-User %v", got)
+	}
+}
+
+func TestSubsonicAuth(t *testing.T) {
+	srv, hits := newProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}), true)
+	encPass := "enc:" + hex.EncodeToString([]byte(ownerPass))
+	tests := []struct {
+		name  string
+		query string
+		code  int // 0 means forwarded
+		json  bool
+	}{
+		{"token", creds(), 0, false},
+		{"plain", "u=owner&p=" + ownerPass + "&v=1&c=x", 0, false},
+		{"enc", "u=owner&p=" + encPass + "&v=1&c=x", 0, false},
+		{"wrong xml", "u=owner&p=nope&v=1&c=x", 40, false},
+		{"wrong json", "u=owner&p=nope&v=1&c=x&f=json", 40, true},
+		{"unknown user", "u=bob&p=" + ownerPass + "&v=1&c=x", 40, false},
+		{"missing u", "p=" + ownerPass + "&v=1&c=x", 10, false},
+		{"missing credential", "u=owner&v=1&c=x&f=json", 10, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			before := hits.Load()
+			resp, err := http.Get(srv.URL + "/rest/ping.view?" + tt.query)
+			if err != nil {
+				t.Fatal(err)
+			}
+			body, _ := io.ReadAll(resp.Body)
+			resp.Body.Close()
+			forwarded := hits.Load() > before
+			if tt.code == 0 {
+				if !forwarded {
+					t.Fatalf("not forwarded; body %s", body)
+				}
+				return
+			}
+			if forwarded || resp.StatusCode != http.StatusOK {
+				t.Fatalf("forwarded=%v status=%d; want an error answer with 200", forwarded, resp.StatusCode)
+			}
+			var code int
+			if tt.json {
+				var v struct {
+					R struct {
+						Status string `json:"status"`
+						Error  struct {
+							Code int `json:"code"`
+						} `json:"error"`
+					} `json:"subsonic-response"`
+				}
+				if err := json.Unmarshal(body, &v); err != nil || v.R.Status != "failed" {
+					t.Fatalf("body %s: %v", body, err)
+				}
+				code = v.R.Error.Code
+			} else {
+				var v struct {
+					Status string `xml:"status,attr"`
+					Error  struct {
+						Code int `xml:"code,attr"`
+					} `xml:"error"`
+				}
+				if err := xml.Unmarshal(body, &v); err != nil || v.Status != "failed" {
+					t.Fatalf("body %s: %v", body, err)
+				}
+				code = v.Error.Code
+			}
+			if code != tt.code {
+				t.Fatalf("code %d, want %d; body %s", code, tt.code, body)
+			}
+		})
+	}
+}
+
+func TestOtherPathsAre404(t *testing.T) {
+	srv, hits := newProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}), true)
+	for _, p := range []string{"/app/", "/api/user", "/auth/login", "/rest/../app/", "/",
+		"//rest/ping.view", "/rest/%2e%2e/app/", "/share/..%2f/app/", "/REST/ping.view"} {
+		resp, err := http.Get(srv.URL + p)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusNotFound {
+			t.Fatalf("%s: status %d, want 404", p, resp.StatusCode)
+		}
+	}
+	if hits.Load() != 0 {
+		t.Fatalf("backend received %d requests", hits.Load())
+	}
+}
+
+func TestFormBodyMergedIntoQuery(t *testing.T) {
+	for _, method := range []string{http.MethodPost, http.MethodPut} {
+		t.Run(method, func(t *testing.T) {
+			var query url.Values
+			var body []byte
+			var contentType string
+			var contentLength int64
+			srv, hits := newProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				query = r.URL.Query()
+				body, _ = io.ReadAll(r.Body)
+				contentType = r.Header.Get("Content-Type")
+				contentLength = r.ContentLength
+			}), true)
+			req, _ := http.NewRequest(method, srv.URL+"/rest/ping.view?"+creds(), strings.NewReader("id=42&name=x"))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				t.Fatal(err)
+			}
+			resp.Body.Close()
+			if hits.Load() != 1 {
+				t.Fatalf("%d backend hits, want 1", hits.Load())
+			}
+			if query.Get("id") != "42" || query.Get("name") != "x" || query.Get("c") != "test" {
+				t.Fatalf("backend query %v lacks the body parameters", query)
+			}
+			if query.Has("u") || query.Has("t") || query.Has("s") {
+				t.Fatalf("backend query %v has credentials", query)
+			}
+			if len(body) != 0 || contentLength > 0 {
+				t.Fatalf("backend body %q, content length %d; want empty", body, contentLength)
+			}
+			if contentType != "" {
+				t.Fatalf("backend Content-Type %q, want none", contentType)
+			}
+		})
 	}
 }
 
@@ -80,7 +266,7 @@ func TestStreamsChunks(t *testing.T) {
 		}
 	}), true)
 	client := &http.Client{Timeout: 10 * time.Second}
-	resp, err := client.Get(srv.URL + "/rest/stream")
+	resp, err := client.Get(srv.URL + "/rest/stream?" + creds())
 	if err != nil {
 		t.Fatal(err)
 	}

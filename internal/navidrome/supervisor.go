@@ -22,7 +22,17 @@ const (
 	readyTimeout  = 120 * time.Second
 	readyInterval = 250 * time.Millisecond
 	stopTimeout   = 10 * time.Second
+	// accountRetry is the wait between attempts to create the owner's
+	// Navidrome user.
+	accountRetry = 5 * time.Second
 )
+
+// Account names the wn-server account whose Navidrome user the supervisor
+// creates before it reports ready.
+type Account struct {
+	ID   string
+	Name string
+}
 
 // Supervisor runs the Navidrome child process.
 type Supervisor struct {
@@ -30,14 +40,16 @@ type Supervisor struct {
 	log    *slog.Logger
 	policy RestartPolicy
 	client *Client
+	owner  Account
 
 	readyOnce sync.Once
 	ready     chan struct{}
 }
 
-// NewSupervisor returns a supervisor for the Navidrome described by cfg. A
-// nil logger selects slog.Default.
-func NewSupervisor(cfg *config.Config, logger *slog.Logger) *Supervisor {
+// NewSupervisor returns a supervisor for the Navidrome described by cfg.
+// owner is the account whose Navidrome user must exist before ready. A nil
+// logger selects slog.Default.
+func NewSupervisor(cfg *config.Config, owner Account, logger *slog.Logger) *Supervisor {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -46,22 +58,20 @@ func NewSupervisor(cfg *config.Config, logger *slog.Logger) *Supervisor {
 		log:    logger,
 		policy: DefaultRestartPolicy(),
 		client: NewClient(cfg.NavidromePort),
+		owner:  owner,
 		ready:  make(chan struct{}),
 	}
 }
 
-// Ready is closed the first time Navidrome answers /ping and its libraries
-// have been synced.
+// Ready is closed the first time Navidrome answers /ping, the owner's
+// Navidrome user exists, and the libraries have been synced.
 func (s *Supervisor) Ready() <-chan struct{} { return s.ready }
 
-// Run verifies the binary, writes navidrome.toml, and keeps Navidrome running
-// until ctx is cancelled. On cancellation it sends SIGTERM, waits up to 10 s,
-// then SIGKILL, and returns nil. It returns an error only when Navidrome
-// cannot be started at all: a version mismatch or a config write failure.
+// Run writes navidrome.toml and keeps Navidrome running until ctx is
+// cancelled. The caller checks the binary with VerifyBinary first. On
+// cancellation it sends SIGTERM, waits up to 10 s, then SIGKILL, and returns
+// nil. It returns an error only when navidrome.toml cannot be written.
 func (s *Supervisor) Run(ctx context.Context) error {
-	if err := VerifyBinary(ctx, s.cfg.NavidromeBin); err != nil {
-		return err
-	}
 	if err := s.cfg.WriteNavidrome(); err != nil {
 		return err
 	}
@@ -148,8 +158,10 @@ func (s *Supervisor) waitReady(ctx context.Context) error {
 	}
 }
 
-// markReady creates wn-server's Navidrome user, syncs libraries, and
-// reports ready. A failure here is logged and the child keeps running.
+// markReady creates wn-server's Navidrome user and the owner's, syncs
+// libraries, and reports ready. Creating the owner's user is retried until it
+// succeeds. Any other failure is logged and the child keeps running without
+// ready.
 func (s *Supervisor) markReady(ctx context.Context) {
 	isAdmin, err := s.client.EnsureUser(ctx)
 	if err != nil {
@@ -160,6 +172,24 @@ func (s *Supervisor) markReady(ctx context.Context) {
 	}
 	if !isAdmin {
 		s.log.Error("navidrome user wn-server is not admin; another client created the first user before wn-server, and library sync will fail", "user", Identity)
+	}
+	for {
+		created, err := EnsureAccountUser(ctx, s.client, s.owner.ID, s.owner.Name)
+		if err == nil {
+			if created {
+				s.log.Info("created owner's navidrome user", "account", s.owner.ID)
+			}
+			break
+		}
+		if ctx.Err() != nil {
+			return
+		}
+		s.log.Error("create owner's navidrome user; retrying", "account", s.owner.ID, "error", err, "delay", accountRetry)
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(accountRetry):
+		}
 	}
 	created, err := SyncLibraries(ctx, s.client, s.cfg.SortedDir, s.cfg.MusicFolders)
 	if err != nil {

@@ -174,3 +174,55 @@ func TestSyncLibrariesCollectsErrors(t *testing.T) {
 		t.Fatalf("got %v, want errors for /music/a and the missing sorted_dir", err)
 	}
 }
+
+func TestEnsureAccountUser(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		listed []User
+		posted []User
+	)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/user", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Remote-User") != Identity {
+			http.Error(w, "Not authenticated", http.StatusUnauthorized)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		_ = json.NewEncoder(w).Encode(listed)
+	})
+	mux.HandleFunc("POST /api/user", func(w http.ResponseWriter, r *http.Request) {
+		var u User
+		if err := json.NewDecoder(r.Body).Decode(&u); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		posted = append(posted, u)
+		_ = json.NewEncoder(w).Encode(map[string]string{"id": "n1"})
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := newClient(srv.URL, Identity)
+	ctx := context.Background()
+
+	created, err := EnsureAccountUser(ctx, c, "0123456789abcdef", "owner")
+	if err != nil || !created {
+		t.Fatalf("EnsureAccountUser on empty list = %v, %v; want created", created, err)
+	}
+	if len(posted) != 1 {
+		t.Fatalf("POST called %d times, want 1", len(posted))
+	}
+	if u := posted[0]; u.UserName != "0123456789abcdef" || u.Name != "owner" || !u.IsAdmin || u.Password == "" {
+		t.Fatalf("POST body %+v", u)
+	}
+
+	mu.Lock()
+	listed = []User{{ID: "a", UserName: Identity, IsAdmin: true}, {ID: "n1", UserName: "0123456789abcdef"}}
+	mu.Unlock()
+	created, err = EnsureAccountUser(ctx, c, "0123456789abcdef", "owner")
+	if err != nil || created || len(posted) != 1 {
+		t.Fatalf("EnsureAccountUser with existing user = %v, %v, %d posts; want no create", created, err, len(posted))
+	}
+}
