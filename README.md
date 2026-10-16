@@ -8,7 +8,7 @@ wn-server is the waxnerd music server. It runs [Navidrome](https://www.navidrome
 
 wn-server is licensed under GPL-3.0 (see `LICENSE`). It is powered by Navidrome, which is also GPL-3.0 and runs as a separate process.
 
-**Status:** scaffold. The commands exist and return "not implemented". This file describes the agreed design and is updated as the code lands.
+**Status:** scaffold plus configuration. `wn-server init` writes `config.toml`, and `internal/config` loads it and renders `navidrome.toml`. The other commands return "not implemented". This file describes the agreed design and is updated as the code lands.
 
 ## Architecture
 
@@ -35,8 +35,8 @@ clients (wn-mobile, wn-desktop, web UI)
 
 | Package | Responsibility |
 |---|---|
-| `internal/cli` | cobra command line: `serve`, `login`, `match`, `version` |
-| `internal/config` | `config.toml`, data directory, rendered `navidrome.toml` |
+| `internal/cli` | cobra command line: `init`, `serve`, `login`, `match`, `version` |
+| `internal/config` | `config.toml` loading and defaults, data directory, rendered `navidrome.toml` |
 | `internal/navidrome` | child process supervisor and wn-server's own Navidrome credential |
 | `internal/proxy` | JWT verification, membership check, `Remote-User` forwarding, rating intercepts |
 | `internal/wncloud` | login flow, server registration, membership lookup, rating writes |
@@ -159,6 +159,26 @@ make test
 make lint     # go vet, plus golangci-lint when installed
 make check    # fmt, lint, test, build
 ```
+
+## Configuration
+
+The data directory is `$XDG_DATA_HOME/wn-server`, or `~/.local/share/wn-server` when `XDG_DATA_HOME` is unset. The config file is `<data dir>/config.toml`. The `--config` flag sets another path. In that case the data directory is the directory that contains the file.
+
+`wn-server init --folder <path>` creates the data directory and a first `config.toml`. The flag repeats for more folders. `init` refuses to overwrite an existing config.
+
+| Key | Default | Meaning |
+|---|---|---|
+| `music_folders` | none, required | Absolute paths of the music folders. At least one. Each must exist and be readable. |
+| `listen` | `0.0.0.0:4533` | Address of the wn-server proxy. |
+| `wn_cloud_url` | `https://waxnerd.com` | Base URL of wn-cloud. |
+| `navidrome_bin` | `navidrome` next to the `wn-server` executable | Navidrome binary. |
+| `beets_bin` | `beets` next to the `wn-server` executable | beets binary. |
+| `fpcalc_bin` | `fpcalc` next to the `wn-server` executable | Chromaprint binary. |
+| `navidrome_port` | `4534` | Loopback port of the Navidrome child process. |
+| `sorted_dir` | `<data dir>/sorted` | Directory beets copies matched albums into. Created on load. |
+| `acoustid_api_key` | empty | Overrides the compiled-in AcoustID key. |
+
+`Config.WriteNavidrome` renders `<data dir>/navidrome.toml`, and the supervisor calls it before starting Navidrome. The file has `Address = "127.0.0.1"`, the Navidrome port, the first music folder as `MusicFolder`, `DataFolder = <data dir>/navidrome`, and `ExtAuth.UserHeader` and `ExtAuth.TrustedSources` set for the proxy. Navidrome's config file takes one `MusicFolder` only. The remaining music folders and `sorted_dir` are added as libraries through Navidrome's API by the supervisor.
 
 ## Repository layout
 
