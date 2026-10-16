@@ -132,10 +132,20 @@ func login(ctx context.Context, in io.Reader, out, errOut io.Writer, st *store.S
 	if err != nil {
 		return explain("wn-cloud did not accept the code", err)
 	}
-	serverID, err := client.RegisterServer(ctx, token, name)
+	// A registration kept by logout belongs to the same server. It is reused
+	// when the same waxnerd user signs in again (docs/wn-cloud-api.md,
+	// POST /servers).
+	serverID, regUserID, registered, err := st.ServerRegistration(ctx)
 	if err != nil {
 		revoke(ctx, client, token, errOut)
-		return explain("wn-cloud did not register the server", err)
+		return err
+	}
+	if !registered || regUserID != userID {
+		serverID, err = client.RegisterServer(ctx, token, name)
+		if err != nil {
+			revoke(ctx, client, token, errOut)
+			return explain("wn-cloud did not register the server", err)
+		}
 	}
 	cred := store.ServerCredential{Token: token, ServerID: serverID, WaxnerdUserID: userID, CreatedAt: time.Now()}
 	if err := st.Link(ctx, owner.ID, cred); err != nil {
@@ -193,8 +203,9 @@ func newLogoutCmd() *cobra.Command {
 	}
 }
 
-// logout revokes the server credential at wn-cloud, deletes it, and clears
-// the owner's waxnerd user id. An unreachable wn-cloud or a 401 is a warning.
+// logout revokes the server credential at wn-cloud, removes the token, and
+// clears the owner's waxnerd user id. The store keeps the server id. Every
+// error from wn-cloud is a warning, and the credential is removed anyway.
 func logout(ctx context.Context, out, errOut io.Writer, st *store.Store, owner store.Account, client *wncloud.Client) error {
 	cred, err := st.ServerCredential(ctx)
 	if errors.Is(err, store.ErrNoServerCredential) {
@@ -209,21 +220,15 @@ func logout(ctx context.Context, out, errOut io.Writer, st *store.Store, owner s
 	if err != nil {
 		return err
 	}
-	err = client.Logout(ctx, cred.Token)
-	switch {
-	case err == nil:
+	if err := client.Logout(ctx, cred.Token); err != nil {
+		fmt.Fprintf(errOut, "warning: wn-cloud did not revoke the server credential; it is removed here (%v)\n", err)
+	} else {
 		fmt.Fprintln(out, "revoked the server credential at wn-cloud")
-	case errors.Is(err, wncloud.ErrUnauthorized):
-		fmt.Fprintln(errOut, "warning: wn-cloud no longer accepts the server credential; it is already revoked")
-	case errors.Is(err, wncloud.ErrUnreachable):
-		fmt.Fprintf(errOut, "warning: wn-cloud is unreachable; the server credential is removed here but not revoked at wn-cloud (%v)\n", err)
-	default:
-		return fmt.Errorf("revoke the server credential: %w", err)
 	}
 	if err := st.Unlink(ctx, owner.ID); err != nil {
 		return err
 	}
-	fmt.Fprintln(out, "deleted the server credential")
+	fmt.Fprintln(out, "removed the server credential")
 	fmt.Fprintf(out, "unlinked owner %q from waxnerd user %s\n", owner.Name, cred.WaxnerdUserID)
 	fmt.Fprintf(out, "wn-cloud keeps the record of server %s\n", cred.ServerID)
 	return nil

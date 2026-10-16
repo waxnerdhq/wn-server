@@ -8,8 +8,8 @@ import (
 	"time"
 )
 
-// ErrNoServerCredential is returned when the store holds no server
-// credential, which means wn-server login has not run.
+// ErrNoServerCredential is returned when the store holds no server token,
+// which means wn-server login has not run or wn-server logout has.
 var ErrNoServerCredential = errors.New("no server credential")
 
 // ServerCredential is the owner's wn-cloud CLI token with the server id and
@@ -26,12 +26,8 @@ type execer interface {
 	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
 }
 
-// SetServerCredential stores c as the server credential, replacing any
+// setServerCredential stores c as the server credential, replacing any
 // stored one. A zero CreatedAt is set to the current time.
-func (s *Store) SetServerCredential(ctx context.Context, c ServerCredential) error {
-	return setServerCredential(ctx, s.db, c)
-}
-
 func setServerCredential(ctx context.Context, db execer, c ServerCredential) error {
 	if c.CreatedAt.IsZero() {
 		c.CreatedAt = time.Now()
@@ -46,7 +42,7 @@ func setServerCredential(ctx context.Context, db execer, c ServerCredential) err
 }
 
 // ServerCredential returns the stored server credential, or
-// ErrNoServerCredential.
+// ErrNoServerCredential when no row exists or its token is empty.
 func (s *Store) ServerCredential(ctx context.Context) (ServerCredential, error) {
 	var (
 		c       ServerCredential
@@ -61,17 +57,29 @@ func (s *Store) ServerCredential(ctx context.Context) (ServerCredential, error) 
 	if err != nil {
 		return ServerCredential{}, err
 	}
+	if c.Token == "" {
+		return ServerCredential{}, ErrNoServerCredential
+	}
 	if c.CreatedAt, err = time.Parse(time.RFC3339, created); err != nil {
 		return ServerCredential{}, fmt.Errorf("server credential: bad created_at: %w", err)
 	}
 	return c, nil
 }
 
-// DeleteServerCredential removes the server credential. It does nothing
-// when none is stored.
-func (s *Store) DeleteServerCredential(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM server_credential`)
-	return err
+// ServerRegistration returns the server id and the waxnerd user id that the
+// store holds, also after logout has cleared the token. found is false when
+// wn-server login has never stored them.
+func (s *Store) ServerRegistration(ctx context.Context) (serverID, waxnerdUserID string, found bool, err error) {
+	err = s.db.QueryRowContext(ctx,
+		`SELECT server_id, waxnerd_user_id FROM server_credential WHERE id = 1`).
+		Scan(&serverID, &waxnerdUserID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", "", false, nil
+	}
+	if err != nil {
+		return "", "", false, err
+	}
+	return serverID, waxnerdUserID, true, nil
 }
 
 // LinkOwner sets the waxnerd user id of the account. An empty id clears it.
@@ -102,11 +110,12 @@ func (s *Store) Link(ctx context.Context, accountID string, c ServerCredential) 
 	})
 }
 
-// Unlink removes the server credential and clears the account's waxnerd
-// user id, in one transaction.
+// Unlink clears the server token and the account's waxnerd user id, in one
+// transaction. The server id and the waxnerd user id of the registration
+// stay, so that a later login by the same user reuses the server id.
 func (s *Store) Unlink(ctx context.Context, accountID string) error {
 	return s.inTx(ctx, func(tx *sql.Tx) error {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM server_credential`); err != nil {
+		if _, err := tx.ExecContext(ctx, `UPDATE server_credential SET token = ''`); err != nil {
 			return err
 		}
 		return linkOwner(ctx, tx, accountID, "")

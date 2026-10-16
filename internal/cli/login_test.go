@@ -27,8 +27,8 @@ var (
 	codeRE    = regexp.MustCompile(`<output id="code">([^<]+)</output>`)
 )
 
-// cloud is the stub behind a handler that counts token exchanges and can
-// make POST /servers fail.
+// cloud is the stub behind a handler that counts token exchanges and server
+// registrations and can make POST /servers and POST /cli/logout fail.
 type cloud struct {
 	stub *stub.Stub
 	srv  *httptest.Server
@@ -37,6 +37,8 @@ type cloud struct {
 	exchanges     int
 	failServers   bool
 	serversBearer string
+	serverPosts   int
+	failLogout    bool
 }
 
 func newCloud(t *testing.T) *cloud {
@@ -47,6 +49,14 @@ func newCloud(t *testing.T) *cloud {
 		c.mu.Lock()
 		if r.URL.Path == "/cli/token" {
 			c.exchanges++
+		}
+		if r.Method == http.MethodPost && r.URL.Path == "/servers" {
+			c.serverPosts++
+		}
+		if c.failLogout && r.URL.Path == "/cli/logout" {
+			c.mu.Unlock()
+			http.Error(w, `{"error":"bad request","code":"invalid_request"}`, http.StatusBadRequest)
+			return
 		}
 		fail := c.failServers && r.URL.Path == "/servers"
 		if fail {
@@ -178,6 +188,78 @@ func TestLoginLogoutStatus(t *testing.T) {
 	}
 	if out, err := run(same, "status"); err != nil || !strings.Contains(out, "not linked") {
 		t.Fatalf("status after logout: %v %q", err, out)
+	}
+}
+
+func TestLogoutErrorStillUnlinks(t *testing.T) {
+	c := newCloud(t)
+	cfg, run := setup(t, c)
+	if out, err := run(same, "login", "--name", "n"); err != nil {
+		t.Fatalf("login: %v\n%s", err, out)
+	}
+	c.mu.Lock()
+	c.failLogout = true
+	c.mu.Unlock()
+	if out, err := run(same, "logout"); err != nil || !strings.Contains(out, "removed the server credential") {
+		t.Fatalf("logout: %v %q", err, out)
+	}
+	if _, err := credential(t, cfg); !errors.Is(err, store.ErrNoServerCredential) {
+		t.Fatalf("credential after logout: %v", err)
+	}
+	if out, err := run(same, "status"); err != nil || !strings.Contains(out, "not linked") {
+		t.Fatalf("status after logout: %v %q", err, out)
+	}
+}
+
+func TestLoginReusesServerID(t *testing.T) {
+	const otherUserID = "0192f1c4-3b7e-7d2a-9a10-5f4e2c1b8a71"
+	c := newCloud(t)
+	c.stub.AddUser(otherUserID, "other@example.com")
+	cfg, run := setup(t, c)
+
+	if out, err := run(same, "login", "--name", "n"); err != nil {
+		t.Fatalf("login: %v\n%s", err, out)
+	}
+	first, err := credential(t, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if out, err := run(same, "logout"); err != nil {
+		t.Fatalf("logout: %v\n%s", err, out)
+	}
+
+	// The same user signs in again: no new registration, same server id.
+	if out, err := run(same, "login", "--name", "n"); err != nil {
+		t.Fatalf("second login: %v\n%s", err, out)
+	}
+	second, err := credential(t, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if second.ServerID != first.ServerID || second.Token == first.Token {
+		t.Fatalf("second credential = %+v, first = %+v; want the same server id and a new token", second, first)
+	}
+	if c.serverPosts != 1 {
+		t.Fatalf("%d calls to POST /servers, want 1", c.serverPosts)
+	}
+
+	// Another user signs in on the same server: a new registration.
+	if out, err := run(same, "logout"); err != nil {
+		t.Fatalf("logout: %v\n%s", err, out)
+	}
+	c.stub.SignInAs(otherUserID)
+	if out, err := run(same, "login", "--name", "n"); err != nil {
+		t.Fatalf("login as another user: %v\n%s", err, out)
+	}
+	third, err := credential(t, cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if third.WaxnerdUserID != otherUserID || third.ServerID == first.ServerID {
+		t.Fatalf("third credential = %+v, first = %+v; want a new server id for the other user", third, first)
+	}
+	if c.serverPosts != 2 {
+		t.Fatalf("%d calls to POST /servers, want 2", c.serverPosts)
 	}
 }
 

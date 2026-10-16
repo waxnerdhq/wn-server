@@ -92,6 +92,9 @@ func TestServerCredential(t *testing.T) {
 	if _, err := s.ServerCredential(ctx); !errors.Is(err, ErrNoServerCredential) {
 		t.Fatalf("ServerCredential on empty store = %v, want ErrNoServerCredential", err)
 	}
+	if _, _, found, err := s.ServerRegistration(ctx); err != nil || found {
+		t.Fatalf("ServerRegistration on empty store = %v, %v; want not found", found, err)
+	}
 	want := ServerCredential{Token: "wn_t", ServerID: "srv", WaxnerdUserID: "user", CreatedAt: time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)}
 	if err := s.Link(ctx, owner.ID, want); err != nil {
 		t.Fatal(err)
@@ -107,6 +110,9 @@ func TestServerCredential(t *testing.T) {
 	}
 	if _, err := s.ServerCredential(ctx); !errors.Is(err, ErrNoServerCredential) {
 		t.Fatalf("ServerCredential after Unlink = %v", err)
+	}
+	if id, user, found, err := s.ServerRegistration(ctx); err != nil || !found || id != "srv" || user != "user" {
+		t.Fatalf("ServerRegistration after Unlink = %q, %q, %v, %v", id, user, found, err)
 	}
 	if got, _ := s.Owner(ctx); got.WaxnerdUserID != "" {
 		t.Fatalf("owner waxnerd user id after Unlink = %q", got.WaxnerdUserID)
