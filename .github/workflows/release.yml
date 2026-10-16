@@ -45,6 +45,11 @@ jobs:
           fi
 
       - name: Build bundle
+        # pex's scie build fetches python-build-standalone release metadata
+        # from the GitHub API. Without a token the runner's shared quota can
+        # run out and the step fails with 403.
+        env:
+          SCIENCE_AUTH_API_GITHUB_COM_BEARER: ${{ secrets.GITHUB_TOKEN }}
         run: bundle/build.sh dist
 
       - uses: actions/upload-artifact@v7
