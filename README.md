@@ -8,7 +8,7 @@ wn-server is the waxnerd music server. It runs [Navidrome](https://www.navidrome
 
 wn-server is licensed under GPL-3.0 (see `LICENSE`). It is powered by Navidrome, which is also GPL-3.0 and runs as a separate process.
 
-**Status:** scaffold plus configuration. `wn-server init` writes `config.toml`, and `internal/config` loads it and renders `navidrome.toml`. The other commands return "not implemented". This file describes the agreed design and is updated as the code lands.
+**Status:** scaffold, configuration, and the Navidrome supervisor. `wn-server init` writes `config.toml`. `wn-server serve` checks the Navidrome version, writes `navidrome.toml`, runs Navidrome as a child process, and adds the configured libraries. There is no proxy yet. `login` and `match` return "not implemented". This file describes the agreed design and is updated as the code lands.
 
 ## Architecture
 
@@ -37,7 +37,7 @@ clients (wn-mobile, wn-desktop, web UI)
 |---|---|
 | `internal/cli` | cobra command line: `init`, `serve`, `login`, `match`, `version` |
 | `internal/config` | `config.toml` loading and defaults, data directory, rendered `navidrome.toml` |
-| `internal/navidrome` | child process supervisor and wn-server's own Navidrome credential |
+| `internal/navidrome` | child process supervisor, version pin, library sync, and wn-server's own Navidrome identity |
 | `internal/proxy` | JWT verification, membership check, `Remote-User` forwarding, rating intercepts |
 | `internal/wncloud` | login flow, server registration, membership lookup, rating writes |
 | `internal/beets` | beets subprocess, match queue |
@@ -60,7 +60,7 @@ Owner setup, once, on the server machine (`wn-server login`). This is wn-cloud's
 3. wn-cloud redirects the browser to `http://127.0.0.1:<port>/callback` with a code.
 4. wn-server posts the code and the PKCE verifier to `POST /cli/token` and receives a CLI token. That token is the server credential.
 5. wn-server registers this server under the owner and receives a server id.
-6. wn-server sends one request to Navidrome with `Remote-User: <owner id>`. Navidrome creates the user. The first user is admin.
+6. wn-server creates the owner's Navidrome user through Navidrome's native API, with admin set explicitly. This lands with WAX-947. wn-server's own identity (`wn-server`) is already Navidrome's first user and its admin, created by the supervisor at startup (see Navidrome supervisor).
 7. Optional: wn-server mints a Navidrome API key for its own background jobs.
 
 First-party clients (wn-mobile, wn-desktop, the web UI), once per device:
@@ -178,7 +178,19 @@ The data directory is `$XDG_DATA_HOME/wn-server`, or `~/.local/share/wn-server` 
 | `sorted_dir` | `<data dir>/sorted` | Directory beets copies matched albums into. Created on load. |
 | `acoustid_api_key` | empty | Overrides the compiled-in AcoustID key. |
 
-`Config.WriteNavidrome` renders `<data dir>/navidrome.toml`. The file has `Address = '127.0.0.1'`, the Navidrome port, the first music folder as `MusicFolder`, `DataFolder = <data dir>/navidrome`, and `ExtAuth.UserHeader` and `ExtAuth.TrustedSources` set for the proxy. Navidrome's config file takes one `MusicFolder` only. The supervisor issue (WAX-929) will call `WriteNavidrome` before it starts Navidrome. It will also add the remaining music folders and `sorted_dir` as libraries through Navidrome's API.
+`Config.WriteNavidrome` renders `<data dir>/navidrome.toml`. The file has `Address = '127.0.0.1'`, the Navidrome port, the first music folder as `MusicFolder`, `DataFolder = <data dir>/navidrome`, and `ExtAuth.UserHeader` and `ExtAuth.TrustedSources` set for the proxy. Navidrome's config file takes one `MusicFolder` only. The supervisor calls `WriteNavidrome` before it starts Navidrome, and adds the remaining music folders and `sorted_dir` as libraries through Navidrome's API.
+
+## Navidrome supervisor
+
+`internal/navidrome` runs the child process. `wn-server serve` loads the config, runs the supervisor, and stops it on SIGINT or SIGTERM.
+
+- **Version pin.** `navidrome.PinnedVersion` is `0.64.2`. Before each start the supervisor runs `<navidrome_bin> --version`, which prints the version without the `v` followed by the commit sha, for example `0.64.2 (101145742)`. If the version differs, `serve` exits with an error that names both versions.
+- **Start.** The supervisor calls `Config.WriteNavidrome`, then runs `<navidrome_bin> -c <data dir>/navidrome.toml`. Each stdout and stderr line of the child goes to wn-server's log through `log/slog`, prefixed `navidrome:`.
+- **Ready.** The supervisor polls `http://127.0.0.1:<navidrome_port>/ping` every 250 ms until it answers 200. After 30 s without a 200 it stops the child and restarts it with backoff.
+- **Restart.** When the child exits unexpectedly, the supervisor restarts it after 1 s. The delay doubles on each further exit, up to 30 s, and resets after the child stayed up for 60 s. `RestartPolicy.Next` computes the delay.
+- **Stop.** On context cancellation the supervisor sends SIGTERM, waits up to 10 s, then sends SIGKILL.
+- **wn-server identity.** `navidrome.Identity` is `wn-server`. The first request after ready is `GET /app/` with `Remote-User: wn-server`. Navidrome creates a header user only on that route, and the first user it creates is admin. Later requests use the same header on the native API, which accepts it from the trusted source `127.0.0.1/32`.
+- **Library sync.** After ready, the supervisor lists `GET /api/library` and creates a library with `POST /api/library` (`{"name": ..., "path": ...}`) for each path in `music_folders` and `sorted_dir` that has none. Each library is named after the last path element, with a numeric suffix when the name is taken. Libraries that wn-server did not create are not changed or deleted.
 
 ## Repository layout
 

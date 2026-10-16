@@ -4,11 +4,15 @@ package cli
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+	"os/signal"
+	"syscall"
 
 	"github.com/spf13/cobra"
 
 	"github.com/waxnerdhq/wn-server/internal/config"
+	"github.com/waxnerdhq/wn-server/internal/navidrome"
 )
 
 // Version is set at build time with -ldflags "-X .../internal/cli.Version=...".
@@ -58,8 +62,20 @@ func newServeCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "serve",
 		Short: "Start Navidrome and the wn-server proxy",
+		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return errNotImplemented
+			flag, _ := cmd.Flags().GetString("config")
+			_, path, err := config.Paths(flag)
+			if err != nil {
+				return err
+			}
+			c, err := config.Load(path)
+			if err != nil {
+				return err
+			}
+			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			return navidrome.NewSupervisor(c, slog.Default()).Run(ctx)
 		},
 	}
 }
