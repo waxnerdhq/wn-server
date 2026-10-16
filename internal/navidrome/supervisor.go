@@ -16,7 +16,10 @@ import (
 )
 
 const (
-	readyTimeout  = 30 * time.Second
+	// readyTimeout is how long Navidrome gets to answer /ping. It runs
+	// database migrations before it listens, and a migration after a version
+	// bump can take minutes.
+	readyTimeout  = 120 * time.Second
 	readyInterval = 250 * time.Millisecond
 	stopTimeout   = 10 * time.Second
 )
@@ -88,7 +91,9 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 	cmd := exec.CommandContext(runCtx, s.cfg.NavidromeBin, "-c", s.cfg.NavidromeConfigPath())
 	stdout, stderr := &lineWriter{log: s.log}, &lineWriter{log: s.log}
 	cmd.Stdout, cmd.Stderr = stdout, stderr
-	cmd.Cancel = func() error { return cmd.Process.Signal(syscall.SIGTERM) }
+	cmd.SysProcAttr = childAttr()
+	// The child leads its own process group, so the signal goes to the group.
+	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM) }
 	cmd.WaitDelay = stopTimeout
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start %s: %w", s.cfg.NavidromeBin, err)
@@ -117,7 +122,7 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 	return err
 }
 
-// waitReady polls /ping until it answers 200, for up to 30 s.
+// waitReady polls /ping until it answers 200, for up to readyTimeout.
 func (s *Supervisor) waitReady(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, readyTimeout)
 	defer cancel()
@@ -146,14 +151,17 @@ func (s *Supervisor) waitReady(ctx context.Context) error {
 // markReady creates wn-server's Navidrome user, syncs libraries, and
 // reports ready. A failure here is logged and the child keeps running.
 func (s *Supervisor) markReady(ctx context.Context) {
-	if err := s.client.EnsureUser(ctx); err != nil {
+	isAdmin, err := s.client.EnsureUser(ctx)
+	if err != nil {
 		if ctx.Err() == nil {
 			s.log.Error("create wn-server user in navidrome", "error", err)
 		}
 		return
 	}
-	paths := append(append([]string{}, s.cfg.MusicFolders...), s.cfg.SortedDir)
-	created, err := SyncLibraries(ctx, s.client, paths)
+	if !isAdmin {
+		s.log.Error("navidrome user wn-server is not admin; another client created the first user before wn-server, and library sync will fail", "user", Identity)
+	}
+	created, err := SyncLibraries(ctx, s.client, s.cfg.SortedDir, s.cfg.MusicFolders)
 	if err != nil {
 		if ctx.Err() == nil {
 			s.log.Error("sync navidrome libraries", "error", err)

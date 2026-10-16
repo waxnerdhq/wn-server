@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
+	"regexp"
 	"strconv"
 	"time"
 )
@@ -75,13 +77,44 @@ func (c *Client) do(ctx context.Context, method, path string, body any) ([]byte,
 	return data, nil
 }
 
-// EnsureUser makes Navidrome create the user for this identity. Navidrome
-// creates a header user only on the web UI route (GET /app/, which injects
-// the login state into index.html), not on /api/* or /rest/*. The first user
-// created is admin, so this must be the first request to a new Navidrome.
-func (c *Client) EnsureUser(ctx context.Context) error {
-	_, err := c.do(ctx, http.MethodGet, "/app/", nil)
-	return err
+// EnsureUser makes Navidrome create the user for this identity and reports
+// whether that user is admin. Navidrome creates a header user only on the web
+// UI route (GET /app/, which injects the login state into index.html), not on
+// /api/* or /rest/*. The first user created is admin, so this must be the
+// first request to a new Navidrome.
+func (c *Client) EnsureUser(ctx context.Context) (isAdmin bool, err error) {
+	data, err := c.do(ctx, http.MethodGet, "/app/", nil)
+	if err != nil {
+		return false, err
+	}
+	return parseIsAdmin(data)
+}
+
+// appConfigRe finds the script line that index.html fills from the
+// AppConfig template field. Navidrome renders the config as JSON and
+// html/template emits that string as a JS string literal.
+var appConfigRe = regexp.MustCompile(`window\.__APP_CONFIG__\s*=\s*("(?:[^"\\]|\\.)*")`)
+
+// parseIsAdmin reads auth.isAdmin from the config that GET /app/ injects into
+// index.html. It is false when the page carries no auth object.
+func parseIsAdmin(page []byte) (bool, error) {
+	m := appConfigRe.FindSubmatch(page)
+	if m == nil {
+		return false, errors.New("no app config in /app/ response")
+	}
+	var raw string
+	if err := json.Unmarshal(m[1], &raw); err != nil {
+		return false, fmt.Errorf("decode app config literal: %w", err)
+	}
+	var cfg struct {
+		Auth struct {
+			IsAdmin bool `json:"isAdmin"`
+		} `json:"auth"`
+	}
+	if err := json.Unmarshal([]byte(raw), &cfg); err != nil {
+		return false, fmt.Errorf("decode app config: %w", err)
+	}
+	return cfg.Auth.IsAdmin, nil
 }
 
 // ListLibraries returns all libraries. The route is admin only.

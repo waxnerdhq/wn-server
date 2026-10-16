@@ -36,13 +36,16 @@ func (c *Config) NavidromeConfigPath() string {
 // RenderNavidrome returns the contents of navidrome.toml.
 //
 // Navidrome's config file has a single MusicFolder string and no list of
-// libraries, so only the first music folder is rendered. The supervisor adds
-// the other music folders and sorted_dir through Navidrome's API.
+// libraries. Navidrome stores MusicFolder as the path of library 1 on every
+// start, and library paths are unique. MusicFolder is therefore sorted_dir,
+// which is created on load and never moves. Changing it with the list of
+// music folders would collide with the libraries created through the API.
+// The supervisor adds every music folder through Navidrome's API.
 func (c *Config) RenderNavidrome() ([]byte, error) {
 	body, err := toml.Marshal(navidromeConfig{
 		Address:     "127.0.0.1",
 		Port:        c.NavidromePort,
-		MusicFolder: c.MusicFolders[0],
+		MusicFolder: c.SortedDir,
 		DataFolder:  c.NavidromeDataDir(),
 		ExtAuth: navidromeExtAuth{
 			UserHeader:     "Remote-User",

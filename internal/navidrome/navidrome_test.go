@@ -63,10 +63,12 @@ func TestRestartPolicyNext(t *testing.T) {
 }
 
 type fakeNavidrome struct {
-	mu      sync.Mutex
-	libs    []Library
-	created []Library
-	users   []string
+	mu       sync.Mutex
+	libs     []Library
+	created  []Library
+	users    []string
+	notAdmin bool
+	failPath string
 }
 
 func (f *fakeNavidrome) handler() http.Handler {
@@ -74,7 +76,14 @@ func (f *fakeNavidrome) handler() http.Handler {
 	mux.HandleFunc("GET /app/", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
 		f.users = append(f.users, r.Header.Get("Remote-User"))
+		admin := !f.notAdmin
 		f.mu.Unlock()
+		cfg, _ := json.Marshal(map[string]any{
+			"version": "0.64.2",
+			"auth":    map[string]any{"id": "u1", "username": Identity, "isAdmin": admin},
+		})
+		lit, _ := json.Marshal(string(cfg))
+		_, _ = w.Write([]byte("<script>\n  window.__APP_CONFIG__ = " + string(lit) + "\n</script>\n"))
 	})
 	mux.HandleFunc("GET /api/library", func(w http.ResponseWriter, r *http.Request) {
 		if r.Header.Get("Remote-User") != Identity {
@@ -93,6 +102,10 @@ func (f *fakeNavidrome) handler() http.Handler {
 		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
+		if l.Path == f.failPath {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
 		l.ID = len(f.libs) + len(f.created) + 1
 		f.created = append(f.created, l)
 		_ = json.NewEncoder(w).Encode(map[string]string{"id": "x"})
@@ -102,7 +115,7 @@ func (f *fakeNavidrome) handler() http.Handler {
 
 func TestSyncLibraries(t *testing.T) {
 	fake := &fakeNavidrome{libs: []Library{
-		{ID: 1, Name: "Music Library", Path: "/music/a"},
+		{ID: 1, Name: "Music Library", Path: "/data/sorted"},
 		{ID: 2, Name: "Other", Path: "/elsewhere/keep"},
 	}}
 	srv := httptest.NewServer(fake.handler())
@@ -110,24 +123,29 @@ func TestSyncLibraries(t *testing.T) {
 	c := newClient(srv.URL, Identity)
 	ctx := context.Background()
 
-	if err := c.EnsureUser(ctx); err != nil {
-		t.Fatal(err)
+	admin, err := c.EnsureUser(ctx)
+	if err != nil || !admin {
+		t.Fatalf("EnsureUser = %v, %v; want admin", admin, err)
 	}
 	if !reflect.DeepEqual(fake.users, []string{Identity}) {
 		t.Fatalf("EnsureUser sent Remote-User %v", fake.users)
 	}
+	fake.notAdmin = true
+	if admin, err := c.EnsureUser(ctx); err != nil || admin {
+		t.Fatalf("EnsureUser = %v, %v; want not admin", admin, err)
+	}
 
-	paths := []string{"/music/a", "/music/b/", "/data/sorted", "/other/Other"}
-	created, err := SyncLibraries(ctx, c, paths)
+	folders := []string{"/music/a", "/music/b/", "/other/Other"}
+	created, err := SyncLibraries(ctx, c, "/data/sorted", folders)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := []string{"/music/b", "/data/sorted", "/other/Other"}; !reflect.DeepEqual(created, want) {
+	if want := []string{"/music/a", "/music/b", "/other/Other"}; !reflect.DeepEqual(created, want) {
 		t.Fatalf("created %v, want %v", created, want)
 	}
 	want := []Library{
-		{ID: 3, Name: "b", Path: "/music/b"},
-		{ID: 4, Name: "sorted", Path: "/data/sorted"},
+		{ID: 3, Name: "a", Path: "/music/a"},
+		{ID: 4, Name: "b", Path: "/music/b"},
 		{ID: 5, Name: "Other 2", Path: "/other/Other"},
 	}
 	if !reflect.DeepEqual(fake.created, want) {
@@ -136,8 +154,23 @@ func TestSyncLibraries(t *testing.T) {
 
 	fake.libs = append(fake.libs, fake.created...)
 	fake.created = nil
-	created, err = SyncLibraries(ctx, c, paths)
+	created, err = SyncLibraries(ctx, c, "/data/sorted", folders)
 	if err != nil || len(created) != 0 || len(fake.created) != 0 {
 		t.Fatalf("second sync created %v (err %v), want nothing", created, err)
+	}
+}
+
+func TestSyncLibrariesCollectsErrors(t *testing.T) {
+	fake := &fakeNavidrome{failPath: "/music/a"}
+	srv := httptest.NewServer(fake.handler())
+	defer srv.Close()
+	c := newClient(srv.URL, Identity)
+
+	created, err := SyncLibraries(context.Background(), c, "/data/sorted", []string{"/music/a", "/music/b"})
+	if want := []string{"/music/b"}; !reflect.DeepEqual(created, want) {
+		t.Fatalf("created %v, want %v", created, want)
+	}
+	if err == nil || !strings.Contains(err.Error(), "/music/a") || !strings.Contains(err.Error(), "sorted_dir /data/sorted") {
+		t.Fatalf("got %v, want errors for /music/a and the missing sorted_dir", err)
 	}
 }
