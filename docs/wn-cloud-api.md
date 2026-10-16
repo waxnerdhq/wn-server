@@ -2,6 +2,8 @@
 
 This document lists every wn-cloud route that wn-server calls, and the routes wn-cloud must offer so that first-party clients can sign in to a wn-server. wn-cloud is the v2 server in `../v2`. wn-cloud is implemented against this document. The package `internal/wncloud/stub` serves the same routes from memory for tests.
 
+**Scope.** v1 of wn-server has one account, the owner. wn-server holds one wn-cloud credential: the server credential, which is the owner's CLI token. Listeners, invites, and server membership are not in v1. Listener sign-in depends on waxnerd relay, which is not specified yet. The routes for listeners return after relay is specified.
+
 Each route is marked **existing** (it is in v2 today and is described as it behaves now) or **new (WAX-nnn)** (wn-cloud does not have it yet).
 
 | Route | Status | Called by |
@@ -10,18 +12,15 @@ Each route is marked **existing** (it is in v2 today and is described as it beha
 | `GET /cli/auth` | existing | the browser, opened by `wn` and first-party apps. wn-server uses the variant below. |
 | `POST /cli/token` | existing | wn-server |
 | `POST /cli/logout` | existing | wn-server |
-| `GET /cli/auth` with `display=code` | new (WAX-933) | the browser, opened by the user at a URL that wn-server shows |
+| `GET /cli/auth` with `display=code` | new (WAX-933) | the browser, opened by the owner at a URL that `wn-server login` prints |
 | `POST /cli/token` without `redirect_port` | new (WAX-933) | wn-server |
 | `POST /servers` | new (WAX-932) | wn-server |
-| `GET /servers/:id/members` | new (WAX-932) | wn-server |
-| `POST /servers/:id/invites` | new (WAX-932) | wn-server |
-| `DELETE /servers/:id/members/:userId` | new (WAX-932) | wn-server |
 | `PUT /ratings/:kind/:mbid` | new (WAX-942) | wn-server |
 | `DELETE /ratings/:kind/:mbid` | new (WAX-942) | wn-server |
 | `GET /ratings/:kind/:mbid` | new (WAX-942) | wn-server |
 | `GET /ratings?since=` | new (WAX-942) | wn-server |
 
-wn-server calls the rating routes on the user's behalf. Clients send ratings to wn-server, through the Subsonic `setRating`, `star`, and `unstar` calls or through wn-server's own `/api/v1/ratings` route. wn-server relays each write to wn-cloud with that user's stored token. Clients never call wn-cloud's rating routes directly, so the local store and the Navidrome mirror stay on one code path (README, Ratings and favorites).
+wn-server calls the rating routes with the server credential, so the ratings are the owner's. Clients send ratings to wn-server, through the Subsonic `setRating`, `star`, and `unstar` calls or through wn-server's own `/api/v1/ratings` route. wn-server relays each write to wn-cloud. Clients never call wn-cloud's rating routes directly, so the local store and the Navidrome mirror stay on one code path (README, Ratings and favorites).
 
 ## Conventions
 
@@ -38,13 +37,13 @@ Every authenticated request sends `Authorization: Bearer <token>`. wn-cloud acce
 
 | Kind | Form | Where wn-server gets it |
 |---|---|---|
-| CLI token | `wn_` followed by 43 base64url characters. Opaque. Does not expire. Ends when revoked with `POST /cli/logout`. | `POST /cli/token`. A first-party client hands its own CLI token to wn-server in `POST /api/v1/session`. wn-server keeps it with the account. |
+| CLI token | `wn_` followed by 43 base64url characters. Opaque. Does not expire. Ends when revoked with `POST /cli/logout`. | `POST /cli/token`, in `wn-server login`. A first-party client also sends its own CLI token to wn-server in `POST /api/v1/session`. wn-server resolves that token with `GET /me` and does not store it. |
 | GoTrue access token | An HS256 JWT signed by GoTrue. Expires after the GoTrue lifetime (one hour by default). | wn-server does not obtain these. The existing routes accept them, so they are listed for completeness. |
-| Server credential | The owner's CLI token only. `wn-server login` obtains it once, on the server machine, from `POST /cli/token`, with the server's name as its label. wn-server uses it for the server-level routes: `POST /servers`, members, and invites. | `wn-server login`. wn-server stores it in its data directory, readable only by the server's user. |
+| Server credential | The owner's CLI token. It is the only credential wn-server holds at wn-cloud. `wn-server login` obtains it once, on the server machine, from `POST /cli/token`, with the server's name as its label. wn-server sends it on `POST /servers` and on the rating routes. | `wn-server login`. wn-server stores it in its data directory, readable only by the server's user. |
 
-Members' tokens are stored per account by `POST /api/v1/session` on wn-server. wn-server calls `GET /me` with such a token at the exchange. After that it uses the token only for the rating routes: rating writes and the rating sync.
+A first-party client's token reaches wn-server only in `POST /api/v1/session`. wn-server calls `GET /me` with it once and does not keep it.
 
-The server credential is an ordinary CLI token. wn-cloud does not tell it apart from other CLI tokens of the owner. A route that requires the server credential authenticates the bearer as a user and then checks that the user is the owner of the server in the path. Any bearer of the owner passes that check. wn-server always sends the server credential on those routes.
+The server credential is an ordinary CLI token. wn-cloud does not tell it apart from other CLI tokens of the owner. Each route authenticates the bearer as a user. `POST /servers` makes that user the owner of the new server. The rating routes read and write that user's ratings.
 
 A bearer on the routes marked "bearer" below goes through v2's `requireUser` check:
 
@@ -152,17 +151,17 @@ Errors:
 | 401 | `{ "error": "Invalid or expired token" }` | The token is unknown or already revoked. |
 | 400 | `{ "error": "Only a CLI token can be revoked here", "code": "invalid_request" }` | The bearer is a GoTrue access token. |
 
-wn-server rule: wn-server calls it in two cases. When a user signs out of the web UI, it revokes the token that the web UI sign-in obtained for that browser. When `wn-server login` replaces the server credential, it revokes the old one. It never revokes a token that a first-party app handed it, because the app still uses that token elsewhere. A 401 counts as success. When wn-cloud is unreachable, wn-server forgets the token locally and does not retry.
+wn-server rule: wn-server calls it in one case. When `wn-server login` replaces the server credential, it revokes the old one. It never revokes a token that a first-party client sent in `POST /api/v1/session`, because the client still uses that token. A 401 counts as success. When wn-cloud is unreachable, wn-server forgets the token locally and does not retry.
 
 ## Sign-in with a displayed code (WAX-933)
 
-The existing flow redirects the browser to `127.0.0.1` on the machine that runs the browser. A redirect only works when the browser can reach the program that started the sign-in. It fails for a headless server, for a browser on another device, and behind the relay. In this variant wn-cloud shows the code on the page, and the user pastes it into wn-server. Nothing redirects to wn-server. `wn-server login` and the web UI sign-in both use it.
+The existing flow redirects the browser to `127.0.0.1` on the machine that runs the browser. A redirect only works when the browser can reach the program that started the sign-in. It fails for a headless server, for a browser on another device, and behind the relay. In this variant wn-cloud shows the code on the page, and the owner pastes it into wn-server. Nothing redirects to wn-server. `wn-server login` uses it. It is the owner's sign-in.
 
-1. wn-server generates `state` and a PKCE verifier. It shows the user the URL `<wn-cloud>/cli/auth?state=…&challenge=…&label=…&display=code`. `wn-server login` prints it in the terminal. The web UI shows it as a link next to a form for the code.
-2. The user opens the URL in any browser, signs in, and approves.
+1. `wn-server login` generates `state` and a PKCE verifier. It prints the URL `<wn-cloud>/cli/auth?state=…&challenge=…&label=…&display=code` in the terminal.
+2. The owner opens the URL in any browser, signs in, and approves.
 3. wn-cloud shows the sign-in code on the page, with a copy button.
-4. The user pastes the code into wn-server: at the terminal prompt of `wn-server login`, or into the form of the web UI.
-5. wn-server checks `state` and posts the code and the verifier to `POST /cli/token`. It receives a CLI token.
+4. The owner pastes the code at the terminal prompt of `wn-server login`.
+5. wn-server checks `state` and posts the code and the verifier to `POST /cli/token`. It receives a CLI token, which becomes the server credential.
 
 ### `GET /cli/auth` with `display=code` (new, WAX-933)
 
@@ -181,7 +180,7 @@ The existing flow redirects the browser to `127.0.0.1` on the machine that runs 
 - Errors: a malformed query, both or neither of `port` and `display`, or a `display` other than `code` gets status 400 and an HTML page.
 - The code is valid for 120 seconds and for one exchange, as in the existing flow. It is bound to the user, the challenge, and the label. It has no port.
 
-wn-server rule: wn-server trims whitespace from the pasted value and splits it at the first `.`. When the state part differs from the `state` it generated, it stops and tells the user to start again. It does not retry. Otherwise it calls `POST /cli/token` once. The web UI keeps `state` and the verifier with the pending sign-in of that browser.
+wn-server rule: wn-server trims whitespace from the pasted value and splits it at the first `.`. When the state part differs from the `state` it generated, it stops and tells the owner to start again. It does not retry. Otherwise it calls `POST /cli/token` once.
 
 ### `POST /cli/token` without `redirect_port` (new, WAX-933)
 
@@ -196,7 +195,7 @@ The route, the response, and the errors are those of the existing exchange. The 
 
 - A body with `redirect_port` for a code-display code, or without `redirect_port` for a port code, is `invalid_grant`.
 
-wn-server rule: one attempt. On any error, `wn-server login` stops and prints the error, and the web UI shows the error and a link to start again. A code cannot be retried, because a failed exchange consumes it.
+wn-server rule: one attempt. On any error, `wn-server login` stops and prints the error. A code cannot be retried, because a failed exchange consumes it.
 
 ### wn-cloud changes for WAX-933
 
@@ -206,11 +205,11 @@ wn-server rule: one attempt. On any error, `wn-server login` stops and prints th
 - `cli_auth_codes` needs no `redirect_uri` column. Its `redirect_port` is `not null` today (`web/migrations/1791212912000_cli-auth.sql`). It must become nullable, and a code-display code stores `null`.
 - `exchangeToken` (`web/src/cliAuth.ts`, near line 175) requires `redirect_port`, and `EXCHANGE_SQL` (near line 119) compares `redirect_port = $3`. It must accept a body without `redirect_port` and compare with `redirect_port is not distinct from $3`. A code-display code then matches only a body without a port, and a port code only its own port.
 
-## Servers and members (WAX-932)
+## Servers (WAX-932)
 
-A server is a record in wn-cloud that names its owner. Its members are the owner and up to 12 listeners. An invite creates a listener membership at once. There is no acceptance step (see [Open questions](#open-questions-for-the-operator)).
+A server is a record in wn-cloud that names its owner.
 
-All error bodies below carry a `code`. All routes also answer the 401 and 403 answers of the bearer check.
+The error body carries a `code`. The route also answers the 401 and 403 answers of the bearer check.
 
 Server object:
 
@@ -222,20 +221,6 @@ Server object:
   "created_at": "2026-10-16T12:00:00Z"
 }
 ```
-
-Member object:
-
-```json
-{
-  "user_id": "0192f9aa-0c11-7b3e-8f42-6a5d1e2c3b40",
-  "email": "nina@example.com",
-  "username": "nina",
-  "role": "listener",
-  "created_at": "2026-10-16T12:05:00Z"
-}
-```
-
-`username` is the user's v2 profile username, or `null` when the user has no profile. wn-server uses it as the account's display name and falls back to `email`.
 
 ### `POST /servers` (new, WAX-932)
 
@@ -261,99 +246,9 @@ Errors:
 
 wn-server rule: `wn-server login` calls it once, when the data directory has no server id. It stores the returned `id`. When a server id is already stored, `login` only replaces the server credential, after checking with `GET /me` that the new token belongs to the stored owner. On an unreachable wn-cloud, `login` stops and the owner runs it again. It does not retry on its own, so it does not register twice.
 
-### `GET /servers/:id/members` (new, WAX-932)
-
-Returns the owner and the listeners of a server.
-
-- Authentication: the server credential.
-- Query parameters: none. There is no pagination. A server has at most 13 members.
-- Request body: none.
-- Response 200:
-
-```json
-{
-  "server_id": "0193a0b2-77c1-7f00-8e21-3d9c5b6a4f10",
-  "owner": {
-    "user_id": "0192f1c4-3b7e-7d2a-9a10-5f4e2c1b8a70",
-    "email": "owner@example.com",
-    "username": "adnan",
-    "role": "owner",
-    "created_at": "2026-10-16T12:00:00Z"
-  },
-  "members": [
-    {
-      "user_id": "0192f9aa-0c11-7b3e-8f42-6a5d1e2c3b40",
-      "email": "nina@example.com",
-      "username": "nina",
-      "role": "listener",
-      "created_at": "2026-10-16T12:05:00Z"
-    }
-  ]
-}
-```
-
-`members` holds the listeners only, ordered by `created_at`. The owner's `created_at` is the server's.
-
-Errors:
-
-| Status | Code | When |
-|---|---|---|
-| 403 | `not_owner` | The bearer's user is not the owner of the server. |
-| 404 | `server_not_found` | No server has this id. |
-
-wn-server rule: see [Rules](#rules-wn-server-applies), member refresh.
-
-### `POST /servers/:id/invites` (new, WAX-932)
-
-Makes a waxnerd user a listener of the server.
-
-- Authentication: the server credential.
-- Query parameters: none.
-- Request body:
-
-```json
-{ "email": "nina@example.com" }
-```
-
-The email is matched against `users.email` without regard to case. The user must already have a waxnerd account.
-
-- Response 201: the member object of the new listener.
-
-Errors:
-
-| Status | Code | When |
-|---|---|---|
-| 400 | `invalid_request` | `email` is missing or malformed. |
-| 403 | `not_owner` | The bearer's user is not the owner of the server. |
-| 404 | `server_not_found` | No server has this id. |
-| 404 | `user_not_found` | No waxnerd user has this email. |
-| 409 | `already_member` | The user is already the owner or a listener. |
-| 409 | `member_limit` | The server already has 12 listeners. |
-
-wn-server rule: wn-server checks the cap before it calls, and wn-cloud checks it again. On success wn-server adds the member to its cached list at once and creates the listener's account and app password. On an unreachable wn-cloud the web UI shows the error. Invites are not queued.
-
-### `DELETE /servers/:id/members/:userId` (new, WAX-932)
-
-Ends a listener's membership.
-
-- Authentication: the server credential.
-- Query parameters: none.
-- Request body: none.
-- Response: 204, no body.
-
-Errors:
-
-| Status | Code | When |
-|---|---|---|
-| 403 | `not_owner` | The bearer's user is not the owner of the server. |
-| 404 | `server_not_found` | No server has this id. |
-| 404 | `not_member` | The user is not a listener of the server. The owner is never a listener, so removing the owner also gets this answer. |
-
-wn-server rule: on 204 or `not_member`, wn-server removes the member from its cached list at once and ends the listener's sessions. On an unreachable wn-cloud the web UI shows the error. The removal is not queued, and the listener keeps access until the owner retries.
-
 ## Ratings (WAX-942)
 
-A rating is the caller's rating of one MusicBrainz subject. The routes read and write v2's `subjects` and `ratings` tables. The caller is always the bearer's user. wn-server calls them with the stored CLI token of the account whose rating it is, never with the server credential for another user.
+A rating is the caller's rating of one MusicBrainz subject. The routes read and write v2's `subjects` and `ratings` tables. The caller is always the bearer's user. wn-server calls them with the server credential, so the caller is the owner.
 
 Path parameters:
 
@@ -384,7 +279,7 @@ Rating object. The field names are the column names of `subjects` and `ratings`:
 
 Sets the caller's rating of a subject. The body replaces the whole value: a field that is `null` or absent is cleared. This matches `saveMark` in v2 (`web/src/marks.ts`, near lines 320-321), except that both fields `null` is a 400. `saveMark` deletes the rating in that case.
 
-- Authentication: bearer (the account's CLI token).
+- Authentication: bearer (the server credential).
 - Query parameters: none.
 - Request body:
 
@@ -406,7 +301,7 @@ wn-server rule: wn-server sends both fields from its local store, so a Subsonic 
 
 Clears the caller's rating of a subject. The `ratings` row is deleted. The `subjects` row stays.
 
-- Authentication: bearer (the account's CLI token).
+- Authentication: bearer (the server credential).
 - Query parameters: none.
 - Request body: none.
 - Response: 204, also when the caller had no rating of the subject.
@@ -423,7 +318,7 @@ wn-server rule: as for `PUT`.
 
 Returns the caller's rating of one subject.
 
-- Authentication: bearer (the account's CLI token).
+- Authentication: bearer (the server credential).
 - Query parameters: none.
 - Request body: none.
 - Response 200: the rating object.
@@ -441,7 +336,7 @@ wn-server rule: not cached by the client of this route. wn-server uses it to che
 
 Returns the caller's rating changes after a cursor, oldest first. wn-server uses it to bring its local store up to date.
 
-- Authentication: bearer (the account's CLI token).
+- Authentication: bearer (the server credential).
 - Query parameters:
 
 | Parameter | Value |
@@ -504,54 +399,45 @@ These restate decisions in `README.md` in terms of the routes above.
 
 ### `GET /me`
 
-- wn-server calls `GET /me` when a first-party client exchanges its CLI token for a session (`POST /api/v1/session`), when the web UI sign-in completes, and in `wn-server login` to confirm the owner.
+- wn-server calls `GET /me` when a first-party client exchanges its CLI token for a session (`POST /api/v1/session`), and in `wn-server login` to confirm the owner.
+- At the exchange, wn-server compares the returned `id` with the owner's waxnerd user id. Any other user is refused. wn-server does not store the client's token.
 - wn-server caches a 200 answer in memory for 5 minutes, keyed by the SHA-256 hash of the token. Requests during that window do not call wn-cloud.
 - A 401 or 403 answer is not cached and not retried. The sign-in is refused.
-- When wn-cloud is unreachable, the sign-in fails with an error that tells the client to use the app password. wn-server does not retry.
+- When wn-cloud is unreachable, the exchange fails with an error that tells the client to use the app password. wn-server does not retry.
 - Requests that carry a wn-server session or an app password never call `GET /me`.
 
-### Member refresh
+### Background tick
 
-- wn-server calls `GET /servers/:id/members` with the server credential every 5 minutes, and at once after a successful invite or removal through wn-server.
-- When a user who is not in the cached list exchanges a token, wn-server refreshes once before it refuses the session. This picks up an invite made elsewhere.
-- A 200 answer replaces the cached list and records the time as the last successful refresh. A listener who is no longer in the list has their sessions ended.
-- When wn-cloud is unreachable, wn-server keeps the cached list and tries again at the next tick.
-- A 401, `not_owner`, or `server_not_found` answer means the server credential no longer works. It counts as a failed refresh. The web UI tells the owner to run `wn-server login` again.
+- In cloud mode, wn-server runs a background tick every 5 minutes. Each tick drains the outbox and then runs the rating sync.
+- A 401 answer to the server credential, on any route, means the credential no longer works. wn-server stops the tick's work and the web UI tells the owner to run `wn-server login` again.
 
 ### Outage
 
 - Sessions already issued keep working. wn-server checks them against its own store and does not call wn-cloud.
-- New sign-ins that need `GET /me` or `POST /cli/token` fail while wn-cloud is unreachable. App passwords keep working.
-- A revocation made in wn-cloud during the outage takes effect at the next successful member refresh.
-- After 30 days without a successful member refresh, wn-server refuses listener sessions with a distinct error code until a refresh succeeds. The owner's sessions are never refused for this reason.
-- The web UI shows a banner with the start of the outage and the cut-off date.
+- The owner is never refused because wn-cloud is unreachable. There is no cut-off.
+- `POST /api/v1/session` and `wn-server login` fail while wn-cloud is unreachable, because they need `GET /me` or `POST /cli/token`. The app password keeps working.
+- Rating writes go to the outbox.
+- wn-server records the time of the first unreachable answer after a successful call. The web UI shows a banner "wn-cloud unreachable since <time>" until a call succeeds.
 
 ### Rating writes and the outbox
 
-- wn-server writes a rating to its local store first, then calls `PUT` or `DELETE /ratings/:kind/:mbid` with the account's CLI token.
-- When wn-cloud is unreachable, wn-server writes the change to a local outbox. The outbox holds one entry per account and subject. A later change replaces the earlier entry.
-- wn-server drains the outbox after each successful member refresh, oldest entry first. A 2xx answer removes the entry. An unreachable answer stops the drain until the next tick.
-- A 400 answer removes the entry and logs it. A 401 answer keeps the entry and marks the account as needing a new sign-in. The entry is sent when the account has a working token again.
-- An account without a wn-cloud token (local-only mode, or a listener who only uses an app password) writes to the local store only. Nothing is queued for it.
+- wn-server writes a rating to its local store first, then calls `PUT` or `DELETE /ratings/:kind/:mbid` with the server credential.
+- When wn-cloud is unreachable, wn-server writes the change to a local outbox. The outbox holds one entry per subject. A later change replaces the earlier entry.
+- wn-server drains the outbox on each tick, oldest entry first. A 2xx answer removes the entry. An unreachable answer stops the drain until the next tick.
+- A 400 answer removes the entry and logs it. A 401 answer keeps the entry and stops the drain. The entry is sent once `wn-server login` has stored a working server credential.
+- In local-only mode wn-server writes to the local store only. Nothing is queued.
 
 ### Rating sync
 
-- After the outbox for an account is empty, wn-server calls `GET /ratings?since=<stored cursor>` for that account on each member refresh tick, and follows `more` until it is `false`. It stores `next` after each page.
+- On each tick, after the outbox is empty, wn-server calls `GET /ratings?since=<stored cursor>` with the server credential, and follows `more` until it is `false`. It stores `next` after each page.
 - A change from wn-cloud overwrites the local value, and wn-server sends Navidrome the rounded value (half stars round up, `love` maps to starred). A `deleted` change clears the local value and unstars and unrates in Navidrome.
 - Draining the outbox before pulling keeps a pending local change from being overwritten by an older value from wn-cloud.
 
 ## Open questions for the operator
 
-1. **Shape of the server credential.** The README makes it the owner's CLI token, and this document follows that. That token has the owner's full rights at wn-cloud, and revoking it signs the server out. Recommendation: keep the owner's CLI token for v1. Consider a separate server secret, returned by `POST /servers`, when the relay lands.
-2. **Scope of tokens that reach wn-server.** A listener's token from the web UI sign-in, or from a first-party app in `POST /api/v1/session`, reaches wn-server, which keeps it. A malicious server owner would then hold a listener's full wn-cloud token. Recommendation: accept this for v1. Later, wn-cloud can issue tokens scoped to `GET /me` and the rating routes, and refuse them elsewhere with 403 `insufficient_scope`. The server credential stays unscoped, since it needs the server-level routes.
-3. **Invite acceptance step.** This document has none: `POST /servers/:id/invites` creates the membership at once, and the listener's first sign-in at the server is the effective acceptance. Recommendation: keep it that way for v1. Add a pending state only if wn-cloud gets a notifications page.
-4. **Invite by email or by user id.** This document takes an email of an existing waxnerd user. It answers `user_not_found` otherwise, which tells the owner whether an email has an account. Recommendation: email for v1. Inviting people without an account (an invite link) is a later item.
-5. **Listener cap in wn-cloud.** The README says wn-server enforces the cap of 12. This document has wn-cloud enforce it as well, with `member_limit`. Recommendation: keep both checks, so a member list never exceeds what wn-server accepts.
-6. **Pagination of members.** None, since a server has at most 13 members. Recommendation: none.
-7. **Deletions in `GET /ratings?since=`.** v2 deletes a rating row on clear, so a delta cannot show clears. Recommendation: wn-cloud records clears in a `rating_deletions` table (user, subject, `deleted_at`, and the cleared rating's `id` and `created_at`) and merges it into the change feed. Rating the subject again removes its deletion row, so the feed shows each subject once. The alternative, a full re-pull on each tick, costs more as libraries grow.
-8. **Ordering of outbox writes against changes made elsewhere.** A queued `PUT` replayed after an outage overwrites a newer value set in wn-cloud's web pages meanwhile. Recommendation: accept this for v1. Later, `PUT` can take an optional `updated_at` from the client, and wn-cloud ignores a write older than the stored value.
-9. **Intervals.** The README says "every few minutes" for the member refresh and gives no `GET /me` cache time. This document uses 5 minutes for both, and ties the outbox drain and rating sync to the same tick. Recommendation: 5 minutes.
-10. **Rating write order.** The README (Ratings and favorites) writes wn-cloud first and then the local store. This document writes the local store first and then wn-cloud, with the outbox on failure. Recommendation: store first, then wn-cloud. Update the README.
-11. **Credential for member refreshes.** The README (Authentication) keeps each user's wn-cloud token "for rating writes and membership refreshes". This document refreshes members with the server credential only. Recommendation: the server credential only. The user's token is for rating writes and the rating sync. Update the README.
+1. **Deletions in `GET /ratings?since=`.** v2 deletes a rating row on clear, so a delta cannot show clears. Recommendation: wn-cloud records clears in a `rating_deletions` table (user, subject, `deleted_at`, and the cleared rating's `id` and `created_at`) and merges it into the change feed. Rating the subject again removes its deletion row, so the feed shows each subject once. The alternative, a full re-pull on each tick, costs more as libraries grow.
+2. **Ordering of outbox writes against changes made elsewhere.** A queued `PUT` replayed after an outage overwrites a newer value set in wn-cloud's web pages meanwhile. Recommendation: accept this for v1. Later, `PUT` can take an optional `updated_at` from the client, and wn-cloud ignores a write older than the stored value.
+3. **Intervals.** The README gives no `GET /me` cache time and no interval for the outbox drain and the rating sync. This document uses 5 minutes for the cache and for the background tick that runs the drain and the sync. Recommendation: 5 minutes.
+4. **Rating write order.** The README (Ratings and favorites) writes wn-cloud first and then the local store. This document writes the local store first and then wn-cloud, with the outbox on failure. Recommendation: store first, then wn-cloud. Update the README.
 
 First-party apps obtain their tokens through wn-cloud's own flows (the loopback port or the code display), and this document does not constrain those.

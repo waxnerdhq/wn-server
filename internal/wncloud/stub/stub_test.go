@@ -17,10 +17,9 @@ import (
 )
 
 const (
-	ownerID    = "0192f1c4-3b7e-7d2a-9a10-5f4e2c1b8a70"
-	listenerID = "0192f9aa-0c11-7b3e-8f42-6a5d1e2c3b40"
-	releaseID  = "6e12a11e-0ef9-49f3-b646-66929507d915"
-	state      = "state-0123456789abcdef"
+	ownerID   = "0192f1c4-3b7e-7d2a-9a10-5f4e2c1b8a70"
+	releaseID = "6e12a11e-0ef9-49f3-b646-66929507d915"
+	state     = "state-0123456789abcdef"
 )
 
 var codeRE = regexp.MustCompile(`<output id="code">([^<]+)</output>`)
@@ -116,8 +115,7 @@ type tokenAnswer struct {
 
 func TestRoutes(t *testing.T) {
 	s := stub.New()
-	s.AddUser(ownerID, "owner@example.com", "adnan")
-	s.AddUser(listenerID, "nina@example.com", "nina")
+	s.AddUser(ownerID, "owner@example.com")
 	s.SignInAs(ownerID)
 	srv := httptest.NewServer(s)
 	defer srv.Close()
@@ -152,28 +150,6 @@ func TestRoutes(t *testing.T) {
 	if st := c.do("POST", "/servers", owner, map[string]string{"name": "living-room"}, &server); st != 201 || server.ID == "" {
 		t.Fatalf("POST /servers: %d", st)
 	}
-	base := "/servers/" + server.ID
-
-	// POST /servers/:id/invites.
-	var member map[string]any
-	if st := c.do("POST", base+"/invites", owner, map[string]string{"email": "Nina@example.com"}, &member); st != 201 || member["user_id"] != listenerID {
-		t.Fatalf("POST invites: %d %v", st, member)
-	}
-
-	// GET /servers/:id/members.
-	var members struct {
-		Owner   map[string]any   `json:"owner"`
-		Members []map[string]any `json:"members"`
-	}
-	if st := c.do("GET", base+"/members", owner, nil, &members); st != 200 || members.Owner["user_id"] != ownerID || len(members.Members) != 1 {
-		t.Fatalf("GET members: %d %+v", st, members)
-	}
-
-	// DELETE /servers/:id/members/:userId.
-	if st := c.do("DELETE", base+"/members/"+listenerID, owner, nil, nil); st != 204 {
-		t.Fatalf("DELETE member: %d", st)
-	}
-
 	// PUT, GET, DELETE /ratings/:kind/:mbid and GET /ratings?since=.
 	path := "/ratings/release/" + releaseID
 	if st := c.do("PUT", path, owner, map[string]any{"half_stars": 9, "like_level": "love"}, nil); st != 200 {

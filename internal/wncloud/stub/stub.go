@@ -6,7 +6,7 @@
 // Use it with httptest:
 //
 //	s := stub.New()
-//	s.AddUser(ownerID, "owner@example.com", "adnan")
+//	s.AddUser(ownerID, "owner@example.com")
 //	s.AddToken("wn_...", ownerID)
 //	srv := httptest.NewServer(s)
 //
@@ -36,9 +36,6 @@ import (
 	"unicode"
 )
 
-// MaxListeners is the number of listeners a server may have.
-const MaxListeners = 12
-
 const codeTTL = 120 * time.Second
 
 // cursorLayout is the time part of the GET /ratings cursor and of the rating
@@ -56,8 +53,8 @@ var (
 )
 
 type user struct {
-	id, email, username string
-	createdAt           time.Time
+	id, email string
+	createdAt time.Time
 }
 
 type authCode struct {
@@ -69,7 +66,6 @@ type authCode struct {
 type server struct {
 	id, ownerID, name string
 	createdAt         time.Time
-	members           map[string]time.Time // listener user id to the time of the invite
 }
 
 type ratingKey struct{ userID, kind, mbid string }
@@ -111,9 +107,6 @@ func New() *Stub {
 	s.mux.HandleFunc("POST /cli/token", s.cliToken)
 	s.mux.HandleFunc("POST /cli/logout", s.cliLogout)
 	s.mux.HandleFunc("POST /servers", s.createServer)
-	s.mux.HandleFunc("GET /servers/{id}/members", s.listMembers)
-	s.mux.HandleFunc("POST /servers/{id}/invites", s.invite)
-	s.mux.HandleFunc("DELETE /servers/{id}/members/{userId}", s.removeMember)
 	s.mux.HandleFunc("PUT /ratings/{kind}/{mbid}", s.putRating)
 	s.mux.HandleFunc("DELETE /ratings/{kind}/{mbid}", s.deleteRating)
 	s.mux.HandleFunc("GET /ratings/{kind}/{mbid}", s.getRating)
@@ -130,12 +123,11 @@ func (s *Stub) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 // Seed helpers.
 
-// AddUser adds a waxnerd user with a row in users. An empty username means
-// the user has no profile.
-func (s *Stub) AddUser(id, email, username string) {
+// AddUser adds a waxnerd user with a row in users.
+func (s *Stub) AddUser(id, email string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.users[id] = &user{id: id, email: email, username: username, createdAt: s.now()}
+	s.users[id] = &user{id: id, email: email, createdAt: s.now()}
 }
 
 // AddToken makes token a valid bearer for the user. A token that starts with
@@ -152,15 +144,7 @@ func (s *Stub) AddToken(token, userID string) {
 func (s *Stub) AddServer(id, ownerID, name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.servers[id] = &server{id: id, ownerID: ownerID, name: name, createdAt: s.now(), members: map[string]time.Time{}}
-}
-
-// AddMember makes userID a listener of the server. It panics when the server
-// does not exist.
-func (s *Stub) AddMember(serverID, userID string) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.servers[serverID].members[userID] = s.now()
+	s.servers[id] = &server{id: id, ownerID: ownerID, name: name, createdAt: s.now()}
 }
 
 // AddRating sets a user's rating. halfStars 0 and likeLevel "" mean null.
@@ -251,20 +235,6 @@ func (s *Stub) authUser(w http.ResponseWriter, r *http.Request) *user {
 		return nil
 	}
 	return u
-}
-
-// ownedServer returns the server in the path when u owns it.
-func (s *Stub) ownedServer(w http.ResponseWriter, r *http.Request, u *user) *server {
-	srv := s.servers[r.PathValue("id")]
-	if srv == nil {
-		writeError(w, http.StatusNotFound, "server_not_found", "No server has this id")
-		return nil
-	}
-	if srv.ownerID != u.id {
-		writeError(w, http.StatusForbidden, "not_owner", "The caller is not the owner of this server")
-		return nil
-	}
-	return srv
 }
 
 func validLabel(label string) bool {
@@ -416,7 +386,7 @@ func (s *Stub) cliLogout(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// Servers and members.
+// Servers.
 
 func serverJSON(srv *server) map[string]any {
 	return map[string]any{
@@ -425,17 +395,6 @@ func serverJSON(srv *server) map[string]any {
 		"name":       srv.name,
 		"created_at": srv.createdAt,
 	}
-}
-
-func (s *Stub) memberJSON(userID, role string, created time.Time) map[string]any {
-	m := map[string]any{"user_id": userID, "email": nil, "username": nil, "role": role, "created_at": created}
-	if u := s.users[userID]; u != nil {
-		m["email"] = u.email
-		if u.username != "" {
-			m["username"] = u.username
-		}
-	}
-	return m
 }
 
 func (s *Stub) createServer(w http.ResponseWriter, r *http.Request) {
@@ -455,91 +414,9 @@ func (s *Stub) createServer(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_request", "name must be 1 to 100 characters")
 		return
 	}
-	srv := &server{id: newUUID(), ownerID: u.id, name: name, createdAt: s.now(), members: map[string]time.Time{}}
+	srv := &server{id: newUUID(), ownerID: u.id, name: name, createdAt: s.now()}
 	s.servers[srv.id] = srv
 	writeJSON(w, http.StatusCreated, serverJSON(srv))
-}
-
-func (s *Stub) listMembers(w http.ResponseWriter, r *http.Request) {
-	u := s.authUser(w, r)
-	if u == nil {
-		return
-	}
-	srv := s.ownedServer(w, r, u)
-	if srv == nil {
-		return
-	}
-	ids := make([]string, 0, len(srv.members))
-	for id := range srv.members {
-		ids = append(ids, id)
-	}
-	sort.Slice(ids, func(i, j int) bool { return srv.members[ids[i]].Before(srv.members[ids[j]]) })
-	members := make([]map[string]any, 0, len(ids))
-	for _, id := range ids {
-		members = append(members, s.memberJSON(id, "listener", srv.members[id]))
-	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"server_id": srv.id,
-		"owner":     s.memberJSON(srv.ownerID, "owner", srv.createdAt),
-		"members":   members,
-	})
-}
-
-func (s *Stub) invite(w http.ResponseWriter, r *http.Request) {
-	u := s.authUser(w, r)
-	if u == nil {
-		return
-	}
-	srv := s.ownedServer(w, r, u)
-	if srv == nil {
-		return
-	}
-	var body struct {
-		Email string `json:"email"`
-	}
-	if err := decode(r, &body); err != nil || !strings.Contains(body.Email, "@") || strings.ContainsAny(body.Email, " \t\r\n") {
-		writeError(w, http.StatusBadRequest, "invalid_request", "email must be an email address")
-		return
-	}
-	var invitee *user
-	for _, x := range s.users {
-		if strings.EqualFold(x.email, body.Email) {
-			invitee = x
-			break
-		}
-	}
-	if invitee == nil {
-		writeError(w, http.StatusNotFound, "user_not_found", "No waxnerd user has this email")
-		return
-	}
-	if _, ok := srv.members[invitee.id]; ok || invitee.id == srv.ownerID {
-		writeError(w, http.StatusConflict, "already_member", "The user is already a member of this server")
-		return
-	}
-	if len(srv.members) >= MaxListeners {
-		writeError(w, http.StatusConflict, "member_limit", "The server already has 12 listeners")
-		return
-	}
-	srv.members[invitee.id] = s.now()
-	writeJSON(w, http.StatusCreated, s.memberJSON(invitee.id, "listener", srv.members[invitee.id]))
-}
-
-func (s *Stub) removeMember(w http.ResponseWriter, r *http.Request) {
-	u := s.authUser(w, r)
-	if u == nil {
-		return
-	}
-	srv := s.ownedServer(w, r, u)
-	if srv == nil {
-		return
-	}
-	id := r.PathValue("userId")
-	if _, ok := srv.members[id]; !ok {
-		writeError(w, http.StatusNotFound, "not_member", "The user is not a listener of this server")
-		return
-	}
-	delete(srv.members, id)
-	w.WriteHeader(http.StatusNoContent)
 }
 
 // Ratings.
