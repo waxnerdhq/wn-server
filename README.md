@@ -225,8 +225,9 @@ The data directory is `$XDG_DATA_HOME/wn-server`, or `~/.local/share/wn-server` 
 | `navidrome_port` | `4534` | Loopback port of the Navidrome child process. |
 | `sorted_dir` | `<data dir>/sorted` | Directory beets copies matched albums into. Created on load. |
 | `acoustid_api_key` | empty | Overrides the compiled-in AcoustID key. |
+| `navidrome_external_services` | `true` | Sets Navidrome's `EnableExternalServices`. `false` turns off Navidrome's artist and album lookups (Deezer, Last.fm, Spotify agents). `init` does not write this key. |
 
-`Config.WriteNavidrome` renders `<data dir>/navidrome.toml`. The file has `Address = '127.0.0.1'`, the Navidrome port, `sorted_dir` as `MusicFolder`, `DataFolder = <data dir>/navidrome`, and `ExtAuth.UserHeader` and `ExtAuth.TrustedSources` set for the proxy. Navidrome's config file takes one `MusicFolder` only. Navidrome stores it as the path of library 1 on every start, and library paths are unique, so `MusicFolder` must never change. `sorted_dir` is created on load and never moves, which makes it the one stable choice. The supervisor calls `WriteNavidrome` before it starts Navidrome, and adds every `music_folders` entry as a library through Navidrome's API.
+`Config.WriteNavidrome` renders `<data dir>/navidrome.toml`. The file has `Address = '127.0.0.1'`, the Navidrome port, `sorted_dir` as `MusicFolder`, `DataFolder = <data dir>/navidrome`, and `ExtAuth.UserHeader` and `ExtAuth.TrustedSources` set for the proxy. The file always has `EnableInsightsCollector = false`, so Navidrome Insights telemetry is off. It has `EnableExternalServices = true` unless `navidrome_external_services` is `false`, so external lookups are on by default. Navidrome's config file takes one `MusicFolder` only. Navidrome stores it as the path of library 1 on every start, and library paths are unique, so `MusicFolder` must never change. `sorted_dir` is created on load and never moves, which makes it the one stable choice. The supervisor calls `WriteNavidrome` before it starts Navidrome, and adds every `music_folders` entry as a library through Navidrome's API.
 
 ## Navidrome supervisor
 

@@ -86,10 +86,45 @@ func TestRenderNavidrome(t *testing.T) {
 		"[ExtAuth]",
 		"UserHeader = 'Remote-User'",
 		"TrustedSources = '127.0.0.1/32'",
+		"EnableInsightsCollector = false",
+		"EnableExternalServices = true",
 	} {
 		if !strings.Contains(string(got), want) {
 			t.Errorf("navidrome.toml lacks %q:\n%s", want, got)
 		}
+	}
+}
+
+func TestRenderNavidromeExternalServicesOff(t *testing.T) {
+	dir := t.TempDir()
+	music := t.TempDir()
+	c, err := Load(writeConfig(t, dir, "music_folders = ['"+music+"']\nnavidrome_external_services = false\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.RenderNavidrome()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"EnableExternalServices = false", "EnableInsightsCollector = false"} {
+		if !strings.Contains(string(got), want) {
+			t.Errorf("navidrome.toml lacks %q:\n%s", want, got)
+		}
+	}
+}
+
+func TestInitOmitsExternalServicesKey(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "config.toml")
+	if _, err := Init(p, []string{t.TempDir()}); err != nil {
+		t.Fatal(err)
+	}
+	body, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "navidrome_external_services") {
+		t.Fatalf("init wrote the key:\n%s", body)
 	}
 }
 
