@@ -62,6 +62,7 @@ import os
 import threading
 from collections import Counter
 
+from beets.importer import Action
 from beets.plugins import BeetsPlugin
 from beets.util import extension as _extension
 
@@ -204,12 +205,10 @@ class WnCandidatesPlugin(BeetsPlugin):
         SKIP. beets' choose_match takes the returned match as the decision
         before its own quiet mode judgment. Return None when the option is
         not set, so beets decides as usual."""
-        release = self.config["apply_release_id"].as_str()
-        if not release:
-            return None
-        from beets.importer import Action
-
         try:
+            release = self.config["apply_release_id"].as_str()
+            if not release:
+                return None
             target = self.config["apply_folder"].as_str()
             if target and os.path.normpath(_folder(task)) != os.path.normpath(target):
                 return Action.SKIP

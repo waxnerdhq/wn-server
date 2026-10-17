@@ -47,7 +47,8 @@ func TestApplyWithFakeBeets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
-	if sum.Applied != 1 || sum.Albums[0].Reason != ReasonRequestedRelease || sum.Albums[0].ReleaseID != mbid || scan.calls != 1 {
+	if sum.Applied != 1 || sum.Albums[0].Reason != ReasonRequestedRelease || sum.Albums[0].ReleaseID != mbid || scan.calls != 1 ||
+		len(sum.MarkersWritten) != 1 || sum.MarkersWritten[0] != album {
 		t.Fatalf("summary = %+v, scans %d", sum, scan.calls)
 	}
 	if _, err := os.Stat(filepath.Join(album, markerName)); err != nil {
@@ -82,7 +83,7 @@ func TestRemoveAndMarker(t *testing.T) {
 		BeetsBin: script,
 		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	for _, p := range []string{sorted, music, filepath.Join(sorted, "..", "x")} {
+	for _, p := range []string{sorted, music, filepath.Join(sorted, "..", "x"), albumCopy + ",", filepath.Join(sorted, `a\:b`)} {
 		if err := r.Remove(context.Background(), p); err == nil {
 			t.Errorf("Remove(%s) succeeded", p)
 		}
@@ -94,6 +95,15 @@ func TestRemoveAndMarker(t *testing.T) {
 	if err := r.Remove(context.Background(), filepath.Join(sorted, "link", "A")); err == nil {
 		t.Error("Remove through a symlink out of sorted_dir succeeded")
 	}
+	// A held lock makes the run fail without calling beets.
+	unlock, err := r.Config.lock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Remove(context.Background(), albumCopy); !errors.Is(err, ErrBusy) {
+		t.Errorf("Remove with the lock held = %v, want ErrBusy", err)
+	}
+	unlock()
 	if err := r.Remove(context.Background(), albumCopy); err != nil {
 		t.Fatalf("Remove: %v", err)
 	}

@@ -106,3 +106,49 @@ func TestMatchQueue(t *testing.T) {
 		t.Fatalf("MatchEntry(999) = %v, want ErrMatchNotFound", err)
 	}
 }
+
+func TestMatchMarkerAndNoteError(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	t0 := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	cand := MatchCandidate{ReleaseID: "a", Distance: 0.2}
+	id, err := s.RecordMatch(ctx, MatchLine{Folder: "/m/x", Decision: LineSkipped, Artist: "Ar", Candidates: []MatchCandidate{cand}}, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// NoteMatchError keeps state, tags, and candidates.
+	if err := s.NoteMatchError(ctx, id, "beets skipped it", t0.Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	e, _ := s.MatchEntry(ctx, id)
+	if e.State != MatchPending || e.Artist != "Ar" || len(e.Candidates) != 1 || e.LastError != "beets skipped it" || !e.LastSeen.Equal(t0.Add(time.Hour)) {
+		t.Fatalf("entry after NoteMatchError = %+v", e)
+	}
+	if err := s.NoteMatchError(ctx, 999, "x", t0); !errors.Is(err, ErrMatchNotFound) {
+		t.Fatalf("NoteMatchError(999) = %v", err)
+	}
+
+	if _, err := s.RecordMatch(ctx, MatchLine{Folder: "/m/x", Decision: LineApplied, ReleaseID: "a", CopiedTo: "/s/x", MarkerWritten: true}, t0); err != nil {
+		t.Fatal(err)
+	}
+	if e, _ := s.MatchEntry(ctx, id); !e.MarkerWritten {
+		t.Fatal("marker_written not set by the applied line")
+	}
+	// A later applied line without a new marker keeps marker_written.
+	if _, err := s.RecordMatch(ctx, MatchLine{Folder: "/m/x", Decision: LineApplied, ReleaseID: "a", CopiedTo: "/s/x"}, t0); err != nil {
+		t.Fatal(err)
+	}
+	if e, _ := s.MatchEntry(ctx, id); !e.MarkerWritten {
+		t.Fatal("marker_written cleared by a second applied line")
+	}
+	if err := s.RevertMatch(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	if e, _ := s.MatchEntry(ctx, id); e.MarkerWritten {
+		t.Fatal("marker_written still set after revert")
+	}
+}

@@ -2,8 +2,10 @@
 -- the wn_candidates output. folder is the absolute path the plugin wrote.
 -- state is pending, applied, dismissed, or duplicate. The tag columns hold
 -- the album's existing tags. The applied columns are set while state is
--- applied and are NULL otherwise. last_error holds the message of the last
--- error line for the folder.
+-- applied and are NULL otherwise. marker_written is 1 when wn-server
+-- created the .ndignore in folder for the applied entry, so a revert deletes
+-- only a marker that wn-server wrote. last_error holds the message of the
+-- last error for the folder.
 CREATE TABLE match_queue (
     id                 INTEGER PRIMARY KEY AUTOINCREMENT,
     folder             TEXT NOT NULL UNIQUE,
@@ -17,6 +19,7 @@ CREATE TABLE match_queue (
     applied_release_id TEXT NULL,
     copied_to          TEXT NULL,
     applied_at         TEXT NULL,
+    marker_written     INTEGER NOT NULL DEFAULT 0,
     last_error         TEXT NULL
 );
 

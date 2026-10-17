@@ -153,7 +153,7 @@ In quiet mode beets applies confident matches and skips the rest. A confident ma
 
 `wn-server match` runs one import over every `music_folders` entry in the foreground:
 
-1. It writes `<data dir>/beets.yaml` (mode 0600) and empties `<data dir>/beets-candidates.jsonl`.
+1. It takes an exclusive lock on `<data dir>/beets.lock`, writes `<data dir>/beets.yaml` (mode 0600), and empties `<data dir>/beets-candidates.jsonl`. `match`, `match apply`, and `match revert` take the same lock, because they share `beets.yaml`, the candidates file, and `beets.db`. When another run holds the lock, the command fails with `another beets run is in progress`.
 2. It runs `<beets_bin> --config <data dir>/beets.yaml import -q <music folders>`. The directory of `fpcalc_bin` goes first on `PATH`, `FPCALC` names `fpcalc_bin`, and `BEETSDIR` is the data directory, so a personal beets config in `~/.config/beets` is not read. `PYTHONDONTWRITEBYTECODE=1` keeps Python from writing `__pycache__` into `beets-plugins`. `HOME` is unchanged. beets also reads `<data dir>/config.yaml` because of `BEETSDIR`. wn-server does not write that file. beets' stderr goes to wn-server's log at info level, and its stdout at debug level. Ctrl-C kills beets and its process group. wn-server then still reads the candidates file and writes the markers for the albums that beets applied before the kill, because beets has already recorded those albums in its incremental history. It starts no scan after a kill.
 3. It reads the candidates file.
 4. It writes an empty `.ndignore` into the original folder of every applied album, with mode 0644, when the file does not exist. It writes no marker into a folder that is itself a `music_folders` entry, because that would hide the whole library. An empty `.ndignore` hides everything below its folder. So it writes no marker, and logs a warning, when another album of the same run that was not applied has its folder below the applied folder. The folder and the music folders are compared after symlinks are resolved. The marker is the only write to the originals tree.
@@ -182,7 +182,7 @@ The `chroma` plugin (AcoustID fingerprints) raises match confidence. The AcoustI
 
 #### Match queue
 
-The match queue is two tables in the store. `match_queue` has one row per album folder: `id`, `folder` (unique), `first_seen`, `last_seen`, `state`, the existing tags (`artist`, `album`, `year`, `track_count`), `applied_release_id`, `copied_to`, `applied_at`, and `last_error`. `state` is `pending`, `applied`, `dismissed`, or `duplicate`. `match_candidates` holds the candidates of the latest line for the folder, in beets' order. Its rows are deleted with their queue row.
+The match queue is two tables in the store. `match_queue` has one row per album folder: `id`, `folder` (unique), `first_seen`, `last_seen`, `state`, the existing tags (`artist`, `album`, `year`, `track_count`), `applied_release_id`, `copied_to`, `applied_at`, `marker_written`, and `last_error`. `marker_written` is 1 when wn-server created the `.ndignore` in the folder for the applied entry. A marker that already existed leaves it at 0. `state` is `pending`, `applied`, `dismissed`, or `duplicate`. `match_candidates` holds the candidates of the latest line for the folder, in beets' order. Its rows are deleted with their queue row.
 
 After every `wn-server match` run, wn-server records each line of the candidates file:
 
@@ -203,10 +203,10 @@ Every line sets `last_seen`. Every line except an `error` line clears `last_erro
 2. It runs `<beets_bin> --config <data dir>/beets.yaml import -q -I -S <mbid> <folder>` with the same environment as `match`. `-S` limits the MusicBrainz lookup to that release. `-I` (`--noincremental`) turns off the incremental history check, so beets imports a folder that its history already lists, for example after a revert.
 3. beets' quiet mode applies only a strong match, also with `-S`. The plugin's `import_task_before_choice` handler therefore returns the candidate whose release id is `apply_release_id`. beets' `choose_match` takes a returned match as the decision before its own quiet-mode judgment. The handler returns SKIP when no candidate has that id. It also returns SKIP for every other album below the folder, whose folder is not `apply_folder`. The `applied` line gets `"reason": "requested_release_id"`.
 4. `-I` also turns off the history writes. The plugin therefore adds the applied folder to the incremental history itself, as a quiet run does for an album it applies.
-5. wn-server records the entry's own line in the queue. Lines for other albums below the folder are not recorded, because their candidates come from a lookup of the requested release only.
+5. wn-server records the entry's own line in the queue only when its decision is `applied`. With `-S`, any other line for the folder holds the requested release or no candidate, so recording it would replace the entry's candidates. For any other decision, wn-server stores the reason in `last_error` and sets `last_seen`, and the state, tags, and candidates stay. Lines for other albums below the folder are not recorded for the same reason.
 6. It writes `.ndignore` into the original folder with the rules of `match`, asks Navidrome to scan, and writes `beets.yaml` again without the apply options.
 
-The command fails when the entry is not `applied` after the run, and names the decision of the line.
+The command fails when beets did not apply the release, and names the decision of the line.
 
 `wn-server match dismiss <id>` sets an entry to `dismissed`. Nothing on disk changes. wn-server refuses an `applied` entry, which is reverted first. A later run that skips the folder again keeps the entry `dismissed` and refreshes its candidates and `last_seen`. A `dismissed` entry can still be applied.
 
@@ -214,7 +214,7 @@ The command fails when the entry is not `applied` after the run, and names the d
 
 1. wn-server checks that `copied_to` resolves to a path strictly inside `sorted_dir`, with symlinks resolved in both, and refuses otherwise.
 2. It runs `<beets_bin> --config <data dir>/beets.yaml remove -a -d -f path:<copied_to>`. beets removes the album from its library, deletes the files of the copy, and removes the folders that become empty. When beets fails and `copied_to` no longer exists, wn-server logs a warning and continues.
-3. It deletes `<folder>/.ndignore` when it is an empty regular file. A marker with content stays.
+3. It deletes `<folder>/.ndignore` only when wn-server wrote it (`marker_written` is 1), when it is an empty regular file, and when the folder is strictly inside a music folder, compared after symlinks are resolved. A marker with content stays.
 4. It sets the entry to `pending` and clears the applied fields.
 5. It asks Navidrome to scan.
 
@@ -344,6 +344,7 @@ The data directory is `$XDG_DATA_HOME/wn-server`, or `~/.local/share/wn-server` 
 | `beets-state.pickle` | beets state file, which holds the incremental import history. |
 | `beets-import.log` | beets' import log. |
 | `beets-candidates.jsonl` | Output of the `wn_candidates` plugin for the last run. |
+| `beets.lock` | Lock file. `match`, `match apply`, and `match revert` hold an exclusive `flock` on it while they run beets. |
 | `wn-server.db` | The match queue, in the tables `match_queue` and `match_candidates`, next to the account and the server credential. |
 
 beets also writes `beets.db-before-*.bak` files when it migrates its database, including on the first run.

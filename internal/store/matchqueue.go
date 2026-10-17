@@ -70,7 +70,10 @@ type MatchEntry struct {
 	AppliedReleaseID string    `json:"applied_release_id,omitempty"`
 	CopiedTo         string    `json:"copied_to,omitempty"`
 	AppliedAt        time.Time `json:"applied_at,omitzero"`
-	LastError        string    `json:"last_error,omitempty"`
+	// MarkerWritten is true when wn-server created the .ndignore in Folder
+	// for the applied entry.
+	MarkerWritten bool   `json:"marker_written"`
+	LastError     string `json:"last_error,omitempty"`
 	// Candidates are in beets' order, best first.
 	Candidates []MatchCandidate `json:"candidates"`
 }
@@ -87,6 +90,9 @@ type MatchLine struct {
 	// ReleaseID and CopiedTo are set on applied lines.
 	ReleaseID string
 	CopiedTo  string
+	// MarkerWritten is true on an applied line when wn-server created the
+	// .ndignore in Folder.
+	MarkerWritten bool
 	// Error is set on error lines.
 	Error string
 }
@@ -97,7 +103,8 @@ type MatchLine struct {
 //
 // A skipped line creates a pending entry or sets an existing one to pending.
 // A dismissed or applied entry keeps its state. An applied line sets the
-// entry to applied with the release id and copied_to. A duplicate line sets
+// entry to applied with the release id, copied_to, and marker_written. On an
+// entry that is already applied, marker_written stays 1. A duplicate line sets
 // duplicate, except on an applied entry, which keeps its state. An error
 // line creates a pending entry or keeps the state of an existing one, and
 // stores the message in last_error. Every line except an error line replaces
@@ -156,7 +163,7 @@ func (s *Store) RecordMatch(ctx context.Context, l MatchLine, now time.Time) (in
 			return err
 		}
 		if l.Decision == LineApplied {
-			if err := setApplied(ctx, tx, id, l.ReleaseID, l.CopiedTo, now); err != nil {
+			if err := setApplied(ctx, tx, id, l.ReleaseID, l.CopiedTo, now, l.MarkerWritten, cur == MatchApplied); err != nil {
 				return err
 			}
 		}
@@ -179,7 +186,7 @@ func (s *Store) RecordMatch(ctx context.Context, l MatchLine, now time.Time) (in
 	return id, nil
 }
 
-const matchColumns = `id, folder, first_seen, last_seen, state, artist, album, year, track_count, applied_release_id, copied_to, applied_at, last_error`
+const matchColumns = `id, folder, first_seen, last_seen, state, artist, album, year, track_count, applied_release_id, copied_to, applied_at, marker_written, last_error`
 
 // MatchEntries returns the entries in the given states, ordered by id, with
 // their candidates. No states returns every entry.
@@ -277,22 +284,33 @@ func (s *Store) SetMatchState(ctx context.Context, id int64, state MatchState) e
 }
 
 // SetMatchApplied sets an entry to applied with the release id, the album
-// folder in sorted_dir, and the time of the apply.
-func (s *Store) SetMatchApplied(ctx context.Context, id int64, releaseID, copiedTo string, at time.Time) error {
-	return setApplied(ctx, s.db, id, releaseID, copiedTo, at)
+// folder in sorted_dir, the time of the apply, and whether wn-server created
+// the .ndignore in the entry's folder.
+func (s *Store) SetMatchApplied(ctx context.Context, id int64, releaseID, copiedTo string, at time.Time, markerWritten bool) error {
+	return setApplied(ctx, s.db, id, releaseID, copiedTo, at, markerWritten, false)
 }
 
-func setApplied(ctx context.Context, db execer, id int64, releaseID, copiedTo string, at time.Time) error {
+// setApplied sets the applied fields. With keepMarker, a marker_written of 1
+// stays 1.
+func setApplied(ctx context.Context, db execer, id int64, releaseID, copiedTo string, at time.Time, markerWritten, keepMarker bool) error {
 	return checkOne(db.ExecContext(ctx,
-		`UPDATE match_queue SET state = ?, applied_release_id = ?, copied_to = ?, applied_at = ? WHERE id = ?`,
-		MatchApplied, releaseID, copiedTo, formatTime(at), id))
+		`UPDATE match_queue SET state = ?, applied_release_id = ?, copied_to = ?, applied_at = ?,
+		 marker_written = CASE WHEN ? THEN MAX(marker_written, ?) ELSE ? END WHERE id = ?`,
+		MatchApplied, releaseID, copiedTo, formatTime(at), keepMarker, markerWritten, markerWritten, id))
 }
 
 // RevertMatch sets an entry to pending and clears the applied fields.
 func (s *Store) RevertMatch(ctx context.Context, id int64) error {
 	return checkOne(s.db.ExecContext(ctx,
-		`UPDATE match_queue SET state = ?, applied_release_id = NULL, copied_to = NULL, applied_at = NULL WHERE id = ?`,
+		`UPDATE match_queue SET state = ?, applied_release_id = NULL, copied_to = NULL, applied_at = NULL, marker_written = 0 WHERE id = ?`,
 		MatchPending, id))
+}
+
+// NoteMatchError stores msg in last_error and now in last_seen. The state,
+// the tags, and the candidates stay.
+func (s *Store) NoteMatchError(ctx context.Context, id int64, msg string, now time.Time) error {
+	return checkOne(s.db.ExecContext(ctx,
+		`UPDATE match_queue SET last_seen = ?, last_error = ? WHERE id = ?`, formatTime(now), msg, id))
 }
 
 // checkOne returns ErrMatchNotFound when an update changed no row.
@@ -317,7 +335,7 @@ func scanMatch(r rowScanner) (MatchEntry, error) {
 		releaseID, copiedTo, at, lastErr sql.NullString
 	)
 	err := r.Scan(&e.ID, &e.Folder, &first, &last, &e.State, &e.Artist, &e.Album, &e.Year, &e.TrackCount,
-		&releaseID, &copiedTo, &at, &lastErr)
+		&releaseID, &copiedTo, &at, &e.MarkerWritten, &lastErr)
 	if err != nil {
 		return MatchEntry{}, err
 	}

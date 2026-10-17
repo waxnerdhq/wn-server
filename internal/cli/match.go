@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"slices"
 	"strconv"
 	"strings"
 	"syscall"
@@ -42,7 +43,7 @@ func newMatchCmd() *cobra.Command {
 			r := beets.NewRunner(c, navidrome.NewClient(c.NavidromePort), slog.Default())
 			sum, err := r.Import(ctx, c.MusicFolders)
 			// Record what beets wrote, also after a cancel.
-			recErr := recordAlbums(context.WithoutCancel(ctx), st, sum.Albums, slog.Default())
+			recErr := recordAlbums(context.WithoutCancel(ctx), st, sum.Albums, sum.MarkersWritten, slog.Default())
 			out := cmd.OutOrStdout()
 			if err == nil || len(sum.Albums) > 0 {
 				printSummary(out, sum)
@@ -101,9 +102,10 @@ func openEntry(cmd *cobra.Command, arg string) (*config.Config, *store.Store, st
 	return c, st, e, nil
 }
 
-// recordAlbums records candidates lines in the match queue. A line without
-// a folder is logged and skipped.
-func recordAlbums(ctx context.Context, st *store.Store, albums []beets.Album, logger *slog.Logger) error {
+// recordAlbums records candidates lines in the match queue. markers holds
+// the folders whose .ndignore the run created. A line without a folder is
+// logged and skipped.
+func recordAlbums(ctx context.Context, st *store.Store, albums []beets.Album, markers []string, logger *slog.Logger) error {
 	now := time.Now()
 	var errs []error
 	for _, a := range albums {
@@ -111,7 +113,9 @@ func recordAlbums(ctx context.Context, st *store.Store, albums []beets.Album, lo
 			logger.Warn("candidates line has no folder; not recorded in the match queue", "decision", a.Decision, "error", a.Error)
 			continue
 		}
-		if _, err := st.RecordMatch(ctx, matchLine(a), now); err != nil {
+		l := matchLine(a)
+		l.MarkerWritten = a.Decision == beets.DecisionApplied && slices.Contains(markers, a.Folder)
+		if _, err := st.RecordMatch(ctx, l, now); err != nil {
 			errs = append(errs, err)
 		}
 	}
@@ -285,32 +289,45 @@ func newMatchApplyCmd() *cobra.Command {
 			logger.Info("applying match", "id", e.ID, "folder", e.Folder, "release_id", release)
 			r := beets.NewRunner(c, navidrome.NewClient(c.NavidromePort), logger)
 			sum, runErr := r.Apply(ctx, e.Folder, release, c.MusicFolders)
-			// Only the entry's own line is recorded. Other albums below the
-			// folder were skipped by the plugin and looked up with the
-			// requested release only, so their candidates are not useful.
-			var own []beets.Album
+			if runErr != nil && len(sum.Albums) == 0 {
+				// beets did not run, or wrote nothing.
+				return runErr
+			}
+			// Only the entry's own applied line is recorded. With -S, any
+			// other line for the folder holds the requested release or no
+			// candidate, so recording it would replace the entry's
+			// candidates. Other albums below the folder were skipped by the
+			// plugin for the same reason.
+			var applied []beets.Album
+			reason := "beets wrote no line for the folder"
 			for _, a := range sum.Albums {
-				if a.Folder == e.Folder {
-					own = append(own, a)
+				if a.Folder != e.Folder {
+					continue
+				}
+				if a.Decision == beets.DecisionApplied {
+					applied = append(applied, a)
+					continue
+				}
+				reason = "decision " + a.Decision
+				if a.Error != "" {
+					reason += ": " + a.Error
 				}
 			}
 			bg := context.WithoutCancel(ctx)
-			if err := recordAlbums(bg, st, own, logger); err != nil || runErr != nil {
+			if len(applied) == 0 {
+				msg := fmt.Sprintf("match apply: beets did not apply release %s (%s)", release, reason)
+				noteErr := st.NoteMatchError(bg, e.ID, msg, time.Now())
+				if runErr == nil {
+					runErr = fmt.Errorf("beets did not apply release %s to %s (%s); see the log for beets' output", release, e.Folder, reason)
+				}
+				return errors.Join(runErr, noteErr)
+			}
+			if err := recordAlbums(bg, st, applied, sum.MarkersWritten, logger); err != nil || runErr != nil {
 				return errors.Join(runErr, err)
 			}
 			got, err := st.MatchEntry(bg, e.ID)
 			if err != nil {
 				return err
-			}
-			if got.State != store.MatchApplied {
-				reason := "beets wrote no line for the folder"
-				if len(own) > 0 {
-					reason = "decision " + own[len(own)-1].Decision
-					if own[len(own)-1].Error != "" {
-						reason += ": " + own[len(own)-1].Error
-					}
-				}
-				return fmt.Errorf("beets did not apply release %s to %s (%s); see the log for beets' output", release, e.Folder, reason)
 			}
 			logger.Info("applied match", "id", e.ID, "folder", e.Folder, "release_id", got.AppliedReleaseID, "copied_to", got.CopiedTo)
 			fmt.Fprintf(cmd.OutOrStdout(), "applied entry %d: %s copied to %s\n", e.ID, e.Folder, got.CopiedTo)
@@ -374,9 +391,12 @@ func newMatchRevertCmd() *cobra.Command {
 			}
 			// The copy is gone. The remaining steps run to the end.
 			bg := context.WithoutCancel(ctx)
-			_, markerErr := r.RemoveMarker(e.Folder, c.MusicFolders)
-			if markerErr != nil {
-				markerErr = fmt.Errorf("remove .ndignore from %s: %w", e.Folder, markerErr)
+			// Only a marker that wn-server created is removed.
+			var markerErr error
+			if e.MarkerWritten {
+				if _, err := r.RemoveMarker(e.Folder, c.MusicFolders); err != nil {
+					markerErr = fmt.Errorf("remove .ndignore from %s: %w", e.Folder, err)
+				}
 			}
 			if err := st.RevertMatch(bg, e.ID); err != nil {
 				return errors.Join(err, markerErr)
