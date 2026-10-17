@@ -21,6 +21,8 @@ func TestRender(t *testing.T) {
 		SortedDir:   "/data/wn-server/sorted",
 		PluginDir:   "/opt/wn-server/beets-plugins",
 		AcoustIDKey: "k3y",
+
+		ForgetFolders: []string{"/music/a", "/music/b"},
 	}
 	body, err := c.Render()
 	if err != nil {
@@ -43,18 +45,21 @@ func TestRender(t *testing.T) {
 			"fix_ext_inplace": false, "remux_mp3_in_wav": false,
 			"log": "/data/wn-server/beets-import.log",
 		},
-		"plugins":       []any{"musicbrainz", "chroma", "wn_candidates"},
-		"pluginpath":    []any{"/opt/wn-server/beets-plugins"},
-		"chroma":        map[string]any{"auto": true},
-		"wn_candidates": map[string]any{"output": "/data/wn-server/beets-candidates.jsonl", "acoustid_app_key": "k3y"},
-		"musicbrainz":   map[string]any{"host": "musicbrainz.org", "ratelimit": 1},
-		"ui":            map[string]any{"color": false},
+		"plugins":    []any{"musicbrainz", "chroma", "wn_candidates"},
+		"pluginpath": []any{"/opt/wn-server/beets-plugins"},
+		"chroma":     map[string]any{"auto": true},
+		"wn_candidates": map[string]any{
+			"output": "/data/wn-server/beets-candidates.jsonl", "acoustid_app_key": "k3y",
+			"forget_folders": []any{"/music/a", "/music/b"},
+		},
+		"musicbrainz": map[string]any{"host": "musicbrainz.org", "ratelimit": 1},
+		"ui":          map[string]any{"color": false},
 	}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("rendered config:\n%s\nparsed %#v\nwant %#v", body, got, want)
 	}
 
-	c.AcoustIDKey = ""
+	c.AcoustIDKey, c.ForgetFolders = "", nil
 	body, err = c.Render()
 	if err != nil {
 		t.Fatal(err)
@@ -65,6 +70,9 @@ func TestRender(t *testing.T) {
 	}
 	if _, ok := got["wn_candidates"].(map[string]any)["acoustid_app_key"]; ok {
 		t.Fatalf("acoustid_app_key present without a key:\n%s", body)
+	}
+	if _, ok := got["wn_candidates"].(map[string]any)["forget_folders"]; ok {
+		t.Fatalf("forget_folders present without folders:\n%s", body)
 	}
 }
 
@@ -161,11 +169,11 @@ func TestImportWithFakeBeets(t *testing.T) {
 		Scanner:   scan,
 		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
-	sum, err := r.Import(context.Background(), []string{music})
+	sum, err := r.Import(context.Background(), []string{music}, nil)
 	if err != nil {
 		t.Fatalf("Import: %v", err)
 	}
-	if sum.Applied != 2 || sum.Skipped != 1 || len(sum.Albums) != 3 {
+	if sum.Applied != 2 || sum.Skipped != 1 || len(sum.Albums) != 3 || !sum.Started {
 		t.Fatalf("summary = %+v", sum)
 	}
 	if scan.calls != 1 {
@@ -237,7 +245,7 @@ func TestImportCancelled(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
-	sum, err := r.Import(ctx, []string{music})
+	sum, err := r.Import(ctx, []string{music}, nil)
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Import error = %v, want deadline exceeded", err)
 	}

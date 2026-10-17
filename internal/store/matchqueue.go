@@ -331,11 +331,52 @@ func (s *Store) MarkApplied(ctx context.Context, id int64, releaseID, copiedTo s
 	return nil
 }
 
-// RevertMatch sets an entry to pending and clears the applied fields.
+// RevertMatch sets an entry to pending, clears the applied fields, and sets
+// forget_pending, so the next full match run removes the folder from beets'
+// incremental history.
 func (s *Store) RevertMatch(ctx context.Context, id int64) error {
 	return checkOne(s.db.ExecContext(ctx,
-		`UPDATE match_queue SET state = ?, applied_release_id = NULL, copied_to = NULL, applied_at = NULL, marker_written = 0 WHERE id = ?`,
+		`UPDATE match_queue SET state = ?, applied_release_id = NULL, copied_to = NULL, applied_at = NULL, marker_written = 0, forget_pending = 1 WHERE id = ?`,
 		MatchPending, id))
+}
+
+// ForgetFolder is the folder of an entry with forget_pending set.
+type ForgetFolder struct {
+	ID     int64
+	Folder string
+}
+
+// ForgetPending returns the entries with forget_pending set, ordered by id.
+func (s *Store) ForgetPending(ctx context.Context) ([]ForgetFolder, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT id, folder FROM match_queue WHERE forget_pending = 1 ORDER BY id`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []ForgetFolder
+	for rows.Next() {
+		var f ForgetFolder
+		if err := rows.Scan(&f.ID, &f.Folder); err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
+}
+
+// ClearForgetPending clears forget_pending on the entries with the given
+// ids. An id that does not exist is ignored.
+func (s *Store) ClearForgetPending(ctx context.Context, ids []int64) error {
+	if len(ids) == 0 {
+		return nil
+	}
+	args := make([]any, len(ids))
+	for i, id := range ids {
+		args[i] = id
+	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE match_queue SET forget_pending = 0 WHERE id IN (?`+strings.Repeat(`, ?`, len(ids)-1)+`)`, args...)
+	return err
 }
 
 // UnmarkedDuplicates returns the duplicate entries without a marker from

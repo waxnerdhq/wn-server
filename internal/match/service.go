@@ -82,9 +82,29 @@ func (r RunResult) Line() string {
 // saw in the match queue. After a cancel it still records the albums that
 // beets wrote before it was killed. The result is valid also when err is
 // not nil.
+//
+// The folders of reverted entries (forget_pending) go to the plugin as
+// forget_folders, which removes them from beets' incremental history so this
+// run offers them again. Once beets has started, the flag is cleared, also
+// when the run fails. A run that did not start leaves it.
 func (s *Service) Run(ctx context.Context) (RunResult, error) {
-	sum, err := s.runner.Import(ctx, s.cfg.MusicFolders)
 	bg := context.WithoutCancel(ctx)
+	var forget []string
+	var forgetIDs []int64
+	pending, ferr := s.st.ForgetPending(bg)
+	if ferr != nil {
+		s.log.Warn("could not read the reverted folders; beets keeps them in its history on this run", "error", ferr)
+	}
+	for _, f := range pending {
+		forget = append(forget, f.Folder)
+		forgetIDs = append(forgetIDs, f.ID)
+	}
+	sum, err := s.runner.Import(ctx, s.cfg.MusicFolders, forget)
+	if sum.Started && len(forgetIDs) > 0 {
+		if cerr := s.st.ClearForgetPending(bg, forgetIDs); cerr != nil {
+			s.log.Warn("could not clear forget_pending; the next run forgets the folders again", "error", cerr)
+		}
+	}
 	recErr := recordAlbums(bg, s.st, sum.Albums, sum.MarkersWritten, s.log)
 	if recErr == nil {
 		// A cancelled run still marks the duplicates of the lines it

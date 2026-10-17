@@ -107,7 +107,7 @@ func TestImportIntegration(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Minute)
 	defer cancel()
-	sum, err := r.Import(ctx, []string{music})
+	sum, err := r.Import(ctx, []string{music}, nil)
 	if err != nil {
 		t.Fatalf("Import: %v", err)
 	}

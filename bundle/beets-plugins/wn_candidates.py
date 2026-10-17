@@ -28,6 +28,15 @@ wn-server reads the file named by the ``output`` option after
 
 Events used (beets 2.14):
 
+- ``import_begin`` runs once, before the import pipeline reads the first
+  directory. The handler removes each folder in the ``forget_folders`` option
+  from beets' incremental history, so the run offers the folder again.
+  wn-server lists the folders of reverted match queue entries there. A
+  history entry is a tuple of the directories of one task. An entry is
+  removed when one of its directories is the folder or is inside it, which
+  covers an album that beets collapsed from several directories. A folder
+  that is not in the history is ignored. The handler logs one line per
+  folder.
 - ``import_task_before_choice`` runs before beets judges the candidates.
   When the ``apply_release_id`` option is set, the handler returns the
   candidate with that release id, and beets applies it also in quiet mode.
@@ -74,6 +83,7 @@ from collections import Counter
 
 from beets import config as beets_config
 from beets.importer import Action
+from beets.importer.state import ImportState
 from beets.plugins import BeetsPlugin
 from beets.util import extension as _extension
 
@@ -164,6 +174,21 @@ def _existing_id_match(item_ids, candidate_id, distance, threshold):
     return distance <= threshold
 
 
+def _forget(history, folder):
+    """Remove from the history set every entry that has a directory equal to
+    folder or inside it, and return the removed entries. history holds tuples
+    of byte paths, as beets stores them. folder is a normalised byte path."""
+    sep = os.fsencode(os.sep)
+    prefix = folder.rstrip(sep) + sep
+    hits = {
+        entry
+        for entry in history
+        if any(p == folder or p.startswith(prefix) for p in map(os.fsencode, entry))
+    }
+    history.difference_update(hits)
+    return hits
+
+
 def _flag_name(value):
     return getattr(value, "name", None) or _str(value)
 
@@ -172,7 +197,13 @@ class WnCandidatesPlugin(BeetsPlugin):
     def __init__(self):
         super().__init__()
         self.config.add(
-            {"output": "", "acoustid_app_key": "", "apply_release_id": "", "apply_folder": ""}
+            {
+                "output": "",
+                "acoustid_app_key": "",
+                "apply_release_id": "",
+                "apply_folder": "",
+                "forget_folders": [],
+            }
         )
         self.config["acoustid_app_key"].redact = True
         self._set_acoustid_key()
@@ -182,6 +213,7 @@ class WnCandidatesPlugin(BeetsPlugin):
         self._pending = {}
         # id(task) -> reason for tasks whose match on_before_choice chose.
         self._requested = {}
+        self.register_listener("import_begin", self.on_import_begin)
         self.register_listener("import_task_before_choice", self.on_before_choice)
         self.register_listener("import_task_choice", self.on_choice)
         self.register_listener("album_imported", self.on_album_imported)
@@ -222,6 +254,29 @@ class WnCandidatesPlugin(BeetsPlugin):
             )
         except Exception as inner:  # noqa: BLE001
             self._log.error("wn_candidates: cannot write error line: {}", inner)
+
+    def on_import_begin(self, session):
+        """Remove the folders of the forget_folders option from beets'
+        incremental history and save the state file. The pipeline has not
+        read the history yet, because ImportSession loads it on first use."""
+        try:
+            folders = [os.path.normpath(f) for f in self.config["forget_folders"].as_str_seq() if f]
+            if not folders:
+                return
+            with ImportState() as state:
+                for folder in folders:
+                    removed = _forget(state.taghistory, os.fsencode(folder))
+                    self._log.info(
+                        "wn_candidates: forgot {} from the incremental history ({} entries)",
+                        folder,
+                        len(removed),
+                    )
+                    # ImportSession caches the history set on first use.
+                    cached = getattr(session, "_history_dirs", None)
+                    if cached is not None:
+                        cached.difference_update(removed)
+        except Exception as exc:  # noqa: BLE001
+            self._log.error("wn_candidates: cannot forget folders: {}", exc)
 
     def on_before_choice(self, session, task):
         """Return the candidate whose release id is apply_release_id, or

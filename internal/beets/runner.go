@@ -90,6 +90,10 @@ type Summary struct {
 	// MarkersWritten holds the Folder of every applied album whose .ndignore
 	// this run created. A marker that already existed is not listed.
 	MarkersWritten []string
+	// Started is true when the beets process started. A run that stopped
+	// before that (the lock, the plugin check, writing beets.yaml) leaves it
+	// false.
+	Started bool
 }
 
 // Scanner starts a Navidrome library scan.
@@ -154,13 +158,18 @@ func NewRunner(c *config.Config, scanner Scanner, logger *slog.Logger) *Runner {
 // candidates file, writes .ndignore into the original folder of every
 // applied album, and starts a Navidrome scan when an album was applied.
 //
+// forget lists folders that the wn_candidates plugin removes from beets'
+// incremental history before the import reads it, so this run offers them
+// again. Summary.Started tells the caller whether beets ran, which is when
+// the plugin forgot them.
+//
 // A failed scan is logged as a warning and does not fail the import. When
 // beets exits non-zero, the summary of what it did write is returned with
 // the error. When ctx is cancelled, the candidates file is still read and the
 // markers are written, because beets has already recorded the applied albums
 // in its incremental history and will not offer them again. The summary is
 // then returned with ctx.Err() and no scan is started.
-func (r *Runner) Import(ctx context.Context, folders []string) (Summary, error) {
+func (r *Runner) Import(ctx context.Context, folders, forget []string) (Summary, error) {
 	if len(folders) == 0 {
 		return Summary{}, errors.New("no folders to import")
 	}
@@ -173,7 +182,9 @@ func (r *Runner) Import(ctx context.Context, folders []string) (Summary, error) 
 		return Summary{}, err
 	}
 	defer unlock()
-	return r.importRun(ctx, r.Config, nil, roots, roots)
+	cfg := r.Config
+	cfg.ForgetFolders = forget
+	return r.importRun(ctx, cfg, nil, roots, roots)
 }
 
 // Apply imports the album in folder with the MusicBrainz release releaseID.
@@ -259,8 +270,9 @@ func (r *Runner) importRun(ctx context.Context, cfg Config, flags, paths, roots 
 
 	args := append(append([]string{"import", "-q"}, flags...), paths...)
 	r.Log.Info("running beets import", "bin", r.BeetsBin, "folders", len(paths))
-	runErr := r.run(ctx, args...)
+	started, runErr := r.runCmd(ctx, args...)
 	sum, err := r.readCandidates()
+	sum.Started = started
 	sum.MarkersWritten = r.writeMarkers(sum.Albums, roots)
 	if ctx.Err() != nil {
 		return sum, ctx.Err()
@@ -384,6 +396,12 @@ func resolveExisting(path string) string {
 
 // run starts `beet --config <beets.yaml> <args>` and waits for it.
 func (r *Runner) run(ctx context.Context, args ...string) error {
+	_, err := r.runCmd(ctx, args...)
+	return err
+}
+
+// runCmd is run that also reports whether the process started.
+func (r *Runner) runCmd(ctx context.Context, args ...string) (started bool, err error) {
 	cmd := exec.CommandContext(ctx, r.BeetsBin, append([]string{"--config", r.Config.Path()}, args...)...)
 	cmd.Env = r.env()
 	stdout := &lineWriter{log: r.Log, level: slog.LevelDebug}
@@ -393,19 +411,20 @@ func (r *Runner) run(ctx context.Context, args ...string) error {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = killWait
-	err := cmd.Run()
+	err = cmd.Run()
+	started = cmd.Process != nil
 	stdout.flush()
 	stderr.flush()
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			if last := stderr.lastLine(); last != "" {
-				return fmt.Errorf("beets %s: %w: %s", args[0], err, last)
+				return started, fmt.Errorf("beets %s: %w: %s", args[0], err, last)
 			}
 		}
-		return fmt.Errorf("beets %s: %w", args[0], err)
+		return started, fmt.Errorf("beets %s: %w", args[0], err)
 	}
-	return nil
+	return started, nil
 }
 
 // env is the environment of the beets process. The directory of fpcalc_bin

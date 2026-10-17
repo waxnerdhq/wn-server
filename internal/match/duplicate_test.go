@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/waxnerdhq/wn-server/internal/config"
@@ -42,7 +43,7 @@ func newDupEnv(t *testing.T) *dupEnv {
 	}
 	script := "#!/bin/sh\n" +
 		"case \"$3\" in\n" +
-		"import) cp '" + filepath.Join(e.data, "next.jsonl") + "' '" + filepath.Join(e.data, "beets-candidates.jsonl") + "' ;;\n" +
+		"import) cp \"$2\" '" + filepath.Join(e.data, "seen.yaml") + "'; cp '" + filepath.Join(e.data, "next.jsonl") + "' '" + filepath.Join(e.data, "beets-candidates.jsonl") + "' ;;\n" +
 		"remove) rm -r \"${7#path:}\" ;;\n" +
 		"*) exit 3 ;;\nesac\n"
 	beetsBin := filepath.Join(bin, "beets")
@@ -89,6 +90,20 @@ func (e *dupEnv) run(lines ...map[string]any) {
 	if _, err := e.svc.Run(context.Background()); err != nil {
 		e.t.Fatalf("Run: %v", err)
 	}
+}
+
+// holdLock takes the beets.lock flock, as a running beets run does, and
+// returns the function that releases it.
+func (e *dupEnv) holdLock() func() {
+	e.t.Helper()
+	f, err := os.OpenFile(filepath.Join(e.data, "beets.lock"), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		e.t.Fatal(err)
+	}
+	return func() { f.Close() }
 }
 
 func (e *dupEnv) entry(folder string) store.MatchEntry {
@@ -202,6 +217,56 @@ func TestRevertKeepsMarkersWhileAnotherEntryIsApplied(t *testing.T) {
 	}
 	if hasMarker(d) || e.entry(d).MarkerWritten {
 		t.Fatal("the duplicate marker stayed after the last applied entry was reverted")
+	}
+}
+
+// TestRevertForgetsFolderOnNextRun checks that the run after a revert lists
+// the folder in forget_folders, that the run after that does not, and that a
+// run which cannot start leaves the flag.
+func TestRevertForgetsFolderOnNextRun(t *testing.T) {
+	const r1 = "11111111-1111-1111-1111-111111111111"
+	e := newDupEnv(t)
+	a := e.folder("a/album")
+	e.run(map[string]any{"folder": a, "decision": "applied", "release_id": r1, "copied_to": e.copyDir("A")})
+	if _, err := e.svc.Revert(context.Background(), e.entry(a).ID); err != nil {
+		t.Fatal(err)
+	}
+	pending := func() int {
+		got, err := e.st.ForgetPending(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(got)
+	}
+	if pending() != 1 {
+		t.Fatalf("forget_pending entries after revert = %d, want 1", pending())
+	}
+
+	// beets.lock held elsewhere: the run does not start and the flag stays.
+	unlock := e.holdLock()
+	if _, err := e.svc.Run(context.Background()); err == nil {
+		t.Fatal("Run succeeded while another run held the lock")
+	}
+	unlock()
+	if pending() != 1 {
+		t.Fatal("a run that did not start cleared forget_pending")
+	}
+
+	e.run(map[string]any{"folder": a, "decision": "skipped"})
+	seen, err := os.ReadFile(filepath.Join(e.data, "seen.yaml"))
+	if err != nil || !strings.Contains(string(seen), "forget_folders:") || !strings.Contains(string(seen), a) {
+		t.Fatalf("beets.yaml of the run after the revert: %v\n%s", err, seen)
+	}
+	if pending() != 0 {
+		t.Fatal("forget_pending stayed after the run")
+	}
+	if e.entry(a).State != store.MatchPending {
+		t.Fatalf("entry state = %s, want pending", e.entry(a).State)
+	}
+	e.run(map[string]any{"folder": a, "decision": "skipped"})
+	seen, _ = os.ReadFile(filepath.Join(e.data, "seen.yaml"))
+	if strings.Contains(string(seen), "forget_folders") {
+		t.Fatalf("the second run still lists forget_folders:\n%s", seen)
 	}
 }
 
