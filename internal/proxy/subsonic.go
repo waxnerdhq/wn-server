@@ -49,8 +49,10 @@ const maxFormBytes = 10 << 20
 // u plus t and s, or u plus p, against the store. On success it forwards the
 // request with the account id as Remote-User and without the credential
 // parameters. On failure it answers as Navidrome does: HTTP 200 with a
-// Subsonic error body.
-func subsonicAuth(st Store, sess *sessions, logger *slog.Logger, next http.Handler) http.Handler {
+// Subsonic error body. Failed credential checks are limited per client
+// address by lim, and beyond the limit the answer is error 40 without a
+// check. A missing credential and a session do not count.
+func subsonicAuth(st Store, sess *sessions, lim *loginLimiter, logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		params, err := subsonicParams(w, r)
 		if err != nil {
@@ -97,14 +99,25 @@ func subsonicAuth(st Store, sess *sessions, logger *slog.Logger, next http.Handl
 			writeSubsonicError(w, params, errMissingParam, "missing parameter: 'p', or 't' and 's'")
 			return
 		}
+		addr := remoteHost(r)
+		ok, warn := lim.begin(addr)
+		if !ok {
+			if warn {
+				logger.Warn("subsonic sign-in rate limited", "remote", addr)
+			}
+			writeSubsonicError(w, params, errWrongCredential, "Wrong username or password")
+			return
+		}
 		acct, err := st.AccountByName(r.Context(), user)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
+				lim.forget(addr)
 				return
 			}
 			if errors.Is(err, store.ErrNotFound) {
 				logger.Warn("subsonic sign-in failed", "remote", r.RemoteAddr, "user", truncate(user, maxLogUser), "reason", "missing_user")
 			} else {
+				lim.forget(addr)
 				logger.Error("look up account", "error", err)
 			}
 			writeSubsonicError(w, params, errWrongCredential, "Wrong username or password")
@@ -115,6 +128,7 @@ func subsonicAuth(st Store, sess *sessions, logger *slog.Logger, next http.Handl
 			writeSubsonicError(w, params, errWrongCredential, "Wrong username or password")
 			return
 		}
+		lim.reset(addr)
 		forwardAccount(w, r, params, st, logger, acct.ID, acct.Name, next)
 	})
 }
