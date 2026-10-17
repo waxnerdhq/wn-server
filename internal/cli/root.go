@@ -22,6 +22,7 @@ import (
 	"github.com/waxnerdhq/wn-server/internal/match"
 	"github.com/waxnerdhq/wn-server/internal/navidrome"
 	"github.com/waxnerdhq/wn-server/internal/proxy"
+	"github.com/waxnerdhq/wn-server/internal/ratings"
 	"github.com/waxnerdhq/wn-server/internal/store"
 	"github.com/waxnerdhq/wn-server/internal/web"
 	"github.com/waxnerdhq/wn-server/internal/wncloud"
@@ -257,9 +258,11 @@ func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.A
 		NavidromeVersion: navidrome.ServerVersion(),
 		Logger:           logger,
 	})
+	cloud := newClient(c)
+	rt := ratings.New(st, cloud, ndClient, cloudStatus, logger)
 	srv := &http.Server{
-		Handler: proxy.New(target, sup.Ready(), st, newClient(c), logger,
-			proxy.WithUI(ui), proxy.WithCloudStatus(cloudStatus)),
+		Handler: proxy.New(target, sup.Ready(), st, cloud, logger,
+			proxy.WithUI(ui), proxy.WithCloudStatus(cloudStatus), proxy.WithRatings(rt)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
@@ -269,6 +272,7 @@ func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.A
 	go func() { supDone <- sup.Run(supCtx) }()
 	srvDone := make(chan error, 1)
 	go func() { srvDone <- srv.Serve(ln) }()
+	go rt.Run(ctx)
 	logger.Info("listening", "addr", ln.Addr().String())
 
 	shutdownServer := func() {

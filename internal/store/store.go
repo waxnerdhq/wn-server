@@ -1,6 +1,6 @@
 // Package store is wn-server's SQLite database. It holds the owner account,
-// the server credential, the sessions of first-party clients, and the match
-// queue. Later migrations add ratings and the outbox.
+// the server credential, the sessions of first-party clients, the match
+// queue, the local rating store, and the rating outbox.
 package store
 
 import (
