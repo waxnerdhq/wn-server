@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -114,7 +115,7 @@ func (e *env) signIn(t *testing.T) *http.Cookie {
 	if c == nil || c.Value == "" {
 		t.Fatal("sign-in set no session cookie")
 	}
-	if !c.HttpOnly || c.SameSite != http.SameSiteLaxMode || c.Path != "/" || c.Secure {
+	if !c.HttpOnly || c.SameSite != http.SameSiteLaxMode || c.Path != "/ui/" || c.MaxAge != cookieMaxAge || c.Secure {
 		t.Fatalf("cookie attributes: %+v", c)
 	}
 	return c
@@ -234,5 +235,20 @@ func TestLimiter(t *testing.T) {
 	now = now.Add(signInWindow + time.Second)
 	if !l.begin("a") {
 		t.Fatal("the window did not expire")
+	}
+	if limitKey("2001:db8::1") != limitKey("2001:db8::2") {
+		t.Fatal("IPv6 addresses in one /64 have different keys")
+	}
+}
+
+func TestLimiterTotal(t *testing.T) {
+	l := newLimiter(time.Now)
+	for i := range signInMaxTotal {
+		if !l.begin(fmt.Sprintf("10.0.%d.%d", i/250, i%250)) {
+			t.Fatalf("refused attempt %d below the total", i)
+		}
+	}
+	if l.begin("192.0.2.1") {
+		t.Fatal("allowed a new address above the total")
 	}
 }

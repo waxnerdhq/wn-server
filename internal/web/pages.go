@@ -66,6 +66,10 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.Logger.Info("web sign-in", "account", acct.ID, "session", sess.ID, "remote", addr)
+	// A session that the browser already holds would be left without a cookie.
+	if c, err := r.Cookie(CookieName); err == nil && c.Value != "" {
+		_, _ = s.Store.RevokeSessionByToken(r.Context(), c.Value)
+	}
 	setCookie(w, r, token)
 	http.Redirect(w, r, "/ui/", http.StatusSeeOther)
 }

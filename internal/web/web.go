@@ -217,13 +217,18 @@ func (s *server) session(r *http.Request) (sess store.Session, ok bool, err erro
 	return sess, true, nil
 }
 
-// setCookie sets the session cookie. It has no expiry, because sessions do
-// not expire on the server.
+// cookieMaxAge is 400 days, the longest lifetime browsers keep. The session
+// row stays until it is revoked.
+const cookieMaxAge = 400 * 24 * 60 * 60
+
+// setCookie sets the session cookie. Its path is /ui/, so the browser does
+// not send it on /rest/* and /share/*.
 func setCookie(w http.ResponseWriter, r *http.Request, token string) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     CookieName,
 		Value:    token,
-		Path:     "/",
+		Path:     "/ui/",
+		MaxAge:   cookieMaxAge,
 		HttpOnly: true,
 		Secure:   r.TLS != nil,
 		SameSite: http.SameSiteLaxMode,
@@ -234,7 +239,7 @@ func clearCookie(w http.ResponseWriter, r *http.Request) {
 	http.SetCookie(w, &http.Cookie{
 		Name:     CookieName,
 		Value:    "",
-		Path:     "/",
+		Path:     "/ui/",
 		MaxAge:   -1,
 		HttpOnly: true,
 		Secure:   r.TLS != nil,

@@ -48,9 +48,10 @@ func New(target *url.URL, ready <-chan struct{}, st Store, cloud Verifier, logge
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
 			// A client must not choose its Navidrome identity. A session in
-			// the Authorization header stays with wn-server.
+			// the Authorization header or in a cookie stays with wn-server.
 			r.Out.Header.Del(userHeader)
 			r.Out.Header.Del("Authorization")
+			r.Out.Header.Del("Cookie")
 			requestIdentity(r)
 			if id, ok := r.In.Context().Value(accountIDKey{}).(string); ok {
 				r.Out.Header.Set(userHeader, id)
