@@ -34,12 +34,12 @@ type accountIDKey struct{}
 
 // New returns a handler that forwards /rest/* with authentication and
 // /share/* without it to Navidrome through rt, the transport from
-// navidrome.NewTransport, and serves wn-server's own /api/v1/* routes. WithUI adds the web UI on / and /ui/*. Every other path answers
-// 404. Until ready is closed, /rest/* and /share/* answer 503 and nothing is
-// forwarded, so that no client can become Navidrome's first user. cloud
-// verifies device codes for POST /api/v1/session. WithRatings adds the
-// rating intercept on setRating, star, and unstar. A nil logger selects
-// slog.Default.
+// navidrome.NewTransport, and serves wn-server's own /api/v1/* routes.
+// WithUI adds the web UI on / and /ui/*. Every other path answers 404. Until
+// ready is closed, /rest/* and /share/* answer 503 and nothing is forwarded,
+// so that no client can become Navidrome's first user. cloud verifies device
+// codes for POST /api/v1/session. WithRatings adds the rating intercept on
+// setRating, star, and unstar. A nil logger selects slog.Default.
 func New(rt http.RoundTripper, ready <-chan struct{}, st Store, cloud Verifier, logger *slog.Logger, opts ...Option) http.Handler {
 	o := newOptions(opts)
 	if logger == nil {

@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
@@ -75,8 +76,9 @@ func (s *Supervisor) Ready() <-chan struct{} { return s.ready }
 // Run writes navidrome.toml and keeps Navidrome running until ctx is
 // cancelled. The caller checks the binary with VerifyBinary first. On
 // cancellation it sends SIGTERM, waits up to 10 s, then SIGKILL, and returns
-// nil. It returns an error only when the socket path is too long or
-// navidrome.toml cannot be written.
+// nil. It returns an error only when the socket path is too long,
+// navidrome.toml cannot be written, or another process listens on the
+// socket (ErrSocketInUse).
 func (s *Supervisor) Run(ctx context.Context) error {
 	if sock := s.cfg.NavidromeSocketPath(); len(sock) > maxSocketPath {
 		return fmt.Errorf("navidrome socket path %s is longer than %d bytes; use a shorter data directory", sock, maxSocketPath)
@@ -91,6 +93,9 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		if ctx.Err() != nil {
 			return nil
 		}
+		if errors.Is(err, ErrSocketInUse) {
+			return err
+		}
 		uptime := time.Since(started)
 		delay = s.policy.Next(delay, uptime)
 		s.log.Warn("navidrome exited; restarting", "error", err, "uptime", uptime.Round(time.Millisecond), "delay", delay)
@@ -102,16 +107,37 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	}
 }
 
+// ErrSocketInUse means a process already accepts connections on Navidrome's
+// socket, for example a Navidrome left from another wn-server. Run returns
+// it instead of restarting.
+var ErrSocketInUse = errors.New("another Navidrome is listening on the socket")
+
+// staleDialTimeout is how long removeStaleSocket waits for a connection.
+const staleDialTimeout = 500 * time.Millisecond
+
+// removeStaleSocket removes the socket file that a stopped child left. It
+// first dials the socket: a dead child's file gives ECONNREFUSED, and an
+// absent file gives ENOENT. A successful dial gives ErrSocketInUse and
+// leaves the file. Navidrome also removes the file before it listens.
+func removeStaleSocket(sock string) error {
+	if conn, err := net.DialTimeout("unix", sock, staleDialTimeout); err == nil {
+		conn.Close()
+		return fmt.Errorf("%w: %s", ErrSocketInUse, sock)
+	}
+	if err := os.Remove(sock); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove stale navidrome socket: %w", err)
+	}
+	return nil
+}
+
 // runOnce starts one child and blocks until it exits.
 func (s *Supervisor) runOnce(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
-	// A socket file left by a killed child would answer nothing. Navidrome
-	// also removes it before it listens.
 	sock := s.cfg.NavidromeSocketPath()
-	if err := os.Remove(sock); err != nil && !errors.Is(err, fs.ErrNotExist) {
-		return fmt.Errorf("remove stale navidrome socket: %w", err)
+	if err := removeStaleSocket(sock); err != nil {
+		return err
 	}
 
 	cmd := exec.CommandContext(runCtx, s.cfg.NavidromeBin, "-c", s.cfg.NavidromeConfigPath())

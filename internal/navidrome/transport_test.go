@@ -2,6 +2,8 @@ package navidrome
 
 import (
 	"context"
+	"errors"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -12,16 +14,43 @@ import (
 	"github.com/waxnerdhq/wn-server/internal/config"
 )
 
-// TestWaitReadyOnSocket starts listening on the socket after the poll has
-// begun, as Navidrome does once its migrations finish.
-func TestWaitReadyOnSocket(t *testing.T) {
-	// macOS limits socket paths to 104 bytes, and t.TempDir paths can be
-	// longer.
+// shortTempDir returns a temporary directory with a short path. macOS limits
+// socket paths to 104 bytes, and t.TempDir paths can be longer.
+func shortTempDir(t *testing.T) string {
+	t.Helper()
 	dir, err := os.MkdirTemp("", "wn")
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.RemoveAll(dir) })
+	return dir
+}
+
+// TestRunRefusesSocketInUse checks that Run stops, without starting a child,
+// when a process already listens on the socket.
+func TestRunRefusesSocketInUse(t *testing.T) {
+	dir := shortTempDir(t)
+	cfg := &config.Config{DataDir: dir, SortedDir: filepath.Join(dir, "sorted"), NavidromeBin: filepath.Join(dir, "no-such-binary")}
+	ln, err := net.Listen("unix", cfg.NavidromeSocketPath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	s := NewSupervisor(cfg, Account{}, NewTransport(cfg.NavidromeSocketPath()), slog.New(slog.DiscardHandler))
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := s.Run(ctx); !errors.Is(err, ErrSocketInUse) {
+		t.Fatalf("Run = %v, want ErrSocketInUse", err)
+	}
+	if _, err := os.Stat(cfg.NavidromeSocketPath()); err != nil {
+		t.Fatalf("socket file removed: %v", err)
+	}
+}
+
+// TestWaitReadyOnSocket starts listening on the socket after the poll has
+// begun, as Navidrome does once its migrations finish.
+func TestWaitReadyOnSocket(t *testing.T) {
+	dir := shortTempDir(t)
 	cfg := &config.Config{DataDir: dir}
 	sock := cfg.NavidromeSocketPath()
 
