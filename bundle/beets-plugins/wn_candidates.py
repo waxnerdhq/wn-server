@@ -26,8 +26,25 @@ wn-server reads the file named by the ``output`` option after
   ``match.medium_rec_thresh``.
 - ``error``: the message. Only on ``error`` lines.
 
+A line with ``decision: "forgotten"`` is not an album. It has only
+``decision`` and ``folder`` and confirms that a folder of the
+``forget_folders`` option is no longer in beets' incremental history (see
+``import_begin`` below).
+
 Events used (beets 2.14):
 
+- ``import_begin`` runs once, before the import pipeline reads the first
+  directory. The handler removes each folder in the ``forget_folders`` option
+  from beets' incremental history, so the run offers the folder again.
+  wn-server lists the folders of reverted match queue entries there. A
+  history entry is a tuple of the directories of one task. An entry is
+  removed when the folder of its task, computed as for the ``folder`` key
+  above (the single directory, or the common parent of several), equals the
+  listed folder. An album folder with album folders below it therefore keeps
+  the history of those. The handler saves the state file, reads it again, and
+  writes a ``forgotten`` line for each folder that is gone from the reread
+  history. A folder that was not in the history gets a warning and the line.
+  The handler logs one line per folder.
 - ``import_task_before_choice`` runs before beets judges the candidates.
   When the ``apply_release_id`` option is set, the handler returns the
   candidate with that release id, and beets applies it also in quiet mode.
@@ -74,6 +91,7 @@ from collections import Counter
 
 from beets import config as beets_config
 from beets.importer import Action
+from beets.importer.state import ImportState
 from beets.plugins import BeetsPlugin
 from beets.util import extension as _extension
 
@@ -114,7 +132,13 @@ def _most_common(values):
 
 
 def _folder(task):
-    paths = [os.path.abspath(os.fsdecode(p)) for p in (task.paths or [])]
+    return _folder_of(task.paths)
+
+
+def _folder_of(task_paths):
+    """The album folder of a task's directories: the single directory, or the
+    common parent of several."""
+    paths = [os.path.abspath(os.fsdecode(p)) for p in (task_paths or [])]
     if not paths:
         return ""
     if len(paths) == 1:
@@ -164,6 +188,21 @@ def _existing_id_match(item_ids, candidate_id, distance, threshold):
     return distance <= threshold
 
 
+def _history_hits(history, folder):
+    """The entries of the history set whose album folder is folder. history
+    holds tuples of byte paths, as beets stores them. folder is a normalised
+    str path."""
+    return {entry for entry in history if _folder_of(entry) == folder}
+
+
+def _forget(history, folder):
+    """Remove the entries of _history_hits from the history set and return
+    them."""
+    hits = _history_hits(history, folder)
+    history.difference_update(hits)
+    return hits
+
+
 def _flag_name(value):
     return getattr(value, "name", None) or _str(value)
 
@@ -172,7 +211,13 @@ class WnCandidatesPlugin(BeetsPlugin):
     def __init__(self):
         super().__init__()
         self.config.add(
-            {"output": "", "acoustid_app_key": "", "apply_release_id": "", "apply_folder": ""}
+            {
+                "output": "",
+                "acoustid_app_key": "",
+                "apply_release_id": "",
+                "apply_folder": "",
+                "forget_folders": [],
+            }
         )
         self.config["acoustid_app_key"].redact = True
         self._set_acoustid_key()
@@ -182,6 +227,7 @@ class WnCandidatesPlugin(BeetsPlugin):
         self._pending = {}
         # id(task) -> reason for tasks whose match on_before_choice chose.
         self._requested = {}
+        self.register_listener("import_begin", self.on_import_begin)
         self.register_listener("import_task_before_choice", self.on_before_choice)
         self.register_listener("import_task_choice", self.on_choice)
         self.register_listener("album_imported", self.on_album_imported)
@@ -222,6 +268,38 @@ class WnCandidatesPlugin(BeetsPlugin):
             )
         except Exception as inner:  # noqa: BLE001
             self._log.error("wn_candidates: cannot write error line: {}", inner)
+
+    def on_import_begin(self, session):
+        """Remove the folders of the forget_folders option from beets'
+        incremental history and save the state file. The pipeline has not
+        read the history yet, because ImportSession loads it on first use.
+        The state file is read again after the save, because ImportState
+        ignores a write error. A folder gets a ``forgotten`` line only when
+        the reread history no longer holds an entry for it."""
+        try:
+            listed = [f for f in self.config["forget_folders"].as_str_seq() if f]
+            if not listed:
+                return
+            removed = {}
+            with ImportState() as state:
+                for folder in listed:
+                    removed[folder] = _forget(state.taghistory, os.path.normpath(folder))
+                    # ImportSession caches the history set on first use.
+                    cached = getattr(session, "_history_dirs", None)
+                    if cached is not None:
+                        cached.difference_update(removed[folder])
+            saved = ImportState().taghistory
+            for folder in listed:
+                if _history_hits(saved, os.path.normpath(folder)):
+                    self._log.error("cannot forget {}: the state file still lists it", folder)
+                    continue
+                if removed[folder]:
+                    self._log.info("forgot {} from the incremental history ({} entries)", folder, len(removed[folder]))
+                else:
+                    self._log.warning("{} is not in the incremental history (0 entries removed)", folder)
+                self._write({"decision": "forgotten", "folder": folder})
+        except Exception as exc:  # noqa: BLE001
+            self._log.error("cannot forget folders: {}", exc)
 
     def on_before_choice(self, session, task):
         """Return the candidate whose release id is apply_release_id, or

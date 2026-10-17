@@ -90,6 +90,10 @@ type Summary struct {
 	// MarkersWritten holds the Folder of every applied album whose .ndignore
 	// this run created. A marker that already existed is not listed.
 	MarkersWritten []string
+	// Forgotten holds the folder of every `forgotten` line: a folder from
+	// forget_folders that the plugin confirmed is no longer in beets'
+	// incremental history.
+	Forgotten []string
 }
 
 // Scanner starts a Navidrome library scan.
@@ -154,13 +158,18 @@ func NewRunner(c *config.Config, scanner Scanner, logger *slog.Logger) *Runner {
 // candidates file, writes .ndignore into the original folder of every
 // applied album, and starts a Navidrome scan when an album was applied.
 //
+// forget lists folders that the wn_candidates plugin removes from beets'
+// incremental history before the import reads it, so this run offers them
+// again. Summary.Forgotten lists the folders for which the plugin confirmed
+// that they are gone from the history.
+//
 // A failed scan is logged as a warning and does not fail the import. When
 // beets exits non-zero, the summary of what it did write is returned with
 // the error. When ctx is cancelled, the candidates file is still read and the
 // markers are written, because beets has already recorded the applied albums
 // in its incremental history and will not offer them again. The summary is
 // then returned with ctx.Err() and no scan is started.
-func (r *Runner) Import(ctx context.Context, folders []string) (Summary, error) {
+func (r *Runner) Import(ctx context.Context, folders, forget []string) (Summary, error) {
 	if len(folders) == 0 {
 		return Summary{}, errors.New("no folders to import")
 	}
@@ -173,7 +182,9 @@ func (r *Runner) Import(ctx context.Context, folders []string) (Summary, error) 
 		return Summary{}, err
 	}
 	defer unlock()
-	return r.importRun(ctx, r.Config, nil, roots, roots)
+	cfg := r.Config
+	cfg.ForgetFolders = forget
+	return r.importRun(ctx, cfg, nil, roots, roots)
 }
 
 // Apply imports the album in folder with the MusicBrainz release releaseID.
@@ -448,11 +459,12 @@ func (r *Runner) readCandidates() (Summary, error) {
 		return Summary{}, fmt.Errorf("read candidates file: %w", err)
 	}
 	defer f.Close()
-	albums, malformed, err := parseCandidates(f)
+	albums, forgotten, malformed, err := parseCandidates(f)
 	if malformed > 0 {
 		r.Log.Warn("skipped malformed lines in the candidates file", "count", malformed, "file", r.Config.CandidatesPath())
 	}
 	sum := summarize(albums, malformed)
+	sum.Forgotten = forgotten
 	if err != nil {
 		return sum, fmt.Errorf("read candidates file: %w", err)
 	}
@@ -478,17 +490,24 @@ func summarize(albums []Album, malformed int) Summary {
 
 // ParseCandidates reads the JSON lines that the wn_candidates plugin writes.
 // Blank lines are ignored. Lines that are not a JSON object with a known
-// decision are skipped.
+// decision are skipped. A `forgotten` line is not an album and is left out.
 func ParseCandidates(r io.Reader) ([]Album, error) {
-	albums, _, err := parseCandidates(r)
+	albums, _, _, err := parseCandidates(r)
 	return albums, err
 }
 
-// parseCandidates is ParseCandidates that also counts the skipped lines.
-func parseCandidates(r io.Reader) ([]Album, int, error) {
+// DecisionForgotten is the decision of a line that confirms a folder of
+// forget_folders is gone from beets' incremental history. The line has only
+// the decision and the folder.
+const DecisionForgotten = "forgotten"
+
+// parseCandidates is ParseCandidates that also returns the folders of the
+// forgotten lines and counts the skipped lines.
+func parseCandidates(r io.Reader) ([]Album, []string, int, error) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64<<10), 4<<20)
 	var albums []Album
+	var forgotten []string
 	malformed := 0
 	for sc.Scan() {
 		line := bytes.TrimSpace(sc.Bytes())
@@ -503,11 +522,17 @@ func parseCandidates(r io.Reader) ([]Album, int, error) {
 		switch a.Decision {
 		case DecisionApplied, DecisionSkipped, DecisionDuplicate, DecisionError:
 			albums = append(albums, a)
+		case DecisionForgotten:
+			if a.Folder == "" {
+				malformed++
+				continue
+			}
+			forgotten = append(forgotten, a.Folder)
 		default:
 			malformed++
 		}
 	}
-	return albums, malformed, sc.Err()
+	return albums, forgotten, malformed, sc.Err()
 }
 
 // writeMarkers writes .ndignore into the original folder of every applied

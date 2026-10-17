@@ -47,6 +47,10 @@ type Config struct {
 	// album in that folder and skips every other album.
 	ApplyReleaseID string
 	ApplyFolder    string
+	// ForgetFolders are absolute album folders that the wn_candidates plugin
+	// removes from beets' incremental history when an import begins. They
+	// are the folders of reverted match queue entries.
+	ForgetFolders []string
 }
 
 // NewConfig builds the beets config from wn-server's config.
@@ -149,6 +153,8 @@ type wnCandidatesYAML struct {
 	AcoustIDAppKey string `yaml:"acoustid_app_key,omitempty"`
 	ApplyReleaseID string `yaml:"apply_release_id,omitempty"`
 	ApplyFolder    string `yaml:"apply_folder,omitempty"`
+	// ForgetFolders is a list of absolute paths.
+	ForgetFolders []string `yaml:"forget_folders,omitempty"`
 }
 
 type musicBrainzYAML struct {
@@ -201,6 +207,7 @@ func (c Config) Render() ([]byte, error) {
 			AcoustIDAppKey: c.AcoustIDKey,
 			ApplyReleaseID: c.ApplyReleaseID,
 			ApplyFolder:    c.ApplyFolder,
+			ForgetFolders:  c.ForgetFolders,
 		},
 		MusicBrainz: musicBrainzYAML{Host: "musicbrainz.org", Ratelimit: 1},
 		// beets colours its output even when it is not a terminal, and the

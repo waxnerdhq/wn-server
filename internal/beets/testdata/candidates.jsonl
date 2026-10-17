@@ -5,3 +5,4 @@
 {"folder": "/music/Empty", "tags": {"artist": "", "album": "", "year": 0, "track_count": 2}, "decision": "skipped", "candidates": []}
 {"folder": "/music/Broken", "tags": {}, "decision": "error", "candidates": [], "error": "ValueError: empty album for album id 7"}
 {"folder": "/music/Truncated", "tags": {"artist": "Trunc
+{"decision":"forgotten","folder":"/music/Reverted"}
