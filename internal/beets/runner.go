@@ -516,32 +516,75 @@ func parseCandidates(r io.Reader) ([]Album, int, error) {
 // same run that was not applied has its folder strictly below it. It returns
 // the Folder of every album whose marker it created.
 func (r *Runner) writeMarkers(albums []Album, roots []string) []string {
-	resolved := make([]string, len(roots))
-	for i, root := range roots {
-		resolved[i] = resolvePath(root)
-	}
-	var notApplied, written []string
+	resolved := resolveAll(roots)
+	notApplied := notAppliedFolders(albums)
+	var written []string
 	for _, a := range albums {
-		if a.Decision != DecisionApplied && filepath.IsAbs(a.Folder) {
-			notApplied = append(notApplied, resolvePath(a.Folder))
-		}
-	}
-	for _, a := range albums {
-		if a.Decision != DecisionApplied {
-			continue
-		}
-		if filepath.IsAbs(a.Folder) {
-			folder := resolvePath(a.Folder)
-			if i := slices.IndexFunc(notApplied, func(p string) bool { return inside(p, folder) }); i >= 0 {
-				r.Log.Warn("not writing .ndignore: it would hide an album below this folder that was not applied", "folder", a.Folder, "below", notApplied[i])
-				continue
-			}
-		}
-		if r.writeMarker(a.Folder, resolved) {
+		if a.Decision == DecisionApplied && r.markFolder(a.Folder, notApplied, resolved) {
 			written = append(written, a.Folder)
 		}
 	}
 	return written
+}
+
+// WriteDuplicateMarkers writes .ndignore into each of folders, the original
+// folders of albums that beets reported as duplicates of an applied album.
+// The rules are those of the applied folders: a folder that is a music
+// folder or outside the music folders gets no marker, an existing file is
+// not overwritten, and a folder gets no marker when an album in albums that
+// was not applied has its folder strictly below it. albums are the lines of
+// the run that holds the duplicates. It returns the folders whose marker it
+// created.
+func (r *Runner) WriteDuplicateMarkers(folders []string, albums []Album, musicFolders []string) ([]string, error) {
+	roots, err := absPaths(musicFolders)
+	if err != nil {
+		return nil, err
+	}
+	resolved := resolveAll(roots)
+	notApplied := notAppliedFolders(albums)
+	var written []string
+	for _, f := range folders {
+		if r.markFolder(f, notApplied, resolved) {
+			r.Log.Info("wrote .ndignore into a duplicate folder", "folder", f)
+			written = append(written, f)
+		}
+	}
+	return written, nil
+}
+
+// resolveAll returns the paths resolved with resolvePath.
+func resolveAll(paths []string) []string {
+	out := make([]string, len(paths))
+	for i, p := range paths {
+		out[i] = resolvePath(p)
+	}
+	return out
+}
+
+// notAppliedFolders returns the resolved folders of the albums that were not
+// applied.
+func notAppliedFolders(albums []Album) []string {
+	var out []string
+	for _, a := range albums {
+		if a.Decision != DecisionApplied && filepath.IsAbs(a.Folder) {
+			out = append(out, resolvePath(a.Folder))
+		}
+	}
+	return out
+}
+
+// markFolder writes the marker into folder unless a folder in notApplied is
+// strictly below it. roots must already be resolved. It reports whether it
+// created the file.
+func (r *Runner) markFolder(folder string, notApplied, roots []string) bool {
+	if filepath.IsAbs(folder) {
+		resolved := resolvePath(folder)
+		if i := slices.IndexFunc(notApplied, func(p string) bool { return inside(p, resolved) }); i >= 0 {
+			r.Log.Warn("not writing .ndignore: it would hide an album below this folder that was not applied", "folder", folder, "below", notApplied[i])
+			return false
+		}
+	}
+	return r.writeMarker(folder, roots)
 }
 
 // resolvePath returns path cleaned and with symlinks resolved. When the path

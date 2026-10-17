@@ -142,7 +142,7 @@ The status page also shows the number of pending match queue entries, with a lin
 
 #### Match review page
 
-`GET /ui/match` lists the pending entries of the [match queue](#match-queue). Each entry shows its folder, its tags (artist, album, year, track count), and the time it was first seen, with its candidates below: artist, album, year, label, distance, a link to the release at `https://musicbrainz.org/release/<release id>` that opens in a new tab with `rel="noopener"`, and an Apply button. A Dismiss button sits on the entry. An entry whose last action failed shows the message from `last_error`. `?all=1` adds the other states: applied entries with the applied release, the folder in `sorted_dir`, and a Revert button (with a confirmation prompt); dismissed entries with their candidates and Apply buttons, because a dismissed entry can be applied; and duplicates. A link switches between the two views, and the buttons keep the view.
+`GET /ui/match` lists the pending entries of the [match queue](#match-queue). Each entry shows its folder, its tags (artist, album, year, track count), and the time it was first seen, with its candidates below: artist, album, year, label, distance, a link to the release at `https://musicbrainz.org/release/<release id>` that opens in a new tab with `rel="noopener"`, and an Apply button. A Dismiss button sits on the entry. An entry whose last action failed shows the message from `last_error`. `?all=1` adds the other states: applied entries with the applied release, the folder in `sorted_dir`, and a Revert button (with a confirmation prompt); dismissed entries with their candidates and Apply buttons, because a dismissed entry can be applied; and duplicates, each with a link to the release it duplicates. A link switches between the two views, and the buttons keep the view.
 
 The buttons post to `POST /ui/match/<id>/apply` (form field `release`, the candidate's release id), `POST /ui/match/<id>/dismiss`, `POST /ui/match/<id>/revert`, and `POST /ui/match/run` (the "Run import" button, a full `wn-server match` run). They redirect back to the match page. A run or an apply takes as long as the beets import, so they run as background jobs in the `serve` process, through the same `internal/match` code as the commands. Dismiss changes only the queue and runs in the request.
 
@@ -179,7 +179,7 @@ Sync only applies to MusicBrainz-matched music. wn-cloud's rating model (`rating
 
 ### MusicBrainz matching
 
-wn-server runs `beet import` in copy mode: `copy: yes`, `move: no`, `write: yes`. beets copies each matched album into the sorted directory (`sorted_dir` in the config) and writes the MusicBrainz ids into the copy. The original files are never modified or moved. Navidrome scans both the original folders and the sorted directory. After a confident copy, wn-server writes an empty `.ndignore` file into the original album folder, which Navidrome's scanner skips, so the album is not shown twice. Deleting the marker brings the original back. That marker is the only write to the originals tree. beets itself writes nothing there, because `beets.yaml` turns off every beets option that writes next to an original, and the `wn_candidates` plugin turns off beets' `fix_extension` (see [Configuration](#configuration)). `sorted_dir` must not be inside a music folder or contain one.
+wn-server runs `beet import` in copy mode: `copy: yes`, `move: no`, `write: yes`. beets copies each matched album into the sorted directory (`sorted_dir` in the config) and writes the MusicBrainz ids into the copy. The original files are never modified or moved. Navidrome scans both the original folders and the sorted directory. After a confident copy, wn-server writes an empty `.ndignore` file into the original album folder, which Navidrome's scanner skips, so the album is not shown twice. It writes the same marker into the folder of every other original copy of an applied release, which beets reports as a duplicate, so those copies are not shown either. Deleting a marker brings the original back. These markers are the only write to the originals tree. beets itself writes nothing there, because `beets.yaml` turns off every beets option that writes next to an original, and the `wn_candidates` plugin turns off beets' `fix_extension` (see [Configuration](#configuration)). `sorted_dir` must not be inside a music folder or contain one.
 
 Matched music therefore exists twice on disk. A move mode or a prune command can reclaim the space later, once the matching is trusted. Not in v1. There is no coupling to Navidrome's database.
 
@@ -190,10 +190,11 @@ In quiet mode beets applies confident matches and skips the rest. A confident ma
 1. It takes an exclusive lock on `<data dir>/beets.lock`, writes `<data dir>/beets.yaml` (mode 0600), and empties `<data dir>/beets-candidates.jsonl`. `match`, `match apply`, and `match revert` take the same lock, also when the web UI starts them, because they share `beets.yaml`, the candidates file, and `beets.db`. When another run holds the lock, the command fails with `another beets run is in progress`.
 2. It runs `<beets_bin> --config <data dir>/beets.yaml import -q <music folders>`. The directory of `fpcalc_bin` goes first on `PATH`, `FPCALC` names `fpcalc_bin`, and `BEETSDIR` is the data directory, so a personal beets config in `~/.config/beets` is not read. `PYTHONDONTWRITEBYTECODE=1` keeps Python from writing `__pycache__` into `beets-plugins`. `HOME` is unchanged. beets also reads `<data dir>/config.yaml` because of `BEETSDIR`. wn-server does not write that file. beets' stderr goes to wn-server's log at info level, and its stdout at debug level. Ctrl-C kills beets and its process group. wn-server then still reads the candidates file and writes the markers for the albums that beets applied before the kill, because beets has already recorded those albums in its incremental history. It starts no scan after a kill.
 3. It reads the candidates file.
-4. It writes an empty `.ndignore` into the original folder of every applied album, with mode 0644, when the file does not exist. It writes no marker into a folder that is itself a `music_folders` entry, because that would hide the whole library. An empty `.ndignore` hides everything below its folder. So it writes no marker, and logs a warning, when another album of the same run that was not applied has its folder below the applied folder. The folder and the music folders are compared after symlinks are resolved. The marker is the only write to the originals tree.
+4. It writes an empty `.ndignore` into the original folder of every applied album, with mode 0644, when the file does not exist. It writes no marker into a folder that is itself a `music_folders` entry, because that would hide the whole library. An empty `.ndignore` hides everything below its folder. So it writes no marker, and logs a warning, when another album of the same run that was not applied has its folder below the applied folder. The folder and the music folders are compared after symlinks are resolved. The markers are the only write to the originals tree. Step 7 writes the markers of duplicates.
 5. When at least one album was applied, it asks Navidrome to scan, as wn-server's identity, with `GET /rest/startScan`. Navidrome's native API has no scan route. When Navidrome is not running, wn-server logs a warning and the command still succeeds.
 6. It records every line of the candidates file in the match queue (see [Match queue](#match-queue)). After a Ctrl-C it records the lines that beets wrote before the kill.
-7. It prints `applied N, skipped N, duplicates N, errors N`, then one line per skipped album with its folder and best candidate, then the number of pending entries in the match queue. A run that the lock refused prints neither.
+7. It writes an empty `.ndignore` into the folder of every `duplicate` entry whose `duplicate_of_release_id` is the `applied_release_id` of an `applied` entry, with the rules of step 4: not into a music folder itself, not over an existing file, and not when another album of the same run that was not applied has its folder below the duplicate folder. It considers the duplicate lines of this run, and the duplicates of earlier runs whose release this run applied. It sets `marker_written` on the duplicate entry when it created the file. A marker that already existed leaves it at 0, so wn-server never removes it. It marks only duplicates whose lines were recorded, so it also runs after a Ctrl-C. It asks Navidrome to scan when it wrote a marker, except after a Ctrl-C. A duplicate of a release that no entry has applied gets no marker.
+8. It prints `applied N, skipped N, duplicates N, errors N`, then one line per skipped album with its folder and best candidate, then the number of pending entries in the match queue. A run that the lock refused prints neither.
 
 The beets plugin `wn_candidates` ships in the bundle as `beets-plugins/wn_candidates.py`. It writes one JSON line per album task to `<data dir>/beets-candidates.jsonl`, with these keys:
 
@@ -204,7 +205,7 @@ The beets plugin `wn_candidates` ships in the bundle as `beets-plugins/wn_candid
 | `decision` | `applied`, `skipped`, `duplicate` (the match is already in the beets library, and beets skips it in quiet mode), or `error`. |
 | `candidates` | Up to 10 candidates in beets' order, each with `release_id` (MusicBrainz release MBID), `artist`, `album`, `year`, `label`, and `distance`. |
 | `copied_to` | The album folder in `sorted_dir`. Only on `applied` lines. |
-| `release_id` | The MusicBrainz release that beets applied. Only on `applied` lines. |
+| `release_id` | The MusicBrainz release that beets applied. On a `duplicate` line, the release that beets chose for the album, which is the release of the album already in the library. Only on `applied` and `duplicate` lines. |
 | `reason` | On an `applied` line whose match the plugin chose. `requested_release_id` for a `match apply` run, where the plugin chose the requested release. `existing_release_id` for a `match` run, where every file already carried the best candidate's release id and its distance was at most `match.medium_rec_thresh`. |
 | `error` | The message. Only on `error` lines. |
 
@@ -216,7 +217,7 @@ The `chroma` plugin (AcoustID fingerprints) raises match confidence. The AcoustI
 
 #### Match queue
 
-The match queue is two tables in the store. `match_queue` has one row per album folder: `id`, `folder` (unique), `first_seen`, `last_seen`, `state`, the existing tags (`artist`, `album`, `year`, `track_count`), `applied_release_id`, `copied_to`, `applied_at`, `marker_written`, and `last_error`. `marker_written` is 1 when wn-server created the `.ndignore` in the folder for the applied entry. A marker that already existed leaves it at 0. `state` is `pending`, `applied`, `dismissed`, or `duplicate`. `match_candidates` holds the candidates of the latest line for the folder, in beets' order. Its rows are deleted with their queue row.
+The match queue is two tables in the store. `match_queue` has one row per album folder: `id`, `folder` (unique), `first_seen`, `last_seen`, `state`, the existing tags (`artist`, `album`, `year`, `track_count`), `applied_release_id`, `copied_to`, `applied_at`, `marker_written`, `duplicate_of_release_id`, and `last_error`. `marker_written` is 1 when wn-server created the `.ndignore` in the folder, for an applied entry or for a duplicate entry of an applied release. A marker that already existed leaves it at 0. `duplicate_of_release_id` is the release id on the latest `duplicate` line of the entry. It is NULL on an entry that never had a duplicate line with a release id, and wn-server clears it when the entry becomes `applied`. `state` is `pending`, `applied`, `dismissed`, or `duplicate`. `match_candidates` holds the candidates of the latest line for the folder, in beets' order. Its rows are deleted with their queue row.
 
 After every `wn-server match` run, wn-server records each line of the candidates file:
 
@@ -224,12 +225,12 @@ After every `wn-server match` run, wn-server records each line of the candidates
 |---|---|
 | `skipped` | Creates a `pending` entry, or sets the entry to `pending`. A `dismissed` entry stays `dismissed`. An `applied` entry stays `applied`. The tags and candidates are replaced. |
 | `applied` | Sets `applied` with the release id, `copied_to`, and `applied_at`. The tags and candidates are replaced. |
-| `duplicate` | Sets `duplicate`. An `applied` entry stays `applied`. The tags and candidates are replaced. |
+| `duplicate` | Sets `duplicate` and `duplicate_of_release_id`. An `applied` entry stays `applied`. The tags and candidates are replaced. |
 | `error` | Creates a `pending` entry or keeps the state of the entry. The message goes to `last_error`. The tags and candidates stay. |
 
 Every line sets `last_seen`. Every line except an `error` line clears `last_error`. A line without a folder is logged and not recorded. An `applied` entry changes state only through an `applied` line or `match revert`, so its copy can always be reverted.
 
-`wn-server match list` prints the pending entries with id, state, folder, tags, and the top candidate with its distance. `--all` prints the entries in every state. `--json` prints the entries with all their candidates as a JSON array.
+`wn-server match list` prints the pending entries with id, state, folder, tags, and the top candidate with its distance. `--all` prints the entries in every state. A `duplicate` entry shows the release it duplicates in the state column. `--json` prints the entries with all their candidates as a JSON array.
 
 `wn-server match apply <id> [--release <mbid>]` tags and copies the album of a `pending` or `dismissed` entry. The release is the entry's first candidate unless `--release` names another. wn-server refuses an entry in another state and a release id that is not a UUID. The run has these steps:
 
@@ -238,7 +239,7 @@ Every line sets `last_seen`. Every line except an `error` line clears `last_erro
 3. beets' quiet mode applies only a strong match, also with `-S`. The plugin's `import_task_before_choice` handler therefore returns the candidate whose release id is `apply_release_id`. beets' `choose_match` takes a returned match as the decision before its own quiet-mode judgment. The handler returns SKIP when no candidate has that id. It also returns SKIP for every other album below the folder, whose folder is not `apply_folder`. The `applied` line gets `"reason": "requested_release_id"`.
 4. `-I` also turns off the history writes. The plugin therefore adds the applied folder to the incremental history itself, as a quiet run does for an album it applies.
 5. wn-server uses the entry's own line only when its decision is `applied`. It then sets the entry to `applied` with the release id, `copied_to`, `applied_at`, and `marker_written`, sets `last_seen`, and clears `last_error`, without the upsert that a `match` run uses. The tags and candidates stay, because with `-S` the line holds only the requested release. For any other decision, wn-server stores the reason in `last_error` and sets `last_seen`, and the state, tags, and candidates stay. Lines for other albums below the folder are not recorded.
-6. It writes `.ndignore` into the original folder with the rules of `match`, asks Navidrome to scan, and writes `beets.yaml` again without the apply options.
+6. It writes `.ndignore` into the original folder with the rules of `match`, and into the folders of earlier `duplicate` entries of the applied release that have no marker. It asks Navidrome to scan and writes `beets.yaml` again without the apply options.
 
 The command fails when beets did not apply the release, and names the decision of the line.
 
@@ -249,18 +250,19 @@ The command fails when beets did not apply the release, and names the decision o
 1. wn-server checks that `copied_to` resolves to a path strictly inside `sorted_dir`, with symlinks resolved in both, and refuses otherwise.
 2. It runs `<beets_bin> --config <data dir>/beets.yaml remove -a -d -f path:<copied_to>`. beets removes the album from its library, deletes the files of the copy, and removes the folders that become empty. When beets fails and `copied_to` no longer exists, wn-server logs a warning and continues.
 3. It deletes `<folder>/.ndignore` only when wn-server wrote it (`marker_written` is 1), when it is an empty regular file, and when the folder is strictly inside a music folder, compared after symlinks are resolved. A marker with content stays.
-4. It sets the entry to `pending` and clears the applied fields.
-5. It asks Navidrome to scan.
+4. It removes the `.ndignore` from every entry whose `duplicate_of_release_id` is the entry's release id, that is not applied, and whose `marker_written` is 1, with the rules of step 3, and clears their `marker_written`. Those entries keep the state `duplicate`. It logs each removal at info level. A marker that the owner made, which has `marker_written` 0, stays.
+5. It sets the entry to `pending` and clears the applied fields.
+6. It asks Navidrome to scan.
 
 beets' incremental history still lists a reverted folder. A later full `match` run therefore does not offer it again. `match apply` runs with `-I` and is the way to tag the folder again.
 
-`match apply` and `match revert` log the entry id, the folder, and the release id at info level. Neither changes, moves, or deletes anything in an originals folder except the empty `.ndignore` marker.
+`match apply` and `match revert` log the entry id, the folder, and the release id at info level. Neither changes, moves, or deletes anything in an originals folder except the empty `.ndignore` markers.
 
 ### Decisions
 
 - Navidrome runs as a separate process, not as an imported Go library and not as a Navidrome Wasm plugin. A library would tie wn-server to Navidrome's internal wiring. A plugin cannot hook auth or run beets.
 - beets runs as a subprocess. It has no embedding story outside Python.
-- beets copies into a sorted directory and never modifies or moves the original files. Originals that were copied are hidden from Navidrome with a `.ndignore` marker. (2026-10-16)
+- beets copies into a sorted directory and never modifies or moves the original files. Originals that were copied are hidden from Navidrome with a `.ndignore` marker, and so are other original copies of an applied release, which beets reports as duplicates. A revert of the applied entry removes the markers of its duplicates. (2026-10-16)
 - `wn-server login` uses a code that wn-cloud shows and the owner pastes into wn-server, not a redirect to wn-server. A redirect fails for a headless server, for a browser on another device, and behind the relay. (2026-10-16)
 - wn-server is written in Go and ships as one static binary inside a release bundle that also carries Navidrome and beets.
 - wn-server is GPL-3.0. It is the free part of waxnerd. wn-cloud and the client apps are separate projects. A managed hosting service running wn-server carries no GPL obligation, since GPL-3.0 has no network clause. A closed-source desktop app may ship wn-server as a separate executable and talk to it over HTTP or the CLI; it may not import its Go packages or link it statically. Outside contributions will need a contributor agreement to keep relicensing possible.

@@ -156,9 +156,18 @@ func printEntries(w io.Writer, entries []store.MatchEntry, all bool) {
 	tw := tabwriter.NewWriter(w, 0, 0, 2, ' ', 0)
 	fmt.Fprintln(tw, "ID\tSTATE\tFOLDER\tTAGS\tTOP CANDIDATE")
 	for _, e := range entries {
-		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\n", e.ID, e.State, e.Folder, entryTags(e), topCandidate(e))
+		fmt.Fprintf(tw, "%d\t%s\t%s\t%s\t%s\n", e.ID, entryState(e), e.Folder, entryTags(e), topCandidate(e))
 	}
 	tw.Flush()
+}
+
+// entryState returns the state of e. A duplicate with a release id also
+// names the release it duplicates.
+func entryState(e store.MatchEntry) string {
+	if e.State == store.MatchDuplicate && e.DuplicateOfReleaseID != "" {
+		return fmt.Sprintf("%s of %s", e.State, e.DuplicateOfReleaseID)
+	}
+	return string(e.State)
 }
 
 func entryTags(e store.MatchEntry) string {
@@ -265,7 +274,8 @@ func newMatchRevertCmd() *cobra.Command {
 		Use:   "revert <id>",
 		Short: "Remove an applied album's copy from sorted_dir and the beets library",
 		Long: "Remove an applied album from the beets library, delete its copy in sorted_dir, delete the empty\n" +
-			".ndignore in the original folder, and set the entry to pending. beets' incremental history still\n" +
+			".ndignore in the original folder and in the duplicate folders of the same release, and set the entry to\n" +
+			"pending. beets' incremental history still\n" +
 			"lists the folder, so `wn-server match` does not offer it again. `wn-server match apply` tags it again.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {

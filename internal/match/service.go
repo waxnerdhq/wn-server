@@ -86,6 +86,11 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	sum, err := s.runner.Import(ctx, s.cfg.MusicFolders)
 	bg := context.WithoutCancel(ctx)
 	recErr := recordAlbums(bg, s.st, sum.Albums, sum.MarkersWritten, s.log)
+	if recErr == nil {
+		// A cancelled run still marks the duplicates of the lines it
+		// recorded, but starts no scan.
+		recErr = s.markDuplicates(bg, sum.Albums, ctx.Err() == nil)
+	}
 	res := RunResult{Summary: sum, Pending: -1}
 	if err == nil || len(sum.Albums) > 0 {
 		res.Reported = true
@@ -209,6 +214,11 @@ func (s *Service) Apply(ctx context.Context, id int64, release string) (ApplyRes
 		return ApplyResult{}, err
 	}
 	s.log.Info("applied match", "id", e.ID, "folder", e.Folder, "release_id", got.AppliedReleaseID, "copied_to", got.CopiedTo)
+	// The entry is applied. A failure to mark earlier duplicates of the
+	// release does not undo that.
+	if err := s.markDuplicates(bg, sum.Albums, true); err != nil {
+		s.log.Warn("could not mark the duplicate folders of the applied release", "id", e.ID, "release_id", release, "error", err)
+	}
 	return ApplyResult{ID: e.ID, Folder: e.Folder, ReleaseID: got.AppliedReleaseID, CopiedTo: got.CopiedTo}, nil
 }
 
@@ -244,8 +254,10 @@ func (r RevertResult) Line() string {
 
 // Revert removes an applied entry's copy from sorted_dir and the beets
 // library, removes the .ndignore that wn-server wrote, and sets the entry to
-// pending. When only the marker could not be removed, it returns the result
-// with Reverted set together with the error.
+// pending. It also removes the .ndignore that wn-server wrote into duplicate
+// folders of the same release. Those entries stay duplicates. When only a
+// marker could not be removed, it returns the result with Reverted set
+// together with the error.
 func (s *Service) Revert(ctx context.Context, id int64) (RevertResult, error) {
 	e, err := s.entry(ctx, id)
 	if err != nil {
@@ -267,12 +279,97 @@ func (s *Service) Revert(ctx context.Context, id int64) (RevertResult, error) {
 			markerErr = fmt.Errorf("remove .ndignore from %s: %w", e.Folder, err)
 		}
 	}
+	if e.AppliedReleaseID != "" {
+		if err := s.unmarkDuplicates(bg, e.AppliedReleaseID); err != nil {
+			markerErr = errors.Join(markerErr, err)
+		}
+	}
 	if err := s.st.RevertMatch(bg, e.ID); err != nil {
 		return RevertResult{}, errors.Join(err, markerErr)
 	}
 	s.runner.Scan(bg)
 	s.log.Info("reverted match", "id", e.ID, "folder", e.Folder, "release_id", e.AppliedReleaseID)
 	return RevertResult{ID: e.ID, Folder: e.Folder, Reverted: true}, markerErr
+}
+
+// markDuplicates writes .ndignore into the folder of every duplicate entry
+// whose release is the applied release of an applied entry, and sets
+// marker_written on the entry when it created the file. It considers the
+// duplicates among albums, the lines of the run just recorded, and the
+// duplicates of earlier runs whose release one of those lines applied. It
+// asks Navidrome to scan when it created a marker and scan is true.
+func (s *Service) markDuplicates(ctx context.Context, albums []beets.Album, scan bool) error {
+	duplicate, applied := map[string]bool{}, map[string]bool{}
+	for _, a := range albums {
+		switch a.Decision {
+		case beets.DecisionDuplicate:
+			duplicate[a.Folder] = true
+		case beets.DecisionApplied:
+			applied[matchLine(a).ReleaseID] = true
+		}
+	}
+	if len(duplicate) == 0 && len(applied) == 0 {
+		return nil
+	}
+	linked, err := s.st.UnmarkedDuplicates(ctx)
+	if err != nil {
+		return err
+	}
+	var folders []string
+	byFolder := map[string]store.MatchEntry{}
+	for _, e := range linked {
+		if duplicate[e.Folder] || applied[e.DuplicateOfReleaseID] {
+			folders = append(folders, e.Folder)
+			byFolder[e.Folder] = e
+		}
+	}
+	if len(folders) == 0 {
+		return nil
+	}
+	written, err := s.runner.WriteDuplicateMarkers(folders, albums, s.cfg.MusicFolders)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, f := range written {
+		e := byFolder[f]
+		if err := s.st.SetMarkerWritten(ctx, e.ID, true); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		s.log.Info("marked duplicate folder", "id", e.ID, "folder", e.Folder, "release_id", e.DuplicateOfReleaseID)
+	}
+	if len(written) > 0 && scan {
+		s.runner.Scan(ctx)
+	}
+	return errors.Join(errs...)
+}
+
+// unmarkDuplicates removes the .ndignore that wn-server wrote into the
+// duplicate folders of releaseID and clears marker_written on their entries.
+// The entries keep their state. It continues after an error and returns all
+// of them.
+func (s *Service) unmarkDuplicates(ctx context.Context, releaseID string) error {
+	dups, err := s.st.MarkedDuplicates(ctx, releaseID)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, d := range dups {
+		removed, err := s.runner.RemoveMarker(d.Folder, s.cfg.MusicFolders)
+		if err != nil {
+			errs = append(errs, fmt.Errorf("remove .ndignore from duplicate folder %s: %w", d.Folder, err))
+			continue
+		}
+		if err := s.st.SetMarkerWritten(ctx, d.ID, false); err != nil {
+			errs = append(errs, err)
+			continue
+		}
+		if removed {
+			s.log.Info("removed .ndignore from duplicate folder", "id", d.ID, "folder", d.Folder, "release_id", releaseID)
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // recordAlbums records candidates lines in the match queue. markers holds

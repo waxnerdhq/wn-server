@@ -70,8 +70,10 @@ type MatchEntry struct {
 	AppliedReleaseID string    `json:"applied_release_id,omitempty"`
 	CopiedTo         string    `json:"copied_to,omitempty"`
 	AppliedAt        time.Time `json:"applied_at,omitzero"`
-	// MarkerWritten is true when wn-server created the .ndignore in Folder
-	// for the applied entry.
+	// DuplicateOfReleaseID is the release that a duplicate entry duplicates.
+	DuplicateOfReleaseID string `json:"duplicate_of_release_id,omitempty"`
+	// MarkerWritten is true when wn-server created the .ndignore in Folder,
+	// for an applied entry or for a duplicate of an applied release.
 	MarkerWritten bool   `json:"marker_written"`
 	LastError     string `json:"last_error,omitempty"`
 	// Candidates are in beets' order, best first.
@@ -87,7 +89,8 @@ type MatchLine struct {
 	Year       int
 	TrackCount int
 	Candidates []MatchCandidate
-	// ReleaseID and CopiedTo are set on applied lines.
+	// ReleaseID is set on applied lines and on duplicate lines. CopiedTo is
+	// set on applied lines.
 	ReleaseID string
 	CopiedTo  string
 	// MarkerWritten is true on an applied line when wn-server created the
@@ -104,8 +107,9 @@ type MatchLine struct {
 // A skipped line creates a pending entry or sets an existing one to pending.
 // A dismissed or applied entry keeps its state. An applied line sets the
 // entry to applied with the release id, copied_to, and marker_written. On an
-// entry that is already applied, marker_written stays 1. A duplicate line sets
-// duplicate, except on an applied entry, which keeps its state. An error
+// entry that is already applied or a duplicate, marker_written stays 1. A
+// duplicate line sets duplicate and duplicate_of_release_id, except on an
+// applied entry, which keeps its state. An error
 // line creates a pending entry or keeps the state of an existing one, and
 // stores the message in last_error. Every line except an error line replaces
 // the tags and the candidates and clears last_error.
@@ -162,8 +166,19 @@ func (s *Store) RecordMatch(ctx context.Context, l MatchLine, now time.Time) (in
 		if err != nil {
 			return err
 		}
-		if l.Decision == LineApplied {
-			if err := setApplied(ctx, tx, id, l.ReleaseID, l.CopiedTo, now, l.MarkerWritten, cur == MatchApplied); err != nil {
+		switch {
+		case l.Decision == LineApplied:
+			// A duplicate folder that wn-server marked keeps its flag, so a
+			// later revert still removes the marker.
+			keep := cur == MatchApplied || cur == MatchDuplicate
+			if err := setApplied(ctx, tx, id, l.ReleaseID, l.CopiedTo, now, l.MarkerWritten, keep); err != nil {
+				return err
+			}
+			if _, err := tx.ExecContext(ctx, `UPDATE match_queue SET duplicate_of_release_id = NULL WHERE id = ?`, id); err != nil {
+				return err
+			}
+		case l.Decision == LineDuplicate && next == MatchDuplicate && l.ReleaseID != "":
+			if _, err := tx.ExecContext(ctx, `UPDATE match_queue SET duplicate_of_release_id = ? WHERE id = ?`, l.ReleaseID, id); err != nil {
 				return err
 			}
 		}
@@ -186,7 +201,7 @@ func (s *Store) RecordMatch(ctx context.Context, l MatchLine, now time.Time) (in
 	return id, nil
 }
 
-const matchColumns = `id, folder, first_seen, last_seen, state, artist, album, year, track_count, applied_release_id, copied_to, applied_at, marker_written, last_error`
+const matchColumns = `id, folder, first_seen, last_seen, state, artist, album, year, track_count, applied_release_id, copied_to, applied_at, marker_written, last_error, duplicate_of_release_id`
 
 // MatchEntries returns the entries in the given states, ordered by id, with
 // their candidates. No states returns every entry.
@@ -320,6 +335,49 @@ func (s *Store) RevertMatch(ctx context.Context, id int64) error {
 		MatchPending, id))
 }
 
+// UnmarkedDuplicates returns the duplicate entries without a marker from
+// wn-server whose duplicate_of_release_id is the applied_release_id of an
+// applied entry. The entries have no candidates.
+func (s *Store) UnmarkedDuplicates(ctx context.Context) ([]MatchEntry, error) {
+	return s.queryEntries(ctx,
+		`WHERE state = ? AND marker_written = 0 AND duplicate_of_release_id IN
+		 (SELECT applied_release_id FROM match_queue WHERE state = ?) ORDER BY id`,
+		MatchDuplicate, MatchApplied)
+}
+
+// MarkedDuplicates returns the entries that are not applied and whose
+// duplicate_of_release_id is releaseID, for which wn-server created the
+// marker. The entries have no candidates.
+func (s *Store) MarkedDuplicates(ctx context.Context, releaseID string) ([]MatchEntry, error) {
+	return s.queryEntries(ctx,
+		`WHERE state != ? AND marker_written = 1 AND duplicate_of_release_id = ? ORDER BY id`,
+		MatchApplied, releaseID)
+}
+
+// SetMarkerWritten sets marker_written of an entry.
+func (s *Store) SetMarkerWritten(ctx context.Context, id int64, written bool) error {
+	return checkOne(s.db.ExecContext(ctx, `UPDATE match_queue SET marker_written = ? WHERE id = ?`, written, id))
+}
+
+// queryEntries returns the entries that the WHERE clause selects, without
+// their candidates.
+func (s *Store) queryEntries(ctx context.Context, where string, args ...any) ([]MatchEntry, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT `+matchColumns+` FROM match_queue `+where, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var entries []MatchEntry
+	for rows.Next() {
+		e, err := scanMatch(rows)
+		if err != nil {
+			return nil, err
+		}
+		entries = append(entries, e)
+	}
+	return entries, rows.Err()
+}
+
 // NoteMatchError stores msg in last_error and now in last_seen. The state,
 // the tags, and the candidates stay.
 func (s *Store) NoteMatchError(ctx context.Context, id int64, msg string, now time.Time) error {
@@ -347,13 +405,15 @@ func scanMatch(r rowScanner) (MatchEntry, error) {
 		e                                MatchEntry
 		first, last                      string
 		releaseID, copiedTo, at, lastErr sql.NullString
+		duplicateOf                      sql.NullString
 	)
 	err := r.Scan(&e.ID, &e.Folder, &first, &last, &e.State, &e.Artist, &e.Album, &e.Year, &e.TrackCount,
-		&releaseID, &copiedTo, &at, &e.MarkerWritten, &lastErr)
+		&releaseID, &copiedTo, &at, &e.MarkerWritten, &lastErr, &duplicateOf)
 	if err != nil {
 		return MatchEntry{}, err
 	}
 	e.AppliedReleaseID, e.CopiedTo, e.LastError = releaseID.String, copiedTo.String, lastErr.String
+	e.DuplicateOfReleaseID = duplicateOf.String
 	if e.FirstSeen, err = time.Parse(time.RFC3339, first); err != nil {
 		return MatchEntry{}, fmt.Errorf("match entry %d: bad first_seen: %w", e.ID, err)
 	}
