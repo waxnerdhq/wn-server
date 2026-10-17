@@ -403,9 +403,29 @@ Pinned versions, all in `bundle/versions.env`:
 
 A test in `internal/navidrome` fails when `NAVIDROME_VERSION` in `bundle/versions.env` differs from `navidrome.PinnedVersion`.
 
-beets is packaged with pex as a scie (`--scie eager`). The executable contains a python-build-standalone interpreter, so the target machine needs no Python. pex resolves the pinned packages once at build time, so the output does not depend on the build host's Python. PyInstaller was not chosen because it freezes the build host's interpreter and needs per-package hooks. On its first run the `beets` executable unpacks itself into `~/.cache/nce`, or into `$SCIE_BASE` when that is set.
+beets is packaged with pex as a scie (`--scie eager`). The executable contains a python-build-standalone interpreter, so the target machine needs no Python. pex builds from the lock file `bundle/beets.lock`, so the output does not depend on the build host's Python or on what PyPI serves at build time. PyInstaller was not chosen because it freezes the build host's interpreter and needs per-package hooks. On its first run the `beets` executable unpacks itself into `~/.cache/nce`, or into `$SCIE_BASE` when that is set.
 
 `bundle/build.sh <output dir>` builds the tarball and a `.sha256` file next to it. It runs on Linux and needs `bash`, GNU `tar`, `curl`, `sha256sum`, `install`, `grep`, `mktemp`, Go, and `uv`. uv supplies the Python that pex runs under. On Linux x86_64 the script runs each binary once to check its version, and checks that beets loads the `chroma` plugin. `make bundle` calls the script with `dist` as the output directory.
+
+#### beets lock and interpreter check
+
+`bundle/beets.lock` is a pex lock file. It pins beets and every transitive dependency to a version with the sha256 of each artifact, so a rebuild installs the same packages. It is a universal lock for CPython 3.13 on Linux (`--style universal --target-system linux`), so one lock made on any host works for the Linux x86_64 build. `build.sh` passes it to pex with `--lock`. pex fails the build when the requirements in `build.sh` or the Python version that pex runs under are not covered by the lock, which is how CI catches a lock that disagrees with `bundle/versions.env`.
+
+Recreate the lock whenever `BEETS_VERSION`, `PYTHON_VERSION` (its major and minor version), or `PEX_VERSION` changes, or when the requirements in `build.sh` change. Run it from the repository root with the values from `bundle/versions.env`, and commit the result:
+
+```
+source bundle/versions.env
+uvx --python "$PYTHON_VERSION" --python-preference only-managed \
+    --from "pex==$PEX_VERSION" pex3 lock create \
+    "beets[chroma]==$BEETS_VERSION" requests \
+    --style universal --target-system linux \
+    --interpreter-constraint "CPython==${PYTHON_VERSION%.*}.*" \
+    --indent 2 -o bundle/beets.lock
+```
+
+Recreating the lock also moves transitive dependencies to the newest versions that PyPI serves at that time. Review the diff of the lock before committing it.
+
+pex has no option to check the python-build-standalone archive that it downloads. `build.sh` therefore reads the scie's manifest after the build (`SCIE=inspect beets`), which records the sha256 of the embedded archive, and compares it with the pin in `bundle/checksums`. The scie launcher checks the archive against the same hash when it unpacks. A build fails when the two differ. The check runs on Linux x86_64 only, because reading the manifest runs the scie. The pinned file is `cpython-<PYTHON_VERSION>+<PBS_RELEASE>-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz`, and its sha256 is on the python-build-standalone release page, in the release's `SHA256SUMS` file. When `PYTHON_VERSION` or `PBS_RELEASE` changes, replace the line in `bundle/checksums` with the entry from `SHA256SUMS`. A build fails with a message if the line is missing.
 
 On first run `beets` unpacks its interpreter into `~/.cache/nce`. On a machine where the service user has no writable home, set `SCIE_BASE` to a writable directory.
 

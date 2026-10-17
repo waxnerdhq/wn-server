@@ -78,9 +78,13 @@ install -m 0755 "$dl/$fp_dir/fpcalc" "$stage/fpcalc"
 echo "==> beets $BEETS_VERSION (pex scie, Python $PYTHON_VERSION)"
 # pex resolves wheels for the interpreter it runs under, so it runs under the
 # same Python version that the scie carries. uv provides that interpreter.
+# bundle/beets.lock pins every package, transitive ones included, to a version
+# and artifact hashes. pex fails when the lock does not satisfy the
+# requirements below or the interpreter, so a changed pin needs a new lock.
 uvx --python "$PYTHON_VERSION" --python-preference only-managed \
 	--from "pex==${PEX_VERSION}" pex \
 	"beets[chroma]==${BEETS_VERSION}" requests \
+	--lock "$repo/bundle/beets.lock" \
 	--console-script beet \
 	--scie eager \
 	--scie-only \
@@ -89,6 +93,27 @@ uvx --python "$PYTHON_VERSION" --python-preference only-managed \
 	--scie-pbs-stripped \
 	-o "$dl/beets.pex"
 install -m 0755 "$dl/beets" "$stage/beets"
+
+# pex fetches the python-build-standalone archive itself and has no option to
+# check it. The scie's manifest records the sha256 of the embedded archive, and
+# the scie launcher checks the archive against it when it unpacks. Compare the
+# recorded hash with the pin in bundle/checksums. Reading the manifest runs the
+# scie, so this check needs a Linux x86_64 host.
+pbs_asset="cpython-${PYTHON_VERSION}+${PBS_RELEASE}-x86_64-unknown-linux-gnu-install_only_stripped.tar.gz"
+pbs_want=$(awk -v n="$pbs_asset" '$2 == n { print $1 }' "$repo/bundle/checksums")
+if [[ ! $pbs_want =~ ^[0-9a-f]{64}$ ]]; then
+	echo "build.sh: $pbs_asset has no sha256 in bundle/checksums" >&2
+	exit 1
+fi
+if [[ $(uname -s) == Linux && $(uname -m) == x86_64 ]]; then
+	echo "==> python-build-standalone $pbs_asset"
+	pbs_got=$(SCIE=inspect "$dl/beets" | grep -F -A4 "\"name\": \"$pbs_asset\"" |
+		sed -n 's/.*"hash": "\([0-9a-f]\{64\}\)".*/\1/p')
+	if [[ $pbs_got != "$pbs_want" ]]; then
+		echo "build.sh: the interpreter in beets has sha256 '${pbs_got:-none}', bundle/checksums pins $pbs_want" >&2
+		exit 1
+	fi
+fi
 mkdir "$stage/beets-plugins"
 cp "$repo/bundle/beets-plugins/wn_candidates.py" "$stage/beets-plugins/wn_candidates.py"
 
