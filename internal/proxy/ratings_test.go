@@ -82,8 +82,7 @@ func newRatingEnv(t *testing.T) *ratingEnv {
 	nd := &fakeNavidrome{}
 	var svc *ratings.Service
 	e := newEnvOpts(t, nd, true, func(e *env) []Option {
-		port, _ := strconv.Atoi(e.target.Port())
-		svc = ratings.New(e.st, wncloud.New(e.cloudURL, "test"), navidrome.NewClient(port), &wncloud.Status{}, slog.New(slog.DiscardHandler))
+		svc = ratings.New(e.st, wncloud.New(e.cloudURL, "test"), navidrome.NewClient(e.rt), &wncloud.Status{}, slog.New(slog.DiscardHandler))
 		return []Option{WithRatings(svc)}
 	})
 	nd.owner = e.owner.ID

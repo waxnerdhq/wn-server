@@ -18,9 +18,8 @@ import (
 
 // Defaults for config.toml keys.
 const (
-	DefaultListen        = "0.0.0.0:4533"
-	DefaultWNCloudURL    = "https://waxnerd.com"
-	DefaultNavidromePort = 4534
+	DefaultListen     = "0.0.0.0:4533"
+	DefaultWNCloudURL = "https://waxnerd.com"
 
 	configFileName = "config.toml"
 	dataDirName    = "wn-server"
@@ -34,9 +33,13 @@ type Config struct {
 	NavidromeBin   string   `toml:"navidrome_bin,omitempty"`
 	BeetsBin       string   `toml:"beets_bin,omitempty"`
 	FpcalcBin      string   `toml:"fpcalc_bin,omitempty"`
-	NavidromePort  int      `toml:"navidrome_port,omitempty"`
 	SortedDir      string   `toml:"sorted_dir,omitempty"`
 	AcoustIDAPIKey string   `toml:"acoustid_api_key,omitempty"`
+
+	// LegacyNavidromePort holds navidrome_port, which init wrote before
+	// Navidrome moved to a Unix socket. It is read so that older config
+	// files still load, and it is ignored.
+	LegacyNavidromePort int `toml:"navidrome_port,omitempty"`
 
 	// NavidromeExternalServices sets Navidrome's EnableExternalServices.
 	// Nil means true. Read it through ExternalServices.
@@ -121,9 +124,6 @@ func (c *Config) applyDefaults() error {
 	if c.WNCloudURL == "" {
 		c.WNCloudURL = DefaultWNCloudURL
 	}
-	if c.NavidromePort == 0 {
-		c.NavidromePort = DefaultNavidromePort
-	}
 	if c.SortedDir == "" {
 		c.SortedDir = filepath.Join(c.DataDir, "sorted")
 	}
@@ -156,9 +156,6 @@ func (c *Config) validate() error {
 	if err := ValidateMusicFolders(c.MusicFolders); err != nil {
 		return err
 	}
-	if c.NavidromePort < 1 || c.NavidromePort > 65535 {
-		return fmt.Errorf("navidrome_port %d is out of range", c.NavidromePort)
-	}
 	_, portStr, err := net.SplitHostPort(c.Listen)
 	if err != nil {
 		return fmt.Errorf("listen %q is not a host:port address: %w", c.Listen, err)
@@ -166,9 +163,6 @@ func (c *Config) validate() error {
 	port, err := strconv.Atoi(portStr)
 	if err != nil || port < 1 || port > 65535 {
 		return fmt.Errorf("listen %q has an invalid port", c.Listen)
-	}
-	if port == c.NavidromePort {
-		return fmt.Errorf("listen port %d is the same as navidrome_port", port)
 	}
 	if u, err := url.Parse(c.WNCloudURL); err != nil || u.Scheme == "" || u.Host == "" {
 		return fmt.Errorf("wn_cloud_url %q is not a URL", c.WNCloudURL)
@@ -264,10 +258,9 @@ func Init(configPath string, folders []string) (*Config, error) {
 		return nil, err
 	}
 	first := Config{
-		MusicFolders:  abs,
-		Listen:        DefaultListen,
-		WNCloudURL:    DefaultWNCloudURL,
-		NavidromePort: DefaultNavidromePort,
+		MusicFolders: abs,
+		Listen:       DefaultListen,
+		WNCloudURL:   DefaultWNCloudURL,
 	}
 	// Validate the in-memory config before writing, so a bad config does not
 	// leave a config.toml behind.

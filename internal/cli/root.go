@@ -9,10 +9,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -217,11 +215,28 @@ const shutdownGrace = 5 * time.Second
 // what beets did before the process exits.
 const jobShutdownWait = 30 * time.Second
 
+// checkDataDirMode refuses a data directory that users other than the owner
+// can read or enter. Navidrome creates its socket in it before it sets the
+// socket's mode to 0600, and in that moment another user could connect.
+func checkDataDirMode(dir string) error {
+	fi, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("stat data directory: %w", err)
+	}
+	if fi.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("data directory %s has mode %04o and other users can read or enter it; run `chmod 0700 %s`", dir, fi.Mode().Perm(), dir)
+	}
+	return nil
+}
+
 // serve runs the Navidrome supervisor and the proxy until ctx is cancelled
 // or one of them fails. The supervisor outlives the HTTP server: on a signal
 // the server drains first, then Navidrome is stopped, so in-flight streams
 // are not cut by an early SIGTERM to Navidrome.
 func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.Account, logger *slog.Logger) error {
+	if err := checkDataDirMode(c.DataDir); err != nil {
+		return err
+	}
 	// Check the binary before binding, so a mismatch logs no listening line.
 	if err := navidrome.VerifyBinary(ctx, c.NavidromeBin); err != nil {
 		return err
@@ -230,8 +245,11 @@ func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.A
 	if err != nil {
 		return err
 	}
-	sup := navidrome.NewSupervisor(c, navidrome.Account{ID: owner.ID, Name: owner.Name}, logger)
-	target := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(c.NavidromePort))}
+	// One transport dials Navidrome's Unix socket for the proxy, the
+	// supervisor, and the client that the web UI, the match service, and
+	// the ratings service share.
+	ndTransport := navidrome.NewTransport(c.NavidromeSocketPath())
+	sup := navidrome.NewSupervisor(c, navidrome.Account{ID: owner.ID, Name: owner.Name}, ndTransport, logger)
 	cloudStatus := &wncloud.Status{}
 	// The server name at wn-cloud is not stored. The UI shows the host name,
 	// which is the default of login --name.
@@ -246,7 +264,7 @@ func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.A
 			logger.Warn("a match job did not stop in time", "wait", jobShutdownWait.String())
 		}
 	}()
-	ndClient := navidrome.NewClient(c.NavidromePort)
+	ndClient := navidrome.NewClient(ndTransport)
 	ui := web.New(web.Options{
 		Store:            st,
 		Navidrome:        ndClient,
@@ -261,7 +279,7 @@ func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.A
 	cloud := newClient(c)
 	rt := ratings.New(st, cloud, ndClient, cloudStatus, logger)
 	srv := &http.Server{
-		Handler: proxy.New(target, sup.Ready(), st, cloud, logger,
+		Handler: proxy.New(ndTransport, sup.Ready(), st, cloud, logger,
 			proxy.WithUI(ui), proxy.WithCloudStatus(cloudStatus), proxy.WithRatings(rt)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}

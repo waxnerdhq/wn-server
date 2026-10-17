@@ -43,7 +43,7 @@
 
   <rect x="1090" y="60" width="220" height="56" rx="6" class="lane-nd"/>
   <text x="1200" y="83" class="lt">Navidrome</text>
-  <text x="1200" y="103" class="ls">child process, 127.0.0.1 only</text>
+  <text x="1200" y="103" class="ls">child process, Unix socket only</text>
 
   <!-- lifelines -->
   <line x1="180" y1="116" x2="180" y2="560" class="life"/>
@@ -89,7 +89,7 @@
   <!-- note -->
   <rect x="70" y="575" width="1240" height="46" rx="6" class="note"/>
   <text x="90" y="594" class="notet">Result: wn-server holds the owner's wn-cloud CLI token as its server credential, and the only Navidrome API key. No browser, phone, or desktop app ever sees a Navidrome key or password.</text>
-  <text x="90" y="612" class="notet">Navidrome never listens on the network; every request reaches it through wn-server's proxy on loopback. Navidrome's own web UI is blocked at the proxy.</text>
+  <text x="90" y="612" class="notet">Navidrome never listens on the network; every request reaches it through wn-server's proxy on a Unix socket. Navidrome's own web UI is blocked at the proxy.</text>
 
   <!-- ===================== Section B ===================== -->
   <text x="40" y="680" class="h">B. First-party clients  (wn-mobile, wn-desktop). The web UI and third-party Subsonic clients use the owner's name and app password instead.</text>
@@ -108,7 +108,7 @@
 
   <rect x="1090" y="700" width="220" height="56" rx="6" class="lane-nd"/>
   <text x="1200" y="723" class="lt">Navidrome</text>
-  <text x="1200" y="743" class="ls">child process, 127.0.0.1 only</text>
+  <text x="1200" y="743" class="ls">child process, Unix socket only</text>
 
   <line x1="180" y1="756" x2="180" y2="1040" class="life"/>
   <line x1="520" y1="756" x2="520" y2="1040" class="life"/>
@@ -138,7 +138,7 @@
 
   <!-- 6 wn-server -> navidrome -->
   <line x1="520" y1="990" x2="1200" y2="990" class="msgb"/>
-  <text x="860" y="980" class="lbl"><tspan class="num">6</tspan> same request on loopback, header Remote-User: &lt;account id&gt;</text>
+  <text x="860" y="980" class="lbl"><tspan class="num">6</tspan> same request on the socket, header Remote-User: &lt;account id&gt;</text>
 
   <!-- 7 response -->
   <line x1="1200" y1="1030" x2="180" y2="1030" class="msgb" stroke-dasharray="6 4"/>
