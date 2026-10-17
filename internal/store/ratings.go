@@ -121,10 +121,13 @@ type OutboxEntry struct {
 	// wn-cloud rejected the entry and that it is not retried.
 	NextAt    time.Time
 	LastError string
+	// Version grows with every change of the entry.
+	Version int64
 }
 
 // EnqueueRating writes e to the outbox. An entry of the same subject is
-// replaced and keeps its id, so it keeps its place in the order. A zero
+// replaced, keeps its id and so its place in the order, and gets a new
+// version. A zero
 // CreatedAt is set to the current time. A zero NextAt keeps the entry out of
 // the retry loop.
 func (s *Store) EnqueueRating(ctx context.Context, e OutboxEntry) error {
@@ -137,7 +140,7 @@ func (s *Store) EnqueueRating(ctx context.Context, e OutboxEntry) error {
 		 ON CONFLICT (kind, mbid) DO UPDATE SET
 		   half_stars = excluded.half_stars, like_level = excluded.like_level, deleted = excluded.deleted,
 		   created_at = excluded.created_at, attempts = excluded.attempts, next_at = excluded.next_at,
-		   last_error = excluded.last_error`,
+		   last_error = excluded.last_error, version = rating_outbox.version + 1`,
 		e.Kind, e.MBID, nullInt(e.HalfStars), nullString(e.LikeLevel), e.Deleted,
 		formatMicros(e.CreatedAt), e.Attempts, nullTime(e.NextAt), sql.NullString{String: e.LastError, Valid: e.LastError != ""})
 	if err != nil {
@@ -146,7 +149,7 @@ func (s *Store) EnqueueRating(ctx context.Context, e OutboxEntry) error {
 	return nil
 }
 
-const outboxColumns = `id, kind, mbid, half_stars, like_level, deleted, created_at, attempts, next_at, last_error`
+const outboxColumns = `id, kind, mbid, half_stars, like_level, deleted, created_at, attempts, next_at, last_error, version`
 
 func scanOutbox(row rowScanner) (OutboxEntry, error) {
 	var (
@@ -155,7 +158,7 @@ func scanOutbox(row rowScanner) (OutboxEntry, error) {
 		like, next, last sql.NullString
 		created          string
 	)
-	if err := row.Scan(&e.ID, &e.Kind, &e.MBID, &half, &like, &e.Deleted, &created, &e.Attempts, &next, &last); err != nil {
+	if err := row.Scan(&e.ID, &e.Kind, &e.MBID, &half, &like, &e.Deleted, &created, &e.Attempts, &next, &last, &e.Version); err != nil {
 		return OutboxEntry{}, err
 	}
 	if half.Valid {
@@ -209,25 +212,20 @@ func (s *Store) Outbox(ctx context.Context) ([]OutboxEntry, error) {
 }
 
 // DeleteOutbox removes the entry with the given id after wn-cloud accepted
-// it.
-func (s *Store) DeleteOutbox(ctx context.Context, id int64) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM rating_outbox WHERE id = ?`, id)
-	return err
-}
-
-// DeleteOutboxSubject removes the entry of a subject after wn-cloud accepted
-// a newer write of it.
-func (s *Store) DeleteOutboxSubject(ctx context.Context, kind, mbid string) error {
-	_, err := s.db.ExecContext(ctx, `DELETE FROM rating_outbox WHERE kind = ? AND mbid = ?`, kind, mbid)
+// it. An entry whose version is no longer the given one changed during the
+// send and stays.
+func (s *Store) DeleteOutbox(ctx context.Context, id, version int64) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM rating_outbox WHERE id = ? AND version = ?`, id, version)
 	return err
 }
 
 // FailOutbox records a failed attempt of the entry with the given id. A zero
-// nextAt keeps the entry out of the retry loop.
-func (s *Store) FailOutbox(ctx context.Context, id int64, attempts int, nextAt time.Time, lastError string) error {
+// nextAt keeps the entry out of the retry loop. An entry whose version is no
+// longer the given one changed during the send and stays as it is.
+func (s *Store) FailOutbox(ctx context.Context, id, version int64, attempts int, nextAt time.Time, lastError string) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE rating_outbox SET attempts = ?, next_at = ?, last_error = ? WHERE id = ?`,
-		attempts, nullTime(nextAt), lastError, id)
+		`UPDATE rating_outbox SET attempts = ?, next_at = ?, last_error = ? WHERE id = ? AND version = ?`,
+		attempts, nullTime(nextAt), lastError, id, version)
 	return err
 }
 
@@ -242,13 +240,21 @@ func queueAllRatings(ctx context.Context, tx *sql.Tx, accountID string, now time
 		 SELECT kind, mbid, half_stars, like_level, 0, ?, 0, ?, NULL FROM ratings WHERE account_id = ? ORDER BY updated_at
 		 ON CONFLICT (kind, mbid) DO UPDATE SET
 		   half_stars = excluded.half_stars, like_level = excluded.like_level, deleted = 0,
-		   attempts = 0, next_at = excluded.next_at, last_error = NULL`,
+		   attempts = 0, next_at = excluded.next_at, last_error = NULL, version = rating_outbox.version + 1`,
 		at, at, accountID)
 	if err != nil {
 		return fmt.Errorf("queue ratings: %w", err)
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE rating_outbox SET attempts = 0, next_at = ? WHERE next_at IS NOT NULL`, at); err != nil {
-		return fmt.Errorf("queue ratings: %w", err)
+	return retryOutboxNow(ctx, tx, now)
+}
+
+// retryOutboxNow makes every entry that waits for a retry due at now.
+// Entries that wn-cloud rejected stay out of the retry loop.
+func retryOutboxNow(ctx context.Context, tx *sql.Tx, now time.Time) error {
+	_, err := tx.ExecContext(ctx,
+		`UPDATE rating_outbox SET attempts = 0, next_at = ?, version = version + 1 WHERE next_at IS NOT NULL`, formatMicros(now))
+	if err != nil {
+		return fmt.Errorf("retry outbox: %w", err)
 	}
 	return nil
 }

@@ -101,13 +101,22 @@ func (e *env) svcURL() string { return e.svc.cloud.(*wncloud.Client).BaseURL }
 func TestOutbox(t *testing.T) {
 	ctx := context.Background()
 	e := newEnv(t, true)
-	e.down.Store(true)
 	six, love := 6, LikeLove
 	if err := e.svc.Set(ctx, e.owner.ID, KindRelease, releaseID, &six, &love); err != nil {
 		t.Fatal(err)
 	}
 	if r, err := e.st.Rating(ctx, e.owner.ID, KindRelease, releaseID); err != nil || *r.HalfStars != 6 || *r.LikeLevel != LikeLove {
 		t.Fatalf("store rating = %+v, %v", r, err)
+	}
+	if e.puts.Load() != 0 || len(e.svc.kick) != 1 {
+		t.Fatalf("Set called wn-cloud %d times, kick %d; want a queued write and a kick", e.puts.Load(), len(e.svc.kick))
+	}
+	<-e.svc.kick
+
+	// wn-cloud is unreachable: the drain keeps the entry and marks the status.
+	e.down.Store(true)
+	if err := e.svc.Drain(ctx); err != nil {
+		t.Fatal(err)
 	}
 	box, err := e.st.Outbox(ctx)
 	if err != nil || len(box) != 1 || box[0].Attempts != 1 || box[0].LastError == "" {
@@ -117,13 +126,12 @@ func TestOutbox(t *testing.T) {
 		t.Fatal("status is reachable after a 503")
 	}
 
-	// While wn-cloud is marked unreachable, a write is queued without a call.
-	before := e.puts.Load()
+	// While wn-cloud is marked unreachable, a write is queued without a kick.
 	if err := e.svc.SetLike(ctx, e.owner.ID, Subject{KindRelease, releaseID}, nil); err != nil {
 		t.Fatal(err)
 	}
-	if e.puts.Load() != before {
-		t.Fatal("wn-cloud was called while marked unreachable")
+	if len(e.svc.kick) != 0 {
+		t.Fatal("kick while wn-cloud is marked unreachable")
 	}
 
 	// wn-cloud returns. The replaced entry is due at once.
@@ -143,11 +151,13 @@ func TestOutbox(t *testing.T) {
 	}
 
 	// A failed entry waits for its backoff.
-	e.down.Store(true)
 	if err := e.svc.Delete(ctx, e.owner.ID, KindRelease, releaseID); err != nil {
 		t.Fatal(err)
 	}
-	e.svc.status.MarkReachable()
+	e.down.Store(true)
+	if err := e.svc.Drain(ctx); err != nil {
+		t.Fatal(err)
+	}
 	e.down.Store(false)
 	if err := e.svc.Drain(ctx); err != nil {
 		t.Fatal(err)
@@ -174,15 +184,16 @@ func TestNotLinked(t *testing.T) {
 	if r, err := e.st.Rating(ctx, e.owner.ID, KindRelease, releaseID); err != nil || *r.HalfStars != 8 {
 		t.Fatalf("store rating = %+v, %v", r, err)
 	}
+	if err := e.svc.Drain(ctx); err != nil {
+		t.Fatal(err)
+	}
 	if e.puts.Load() != 0 {
 		t.Fatal("wn-cloud was called in local-only mode")
 	}
-	if box, _ := e.st.Outbox(ctx); len(box) != 0 {
-		t.Fatalf("outbox = %+v", box)
-	}
 
-	// The first login queues the local ratings, and the next drain sends them.
-	if err := e.st.Link(ctx, e.owner.ID, store.ServerCredential{Token: cloudToken, ServerID: serverID, WaxnerdUserID: waxnerdID}); err != nil {
+	// The first link queues the local ratings, and the next drain sends them.
+	cred := store.ServerCredential{Token: cloudToken, ServerID: serverID, WaxnerdUserID: waxnerdID}
+	if err := e.st.Link(ctx, e.owner.ID, cred); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.svc.Drain(ctx); err != nil {
@@ -190,5 +201,23 @@ func TestNotLinked(t *testing.T) {
 	}
 	if got, err := e.cloudRating(t); err != nil || *got.HalfStars != 8 {
 		t.Fatalf("wn-cloud rating after login = %+v, %v", got, err)
+	}
+
+	// A rating cleared in local-only mode waits in the outbox as a delete and
+	// is sent after a login of the same user.
+	if err := e.st.Unlink(ctx, e.owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.Delete(ctx, e.owner.ID, KindRelease, releaseID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.st.Link(ctx, e.owner.ID, cred); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.svc.Drain(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.cloudRating(t); !errors.Is(err, wncloud.ErrNotFound) {
+		t.Fatalf("wn-cloud rating after the re-link: %v, want ErrNotFound", err)
 	}
 }

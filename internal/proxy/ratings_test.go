@@ -73,15 +73,17 @@ func (f *fakeNavidrome) count() int {
 
 type ratingEnv struct {
 	*env
-	nd *fakeNavidrome
+	nd  *fakeNavidrome
+	svc *ratings.Service
 }
 
 func newRatingEnv(t *testing.T) *ratingEnv {
 	t.Helper()
 	nd := &fakeNavidrome{}
+	var svc *ratings.Service
 	e := newEnvOpts(t, nd, true, func(e *env) []Option {
 		port, _ := strconv.Atoi(e.target.Port())
-		svc := ratings.New(e.st, wncloud.New(e.cloudURL, "test"), navidrome.NewClient(port), &wncloud.Status{}, slog.New(slog.DiscardHandler))
+		svc = ratings.New(e.st, wncloud.New(e.cloudURL, "test"), navidrome.NewClient(port), &wncloud.Status{}, slog.New(slog.DiscardHandler))
 		return []Option{WithRatings(svc)}
 	})
 	nd.owner = e.owner.ID
@@ -90,7 +92,7 @@ func newRatingEnv(t *testing.T) *ratingEnv {
 	if err := e.st.Link(context.Background(), e.owner.ID, store.ServerCredential{Token: cloudToken, ServerID: serverID, WaxnerdUserID: waxnerdID}); err != nil {
 		t.Fatal(err)
 	}
-	return &ratingEnv{env: e, nd: nd}
+	return &ratingEnv{env: e, nd: nd, svc: svc}
 }
 
 // call sends a Subsonic call and fails unless the answer is Navidrome's.
@@ -120,9 +122,13 @@ func (e *ratingEnv) local(t *testing.T, kind, mbid string) (*int, *string) {
 	return r.HalfStars, r.LikeLevel
 }
 
-// remote returns the wn-cloud rating, or nil values when there is none.
+// remote drains the outbox and returns the wn-cloud rating, or nil values
+// when there is none.
 func (e *ratingEnv) remote(t *testing.T, kind, mbid string) (*int, *string) {
 	t.Helper()
+	if err := e.svc.Drain(context.Background()); err != nil {
+		t.Fatal(err)
+	}
 	r, err := wncloud.New(e.cloudURL, "test").GetRating(context.Background(), cloudToken, kind, mbid)
 	if errors.Is(err, wncloud.ErrNotFound) {
 		return nil, nil
@@ -161,6 +167,9 @@ func TestSetRatingOnAlbum(t *testing.T) {
 	e.call(t, "setRating?id="+unmatchedAlbum+"&rating=2")
 	if e.nd.count() != 2 {
 		t.Fatalf("Navidrome calls %v", e.nd.calls)
+	}
+	if err := e.svc.Drain(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 	page, err := wncloud.New(e.cloudURL, "test").ListRatings(context.Background(), cloudToken, "", 0)
 	if err != nil || len(page.Changes) != 1 {

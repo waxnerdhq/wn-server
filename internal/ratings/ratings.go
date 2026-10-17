@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"regexp"
 	"strings"
 	"sync"
@@ -92,9 +93,8 @@ type Store interface {
 	ServerCredential(ctx context.Context) (store.ServerCredential, error)
 	EnqueueRating(ctx context.Context, e store.OutboxEntry) error
 	NextOutbox(ctx context.Context, now time.Time) (store.OutboxEntry, error)
-	DeleteOutbox(ctx context.Context, id int64) error
-	DeleteOutboxSubject(ctx context.Context, kind, mbid string) error
-	FailOutbox(ctx context.Context, id int64, attempts int, nextAt time.Time, lastError string) error
+	DeleteOutbox(ctx context.Context, id, version int64) error
+	FailOutbox(ctx context.Context, id, version int64, attempts int, nextAt time.Time, lastError string) error
 }
 
 // Cloud is the part of the wn-cloud client that the service uses.
@@ -111,9 +111,10 @@ type Navidrome interface {
 	Album(ctx context.Context, user, id string) (navidrome.Album, error)
 }
 
-// Service records ratings. Writes to the store and to wn-cloud run one at a
-// time, so a drained outbox entry never overtakes a newer write of the same
-// subject.
+// Service records ratings. A write goes to the local store and the outbox,
+// and the drain sends it to wn-cloud. Store writes run one at a time. The
+// drain sends without holding the lock and removes or delays an entry only
+// when it did not change during the send.
 type Service struct {
 	store  Store
 	cloud  Cloud
@@ -123,6 +124,8 @@ type Service struct {
 	now    func() time.Time
 
 	mu sync.Mutex
+	// kick asks Run to drain at once.
+	kick chan struct{}
 
 	logMu   sync.Mutex
 	lastLog time.Time
@@ -134,7 +137,7 @@ func New(st Store, cloud Cloud, nd Navidrome, status *wncloud.Status, logger *sl
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Service{store: st, cloud: cloud, nd: nd, status: status, logger: logger, now: time.Now}
+	return &Service{store: st, cloud: cloud, nd: nd, status: status, logger: logger, now: time.Now, kick: make(chan struct{}, 1)}
 }
 
 // Resolve maps a Navidrome song or album id to its subject, as the Navidrome
@@ -168,10 +171,9 @@ func subjectOf(kind, mbid string) (Subject, error) {
 }
 
 // Set replaces the account's rating of a subject with both values. Both nil
-// clears the rating. It writes the local store, then wn-cloud with the
-// server credential. When wn-cloud is unreachable or refuses the write, the
-// write goes to the outbox. Without a server credential nothing is sent. The
-// returned error is about the local store only.
+// clears the rating. It writes the local store and queues the value in the
+// outbox. Run sends it to wn-cloud with the server credential. Without a
+// server credential the entry waits in the outbox until wn-server login.
 func (s *Service) Set(ctx context.Context, accountID, kind, mbid string, halfStars *int, likeLevel *string) error {
 	if err := validate(kind, mbid, halfStars, likeLevel); err != nil {
 		return err
@@ -233,7 +235,7 @@ func validate(kind, mbid string, halfStars *int, likeLevel *string) error {
 	return nil
 }
 
-// write stores r and sends it to wn-cloud. s.mu is held.
+// write stores r and queues it in the outbox, due at once. s.mu is held.
 func (s *Service) write(ctx context.Context, r store.Rating) error {
 	if r.UpdatedAt.IsZero() {
 		r.UpdatedAt = s.now()
@@ -241,29 +243,21 @@ func (s *Service) write(ctx context.Context, r store.Rating) error {
 	if err := s.store.PutRating(ctx, r); err != nil {
 		return fmt.Errorf("store rating: %w", err)
 	}
-	cred, err := s.store.ServerCredential(ctx)
-	if errors.Is(err, store.ErrNoServerCredential) {
-		return nil // local-only mode
-	}
-	if err != nil {
-		return err
-	}
 	now := s.now()
 	e := store.OutboxEntry{
 		Kind: r.Kind, MBID: r.MBID, HalfStars: r.HalfStars, LikeLevel: r.LikeLevel,
-		Deleted: r.Cleared(), CreatedAt: now,
+		Deleted: r.Cleared(), CreatedAt: now, NextAt: now,
 	}
-	if _, down := s.status.UnreachableSince(); down {
-		// Do not make the client wait for a timeout. The next drain sends it.
-		e.NextAt = now
-		return s.store.EnqueueRating(ctx, e)
+	if err := s.store.EnqueueRating(ctx, e); err != nil {
+		return err
 	}
-	sendErr := s.send(ctx, cred.Token, e)
-	if sendErr == nil {
-		return s.store.DeleteOutboxSubject(ctx, e.Kind, e.MBID)
+	if _, down := s.status.UnreachableSince(); !down {
+		select {
+		case s.kick <- struct{}{}:
+		default:
+		}
 	}
-	e.Attempts, e.NextAt, e.LastError = s.failure(e, 1, sendErr)
-	return s.store.EnqueueRating(ctx, e)
+	return nil
 }
 
 // send writes one entry to wn-cloud and records in the status whether
@@ -291,7 +285,9 @@ func (s *Service) failure(e store.OutboxEntry, attempts int, err error) (int, ti
 	switch {
 	case errors.Is(err, wncloud.ErrUnreachable):
 		s.logUnreachable(err)
-	case errors.Is(err, wncloud.ErrInvalidRequest), errors.Is(err, wncloud.ErrForbidden):
+	case errors.Is(err, wncloud.ErrRateLimited):
+		s.logger.Warn("wn-cloud rate-limits rating writes; the drain waits", "error", err)
+	case errors.Is(err, wncloud.ErrInvalidRequest), httpStatus(err) == http.StatusForbidden:
 		s.logger.Warn("wn-cloud rejected a rating write; it is not retried", "kind", e.Kind, "mbid", e.MBID, "error", err)
 		return attempts, time.Time{}, msg
 	case errors.Is(err, wncloud.ErrUnauthorized):
@@ -300,6 +296,15 @@ func (s *Service) failure(e store.OutboxEntry, attempts int, err error) (int, ti
 		s.logger.Warn("rating write to wn-cloud failed; it is retried", "kind", e.Kind, "mbid", e.MBID, "error", err)
 	}
 	return attempts, s.now().Add(Backoff(attempts)), msg
+}
+
+// httpStatus returns the HTTP status of a wn-cloud error, or 0.
+func httpStatus(err error) int {
+	var e *wncloud.Error
+	if errors.As(err, &e) {
+		return e.Status
+	}
+	return 0
 }
 
 // Backoff returns the wait after the given number of failed attempts: 1, 2,
@@ -329,7 +334,7 @@ func (s *Service) logUnreachable(err error) {
 
 // Drain sends the due outbox entries to wn-cloud with the server credential,
 // oldest first. An accepted entry is removed. An entry that wn-cloud rejects
-// with invalid_request or forbidden stays with its error and is not retried.
+// with invalid_request or any 403 stays with its error and is not retried.
 // Any other failure sets the time of the next attempt. An unreachable
 // wn-cloud, a refused credential, or a rate limit stops the drain. Without a
 // server credential Drain does nothing.
@@ -351,11 +356,12 @@ func (s *Service) Drain(ctx context.Context) error {
 }
 
 // drainOne sends the oldest due entry. stop is true when the outbox has no
-// due entry or the drain should wait for the next run.
+// due entry or the drain should wait for the next run. The lock is held for
+// the store reads and writes only, not for the send.
 func (s *Service) drainOne(ctx context.Context, token string) (stop bool, err error) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	e, err := s.store.NextOutbox(ctx, s.now())
+	s.mu.Unlock()
 	if errors.Is(err, store.ErrOutboxEmpty) {
 		return true, nil
 	}
@@ -366,11 +372,13 @@ func (s *Service) drainOne(ctx context.Context, token string) (stop bool, err er
 	if ctx.Err() != nil {
 		return true, nil // shutting down; the entry stays as it was
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	if sendErr == nil {
-		return false, s.store.DeleteOutbox(ctx, e.ID)
+		return false, s.store.DeleteOutbox(ctx, e.ID, e.Version)
 	}
 	attempts, next, msg := s.failure(e, e.Attempts+1, sendErr)
-	if err := s.store.FailOutbox(ctx, e.ID, attempts, next, msg); err != nil {
+	if err := s.store.FailOutbox(ctx, e.ID, e.Version, attempts, next, msg); err != nil {
 		return true, err
 	}
 	stop = errors.Is(sendErr, wncloud.ErrUnreachable) || errors.Is(sendErr, wncloud.ErrUnauthorized) ||
@@ -378,8 +386,8 @@ func (s *Service) drainOne(ctx context.Context, token string) (stop bool, err er
 	return stop, nil
 }
 
-// Run drains the outbox at once and then every DrainInterval until ctx is
-// done.
+// Run drains the outbox at once, after every write while wn-cloud is not
+// recorded as unreachable, and every DrainInterval, until ctx is done.
 func (s *Service) Run(ctx context.Context) {
 	t := time.NewTicker(DrainInterval)
 	defer t.Stop()
@@ -391,6 +399,7 @@ func (s *Service) Run(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
+		case <-s.kick:
 		}
 	}
 }

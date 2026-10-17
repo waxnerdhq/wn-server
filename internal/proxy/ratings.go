@@ -149,10 +149,12 @@ func recordRatings(resp *http.Response) error {
 	}
 	orig := resp.Body
 	body, err := io.ReadAll(io.LimitReader(orig, maxRatingBody+1))
-	if err != nil {
-		return err
-	}
-	if len(body) > maxRatingBody {
+	if err != nil || len(body) > maxRatingBody {
+		if err != nil {
+			// Navidrome has applied the call. The client gets what was read
+			// and the rest, not a 502, and the change is not recorded.
+			plan.logger.Warn("read the answer to a rating call; not synced", "error", err)
+		}
 		resp.Body = struct {
 			io.Reader
 			io.Closer

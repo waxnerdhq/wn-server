@@ -18,7 +18,9 @@ CREATE TABLE ratings (
 -- a later change replaces the values of the earlier entry. deleted is 1 for
 -- a cleared rating, which is sent as DELETE. next_at is the earliest time of
 -- the next attempt, or NULL for an entry that wn-cloud rejected and that is
--- not retried. Times are UTC with microseconds, so they sort as text.
+-- not retried. version grows with every change of the entry, so that the
+-- drain does not remove or delay an entry that changed while it was being
+-- sent. Times are UTC with microseconds, so they sort as text.
 CREATE TABLE rating_outbox (
     id         INTEGER PRIMARY KEY AUTOINCREMENT,
     kind       TEXT NOT NULL,
@@ -30,6 +32,7 @@ CREATE TABLE rating_outbox (
     attempts   INTEGER NOT NULL DEFAULT 0,
     next_at    TEXT NULL,
     last_error TEXT NULL,
+    version    INTEGER NOT NULL DEFAULT 0,
     UNIQUE (kind, mbid)
 );
 

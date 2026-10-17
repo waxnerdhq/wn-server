@@ -99,19 +99,29 @@ func linkOwner(ctx context.Context, db execer, accountID, waxnerdUserID string) 
 	return nil
 }
 
-// Link stores the server credential, sets the account's waxnerd user id to
-// c.WaxnerdUserID, and queues every rating of the account in the outbox, in
-// one transaction. The next drain sends the queued ratings to wn-cloud with
-// the new credential (README, Authentication, step 8).
+// Link stores the server credential and sets the account's waxnerd user id
+// to c.WaxnerdUserID, in one transaction. When the stored registration
+// belongs to another waxnerd user, or there is none, it also queues every
+// rating of the account in the outbox, so that they become the new user's
+// ratings at wn-cloud. Either way every outbox entry that waits for a retry
+// becomes due at once (README, Authentication, step 8).
 func (s *Store) Link(ctx context.Context, accountID string, c ServerCredential) error {
 	return s.inTx(ctx, func(tx *sql.Tx) error {
+		var prev string
+		err := tx.QueryRowContext(ctx, `SELECT waxnerd_user_id FROM server_credential WHERE id = 1`).Scan(&prev)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return err
+		}
 		if err := setServerCredential(ctx, tx, c); err != nil {
 			return err
 		}
 		if err := linkOwner(ctx, tx, accountID, c.WaxnerdUserID); err != nil {
 			return err
 		}
-		return queueAllRatings(ctx, tx, accountID, time.Now())
+		if prev != c.WaxnerdUserID {
+			return queueAllRatings(ctx, tx, accountID, time.Now())
+		}
+		return retryOutboxNow(ctx, tx, time.Now())
 	})
 }
 
