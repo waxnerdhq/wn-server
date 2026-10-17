@@ -121,3 +121,66 @@ func TestServerCredential(t *testing.T) {
 		t.Fatalf("LinkOwner(nobody) = %v, want ErrNotFound", err)
 	}
 }
+
+func TestSessions(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	owner, err := s.CreateOwner(ctx, "owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	token, created, err := s.CreateSession(ctx, owner.ID, "phone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The prefix and 43 base64url characters for 32 bytes.
+	if !strings.HasPrefix(token, SessionTokenPrefix) || len(token) != len(SessionTokenPrefix)+43 {
+		t.Fatalf("token %q", token)
+	}
+	got, err := s.SessionByToken(ctx, token)
+	if err != nil || got != created || got.AccountID != owner.ID || got.Device != "phone" {
+		t.Fatalf("SessionByToken = %+v, %v; want %+v", got, err, created)
+	}
+	for _, unknown := range []string{"", "wns_unknown", token + "x", strings.TrimPrefix(token, SessionTokenPrefix)} {
+		if _, err := s.SessionByToken(ctx, unknown); !errors.Is(err, ErrSessionNotFound) {
+			t.Fatalf("SessionByToken(%q) = %v, want ErrSessionNotFound", unknown, err)
+		}
+	}
+	later := created.LastSeenAt.Add(time.Hour)
+	if err := s.TouchSession(ctx, created.ID, later); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.SessionByToken(ctx, token); !got.LastSeenAt.Equal(later) {
+		t.Fatalf("last seen %v, want %v", got.LastSeenAt, later)
+	}
+
+	token2, second, err := s.CreateSession(ctx, owner.ID, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if list, err := s.Sessions(ctx, owner.ID); err != nil || len(list) != 2 || list[0].ID != created.ID || list[1].ID != second.ID {
+		t.Fatalf("Sessions = %+v, %v", list, err)
+	}
+	if err := s.RevokeSession(ctx, created.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.RevokeSession(ctx, created.ID); !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("second RevokeSession = %v, want ErrSessionNotFound", err)
+	}
+	if _, err := s.SessionByToken(ctx, token); !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("SessionByToken after revoke = %v", err)
+	}
+	if got, err := s.RevokeSessionByToken(ctx, token2); err != nil || got.ID != second.ID {
+		t.Fatalf("RevokeSessionByToken = %+v, %v", got, err)
+	}
+	if _, err := s.RevokeSessionByToken(ctx, token2); !errors.Is(err, ErrSessionNotFound) {
+		t.Fatalf("second RevokeSessionByToken = %v, want ErrSessionNotFound", err)
+	}
+	if list, err := s.Sessions(ctx, owner.ID); err != nil || len(list) != 0 {
+		t.Fatalf("Sessions after revoke = %+v, %v", list, err)
+	}
+}

@@ -227,7 +227,7 @@ func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.A
 	sup := navidrome.NewSupervisor(c, navidrome.Account{ID: owner.ID, Name: owner.Name}, logger)
 	target := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(c.NavidromePort))}
 	srv := &http.Server{
-		Handler:           proxy.New(target, sup.Ready(), st, logger),
+		Handler:           proxy.New(target, sup.Ready(), st, newClient(c), logger),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 
