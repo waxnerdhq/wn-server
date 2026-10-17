@@ -23,6 +23,7 @@ type ReconcileResult struct {
 	// Applied is the number of changes that altered the local store.
 	Applied int
 	// Unchanged is the number of changes that the local store already held.
+	// They are pushed into Navidrome as well.
 	Unchanged int
 	// KeptLocal is the number of changes that a newer outbox entry of the
 	// subject overruled.
@@ -82,13 +83,16 @@ func (s *Service) Reconcile(ctx context.Context) error {
 				return err
 			}
 		}
-		if page.Next != "" && page.Next != cursor {
+		// A page that does not move the cursor ends the run, so a page that
+		// repeats itself cannot loop.
+		advanced := page.Next != "" && page.Next != cursor
+		if advanced {
 			if err := s.store.SetRatingSyncCursor(ctx, page.Next); err != nil {
 				return err
 			}
 			cursor = page.Next
 		}
-		if !page.More || len(page.Changes) == 0 {
+		if !advanced || !page.More || len(page.Changes) == 0 {
 			break
 		}
 	}
@@ -124,7 +128,7 @@ func (s *Service) reconcileFailure(ctx context.Context, err error) {
 }
 
 // applyRemote writes one change from wn-cloud to the local store and, when
-// it altered the store, pushes it into Navidrome. A returned error is a
+// it did not lose to a newer local write, pushes it into Navidrome. A returned error is a
 // store failure.
 func (s *Service) applyRemote(ctx context.Context, accountID string, c wncloud.Rating, res *ReconcileResult) error {
 	res.Pulled++
@@ -150,7 +154,11 @@ func (s *Service) applyRemote(ctx context.Context, accountID string, c wncloud.R
 	}
 	switch result {
 	case store.RemoteUnchanged:
+		// The store holds the values, but Navidrome may not: an earlier push
+		// can have failed or been interrupted, or a scan can have added the
+		// item. Pushing again repairs the mirror.
 		res.Unchanged++
+		s.pushRemote(ctx, accountID, r, res)
 	case store.RemoteKeptLocal:
 		res.KeptLocal++
 	case store.RemoteApplied:

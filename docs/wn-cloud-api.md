@@ -473,7 +473,7 @@ These restate decisions in `README.md` in terms of the routes above.
 
 ### Background tick
 
-- In cloud mode, wn-server runs a background tick every 5 minutes. Each tick drains the outbox and then runs the rating sync. The rating sync is added in WAX-944.
+- In cloud mode, wn-server runs a background tick at start and every 15 minutes. Each tick drains the outbox and then runs the rating sync.
 - Apart from the tick, `serve` drains the outbox after each rating write, at start, and every minute.
 - A 401 answer to the server credential, on any route, means the credential no longer works. wn-server stops the tick's work and the web UI tells the owner to run `wn-server login` again.
 
@@ -505,4 +505,4 @@ These restate decisions in `README.md` in terms of the routes above.
 
 1. **Deletions in `GET /ratings?since=`.** v2 deletes a rating row on clear, so a delta cannot show clears. Recommendation: wn-cloud records clears in a `rating_deletions` table (user, subject, `deleted_at`, and the cleared rating's `id` and `created_at`) and merges it into the change feed. Rating the subject again removes its deletion row, so the feed shows each subject once. The alternative, a full re-pull on each tick, costs more as libraries grow.
 2. **Ordering of outbox writes against changes made elsewhere.** A queued `PUT` replayed after an outage overwrites a newer value set in wn-cloud's web pages meanwhile. Recommendation: accept this for v1. Later, `PUT` can take an optional `updated_at` from the client, and wn-cloud ignores a write older than the stored value.
-3. **Intervals.** The README and this document both use 5 minutes for the background tick that runs the outbox drain and the rating sync. Recommendation: 5 minutes.
+3. **Intervals.** The README and this document both use 15 minutes for the background tick that runs the outbox drain and the rating sync. Recommendation: 15 minutes.

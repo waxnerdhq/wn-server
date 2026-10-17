@@ -297,8 +297,9 @@ func (s *Service) send(ctx context.Context, token string, e store.OutboxEntry) e
 
 // noteCloud records in the status the outcome of a call to wn-cloud: whether
 // wn-cloud answered, and whether it refused the server credential with 401.
-// A 403 says nothing about the credential for a rating write, so it leaves
-// the credential state as it was.
+// Only a 2xx answer shows that the credential works, so only that clears the
+// rejected state. Any other outcome, such as 400, 403, or 429, leaves it as
+// it was.
 func (s *Service) noteCloud(err error) {
 	if errors.Is(err, wncloud.ErrUnreachable) {
 		s.status.MarkUnreachable(s.now())
@@ -308,7 +309,7 @@ func (s *Service) noteCloud(err error) {
 	switch {
 	case errors.Is(err, wncloud.ErrUnauthorized):
 		s.status.SetCredentialRejected(true)
-	case httpStatus(err) != http.StatusForbidden:
+	case err == nil:
 		s.status.SetCredentialRejected(false)
 	}
 }
