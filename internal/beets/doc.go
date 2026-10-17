@@ -4,4 +4,8 @@
 // its candidates in a JSON lines file, which this package parses. After an
 // import, the original folder of every applied album gets an empty
 // .ndignore, and Navidrome is asked to scan.
+//
+// Apply imports one album folder with a release that the owner chose.
+// Remove takes an applied album out of the beets library and deletes its
+// copy in sorted_dir. RemoveMarker deletes the empty .ndignore again.
 package beets

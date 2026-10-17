@@ -14,10 +14,22 @@ wn-server reads the file named by the ``output`` option after
   ``distance``.
 - ``copied_to``: the album directory in the beets library. Only on
   ``applied`` lines.
+- ``release_id``: the MusicBrainz release that beets applied. Only on
+  ``applied`` lines.
+- ``reason``: ``requested_release_id`` on the ``applied`` line of an album
+  whose release the ``apply_release_id`` option chose.
 - ``error``: the message. Only on ``error`` lines.
 
 Events used (beets 2.14):
 
+- ``import_task_before_choice`` runs before beets judges the candidates.
+  When the ``apply_release_id`` option is set, the handler returns the
+  candidate with that release id, and beets applies it also in quiet mode.
+  It returns SKIP for a task without that candidate and for a task whose
+  folder is not ``apply_folder``. wn-server sets both options for
+  ``wn-server match apply`` only. The handler then also adds the folder to
+  beets' incremental history after the album is imported, because the apply
+  run uses ``-I``, which records no history.
 - ``import_task_choice`` runs after beets chose a match. The candidates and
   the original tags are recorded here, because ``task.items`` change once the
   match is applied. A task whose choice is SKIP is written at once.
@@ -50,6 +62,7 @@ import os
 import threading
 from collections import Counter
 
+from beets.importer import Action
 from beets.plugins import BeetsPlugin
 from beets.util import extension as _extension
 
@@ -135,13 +148,18 @@ def _flag_name(value):
 class WnCandidatesPlugin(BeetsPlugin):
     def __init__(self):
         super().__init__()
-        self.config.add({"output": "", "acoustid_app_key": ""})
+        self.config.add(
+            {"output": "", "acoustid_app_key": "", "apply_release_id": "", "apply_folder": ""}
+        )
         self.config["acoustid_app_key"].redact = True
         self._set_acoustid_key()
         self._lock = threading.Lock()
         # id(task) -> (task, line) for tasks that chose a match and have no
         # final decision yet.
         self._pending = {}
+        # id(task) of tasks whose match on_before_choice chose.
+        self._requested = set()
+        self.register_listener("import_task_before_choice", self.on_before_choice)
         self.register_listener("import_task_choice", self.on_choice)
         self.register_listener("album_imported", self.on_album_imported)
         self.register_listener("import", self.on_import_end)
@@ -182,6 +200,29 @@ class WnCandidatesPlugin(BeetsPlugin):
         except Exception as inner:  # noqa: BLE001
             self._log.error("wn_candidates: cannot write error line: {}", inner)
 
+    def on_before_choice(self, session, task):
+        """Return the candidate whose release id is apply_release_id, or
+        SKIP. beets' choose_match takes the returned match as the decision
+        before its own quiet mode judgment. Return None when the option is
+        not set, so beets decides as usual."""
+        try:
+            release = self.config["apply_release_id"].as_str()
+            if not release:
+                return None
+            target = self.config["apply_folder"].as_str()
+            if target and os.path.normpath(_folder(task)) != os.path.normpath(target):
+                return Action.SKIP
+            for match in list(task.candidates or []):
+                if _str(getattr(match.info, "album_id", None)) == release:
+                    with self._lock:
+                        self._requested.add(id(task))
+                    return match
+            self._log.info("wn_candidates: release {} is not a candidate for {}", release, _folder(task))
+            return Action.SKIP
+        except Exception as exc:  # noqa: BLE001
+            self._log.error("wn_candidates: cannot choose the requested release: {}", exc)
+            return Action.SKIP
+
     def on_choice(self, session, task):
         folder = ""
         try:
@@ -196,7 +237,13 @@ class WnCandidatesPlugin(BeetsPlugin):
             }
             flag = _flag_name(task.choice_flag)
             if flag == "APPLY":
+                match = getattr(task, "match", None)
+                if match is not None:
+                    line["release_id"] = _str(getattr(match.info, "album_id", None))
                 with self._lock:
+                    if id(task) in self._requested:
+                        self._requested.discard(id(task))
+                        line["reason"] = "requested_release_id"
                     self._pending[id(task)] = (task, line)
                 return
             line["decision"] = "skipped"
@@ -213,16 +260,28 @@ class WnCandidatesPlugin(BeetsPlugin):
                     task_album = getattr(task, "album", None)
                     if task_album is not None and task_album.id == album.id:
                         found = line
+                        found_task = task
                         del self._pending[key]
                         break
             if found is None:
                 return
+            if found.get("reason") == "requested_release_id":
+                self._save_history(found_task)
             folder = found["folder"]
             found["decision"] = "applied"
             found["copied_to"] = os.path.abspath(os.fsdecode(album.item_dir()))
             self._write(found)
         except Exception as exc:  # noqa: BLE001
             self._write_error(folder, exc)
+
+    def _save_history(self, task):
+        """Add the task's folders to beets' incremental history. A later
+        quiet import then does not offer the album again, as for an album
+        that a quiet import applied."""
+        try:
+            task.save_history()
+        except Exception as exc:  # noqa: BLE001
+            self._log.warning("wn_candidates: cannot add the folder to the incremental history: {}", exc)
 
     def on_import_end(self, lib, paths):
         with self._lock:

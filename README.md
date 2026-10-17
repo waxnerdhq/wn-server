@@ -8,7 +8,7 @@ wn-server is the waxnerd music server. It runs [Navidrome](https://www.navidrome
 
 wn-server is licensed under GPL-3.0 (see `LICENSE`). It is powered by Navidrome, which is also GPL-3.0 and runs as a separate process.
 
-**Status:** configuration, the Navidrome supervisor, the account store, and local-only mode. `wn-server init` writes `config.toml` and creates the owner account with an app password. `wn-server password` prints the app password and `--reset` replaces it. `wn-server serve` checks the Navidrome version, writes `navidrome.toml`, runs Navidrome as a child process, creates the owner's Navidrome user, adds the configured libraries, and serves the proxy on `listen`. The proxy checks a wn-server session or the owner's app password on `/rest/*`, passes `/share/*` without a check, serves wn-server's own `/api/v1/*` routes, answers 404 on every other path, and answers 503 on `/rest/*` and `/share/*` until the supervisor reports ready. First-party clients exchange a device code for a session at `POST /api/v1/session` and revoke it with `DELETE /api/v1/session`. `wn-server login` links the owner account to a waxnerd user and stores the server credential. `wn-server logout` revokes and removes it. `wn-server status` prints the owner account and the link without calling wn-cloud. `wn-server match` runs a quiet beets import over the music folders, copies confident matches into `sorted_dir`, marks their original folders with `.ndignore`, and asks Navidrome to scan. The match queue and the `match` subcommands are not built yet. The wn-cloud client covers sign-in, server registration, and device code verification. The wn-cloud API contract and an in-memory wn-cloud stub for tests are in place. v1 has one account, the owner. This file describes the agreed design and is updated as the code lands.
+**Status:** configuration, the Navidrome supervisor, the account store, and local-only mode. `wn-server init` writes `config.toml` and creates the owner account with an app password. `wn-server password` prints the app password and `--reset` replaces it. `wn-server serve` checks the Navidrome version, writes `navidrome.toml`, runs Navidrome as a child process, creates the owner's Navidrome user, adds the configured libraries, and serves the proxy on `listen`. The proxy checks a wn-server session or the owner's app password on `/rest/*`, passes `/share/*` without a check, serves wn-server's own `/api/v1/*` routes, answers 404 on every other path, and answers 503 on `/rest/*` and `/share/*` until the supervisor reports ready. First-party clients exchange a device code for a session at `POST /api/v1/session` and revoke it with `DELETE /api/v1/session`. `wn-server login` links the owner account to a waxnerd user and stores the server credential. `wn-server logout` revokes and removes it. `wn-server status` prints the owner account and the link without calling wn-cloud. `wn-server match` runs a quiet beets import over the music folders, copies confident matches into `sorted_dir`, marks their original folders with `.ndignore`, and asks Navidrome to scan. It records every album of the run in the match queue in the store. `wn-server match list` prints the queue. `wn-server match apply` tags and copies an album with a release that the owner chose. `wn-server match dismiss` sets an entry aside. `wn-server match revert` removes an applied copy from `sorted_dir` and the beets library. The wn-cloud client covers sign-in, server registration, and device code verification. The wn-cloud API contract and an in-memory wn-cloud stub for tests are in place. v1 has one account, the owner. This file describes the agreed design and is updated as the code lands.
 
 ## Architecture
 
@@ -35,14 +35,14 @@ clients (wn-mobile, wn-desktop, web UI)
 
 | Package | Responsibility |
 |---|---|
-| `internal/cli` | cobra command line: `init`, `serve`, `password`, `login`, `logout`, `status`, `match`, `version` |
+| `internal/cli` | cobra command line: `init`, `serve`, `password`, `login`, `logout`, `status`, `match` with `list`, `apply`, `dismiss`, and `revert`, `version` |
 | `internal/config` | `config.toml` loading and defaults, data directory, rendered `navidrome.toml` |
 | `internal/navidrome` | child process supervisor, version pin, library sync, wn-server's own Navidrome identity, and the owner's Navidrome user |
 | `internal/proxy` | reverse proxy to Navidrome. It forwards `/rest/*` after checking a wn-server session (`apiKey` or `Authorization: Bearer`) or the Subsonic credentials against the app password, and `/share/*` without a check. It serves wn-server's own `/api/v1/*` routes: the device code exchange and session revocation at `/api/v1/session`, with a local rate limit on failed exchanges. Every other path answers 404. It answers 503 on `/rest/*` and `/share/*` until the supervisor is ready, strips incoming `Remote-User` and `Authorization`, sets `Remote-User` to the account id after a successful check, removes the credential parameters before forwarding, and streams responses unbuffered. Rating intercepts are not built yet |
 | `internal/wncloud` | wn-cloud client: PKCE and state, the code display sign-in, `POST /cli/token`, `POST /cli/logout`, server registration, and device code verification, with typed errors per error code. The rating routes are not built yet. `stub` serves the same routes from memory for tests |
-| `internal/beets` | generated beets config, `beet import` subprocess, candidates file parser, `.ndignore` markers, scan trigger. The match queue is not built yet |
+| `internal/beets` | generated beets config, `beet import` subprocess, candidates file parser, `.ndignore` markers, scan trigger, the apply run with a chosen release, and the revert (`beet remove` and removal of the empty marker) |
 | `internal/ratings` | local store of ratings and favorites, rating API, reconcile loop |
-| `internal/store` | wn-server's SQLite database, `<data dir>/wn-server.db`, mode 0600, with embedded migrations. It holds the owner account, the app password, the server credential, and the sessions of first-party clients. The match queue, ratings, and the outbox are not built yet |
+| `internal/store` | wn-server's SQLite database, `<data dir>/wn-server.db`, mode 0600, with embedded migrations. It holds the owner account, the app password, the server credential, the sessions of first-party clients, and the match queue. Ratings and the outbox are not built yet |
 | `internal/web` | web UI for the owner: app password sign-in, status, match review, account page |
 
 ### Authentication
@@ -153,12 +153,13 @@ In quiet mode beets applies confident matches and skips the rest. A confident ma
 
 `wn-server match` runs one import over every `music_folders` entry in the foreground:
 
-1. It writes `<data dir>/beets.yaml` (mode 0600) and empties `<data dir>/beets-candidates.jsonl`.
+1. It takes an exclusive lock on `<data dir>/beets.lock`, writes `<data dir>/beets.yaml` (mode 0600), and empties `<data dir>/beets-candidates.jsonl`. `match`, `match apply`, and `match revert` take the same lock, because they share `beets.yaml`, the candidates file, and `beets.db`. When another run holds the lock, the command fails with `another beets run is in progress`.
 2. It runs `<beets_bin> --config <data dir>/beets.yaml import -q <music folders>`. The directory of `fpcalc_bin` goes first on `PATH`, `FPCALC` names `fpcalc_bin`, and `BEETSDIR` is the data directory, so a personal beets config in `~/.config/beets` is not read. `PYTHONDONTWRITEBYTECODE=1` keeps Python from writing `__pycache__` into `beets-plugins`. `HOME` is unchanged. beets also reads `<data dir>/config.yaml` because of `BEETSDIR`. wn-server does not write that file. beets' stderr goes to wn-server's log at info level, and its stdout at debug level. Ctrl-C kills beets and its process group. wn-server then still reads the candidates file and writes the markers for the albums that beets applied before the kill, because beets has already recorded those albums in its incremental history. It starts no scan after a kill.
 3. It reads the candidates file.
 4. It writes an empty `.ndignore` into the original folder of every applied album, with mode 0644, when the file does not exist. It writes no marker into a folder that is itself a `music_folders` entry, because that would hide the whole library. An empty `.ndignore` hides everything below its folder. So it writes no marker, and logs a warning, when another album of the same run that was not applied has its folder below the applied folder. The folder and the music folders are compared after symlinks are resolved. The marker is the only write to the originals tree.
 5. When at least one album was applied, it asks Navidrome to scan, as wn-server's identity, with `GET /rest/startScan`. Navidrome's native API has no scan route. When Navidrome is not running, wn-server logs a warning and the command still succeeds.
-6. It prints `applied N, skipped N, duplicates N, errors N`, then one line per skipped album with its folder and best candidate.
+6. It records every line of the candidates file in the match queue (see [Match queue](#match-queue)). After a Ctrl-C it records the lines that beets wrote before the kill.
+7. It prints `applied N, skipped N, duplicates N, errors N`, then one line per skipped album with its folder and best candidate, then the number of pending entries in the match queue.
 
 The beets plugin `wn_candidates` ships in the bundle as `beets-plugins/wn_candidates.py`. It writes one JSON line per album task to `<data dir>/beets-candidates.jsonl`, with these keys:
 
@@ -169,11 +170,57 @@ The beets plugin `wn_candidates` ships in the bundle as `beets-plugins/wn_candid
 | `decision` | `applied`, `skipped`, `duplicate` (the match is already in the beets library, and beets skips it in quiet mode), or `error`. |
 | `candidates` | Up to 10 candidates in beets' order, each with `release_id` (MusicBrainz release MBID), `artist`, `album`, `year`, `label`, and `distance`. |
 | `copied_to` | The album folder in `sorted_dir`. Only on `applied` lines. |
+| `release_id` | The MusicBrainz release that beets applied. Only on `applied` lines. |
+| `reason` | `requested_release_id` on the `applied` line of a `match apply` run, where the plugin chose the release. |
 | `error` | The message. Only on `error` lines. |
 
-The plugin records the candidates on the `import_task_choice` event, writes `applied` lines on `album_imported`, and writes the remaining tasks when the `import` event ends the session. beets 2.14 decides duplicates after `import_task_choice` and sends no event for an album it skips as a duplicate, so those lines are written at the end of the run. The plugin never raises out of a hook. An internal error becomes an `error` line. wn-server skips lines that do not parse and counts them as errors. The match queue that will read this file (WAX-940) is not built yet.
+The plugin records the candidates on the `import_task_choice` event, writes `applied` lines on `album_imported`, and writes the remaining tasks when the `import` event ends the session. beets 2.14 decides duplicates after `import_task_choice` and sends no event for an album it skips as a duplicate, so those lines are written at the end of the run. The plugin never raises out of a hook. An internal error becomes an `error` line. wn-server skips lines that do not parse and counts them as errors.
+
+The plugin also registers an `import_task_before_choice` handler. It does nothing unless `wn_candidates.apply_release_id` is set in `beets.yaml`, which wn-server does for a `match apply` run only. See [Match queue](#match-queue).
 
 The `chroma` plugin (AcoustID fingerprints) raises match confidence. The AcoustID application key is compiled in with `-ldflags "-X github.com/waxnerdhq/wn-server/internal/beets.DefaultAcoustIDKey=..."`. `make build`, `make bundle`, and `bundle/build.sh` take it from `WN_ACOUSTID_KEY` in the environment, which is empty by default. `acoustid_api_key` in `config.toml` overrides it. beets has no option for the lookup key: the chroma plugin looks up fingerprints with its module constant `beetsplug.chroma.API_KEY`, and `acoustid.apikey` is the user key for `beet submit`. wn-server therefore writes the key to `wn_candidates.acoustid_app_key` in `beets.yaml`, and the `wn_candidates` plugin sets `beetsplug.chroma.API_KEY` from it when it loads. When both keys are empty, `beets.yaml` has no `acoustid_app_key` and the chroma plugin uses its own key.
+
+#### Match queue
+
+The match queue is two tables in the store. `match_queue` has one row per album folder: `id`, `folder` (unique), `first_seen`, `last_seen`, `state`, the existing tags (`artist`, `album`, `year`, `track_count`), `applied_release_id`, `copied_to`, `applied_at`, `marker_written`, and `last_error`. `marker_written` is 1 when wn-server created the `.ndignore` in the folder for the applied entry. A marker that already existed leaves it at 0. `state` is `pending`, `applied`, `dismissed`, or `duplicate`. `match_candidates` holds the candidates of the latest line for the folder, in beets' order. Its rows are deleted with their queue row.
+
+After every `wn-server match` run, wn-server records each line of the candidates file:
+
+| Line | Effect on the queue |
+|---|---|
+| `skipped` | Creates a `pending` entry, or sets the entry to `pending`. A `dismissed` entry stays `dismissed`. An `applied` entry stays `applied`. The tags and candidates are replaced. |
+| `applied` | Sets `applied` with the release id, `copied_to`, and `applied_at`. The tags and candidates are replaced. |
+| `duplicate` | Sets `duplicate`. An `applied` entry stays `applied`. The tags and candidates are replaced. |
+| `error` | Creates a `pending` entry or keeps the state of the entry. The message goes to `last_error`. The tags and candidates stay. |
+
+Every line sets `last_seen`. Every line except an `error` line clears `last_error`. A line without a folder is logged and not recorded. An `applied` entry changes state only through an `applied` line or `match revert`, so its copy can always be reverted.
+
+`wn-server match list` prints the pending entries with id, state, folder, tags, and the top candidate with its distance. `--all` prints the entries in every state. `--json` prints the entries with all their candidates as a JSON array.
+
+`wn-server match apply <id> [--release <mbid>]` tags and copies the album of a `pending` or `dismissed` entry. The release is the entry's first candidate unless `--release` names another. wn-server refuses an entry in another state and a release id that is not a UUID. The run has these steps:
+
+1. wn-server writes `beets.yaml` with `wn_candidates.apply_release_id` set to the release and `wn_candidates.apply_folder` set to the entry's folder, and empties the candidates file.
+2. It runs `<beets_bin> --config <data dir>/beets.yaml import -q -I -S <mbid> <folder>` with the same environment as `match`. `-S` limits the MusicBrainz lookup to that release. `-I` (`--noincremental`) turns off the incremental history check, so beets imports a folder that its history already lists, for example after a revert.
+3. beets' quiet mode applies only a strong match, also with `-S`. The plugin's `import_task_before_choice` handler therefore returns the candidate whose release id is `apply_release_id`. beets' `choose_match` takes a returned match as the decision before its own quiet-mode judgment. The handler returns SKIP when no candidate has that id. It also returns SKIP for every other album below the folder, whose folder is not `apply_folder`. The `applied` line gets `"reason": "requested_release_id"`.
+4. `-I` also turns off the history writes. The plugin therefore adds the applied folder to the incremental history itself, as a quiet run does for an album it applies.
+5. wn-server records the entry's own line in the queue only when its decision is `applied`. With `-S`, any other line for the folder holds the requested release or no candidate, so recording it would replace the entry's candidates. For any other decision, wn-server stores the reason in `last_error` and sets `last_seen`, and the state, tags, and candidates stay. Lines for other albums below the folder are not recorded for the same reason.
+6. It writes `.ndignore` into the original folder with the rules of `match`, asks Navidrome to scan, and writes `beets.yaml` again without the apply options.
+
+The command fails when beets did not apply the release, and names the decision of the line.
+
+`wn-server match dismiss <id>` sets an entry to `dismissed`. Nothing on disk changes. wn-server refuses an `applied` entry, which is reverted first. A later run that skips the folder again keeps the entry `dismissed` and refreshes its candidates and `last_seen`. A `dismissed` entry can still be applied.
+
+`wn-server match revert <id>` undoes an `applied` entry:
+
+1. wn-server checks that `copied_to` resolves to a path strictly inside `sorted_dir`, with symlinks resolved in both, and refuses otherwise.
+2. It runs `<beets_bin> --config <data dir>/beets.yaml remove -a -d -f path:<copied_to>`. beets removes the album from its library, deletes the files of the copy, and removes the folders that become empty. When beets fails and `copied_to` no longer exists, wn-server logs a warning and continues.
+3. It deletes `<folder>/.ndignore` only when wn-server wrote it (`marker_written` is 1), when it is an empty regular file, and when the folder is strictly inside a music folder, compared after symlinks are resolved. A marker with content stays.
+4. It sets the entry to `pending` and clears the applied fields.
+5. It asks Navidrome to scan.
+
+beets' incremental history still lists a reverted folder. A later full `match` run therefore does not offer it again. `match apply` runs with `-I` and is the way to tag the folder again.
+
+`match apply` and `match revert` log the entry id, the folder, and the release id at info level. Neither changes, moves, or deletes anything in an originals folder except the empty `.ndignore` marker.
 
 ### Decisions
 
@@ -292,15 +339,17 @@ The data directory is `$XDG_DATA_HOME/wn-server`, or `~/.local/share/wn-server` 
 
 | File | Contents |
 |---|---|
-| `beets.yaml` | Generated beets config, mode 0600. Rewritten on every run. |
+| `beets.yaml` | Generated beets config, mode 0600. Rewritten on every run. During a `match apply` run it also holds `wn_candidates.apply_release_id` and `wn_candidates.apply_folder`. wn-server writes it again without them after the run. |
 | `beets.db` | beets library database. |
 | `beets-state.pickle` | beets state file, which holds the incremental import history. |
 | `beets-import.log` | beets' import log. |
 | `beets-candidates.jsonl` | Output of the `wn_candidates` plugin for the last run. |
+| `beets.lock` | Lock file. `match`, `match apply`, and `match revert` hold an exclusive `flock` on it while they run beets. |
+| `wn-server.db` | The match queue, in the tables `match_queue` and `match_candidates`, next to the account and the server credential. |
 
 beets also writes `beets.db-before-*.bak` files when it migrates its database, including on the first run.
 
-`beets.yaml` sets `library`, `directory` (`sorted_dir`), `statefile`, the path format `$albumartist/$album%aunique{}/$track $title`, `import` (`copy`, `write`, `quiet`, `autotag`, `incremental`, and `incremental_skip_later` on; `move`, `link`, `hardlink`, `reflink`, `delete`, `resume`, `fix_ext_inplace`, and `remux_mp3_in_wav` off; `duplicate_action: skip`; `quiet_fallback: skip`; `log`), `plugins` (`musicbrainz`, `chroma`, `wn_candidates`), `pluginpath` (`beets-plugins` next to the beets executable), `chroma.auto`, `wn_candidates.output`, `wn_candidates.acoustid_app_key` when a key is set, `musicbrainz` (`host: musicbrainz.org`, `ratelimit: 1`), and `ui.color: no`. beets 2.14 loads MusicBrainz as a plugin, and a `plugins` key replaces its default list, so `musicbrainz` is listed explicitly.
+`beets.yaml` sets `library`, `directory` (`sorted_dir`), `statefile`, the path format `$albumartist/$album%aunique{}/$track $title`, `import` (`copy`, `write`, `quiet`, `autotag`, `incremental`, and `incremental_skip_later` on; `move`, `link`, `hardlink`, `reflink`, `delete`, `resume`, `fix_ext_inplace`, and `remux_mp3_in_wav` off; `duplicate_action: skip`; `quiet_fallback: skip`; `log`), `plugins` (`musicbrainz`, `chroma`, `wn_candidates`), `pluginpath` (`beets-plugins` next to the beets executable), `chroma.auto`, `wn_candidates.output`, `wn_candidates.acoustid_app_key` when a key is set, `wn_candidates.apply_release_id` and `wn_candidates.apply_folder` during a `match apply` run, `musicbrainz` (`host: musicbrainz.org`, `ratelimit: 1`), and `ui.color: no`. beets 2.14 loads MusicBrainz as a plugin, and a `plugins` key replaces its default list, so `musicbrainz` is listed explicitly.
 
 The import options keep beets from writing to the original folders. Copy is the only file operation. `link`, `hardlink`, `reflink`, and `delete` are beets' defaults and are set explicitly. `remux_mp3_in_wav` defaults to on in beets 2.14. With it on, beets writes an `.mp3` next to a WAV file that holds an MP3 stream and deletes the WAV. `fix_ext_inplace` is off by default and is set explicitly. beets 2.14 also runs `fix_extension` on every file without an extension. When `ffprobe` is on `PATH`, it copies the file to `<name>.<ext>` in the original folder. beets has no option for it, so the `wn_candidates` plugin replaces `beets.util.extension.fix_extension` with a function that returns the path unchanged. beets then reads an extensionless file under its own name.
 
