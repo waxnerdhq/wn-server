@@ -31,6 +31,17 @@ func TestParseVersion(t *testing.T) {
 	}
 }
 
+func TestFullVersion(t *testing.T) {
+	for in, want := range map[string]string{
+		"0.64.2 (10114574)\n": "0.64.2 (10114574)",
+		"v0.64.2\n":           "0.64.2",
+	} {
+		if got := fullVersion(in); got != want {
+			t.Errorf("fullVersion(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
 func TestCheckVersion(t *testing.T) {
 	if err := CheckVersion(PinnedVersion); err != nil {
 		t.Fatal(err)
