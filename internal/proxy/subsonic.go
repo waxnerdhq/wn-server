@@ -100,8 +100,7 @@ func subsonicAuth(st Store, sess *sessions, lim *loginLimiter, logger *slog.Logg
 			return
 		}
 		addr := remoteHost(r)
-		ok, warn := lim.begin(addr)
-		if !ok {
+		if limited, warn := lim.limited(addr); limited {
 			if warn {
 				logger.Warn("subsonic sign-in rate limited", "remote", addr)
 			}
@@ -111,19 +110,19 @@ func subsonicAuth(st Store, sess *sessions, lim *loginLimiter, logger *slog.Logg
 		acct, err := st.AccountByName(r.Context(), user)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
-				lim.forget(addr)
 				return
 			}
 			if errors.Is(err, store.ErrNotFound) {
+				lim.fail(addr)
 				logger.Warn("subsonic sign-in failed", "remote", r.RemoteAddr, "user", truncate(user, maxLogUser), "reason", "missing_user")
 			} else {
-				lim.forget(addr)
 				logger.Error("look up account", "error", err)
 			}
 			writeSubsonicError(w, params, errWrongCredential, "Wrong username or password")
 			return
 		}
 		if !checkCredential(acct.AppPassword, pass, token, salt) {
+			lim.fail(addr)
 			logger.Warn("subsonic sign-in failed", "remote", r.RemoteAddr, "user", truncate(user, maxLogUser), "reason", "bad_credentials")
 			writeSubsonicError(w, params, errWrongCredential, "Wrong username or password")
 			return

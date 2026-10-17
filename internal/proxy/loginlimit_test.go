@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -10,7 +12,22 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/waxnerdhq/wn-server/internal/store"
 )
+
+// failingStore fails AccountByName with a store error while fail is set.
+type failingStore struct {
+	Store
+	fail *bool
+}
+
+func (f failingStore) AccountByName(ctx context.Context, name string) (store.Account, error) {
+	if *f.fail {
+		return store.Account{}, errors.New("database is locked")
+	}
+	return f.Store.AccountByName(ctx, name)
+}
 
 func TestSubsonicLoginLimit(t *testing.T) {
 	e := newEnv(t, http.NotFoundHandler(), true)
@@ -19,7 +36,9 @@ func TestSubsonicLoginLimit(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(&logs, nil))
 	lim := newLoginLimiter(func() time.Time { return now })
 	forwarded := 0
-	h := subsonicAuth(e.st, newSessions(e.st, nil, logger), lim, logger,
+	storeFails := false
+	st := failingStore{Store: e.st, fail: &storeFails}
+	h := subsonicAuth(st, newSessions(st, nil, logger), lim, logger,
 		http.HandlerFunc(func(http.ResponseWriter, *http.Request) { forwarded++ }))
 	// call sends a request from addr and returns the Subsonic error code, or
 	// 0 when the request was forwarded.
@@ -66,10 +85,26 @@ func TestSubsonicLoginLimit(t *testing.T) {
 			t.Fatalf("missing credential: code %d, want 10", c)
 		}
 	}
-	// After 10 failures the correct password is refused without a check.
-	for range loginMaxPerAddr {
+	// A store error does not count.
+	storeFails = true
+	for range 2 * loginMaxPerAddr {
+		if c := call(a, good); c != 40 {
+			t.Fatalf("store error: code %d, want 40", c)
+		}
+	}
+	storeFails = false
+	for range loginMaxPerAddr - 1 {
 		call(a, bad)
 	}
+	if c := call(a, good); c != 0 {
+		t.Fatalf("after store errors: code %d, want forwarded", c)
+	}
+	// After 10 failures, an unknown user among them, the correct password is
+	// refused without a check.
+	for range loginMaxPerAddr - 1 {
+		call(a, bad)
+	}
+	call(a, "u=nobody&p=nope&v=1&c=x")
 	for range 3 {
 		if c := call("192.0.2.1:6000", good); c != 40 {
 			t.Fatalf("limited address: code %d, want 40", c)
