@@ -152,8 +152,8 @@ func login(ctx context.Context, in io.Reader, out, errOut io.Writer, st *store.S
 		revoke(ctx, client, token, errOut)
 		return fmt.Errorf("store the server credential: %w", err)
 	}
-	// The rating outbox step runs here: queue every rating in the local store
-	// in the outbox (README, Authentication, step 7). Milestone 4.
+	// Link also queued every local rating in the outbox. The drain in serve
+	// sends them with the new credential (README, Authentication, step 8).
 
 	fmt.Fprintf(out, "linked owner %q to waxnerd user %s\n", owner.Name, userID)
 	fmt.Fprintf(out, "server id: %s\n", serverID)

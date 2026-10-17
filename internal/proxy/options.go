@@ -13,6 +13,7 @@ type Option func(*options)
 type options struct {
 	ui          http.Handler
 	cloudStatus *wncloud.Status
+	ratings     Ratings
 }
 
 func newOptions(opts []Option) options {
@@ -33,6 +34,12 @@ func WithUI(h http.Handler) Option {
 // answered.
 func WithCloudStatus(st *wncloud.Status) Option {
 	return func(o *options) { o.cloudStatus = st }
+}
+
+// WithRatings records the ratings and favorites of the Subsonic calls
+// setRating, star, and unstar in rt after Navidrome accepted them.
+func WithRatings(rt Ratings) Option {
+	return func(o *options) { o.ratings = rt }
 }
 
 // isUIPath reports whether p belongs to the handler given with WithUI.

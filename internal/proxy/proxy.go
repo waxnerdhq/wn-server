@@ -37,7 +37,8 @@ type accountIDKey struct{}
 // routes. WithUI adds the web UI on / and /ui/*. Every other path answers
 // 404. Until ready is closed, /rest/* and /share/* answer 503 and nothing is
 // forwarded, so that no client can become Navidrome's first user. cloud
-// verifies device codes for POST /api/v1/session. A nil logger selects
+// verifies device codes for POST /api/v1/session. WithRatings adds the
+// rating intercept on setRating, star, and unstar. A nil logger selects
 // slog.Default.
 func New(target *url.URL, ready <-chan struct{}, st Store, cloud Verifier, logger *slog.Logger, opts ...Option) http.Handler {
 	o := newOptions(opts)
@@ -57,7 +58,12 @@ func New(target *url.URL, ready <-chan struct{}, st Store, cloud Verifier, logge
 				r.Out.Header.Set(userHeader, id)
 			}
 		},
-		ModifyResponse: rewriteUserResponse,
+		ModifyResponse: func(resp *http.Response) error {
+			if err := rewriteUserResponse(resp); err != nil {
+				return err
+			}
+			return recordRatings(resp)
+		},
 		// Flush after every write so audio and large bodies stream.
 		FlushInterval: -1,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
@@ -72,7 +78,7 @@ func New(target *url.URL, ready <-chan struct{}, st Store, cloud Verifier, logge
 	}
 	sess := newSessions(st, cloud, logger)
 	sess.cloudStatus = o.cloudStatus
-	rest := gateReady(ready, subsonicAuth(st, sess, logger, rp))
+	rest := gateReady(ready, subsonicAuth(st, sess, logger, interceptRatings(o.ratings, logger, rp)))
 	share := gateReady(ready, rp)
 	api := sess.apiHandler()
 	return logRequests(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

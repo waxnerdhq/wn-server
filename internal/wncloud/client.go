@@ -28,6 +28,8 @@ var (
 	ErrForbidden = errors.New("forbidden")
 	// ErrRateLimited is a 429, code rate_limited.
 	ErrRateLimited = errors.New("rate_limited")
+	// ErrNotFound is a 404 with code not_found.
+	ErrNotFound = errors.New("not_found")
 	// ErrUnauthorized is a 401: the bearer is missing, unknown, or revoked.
 	ErrUnauthorized = errors.New("unauthorized")
 	// ErrUnreachable is a timeout, a connection error, or a 5xx status.
@@ -234,6 +236,8 @@ func kindOf(status int, code string) error {
 		return ErrInvalidRequest
 	case status == http.StatusForbidden && code == "forbidden":
 		return ErrForbidden
+	case status == http.StatusNotFound && code == "not_found":
+		return ErrNotFound
 	default:
 		return ErrUnexpected
 	}

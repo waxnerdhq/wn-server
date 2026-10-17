@@ -4,5 +4,7 @@
 // loopback once the supervisor reports ready. It serves wn-server's own
 // /api/v1/* routes, among them the device code exchange at /api/v1/session,
 // and passes / and /ui/* to the web UI handler given with WithUI. Every
-// other path answers 404. Rating intercepts are added in later issues.
+// other path answers 404. The Subsonic calls setRating, star, and unstar
+// are forwarded and, once Navidrome accepted them, recorded as ratings of
+// MusicBrainz subjects.
 package proxy

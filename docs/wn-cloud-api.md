@@ -471,7 +471,8 @@ These restate decisions in `README.md` in terms of the routes above.
 
 ### Background tick
 
-- In cloud mode, wn-server runs a background tick every 5 minutes. Each tick drains the outbox and then runs the rating sync.
+- In cloud mode, wn-server runs a background tick every 5 minutes. Each tick drains the outbox and then runs the rating sync. The rating sync is added in WAX-944.
+- Apart from the tick, `serve` drains the outbox at start and every minute.
 - A 401 answer to the server credential, on any route, means the credential no longer works. wn-server stops the tick's work and the web UI tells the owner to run `wn-server login` again.
 
 ### Outage
@@ -484,12 +485,12 @@ These restate decisions in `README.md` in terms of the routes above.
 
 ### Rating writes and the outbox
 
-- wn-server writes a rating to its local store first, then calls `PUT` or `DELETE /ratings/:kind/:mbid` with the server credential.
-- When wn-cloud is unreachable, wn-server writes the change to a local outbox. The outbox holds one entry per subject. A later change replaces the earlier entry.
-- wn-server drains the outbox on each tick, oldest entry first. A 2xx answer removes the entry. An unreachable answer stops the drain until the next tick.
-- A 400 answer removes the entry and logs it. A 401 answer keeps the entry and stops the drain. The entry is sent once `wn-server login` has stored a working server credential.
+- For a Subsonic `setRating`, `star`, or `unstar`, wn-server forwards the call to Navidrome first. When Navidrome answers `ok`, wn-server writes the rating to its local store, then calls `PUT` or `DELETE /ratings/:kind/:mbid` with the server credential.
+- When wn-cloud is unreachable or gives another answer than 2xx, wn-server writes the change to a local outbox. The outbox holds one entry per subject. A later change replaces the earlier entry. While wn-server records wn-cloud as unreachable, a new change goes to the outbox without a call.
+- wn-server drains the outbox oldest entry first. A 2xx answer removes the entry. After a failed attempt an entry waits 1, 2, 4, and so on minutes, at most one hour. An unreachable answer, a 401, or a 429 stops the drain until the next run.
+- A 400 `invalid_request` or a 403 `forbidden` answer keeps the entry with its error, out of the retry loop, and logs it. A 401 answer keeps the entry and stops the drain. `wn-server login` makes every waiting entry due at once, so the entry is sent once a working server credential is stored.
 - In local-only mode wn-server writes to the local store only. Nothing is queued.
-- When `wn-server login` first runs, wn-server queues every rating in the local store in the outbox. The next drain sends them to wn-cloud with the server credential, so they become the owner's ratings.
+- When `wn-server login` runs, wn-server queues every rating in the local store in the outbox. The next drain sends them to wn-cloud with the server credential, so they become the owner's ratings. This runs on every login, so ratings set in local-only mode after a logout are also sent.
 
 ### Rating sync
 

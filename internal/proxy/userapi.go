@@ -74,9 +74,11 @@ func forwardAccount(w http.ResponseWriter, r *http.Request, params url.Values, s
 }
 
 // requestIdentity asks Navidrome for an uncompressed body when the response
-// will be rewritten.
+// will be rewritten or read.
 func requestIdentity(r *httputil.ProxyRequest) {
-	if _, ok := r.In.Context().Value(renameKey{}).(userRename); ok {
+	_, rename := r.In.Context().Value(renameKey{}).(userRename)
+	_, rating := r.In.Context().Value(ratingPlanKey{}).(*ratingPlan)
+	if rename || rating {
 		r.Out.Header.Set("Accept-Encoding", "identity")
 	}
 }

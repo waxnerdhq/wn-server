@@ -46,7 +46,15 @@ func newClient(base, user string) *Client {
 	return &Client{base: base, user: user, http: &http.Client{Timeout: 30 * time.Second}}
 }
 
+// ErrNotFound is returned when Navidrome answers 404.
+var ErrNotFound = errors.New("not found in navidrome")
+
 func (c *Client) do(ctx context.Context, method, path string, body any) ([]byte, error) {
+	return c.doAs(ctx, c.user, method, path, body)
+}
+
+// doAs sends one request with user as Remote-User.
+func (c *Client) doAs(ctx context.Context, user, method, path string, body any) ([]byte, error) {
 	var rd io.Reader
 	if body != nil {
 		b, err := json.Marshal(body)
@@ -59,7 +67,7 @@ func (c *Client) do(ctx context.Context, method, path string, body any) ([]byte,
 	if err != nil {
 		return nil, err
 	}
-	req.Header.Set(userHeader, c.user)
+	req.Header.Set(userHeader, user)
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
@@ -72,10 +80,55 @@ func (c *Client) do(ctx context.Context, method, path string, body any) ([]byte,
 	if err != nil {
 		return nil, err
 	}
+	if resp.StatusCode == http.StatusNotFound {
+		return nil, fmt.Errorf("%s %s: %w", method, path, ErrNotFound)
+	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return nil, fmt.Errorf("%s %s: %s: %s", method, path, resp.Status, bytes.TrimSpace(data))
 	}
 	return data, nil
+}
+
+// Song is the part of a Navidrome media file that wn-server reads.
+type Song struct {
+	ID string `json:"id"`
+	// MbzReleaseTrackID is the MusicBrainz track id, not the recording id.
+	MbzReleaseTrackID string `json:"mbzReleaseTrackId"`
+	MbzAlbumID        string `json:"mbzAlbumId"`
+}
+
+// Album is the part of a Navidrome album that wn-server reads.
+type Album struct {
+	ID         string `json:"id"`
+	MbzAlbumID string `json:"mbzAlbumId"`
+}
+
+// Song returns a media file through the native API (GET /api/song/:id) as
+// user. The Subsonic getSong response carries only the recording id, so the
+// native API is used. An unknown id gives ErrNotFound.
+func (c *Client) Song(ctx context.Context, user, id string) (Song, error) {
+	var s Song
+	err := c.getJSON(ctx, user, "/api/song/"+url.PathEscape(id), &s)
+	return s, err
+}
+
+// Album returns an album through the native API (GET /api/album/:id) as
+// user. An unknown id gives ErrNotFound.
+func (c *Client) Album(ctx context.Context, user, id string) (Album, error) {
+	var a Album
+	err := c.getJSON(ctx, user, "/api/album/"+url.PathEscape(id), &a)
+	return a, err
+}
+
+func (c *Client) getJSON(ctx context.Context, user, path string, out any) error {
+	data, err := c.doAs(ctx, user, http.MethodGet, path, nil)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(data, out); err != nil {
+		return fmt.Errorf("decode %s: %w", path, err)
+	}
+	return nil
 }
 
 // EnsureUser makes Navidrome create the user for this identity and reports

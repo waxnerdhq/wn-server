@@ -45,9 +45,18 @@ type env struct {
 	st    *store.Store
 	owner store.Account
 	cloud *stub.Stub
+	// target and cloudURL are the fake Navidrome and the wn-cloud stub.
+	target   *url.URL
+	cloudURL string
 }
 
 func newEnv(t *testing.T, backend http.Handler, ready bool) *env {
+	t.Helper()
+	return newEnvOpts(t, backend, ready, nil)
+}
+
+// newEnvOpts is newEnv with proxy options built from the environment.
+func newEnvOpts(t *testing.T, backend http.Handler, ready bool, opts func(*env) []Option) *env {
 	t.Helper()
 	ctx := context.Background()
 	var hits atomic.Int32
@@ -80,9 +89,14 @@ func newEnv(t *testing.T, backend http.Handler, ready bool) *env {
 		close(ch)
 	}
 	logger := slog.New(slog.DiscardHandler)
-	srv := httptest.NewServer(New(target, ch, st, wncloud.New(cloudSrv.URL, "test"), logger))
-	t.Cleanup(srv.Close)
-	return &env{srv: srv, hits: &hits, st: st, owner: owner, cloud: cloud}
+	e := &env{hits: &hits, st: st, owner: owner, cloud: cloud, target: target, cloudURL: cloudSrv.URL}
+	var o []Option
+	if opts != nil {
+		o = opts(e)
+	}
+	e.srv = httptest.NewServer(New(target, ch, st, wncloud.New(cloudSrv.URL, "test"), logger, o...))
+	t.Cleanup(e.srv.Close)
+	return e
 }
 
 func newProxy(t *testing.T, backend http.Handler, ready bool) (*httptest.Server, *atomic.Int32) {
