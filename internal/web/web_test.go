@@ -367,3 +367,18 @@ func TestMatchApplyJob(t *testing.T) {
 		t.Fatalf("the result showed twice:\n%s", body)
 	}
 }
+
+func TestMatchAllShowsDuplicateRelease(t *testing.T) {
+	const release = "1a2b3c4d-5e6f-7081-92a3-b4c5d6e7f809"
+	e := newEnv(t)
+	c := e.signIn(t)
+	if _, err := e.st.RecordMatch(context.Background(), store.MatchLine{
+		Folder: "/music/Copy 2", Decision: store.LineDuplicate, Artist: "Ar", Album: "Al", ReleaseID: release,
+	}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	resp, body := e.doBody(t, http.MethodGet, "/ui/match?all=1", nil, c, "")
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, "https://musicbrainz.org/release/"+release) {
+		t.Fatalf("all view: status %d\n%s", resp.StatusCode, body)
+	}
+}

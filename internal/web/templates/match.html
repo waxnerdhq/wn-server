@@ -66,13 +66,14 @@
 </table>{{else}}<p class="muted">No dismissed entries.</p>{{end}}
 
 <h2>Duplicates ({{len .Duplicates}})</h2>
-<p>Albums whose match is already in the beets library.</p>
+<p>Albums whose match is already in the beets library. wn-server hides the folder of a duplicate of an applied release from Navidrome.</p>
 {{if .Duplicates}}<table>
-<thead><tr><th>Folder</th><th>Tags</th><th>First seen</th><th>Last seen</th></tr></thead>
+<thead><tr><th>Folder</th><th>Tags</th><th>Duplicate of release</th><th>First seen</th><th>Last seen</th></tr></thead>
 <tbody>
 {{range .Duplicates}}<tr>
 <td class="mono">{{.Folder}}</td>
 <td>{{tags .MatchEntry}}</td>
+<td>{{with .DuplicateOfReleaseID}}<a href="https://musicbrainz.org/release/{{.}}" target="_blank" rel="noopener">{{.}}</a>{{else}}<span class="muted">unknown</span>{{end}}</td>
 <td>{{when .FirstSeen}}</td>
 <td>{{when .LastSeen}}</td>
 </tr>

@@ -199,3 +199,103 @@ func TestMarkAppliedKeepsCandidates(t *testing.T) {
 		t.Fatalf("MarkApplied(999) = %v, want ErrMatchNotFound", err)
 	}
 }
+
+func TestDuplicateLinkAndFlag(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	t0 := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	rec := func(l MatchLine) int64 {
+		t.Helper()
+		id, err := s.RecordMatch(ctx, l, t0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return id
+	}
+	applied := rec(MatchLine{Folder: "/m/a", Decision: LineApplied, ReleaseID: "r1", CopiedTo: "/s/a"})
+	dup := rec(MatchLine{Folder: "/m/d", Decision: LineDuplicate, ReleaseID: "r1"})
+	other := rec(MatchLine{Folder: "/m/o", Decision: LineDuplicate, ReleaseID: "r2"})
+
+	if e, _ := s.MatchEntry(ctx, dup); e.State != MatchDuplicate || e.DuplicateOfReleaseID != "r1" || e.MarkerWritten {
+		t.Fatalf("duplicate entry = %+v", e)
+	}
+	// Only a duplicate of an applied release is listed as one to mark.
+	list, err := s.UnmarkedDuplicates(ctx)
+	if err != nil || len(list) != 1 || list[0].ID != dup {
+		t.Fatalf("UnmarkedDuplicates = %+v, %v; want entry %d only", list, err, dup)
+	}
+	if err := s.SetMarkerWritten(ctx, dup, true); err != nil {
+		t.Fatal(err)
+	}
+	if list, _ := s.UnmarkedDuplicates(ctx); len(list) != 0 {
+		t.Fatalf("UnmarkedDuplicates after the flag = %+v", list)
+	}
+	marked, err := s.MarkedDuplicates(ctx, "r1")
+	if err != nil || len(marked) != 1 || marked[0].ID != dup {
+		t.Fatalf("MarkedDuplicates(r1) = %+v, %v", marked, err)
+	}
+	if marked, _ := s.MarkedDuplicates(ctx, "r2"); len(marked) != 0 {
+		t.Fatalf("MarkedDuplicates(r2) = %+v; entry %d has no flag", marked, other)
+	}
+
+	// Another duplicate line keeps the flag and refreshes the link.
+	rec(MatchLine{Folder: "/m/d", Decision: LineDuplicate, ReleaseID: "r1"})
+	if e, _ := s.MatchEntry(ctx, dup); !e.MarkerWritten || e.DuplicateOfReleaseID != "r1" {
+		t.Fatalf("duplicate entry after a second line = %+v", e)
+	}
+	// A duplicate line does not change an applied entry or give it a link.
+	rec(MatchLine{Folder: "/m/a", Decision: LineDuplicate, ReleaseID: "r1"})
+	if e, _ := s.MatchEntry(ctx, applied); e.State != MatchApplied || e.DuplicateOfReleaseID != "" {
+		t.Fatalf("applied entry after a duplicate line = %+v", e)
+	}
+	// The duplicate becomes applied: the link ends, the flag stays.
+	rec(MatchLine{Folder: "/m/d", Decision: LineApplied, ReleaseID: "r3", CopiedTo: "/s/d"})
+	if e, _ := s.MatchEntry(ctx, dup); e.State != MatchApplied || e.DuplicateOfReleaseID != "" || !e.MarkerWritten {
+		t.Fatalf("entry after it was applied = %+v", e)
+	}
+}
+
+func TestMarkAppliedKeepsDuplicateMarker(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	t0 := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	first, err := s.RecordMatch(ctx, MatchLine{Folder: "/m/a", Decision: LineApplied, ReleaseID: "r1", CopiedTo: "/s/a"}, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A marked duplicate that the owner dismissed and then applies.
+	id, err := s.RecordMatch(ctx, MatchLine{Folder: "/m/d", Decision: LineDuplicate, ReleaseID: "r1"}, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetMarkerWritten(ctx, id, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetMatchState(ctx, id, MatchDismissed); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.MarkApplied(ctx, id, "r2", "/s/d", false, t0); err != nil {
+		t.Fatal(err)
+	}
+	if e, _ := s.MatchEntry(ctx, id); e.State != MatchApplied || !e.MarkerWritten || e.DuplicateOfReleaseID != "" {
+		t.Fatalf("entry after MarkApplied = %+v", e)
+	}
+	// Two applied entries share a release id.
+	if n, err := s.CountAppliedRelease(ctx, "r1", first); err != nil || n != 0 {
+		t.Fatalf("CountAppliedRelease(r1, first) = %d, %v; want 0", n, err)
+	}
+	if err := s.MarkApplied(ctx, id, "r1", "/s/d", true, t0); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := s.CountAppliedRelease(ctx, "r1", first); err != nil || n != 1 {
+		t.Fatalf("CountAppliedRelease(r1, first) = %d, %v; want 1", n, err)
+	}
+}
