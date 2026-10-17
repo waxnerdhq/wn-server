@@ -5,7 +5,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"io"
 	"io/fs"
 	"log/slog"
 	"net"
@@ -19,7 +18,6 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/waxnerdhq/wn-server/internal/beets"
 	"github.com/waxnerdhq/wn-server/internal/config"
 	"github.com/waxnerdhq/wn-server/internal/navidrome"
 	"github.com/waxnerdhq/wn-server/internal/proxy"
@@ -268,52 +266,6 @@ func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.A
 			err = errors.New("http server stopped")
 		}
 		return err
-	}
-}
-
-// newMatchCmd is the bare `match` command. The subcommands list, apply, and
-// dismiss, which drive the match queue, are WAX-940 and not built yet.
-func newMatchCmd() *cobra.Command {
-	return &cobra.Command{
-		Use:   "match",
-		Short: "Match albums to MusicBrainz with beets and copy confident matches into sorted_dir",
-		Args:  cobra.NoArgs,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			flag, _ := cmd.Flags().GetString("config")
-			_, path, err := config.Paths(flag)
-			if err != nil {
-				return err
-			}
-			c, err := config.Load(path)
-			if err != nil {
-				return err
-			}
-			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
-			defer stop()
-			r := beets.NewRunner(c, navidrome.NewClient(c.NavidromePort), slog.Default())
-			sum, err := r.Import(ctx, c.MusicFolders)
-			if err == nil || len(sum.Albums) > 0 {
-				printSummary(cmd.OutOrStdout(), sum)
-			}
-			return err
-		},
-	}
-}
-
-// printSummary prints the counts and one line per skipped album with its
-// best candidate.
-func printSummary(w io.Writer, sum beets.Summary) {
-	fmt.Fprintf(w, "applied %d, skipped %d, duplicates %d, errors %d\n", sum.Applied, sum.Skipped, sum.Duplicate, sum.Errors)
-	for _, a := range sum.Albums {
-		if a.Decision != beets.DecisionSkipped {
-			continue
-		}
-		if len(a.Candidates) == 0 {
-			fmt.Fprintf(w, "skipped %s: no candidates\n", a.Folder)
-			continue
-		}
-		c := a.Candidates[0]
-		fmt.Fprintf(w, "skipped %s: best candidate %s - %s (%d) %s, distance %.3f\n", a.Folder, c.Artist, c.Album, c.Year, c.ReleaseID, c.Distance)
 	}
 }
 

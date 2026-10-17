@@ -1,6 +1,6 @@
 // Package store is wn-server's SQLite database. It holds the owner account,
-// the server credential, and the sessions of first-party clients. Later
-// migrations add the match queue, ratings, and the outbox.
+// the server credential, the sessions of first-party clients, and the match
+// queue. Later migrations add ratings and the outbox.
 package store
 
 import (
@@ -70,7 +70,7 @@ func Open(ctx context.Context, path string) (*Store, error) {
 	dsn := (&url.URL{
 		Scheme:   "file",
 		Path:     path,
-		RawQuery: "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)",
+		RawQuery: "_pragma=journal_mode(WAL)&_pragma=busy_timeout(5000)&_pragma=foreign_keys(1)",
 	}).String()
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {

@@ -42,6 +42,11 @@ type Config struct {
 	// AcoustIDKey is empty when neither the config nor the build sets a key.
 	// The chroma plugin then looks up with its own key.
 	AcoustIDKey string
+	// ApplyReleaseID and ApplyFolder are set for a `match apply` run only.
+	// The wn_candidates plugin then applies that MusicBrainz release to the
+	// album in that folder and skips every other album.
+	ApplyReleaseID string
+	ApplyFolder    string
 }
 
 // NewConfig builds the beets config from wn-server's config.
@@ -142,6 +147,8 @@ type wnCandidatesYAML struct {
 	// beets has no option for it: acoustid.apikey is the user key for
 	// `beet submit`.
 	AcoustIDAppKey string `yaml:"acoustid_app_key,omitempty"`
+	ApplyReleaseID string `yaml:"apply_release_id,omitempty"`
+	ApplyFolder    string `yaml:"apply_folder,omitempty"`
 }
 
 type musicBrainzYAML struct {
@@ -186,11 +193,16 @@ func (c Config) Render() ([]byte, error) {
 			RemuxMP3InWAV:        false,
 			Log:                  c.ImportLogPath(),
 		},
-		Plugins:      []string{"musicbrainz", "chroma", "wn_candidates"},
-		Pluginpath:   []string{c.PluginDir},
-		Chroma:       chromaYAML{Auto: true},
-		WnCandidates: wnCandidatesYAML{Output: c.CandidatesPath(), AcoustIDAppKey: c.AcoustIDKey},
-		MusicBrainz:  musicBrainzYAML{Host: "musicbrainz.org", Ratelimit: 1},
+		Plugins:    []string{"musicbrainz", "chroma", "wn_candidates"},
+		Pluginpath: []string{c.PluginDir},
+		Chroma:     chromaYAML{Auto: true},
+		WnCandidates: wnCandidatesYAML{
+			Output:         c.CandidatesPath(),
+			AcoustIDAppKey: c.AcoustIDKey,
+			ApplyReleaseID: c.ApplyReleaseID,
+			ApplyFolder:    c.ApplyFolder,
+		},
+		MusicBrainz: musicBrainzYAML{Host: "musicbrainz.org", Ratelimit: 1},
 		// beets colours its output even when it is not a terminal, and the
 		// output goes to wn-server's log.
 		UI: uiYAML{Color: false},

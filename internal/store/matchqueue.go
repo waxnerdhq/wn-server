@@ -1,0 +1,339 @@
+package store
+
+import (
+	"context"
+	"database/sql"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+)
+
+// ErrMatchNotFound is returned when a match queue entry does not exist.
+var ErrMatchNotFound = errors.New("match queue entry not found")
+
+// MatchState is the state of a match queue entry.
+type MatchState string
+
+// Match queue states.
+const (
+	// MatchPending is an album that beets did not apply and that waits for
+	// review.
+	MatchPending MatchState = "pending"
+	// MatchApplied is an album that beets copied into sorted_dir.
+	MatchApplied MatchState = "applied"
+	// MatchDismissed is an album that the owner chose not to match.
+	MatchDismissed MatchState = "dismissed"
+	// MatchDuplicate is an album whose match is already in the beets library.
+	MatchDuplicate MatchState = "duplicate"
+)
+
+// Valid reports whether s is one of the four states.
+func (s MatchState) Valid() bool {
+	switch s {
+	case MatchPending, MatchApplied, MatchDismissed, MatchDuplicate:
+		return true
+	}
+	return false
+}
+
+// Decisions of a candidates line, as the wn_candidates plugin writes them.
+const (
+	LineApplied   = "applied"
+	LineSkipped   = "skipped"
+	LineDuplicate = "duplicate"
+	LineError     = "error"
+)
+
+// MatchCandidate is one MusicBrainz release that beets considered.
+type MatchCandidate struct {
+	ReleaseID string  `json:"release_id"`
+	Artist    string  `json:"artist"`
+	Album     string  `json:"album"`
+	Year      int     `json:"year"`
+	Label     string  `json:"label"`
+	Distance  float64 `json:"distance"`
+}
+
+// MatchEntry is one album folder in the match queue.
+type MatchEntry struct {
+	ID         int64      `json:"id"`
+	Folder     string     `json:"folder"`
+	FirstSeen  time.Time  `json:"first_seen"`
+	LastSeen   time.Time  `json:"last_seen"`
+	State      MatchState `json:"state"`
+	Artist     string     `json:"artist"`
+	Album      string     `json:"album"`
+	Year       int        `json:"year"`
+	TrackCount int        `json:"track_count"`
+	// The applied fields are set while State is MatchApplied.
+	AppliedReleaseID string    `json:"applied_release_id,omitempty"`
+	CopiedTo         string    `json:"copied_to,omitempty"`
+	AppliedAt        time.Time `json:"applied_at,omitzero"`
+	LastError        string    `json:"last_error,omitempty"`
+	// Candidates are in beets' order, best first.
+	Candidates []MatchCandidate `json:"candidates"`
+}
+
+// MatchLine is one parsed line of the candidates file.
+type MatchLine struct {
+	Folder     string
+	Decision   string // LineApplied, LineSkipped, LineDuplicate, or LineError
+	Artist     string
+	Album      string
+	Year       int
+	TrackCount int
+	Candidates []MatchCandidate
+	// ReleaseID and CopiedTo are set on applied lines.
+	ReleaseID string
+	CopiedTo  string
+	// Error is set on error lines.
+	Error string
+}
+
+// RecordMatch records one candidates line in the match queue and returns
+// the entry id. now is the time stored as last_seen, and as first_seen and
+// applied_at where they are set.
+//
+// A skipped line creates a pending entry or sets an existing one to pending.
+// A dismissed or applied entry keeps its state. An applied line sets the
+// entry to applied with the release id and copied_to. A duplicate line sets
+// duplicate, except on an applied entry, which keeps its state. An error
+// line creates a pending entry or keeps the state of an existing one, and
+// stores the message in last_error. Every line except an error line replaces
+// the tags and the candidates and clears last_error.
+func (s *Store) RecordMatch(ctx context.Context, l MatchLine, now time.Time) (int64, error) {
+	if l.Folder == "" {
+		return 0, errors.New("record match: empty folder")
+	}
+	switch l.Decision {
+	case LineApplied, LineSkipped, LineDuplicate, LineError:
+	default:
+		return 0, fmt.Errorf("record match: unknown decision %q", l.Decision)
+	}
+	ts := formatTime(now)
+	var id int64
+	err := s.inTx(ctx, func(tx *sql.Tx) error {
+		var cur MatchState
+		err := tx.QueryRowContext(ctx, `SELECT id, state FROM match_queue WHERE folder = ?`, l.Folder).Scan(&id, &cur)
+		if errors.Is(err, sql.ErrNoRows) {
+			res, err := tx.ExecContext(ctx,
+				`INSERT INTO match_queue (folder, first_seen, last_seen, state) VALUES (?, ?, ?, ?)`,
+				l.Folder, ts, ts, MatchPending)
+			if err != nil {
+				return err
+			}
+			if id, err = res.LastInsertId(); err != nil {
+				return err
+			}
+			cur = MatchPending
+		} else if err != nil {
+			return err
+		}
+
+		if l.Decision == LineError {
+			_, err := tx.ExecContext(ctx, `UPDATE match_queue SET last_seen = ?, last_error = ? WHERE id = ?`, ts, l.Error, id)
+			return err
+		}
+
+		next := cur
+		switch l.Decision {
+		case LineApplied:
+			next = MatchApplied
+		case LineSkipped:
+			if cur != MatchDismissed && cur != MatchApplied {
+				next = MatchPending
+			}
+		case LineDuplicate:
+			if cur != MatchApplied {
+				next = MatchDuplicate
+			}
+		}
+		_, err = tx.ExecContext(ctx,
+			`UPDATE match_queue SET last_seen = ?, state = ?, artist = ?, album = ?, year = ?, track_count = ?, last_error = NULL WHERE id = ?`,
+			ts, next, l.Artist, l.Album, l.Year, l.TrackCount, id)
+		if err != nil {
+			return err
+		}
+		if l.Decision == LineApplied {
+			if err := setApplied(ctx, tx, id, l.ReleaseID, l.CopiedTo, now); err != nil {
+				return err
+			}
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM match_candidates WHERE queue_id = ?`, id); err != nil {
+			return err
+		}
+		for i, c := range l.Candidates {
+			_, err := tx.ExecContext(ctx,
+				`INSERT INTO match_candidates (queue_id, position, release_id, artist, album, year, label, distance) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+				id, i, c.ReleaseID, c.Artist, c.Album, c.Year, c.Label, c.Distance)
+			if err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, fmt.Errorf("record match %s: %w", l.Folder, err)
+	}
+	return id, nil
+}
+
+const matchColumns = `id, folder, first_seen, last_seen, state, artist, album, year, track_count, applied_release_id, copied_to, applied_at, last_error`
+
+// MatchEntries returns the entries in the given states, ordered by id, with
+// their candidates. No states returns every entry.
+func (s *Store) MatchEntries(ctx context.Context, states ...MatchState) ([]MatchEntry, error) {
+	where, args := "", []any{}
+	if len(states) > 0 {
+		where = ` WHERE state IN (?` + strings.Repeat(`, ?`, len(states)-1) + `)`
+		for _, st := range states {
+			args = append(args, st)
+		}
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT `+matchColumns+` FROM match_queue`+where+` ORDER BY id`, args...)
+	if err != nil {
+		return nil, err
+	}
+	var entries []MatchEntry
+	index := map[int64]int{}
+	for rows.Next() {
+		e, err := scanMatch(rows)
+		if err != nil {
+			rows.Close()
+			return nil, err
+		}
+		index[e.ID] = len(entries)
+		entries = append(entries, e)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	if len(entries) == 0 {
+		return entries, nil
+	}
+	crows, err := s.db.QueryContext(ctx,
+		`SELECT queue_id, release_id, artist, album, year, label, distance FROM match_candidates
+		 WHERE queue_id IN (SELECT id FROM match_queue`+where+`) ORDER BY queue_id, position`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer crows.Close()
+	for crows.Next() {
+		var (
+			qid int64
+			c   MatchCandidate
+		)
+		if err := crows.Scan(&qid, &c.ReleaseID, &c.Artist, &c.Album, &c.Year, &c.Label, &c.Distance); err != nil {
+			return nil, err
+		}
+		if i, ok := index[qid]; ok {
+			entries[i].Candidates = append(entries[i].Candidates, c)
+		}
+	}
+	return entries, crows.Err()
+}
+
+// MatchEntry returns the entry with the given id and its candidates.
+func (s *Store) MatchEntry(ctx context.Context, id int64) (MatchEntry, error) {
+	e, err := scanMatch(s.db.QueryRowContext(ctx, `SELECT `+matchColumns+` FROM match_queue WHERE id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return MatchEntry{}, ErrMatchNotFound
+	}
+	if err != nil {
+		return MatchEntry{}, err
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT release_id, artist, album, year, label, distance FROM match_candidates WHERE queue_id = ? ORDER BY position`, id)
+	if err != nil {
+		return MatchEntry{}, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var c MatchCandidate
+		if err := rows.Scan(&c.ReleaseID, &c.Artist, &c.Album, &c.Year, &c.Label, &c.Distance); err != nil {
+			return MatchEntry{}, err
+		}
+		e.Candidates = append(e.Candidates, c)
+	}
+	return e, rows.Err()
+}
+
+// CountMatches returns the number of entries in state.
+func (s *Store) CountMatches(ctx context.Context, state MatchState) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM match_queue WHERE state = ?`, state).Scan(&n)
+	return n, err
+}
+
+// SetMatchState sets the state of an entry. It refuses MatchApplied, which
+// SetMatchApplied sets together with the applied fields.
+func (s *Store) SetMatchState(ctx context.Context, id int64, state MatchState) error {
+	if !state.Valid() || state == MatchApplied {
+		return fmt.Errorf("set match state: invalid state %q", state)
+	}
+	return checkOne(s.db.ExecContext(ctx, `UPDATE match_queue SET state = ? WHERE id = ?`, state, id))
+}
+
+// SetMatchApplied sets an entry to applied with the release id, the album
+// folder in sorted_dir, and the time of the apply.
+func (s *Store) SetMatchApplied(ctx context.Context, id int64, releaseID, copiedTo string, at time.Time) error {
+	return setApplied(ctx, s.db, id, releaseID, copiedTo, at)
+}
+
+func setApplied(ctx context.Context, db execer, id int64, releaseID, copiedTo string, at time.Time) error {
+	return checkOne(db.ExecContext(ctx,
+		`UPDATE match_queue SET state = ?, applied_release_id = ?, copied_to = ?, applied_at = ? WHERE id = ?`,
+		MatchApplied, releaseID, copiedTo, formatTime(at), id))
+}
+
+// RevertMatch sets an entry to pending and clears the applied fields.
+func (s *Store) RevertMatch(ctx context.Context, id int64) error {
+	return checkOne(s.db.ExecContext(ctx,
+		`UPDATE match_queue SET state = ?, applied_release_id = NULL, copied_to = NULL, applied_at = NULL WHERE id = ?`,
+		MatchPending, id))
+}
+
+// checkOne returns ErrMatchNotFound when an update changed no row.
+func checkOne(res sql.Result, err error) error {
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrMatchNotFound
+	}
+	return nil
+}
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanMatch(r rowScanner) (MatchEntry, error) {
+	var (
+		e                                MatchEntry
+		first, last                      string
+		releaseID, copiedTo, at, lastErr sql.NullString
+	)
+	err := r.Scan(&e.ID, &e.Folder, &first, &last, &e.State, &e.Artist, &e.Album, &e.Year, &e.TrackCount,
+		&releaseID, &copiedTo, &at, &lastErr)
+	if err != nil {
+		return MatchEntry{}, err
+	}
+	e.AppliedReleaseID, e.CopiedTo, e.LastError = releaseID.String, copiedTo.String, lastErr.String
+	if e.FirstSeen, err = time.Parse(time.RFC3339, first); err != nil {
+		return MatchEntry{}, fmt.Errorf("match entry %d: bad first_seen: %w", e.ID, err)
+	}
+	if e.LastSeen, err = time.Parse(time.RFC3339, last); err != nil {
+		return MatchEntry{}, fmt.Errorf("match entry %d: bad last_seen: %w", e.ID, err)
+	}
+	if at.Valid {
+		if e.AppliedAt, err = time.Parse(time.RFC3339, at.String); err != nil {
+			return MatchEntry{}, fmt.Errorf("match entry %d: bad applied_at: %w", e.ID, err)
+		}
+	}
+	return e, nil
+}
+
+func formatTime(t time.Time) string { return t.UTC().Format(time.RFC3339) }

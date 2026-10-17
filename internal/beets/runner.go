@@ -13,6 +13,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -29,6 +30,10 @@ const (
 	DecisionDuplicate = "duplicate"
 	DecisionError     = "error"
 )
+
+// ReasonRequestedRelease is the reason on the applied line of a `match
+// apply` run, where the plugin applied the release that the owner chose.
+const ReasonRequestedRelease = "requested_release_id"
 
 // markerName is the file that makes Navidrome's scanner skip a folder. An
 // empty file ignores everything in the folder and below it.
@@ -63,6 +68,11 @@ type Album struct {
 	Candidates []Candidate `json:"candidates"`
 	// CopiedTo is the album directory in sorted_dir. Only on applied lines.
 	CopiedTo string `json:"copied_to,omitempty"`
+	// ReleaseID is the MusicBrainz release that beets applied. Only on
+	// applied lines.
+	ReleaseID string `json:"release_id,omitempty"`
+	// Reason is ReasonRequestedRelease on the applied line of an apply run.
+	Reason string `json:"reason,omitempty"`
 	// Error is set on error lines.
 	Error string `json:"error,omitempty"`
 }
@@ -123,28 +133,89 @@ func (r *Runner) Import(ctx context.Context, folders []string) (Summary, error) 
 	if len(folders) == 0 {
 		return Summary{}, errors.New("no folders to import")
 	}
-	roots := make([]string, len(folders))
-	for i, f := range folders {
-		abs, err := filepath.Abs(f)
-		if err != nil {
-			return Summary{}, err
-		}
-		roots[i] = filepath.Clean(abs)
+	roots, err := absPaths(folders)
+	if err != nil {
+		return Summary{}, err
 	}
+	return r.importRun(ctx, r.Config, nil, roots, roots)
+}
+
+// Apply imports the album in folder with the MusicBrainz release releaseID.
+// It runs `beet import -q -I -S <releaseID> <folder>` with apply_release_id
+// and apply_folder set in beets.yaml. The wn_candidates plugin then applies
+// that release to the album in folder, also when beets' quiet mode would
+// skip it, and skips every other album below folder. -I turns off the
+// incremental history check, so a folder that beets already recorded is
+// imported again. musicFolders are the import roots for the .ndignore
+// checks. The rest is as for Import. After the run, beets.yaml is written
+// again without the apply options.
+func (r *Runner) Apply(ctx context.Context, folder, releaseID string, musicFolders []string) (Summary, error) {
+	if !ValidReleaseID(releaseID) {
+		return Summary{}, fmt.Errorf("release id %q is not a MusicBrainz id (a UUID)", releaseID)
+	}
+	if !filepath.IsAbs(folder) {
+		return Summary{}, fmt.Errorf("folder %s is not absolute", folder)
+	}
+	info, err := os.Stat(folder)
+	if err != nil {
+		return Summary{}, fmt.Errorf("album folder: %w", err)
+	}
+	if !info.IsDir() {
+		return Summary{}, fmt.Errorf("album folder %s is not a directory", folder)
+	}
+	roots, err := absPaths(musicFolders)
+	if err != nil {
+		return Summary{}, err
+	}
+	cfg := r.Config
+	cfg.ApplyReleaseID, cfg.ApplyFolder = releaseID, folder
+	defer func() {
+		if err := r.Config.Write(); err != nil {
+			r.Log.Warn("could not write beets.yaml without the apply options", "error", err)
+		}
+	}()
+	return r.importRun(ctx, cfg, []string{"-I", "-S", releaseID}, []string{folder}, roots)
+}
+
+// releaseIDRe matches a MusicBrainz id, which is a UUID.
+var releaseIDRe = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// ValidReleaseID reports whether id has the form of a MusicBrainz id.
+func ValidReleaseID(id string) bool { return releaseIDRe.MatchString(id) }
+
+// absPaths returns the paths made absolute and cleaned.
+func absPaths(paths []string) ([]string, error) {
+	out := make([]string, len(paths))
+	for i, p := range paths {
+		abs, err := filepath.Abs(p)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = filepath.Clean(abs)
+	}
+	return out, nil
+}
+
+// importRun writes cfg to beets.yaml, empties the candidates file, runs
+// `beet import -q <flags> <paths>`, reads the candidates file, writes the
+// markers below roots, and starts a scan when an album was applied.
+func (r *Runner) importRun(ctx context.Context, cfg Config, flags, paths, roots []string) (Summary, error) {
 	// beets only warns about a missing plugin and imports anyway, which
 	// would leave the candidates file empty.
-	plugin := filepath.Join(r.Config.PluginDir, pluginFileName)
+	plugin := filepath.Join(cfg.PluginDir, pluginFileName)
 	if _, err := os.Stat(plugin); err != nil {
 		return Summary{}, fmt.Errorf("beets plugin %s not found; it ships in beets-plugins next to the beets executable: %w", plugin, err)
 	}
-	if err := r.Config.Write(); err != nil {
+	if err := cfg.Write(); err != nil {
 		return Summary{}, err
 	}
-	if err := os.WriteFile(r.Config.CandidatesPath(), nil, 0o600); err != nil {
+	if err := os.WriteFile(cfg.CandidatesPath(), nil, 0o600); err != nil {
 		return Summary{}, fmt.Errorf("truncate candidates file: %w", err)
 	}
 
-	runErr := r.run(ctx, roots)
+	args := append(append([]string{"import", "-q"}, flags...), paths...)
+	r.Log.Info("running beets import", "bin", r.BeetsBin, "folders", len(paths))
+	runErr := r.run(ctx, args...)
 	sum, err := r.readCandidates()
 	r.writeMarkers(sum.Albums, roots)
 	if ctx.Err() != nil {
@@ -153,18 +224,113 @@ func (r *Runner) Import(ctx context.Context, folders []string) (Summary, error) 
 	if err != nil {
 		return sum, errors.Join(runErr, err)
 	}
-	if sum.Applied > 0 && r.Scanner != nil {
-		if err := r.Scanner.StartScan(ctx); err != nil {
-			r.Log.Warn("could not start a Navidrome scan; it runs at the next scheduled scan or `wn-server serve` start", "error", err)
-		}
+	if sum.Applied > 0 {
+		r.Scan(ctx)
 	}
 	return sum, runErr
 }
 
-// run starts beets and waits for it.
-func (r *Runner) run(ctx context.Context, folders []string) error {
-	args := append([]string{"--config", r.Config.Path(), "import", "-q"}, folders...)
-	cmd := exec.CommandContext(ctx, r.BeetsBin, args...)
+// Scan asks Navidrome to scan. A failure is logged as a warning. A nil
+// Scanner does nothing.
+func (r *Runner) Scan(ctx context.Context) {
+	if r.Scanner == nil {
+		return
+	}
+	if err := r.Scanner.StartScan(ctx); err != nil {
+		r.Log.Warn("could not start a Navidrome scan; it runs at the next scheduled scan or `wn-server serve` start", "error", err)
+	}
+}
+
+// Remove removes the album in copiedTo, an album folder in sorted_dir, from
+// the beets library and deletes its files with
+// `beet remove -a -d -f path:<copiedTo>`. beets also removes the folders
+// that become empty. Remove refuses a copiedTo that does not resolve to a
+// path strictly inside sorted_dir. When beets fails and copiedTo no longer
+// exists, Remove logs a warning and returns nil.
+func (r *Runner) Remove(ctx context.Context, copiedTo string) error {
+	if !filepath.IsAbs(copiedTo) {
+		return fmt.Errorf("copied_to %q is not absolute", copiedTo)
+	}
+	sorted := resolveExisting(r.Config.SortedDir)
+	if target := resolveExisting(copiedTo); !inside(target, sorted) {
+		return fmt.Errorf("refusing to remove %s: it is not inside sorted_dir %s", copiedTo, r.Config.SortedDir)
+	}
+	if err := r.Config.Write(); err != nil {
+		return err
+	}
+	r.Log.Info("running beets remove", "bin", r.BeetsBin, "path", copiedTo)
+	err := r.run(ctx, "remove", "-a", "-d", "-f", "path:"+copiedTo)
+	_, statErr := os.Lstat(copiedTo)
+	if err != nil {
+		if errors.Is(statErr, fs.ErrNotExist) {
+			r.Log.Warn("beets remove failed and the album folder no longer exists; continuing", "path", copiedTo, "error", err)
+			return nil
+		}
+		return err
+	}
+	if statErr == nil {
+		r.Log.Warn("the album folder in sorted_dir still exists after beets remove; it holds files that beets did not import", "path", copiedTo)
+	}
+	return nil
+}
+
+// RemoveMarker deletes folder/.ndignore when it is an empty regular file and
+// folder is strictly inside one of musicFolders. It leaves a marker with
+// content in place, because wn-server writes only empty markers. It reports
+// whether it removed the file.
+func (r *Runner) RemoveMarker(folder string, musicFolders []string) (bool, error) {
+	if !filepath.IsAbs(folder) {
+		return false, fmt.Errorf("folder %q is not absolute", folder)
+	}
+	roots, err := absPaths(musicFolders)
+	if err != nil {
+		return false, err
+	}
+	for i, root := range roots {
+		roots[i] = resolvePath(root)
+	}
+	folder = resolvePath(folder)
+	if !insideAny(folder, roots) {
+		r.Log.Warn("not removing .ndignore: folder is a music folder itself or outside the music folders", "folder", folder)
+		return false, nil
+	}
+	path := filepath.Join(folder, markerName)
+	info, err := os.Lstat(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	if !info.Mode().IsRegular() || info.Size() != 0 {
+		r.Log.Warn("not removing .ndignore: it is not an empty file", "path", path)
+		return false, nil
+	}
+	if err := os.Remove(path); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// resolveExisting resolves symlinks in the longest existing prefix of path
+// and appends the rest. It returns path cleaned when no prefix resolves.
+func resolveExisting(path string) string {
+	path = filepath.Clean(path)
+	var rest []string
+	for p := path; ; p = filepath.Dir(p) {
+		if real, err := filepath.EvalSymlinks(p); err == nil {
+			return filepath.Join(append([]string{real}, rest...)...)
+		}
+		if filepath.Dir(p) == p {
+			return path
+		}
+		rest = append([]string{filepath.Base(p)}, rest...)
+	}
+}
+
+// run starts `beet --config <beets.yaml> <args>` and waits for it.
+func (r *Runner) run(ctx context.Context, args ...string) error {
+	cmd := exec.CommandContext(ctx, r.BeetsBin, append([]string{"--config", r.Config.Path()}, args...)...)
 	cmd.Env = r.env()
 	stdout := &lineWriter{log: r.Log, level: slog.LevelDebug}
 	stderr := &lineWriter{log: r.Log, level: slog.LevelInfo}
@@ -173,7 +339,6 @@ func (r *Runner) run(ctx context.Context, folders []string) error {
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = killWait
-	r.Log.Info("running beets import", "bin", r.BeetsBin, "folders", len(folders))
 	err := cmd.Run()
 	stdout.flush()
 	stderr.flush()
@@ -181,10 +346,10 @@ func (r *Runner) run(ctx context.Context, folders []string) error {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			if last := stderr.lastLine(); last != "" {
-				return fmt.Errorf("beets import: %w: %s", err, last)
+				return fmt.Errorf("beets %s: %w: %s", args[0], err, last)
 			}
 		}
-		return fmt.Errorf("beets import: %w", err)
+		return fmt.Errorf("beets %s: %w", args[0], err)
 	}
 	return nil
 }
