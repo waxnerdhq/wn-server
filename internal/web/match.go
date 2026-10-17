@@ -90,15 +90,12 @@ func (s *server) matchPage(w http.ResponseWriter, r *http.Request, _ store.Sessi
 // or the last finished job once.
 func (s *server) renderMatch(w http.ResponseWriter, r *http.Request, status int, all bool, message, notice string) {
 	ctx := r.Context()
-	jobs := s.Jobs.Take()
+	jobs := s.Jobs.Status()
 	data := matchData{page: s.signedIn("Match review", "match"), All: all, Busy: jobs.Running != nil, Message: message, Notice: notice}
 	data.Wide = true
 	if jobs.Running != nil {
 		data.Running = &jobView{Label: jobLabel(jobs.Running.Kind, jobs.Running.EntryID), Time: jobs.Running.StartedAt}
 		data.RefreshURL = matchURL(all, "")
-	}
-	if l := jobs.Last; l != nil {
-		data.Last = &jobView{Label: jobLabel(l.Kind, l.EntryID), Time: l.FinishedAt, Summary: l.Summary, Error: l.Error, Finished: true}
 	}
 	var entries []store.MatchEntry
 	var err error
@@ -110,6 +107,15 @@ func (s *server) renderMatch(w http.ResponseWriter, r *http.Request, status int,
 	if err != nil {
 		s.internalError(w, r, "list match entries", err)
 		return
+	}
+	// The result is taken only when the page is about to be sent. A HEAD
+	// request does not take it.
+	last := jobs.Last
+	if r.Method != http.MethodHead {
+		last = s.Jobs.Take().Last
+	}
+	if l := last; l != nil {
+		data.Last = &jobView{Label: jobLabel(l.Kind, l.EntryID), Time: l.FinishedAt, Summary: l.Summary, Error: l.Error, Finished: true}
 	}
 	for _, e := range entries {
 		row := matchRow{MatchEntry: e, Busy: data.Busy, All: all}

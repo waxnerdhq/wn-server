@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 	"time"
 )
@@ -78,9 +79,14 @@ func NewJobs(ctx context.Context, logger *slog.Logger) *Jobs {
 // Start runs fn in the background as a job of the given kind. It returns
 // ErrJobRunning when a job is running. fn returns the one-line summary and
 // an error; both are kept as the job's result. A panic in fn becomes an
-// error.
+// error. Start returns the context's error once the context has ended, so
+// no job starts during a shutdown.
 func (j *Jobs) Start(kind Kind, entryID int64, fn func(ctx context.Context) (string, error)) error {
 	j.mu.Lock()
+	if err := j.ctx.Err(); err != nil {
+		j.mu.Unlock()
+		return err
+	}
 	if j.running != nil {
 		j.mu.Unlock()
 		return ErrJobRunning
@@ -113,6 +119,7 @@ func (j *Jobs) Start(kind Kind, entryID int64, fn func(ctx context.Context) (str
 func (j *Jobs) call(fn func(ctx context.Context) (string, error)) (summary string, err error) {
 	defer func() {
 		if p := recover(); p != nil {
+			j.log.Error("match job panicked", "panic", p, "stack", string(debug.Stack()))
 			err = fmt.Errorf("job panicked: %v", p)
 		}
 	}()
