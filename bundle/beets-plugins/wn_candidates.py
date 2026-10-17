@@ -16,8 +16,11 @@ wn-server reads the file named by the ``output`` option after
   ``applied`` lines.
 - ``release_id``: the MusicBrainz release that beets applied. Only on
   ``applied`` lines.
-- ``reason``: ``requested_release_id`` on the ``applied`` line of an album
-  whose release the ``apply_release_id`` option chose.
+- ``reason``: on the ``applied`` line of an album whose match the plugin
+  chose. ``requested_release_id`` means the ``apply_release_id`` option chose
+  the release. ``existing_release_id`` means every file already carried the
+  id of the best candidate and its distance was at most
+  ``match.medium_rec_thresh``.
 - ``error``: the message. Only on ``error`` lines.
 
 Events used (beets 2.14):
@@ -30,6 +33,10 @@ Events used (beets 2.14):
   ``wn-server match apply`` only. The handler then also adds the folder to
   beets' incremental history after the album is imported, because the apply
   run uses ``-I``, which records no history.
+  When ``apply_release_id`` is not set, the handler returns the best
+  candidate if every item has the same non-empty ``mb_albumid``, that id is
+  the best candidate's release id, and its distance is at most
+  ``match.medium_rec_thresh``. Otherwise it returns None and beets decides.
 - ``import_task_choice`` runs after beets chose a match. The candidates and
   the original tags are recorded here, because ``task.items`` change once the
   match is applied. A task whose choice is SKIP is written at once.
@@ -62,6 +69,7 @@ import os
 import threading
 from collections import Counter
 
+from beets import config as beets_config
 from beets.importer import Action
 from beets.plugins import BeetsPlugin
 from beets.util import extension as _extension
@@ -141,6 +149,18 @@ def _candidates(task):
     return out
 
 
+def _existing_id_match(item_ids, candidate_id, distance, threshold):
+    """True when every item carries the same non-empty release id, that id is
+    the candidate's release id, and the distance is at most the threshold."""
+    ids = set(item_ids)
+    if len(ids) != 1:
+        return False
+    (only,) = ids
+    if not only or only != candidate_id:
+        return False
+    return distance <= threshold
+
+
 def _flag_name(value):
     return getattr(value, "name", None) or _str(value)
 
@@ -157,8 +177,8 @@ class WnCandidatesPlugin(BeetsPlugin):
         # id(task) -> (task, line) for tasks that chose a match and have no
         # final decision yet.
         self._pending = {}
-        # id(task) of tasks whose match on_before_choice chose.
-        self._requested = set()
+        # id(task) -> reason for tasks whose match on_before_choice chose.
+        self._requested = {}
         self.register_listener("import_task_before_choice", self.on_before_choice)
         self.register_listener("import_task_choice", self.on_choice)
         self.register_listener("album_imported", self.on_album_imported)
@@ -203,25 +223,47 @@ class WnCandidatesPlugin(BeetsPlugin):
     def on_before_choice(self, session, task):
         """Return the candidate whose release id is apply_release_id, or
         SKIP. beets' choose_match takes the returned match as the decision
-        before its own quiet mode judgment. Return None when the option is
-        not set, so beets decides as usual."""
+        before its own quiet mode judgment. When the option is not set,
+        return the best candidate if the files already carry its release id
+        (see _existing_id_match), and None otherwise, so beets decides as
+        usual."""
         try:
             release = self.config["apply_release_id"].as_str()
             if not release:
-                return None
+                return self._existing_id_choice(task)
             target = self.config["apply_folder"].as_str()
             if target and os.path.normpath(_folder(task)) != os.path.normpath(target):
                 return Action.SKIP
             for match in list(task.candidates or []):
                 if _str(getattr(match.info, "album_id", None)) == release:
                     with self._lock:
-                        self._requested.add(id(task))
+                        self._requested[id(task)] = "requested_release_id"
                     return match
             self._log.info("wn_candidates: release {} is not a candidate for {}", release, _folder(task))
             return Action.SKIP
         except Exception as exc:  # noqa: BLE001
             self._log.error("wn_candidates: cannot choose the requested release: {}", exc)
             return Action.SKIP
+
+    def _existing_id_choice(self, task):
+        if not getattr(task, "is_album", False):
+            return None
+        candidates = list(task.candidates or [])
+        items = list(task.items or [])
+        if not candidates or not items:
+            return None
+        best = candidates[0]
+        threshold = beets_config["match"]["medium_rec_thresh"].as_number()
+        if not _existing_id_match(
+            [_str(getattr(i, "mb_albumid", None)) for i in items],
+            _str(getattr(best.info, "album_id", None)),
+            float(best.distance.distance),
+            threshold,
+        ):
+            return None
+        with self._lock:
+            self._requested[id(task)] = "existing_release_id"
+        return best
 
     def on_choice(self, session, task):
         folder = ""
@@ -241,9 +283,9 @@ class WnCandidatesPlugin(BeetsPlugin):
                 if match is not None:
                     line["release_id"] = _str(getattr(match.info, "album_id", None))
                 with self._lock:
-                    if id(task) in self._requested:
-                        self._requested.discard(id(task))
-                        line["reason"] = "requested_release_id"
+                    reason = self._requested.pop(id(task), None)
+                    if reason:
+                        line["reason"] = reason
                     self._pending[id(task)] = (task, line)
                 return
             line["decision"] = "skipped"
