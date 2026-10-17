@@ -21,7 +21,8 @@ import (
 const (
 	exchangeWindow      = 10 * time.Minute
 	exchangeMaxPerAddr  = 5
-	exchangeMaxTotal    = 30
+	exchangeMaxTotal    = 10
+	exchangeReadTimeout = 10 * time.Second
 	maxDeviceLength     = 100
 	maxSessionBodyBytes = 4 << 10
 	// touchInterval is the least time between two writes of a session's
@@ -156,12 +157,15 @@ type exchangeError struct {
 }
 
 var (
-	errNotLinked  = &exchangeError{http.StatusConflict, "not_linked", "this server is not linked to waxnerd; run `wn-server login` on the server", false}
-	errBadCode    = &exchangeError{http.StatusUnauthorized, "invalid_code", "the code is invalid, expired, or already used; get a new code", true}
-	errNotOwner   = &exchangeError{http.StatusForbidden, "not_owner", "the code was issued by a waxnerd user who does not own this server", true}
-	errLimited    = &exchangeError{http.StatusTooManyRequests, "rate_limited", "too many failed attempts; try again later", false}
-	errCloud      = &exchangeError{http.StatusBadGateway, "cloud_error", "wn-cloud refused this server's credential; the owner must run `wn-server login` again", false}
-	errCloudDown  = &exchangeError{http.StatusServiceUnavailable, "cloud_unreachable", "wn-cloud is unreachable; try again later or use the app password", false}
+	errNotLinked = &exchangeError{http.StatusConflict, "not_linked", "this server is not linked to waxnerd; run `wn-server login` on the server", false}
+	errBadCode   = &exchangeError{http.StatusUnauthorized, "invalid_code", "the code is invalid, expired, or already used; get a new code", true}
+	errNotOwner  = &exchangeError{http.StatusForbidden, "not_owner", "the code was issued by a waxnerd user who does not own this server", true}
+	errLimited   = &exchangeError{http.StatusTooManyRequests, "rate_limited", "too many failed attempts; try again later", false}
+	errCloud     = &exchangeError{http.StatusBadGateway, "cloud_error", "wn-cloud refused this server's credential; the owner must run `wn-server logout`, then `wn-server login`", false}
+	errCloudDown = &exchangeError{http.StatusServiceUnavailable, "cloud_unreachable", "wn-cloud is unreachable; try again later or use the app password", false}
+	// errCanceled is a verification that ended because the client went
+	// away. It counts, because wn-cloud may have seen the code.
+	errCanceled   = &exchangeError{http.StatusServiceUnavailable, "cloud_unreachable", "the request was canceled", true}
 	errInternal   = &exchangeError{http.StatusInternalServerError, "internal", "internal error", false}
 	errBadRequest = func(msg string) *exchangeError {
 		return &exchangeError{http.StatusBadRequest, "invalid_request", msg, true}
@@ -186,7 +190,16 @@ type exchangeAccount struct {
 // exchange serves POST /api/v1/session: it verifies a device code at
 // wn-cloud and issues a session for the owner.
 func (s *sessions) exchange(w http.ResponseWriter, r *http.Request) {
+	// The server sets only ReadHeaderTimeout. A slow body must not hold the
+	// handler.
+	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(exchangeReadTimeout))
 	addr := remoteHost(r)
+	code, device, xerr := readExchange(w, r)
+	if xerr != nil {
+		s.limiter.fail(addr)
+		s.refuse(w, addr, xerr)
+		return
+	}
 	if !s.limiter.acquire(addr) {
 		s.refuse(w, addr, errLimited)
 		return
@@ -194,12 +207,13 @@ func (s *sessions) exchange(w http.ResponseWriter, r *http.Request) {
 	failed := false
 	defer func() { s.limiter.release(addr, failed) }()
 
-	token, owner, xerr := s.exchangeCode(w, r)
+	token, owner, xerr := s.exchangeCode(r.Context(), addr, code, device)
+	if r.Context().Err() != nil {
+		failed = true
+		return
+	}
 	if xerr != nil {
 		failed = xerr.counted
-		if r.Context().Err() != nil {
-			return
-		}
 		s.refuse(w, addr, xerr)
 		return
 	}
@@ -207,32 +221,36 @@ func (s *sessions) exchange(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, exchangeResponse{Token: token, Account: exchangeAccount{ID: owner.ID, Name: owner.Name}})
 }
 
-func (s *sessions) exchangeCode(w http.ResponseWriter, r *http.Request) (string, store.Account, *exchangeError) {
-	ctx := r.Context()
+// readExchange decodes and validates the request body. It returns the
+// normalized code and the trimmed device label.
+func readExchange(w http.ResponseWriter, r *http.Request) (code, device string, xerr *exchangeError) {
 	var req exchangeRequest
 	if err := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxSessionBodyBytes)).Decode(&req); err != nil {
-		return "", store.Account{}, errBadRequest("the body is not valid JSON")
+		return "", "", errBadRequest("the body is not valid JSON")
 	}
 	code, ok := normalizeDeviceCode(req.Code)
 	if !ok {
-		return "", store.Account{}, errBadRequest("code must be 8 characters of the device code alphabet")
+		return "", "", errBadRequest("code must be 8 characters of the device code alphabet")
 	}
-	device := strings.TrimSpace(req.Device)
+	device = strings.TrimSpace(req.Device)
 	if !validDevice(device) {
-		return "", store.Account{}, errBadRequest("device must be at most 100 characters without control characters")
+		return "", "", errBadRequest("device must be at most 100 characters without control characters")
 	}
+	return code, device, nil
+}
 
+func (s *sessions) exchangeCode(ctx context.Context, addr, code, device string) (string, store.Account, *exchangeError) {
 	cred, err := s.store.ServerCredential(ctx)
 	if errors.Is(err, store.ErrNoServerCredential) {
 		return "", store.Account{}, errNotLinked
 	}
 	if err != nil {
-		s.logger.Error("read server credential", "error", err)
+		s.logger.Error("read server credential", "remote", addr, "error", err)
 		return "", store.Account{}, errInternal
 	}
 	owner, err := s.store.Owner(ctx)
 	if err != nil {
-		s.logger.Error("read owner account", "error", err)
+		s.logger.Error("read owner account", "remote", addr, "error", err)
 		return "", store.Account{}, errInternal
 	}
 	if owner.WaxnerdUserID == "" {
@@ -247,12 +265,15 @@ func (s *sessions) exchangeCode(w http.ResponseWriter, r *http.Request) (string,
 	case errors.Is(err, wncloud.ErrRateLimited):
 		return "", store.Account{}, errLimited
 	case errors.Is(err, wncloud.ErrUnreachable):
+		if ctx.Err() != nil {
+			return "", store.Account{}, errCanceled
+		}
 		s.logUnreachable(err)
 		return "", store.Account{}, errCloudDown
 	default:
 		if ctx.Err() == nil {
-			s.logger.Error("wn-cloud refused the device code verification; run `wn-server login` again if the server credential no longer works",
-				"server", cred.ServerID, "error", err)
+			s.logger.Error("wn-cloud refused the device code verification; if the server credential no longer works, run `wn-server logout`, then `wn-server login`",
+				"server", cred.ServerID, "remote", addr, "error", err)
 		}
 		return "", store.Account{}, errCloud
 	}
@@ -262,7 +283,7 @@ func (s *sessions) exchangeCode(w http.ResponseWriter, r *http.Request) (string,
 
 	token, sess, err := s.store.CreateSession(ctx, owner.ID, device)
 	if err != nil {
-		s.logger.Error("create session", "error", err)
+		s.logger.Error("create session", "remote", addr, "error", err)
 		return "", store.Account{}, errInternal
 	}
 	s.logger.Info("session created", "session", sess.ID, "account", owner.ID, "device", device)
@@ -388,6 +409,22 @@ func (l *limiter) acquire(addr string) bool {
 	l.pending[addr]++
 	l.pendingTotal++
 	return true
+}
+
+// fail records a failed exchange that did not acquire a slot, such as a
+// malformed request. While a limit is reached it records nothing, so the
+// lists stay bounded.
+func (l *limiter) fail(addr string) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.prune()
+	if len(l.failures[addr])+l.pending[addr] >= exchangeMaxPerAddr ||
+		len(l.total)+l.pendingTotal >= exchangeMaxTotal {
+		return
+	}
+	now := l.now()
+	l.failures[addr] = append(l.failures[addr], now)
+	l.total = append(l.total, now)
 }
 
 // release ends an exchange. A failed exchange is recorded.

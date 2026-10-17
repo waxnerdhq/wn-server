@@ -75,7 +75,7 @@ func subsonicAuth(st Store, sess *sessions, logger *slog.Logger, next http.Handl
 				}
 				if !errors.Is(err, store.ErrSessionNotFound) {
 					logger.Error("look up session", "error", err)
-					writeSubsonicError(w, params, errWrongCredential, "Wrong username or password")
+					writeSubsonicError(w, params, errGeneric, "internal error")
 					return
 				}
 				logger.Warn("subsonic session unknown", "remote", r.RemoteAddr)

@@ -101,6 +101,18 @@ func TestSessionExchange(t *testing.T) {
 	e.cloud.AddUser(otherID, "other@example.com")
 	e.exchange(t, e.cloud.IssueDeviceCode(serverID, otherID), http.StatusForbidden, "not_owner")
 
+	ctx := context.Background()
+	// A server credential that wn-cloud does not know.
+	if err := e.st.Link(ctx, e.owner.ID, store.ServerCredential{Token: "wn_revoked", ServerID: serverID, WaxnerdUserID: waxnerdID}); err != nil {
+		t.Fatal(err)
+	}
+	e.exchange(t, e.cloud.IssueDeviceCode(serverID, waxnerdID), http.StatusBadGateway, "cloud_error")
+	if err := e.st.Unlink(ctx, e.owner.ID); err != nil {
+		t.Fatal(err)
+	}
+	e.exchange(t, e.cloud.IssueDeviceCode(serverID, waxnerdID), http.StatusConflict, "not_linked")
+	e.link(t)
+
 	// The code is accepted in lower case and with spaces.
 	code := strings.ToLower(strings.Replace(e.cloud.IssueDeviceCode(serverID, waxnerdID), "-", " ", 1))
 	out := e.exchange(t, code, http.StatusOK, "")
@@ -131,6 +143,9 @@ func TestSessionExchange(t *testing.T) {
 	}
 	if c := subsonicCode(t, e, "/rest/ping.view?apiKey="+out.Token, out.Token); c != errMultipleAuth {
 		t.Fatalf("apiKey with Bearer: error %d, want %d", c, errMultipleAuth)
+	}
+	if c := subsonicCode(t, e, "/rest/ping.view?"+creds(), out.Token); c != errMultipleAuth {
+		t.Fatalf("Bearer with u, t, s: error %d, want %d", c, errMultipleAuth)
 	}
 	if c := subsonicCode(t, e, "/rest/ping.view?apiKey=wns_unknown", ""); c != errInvalidAPIKey {
 		t.Fatalf("unknown apiKey: error %d, want %d", c, errInvalidAPIKey)
