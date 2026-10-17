@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/waxnerdhq/wn-server/internal/match"
 	"github.com/waxnerdhq/wn-server/internal/navidrome"
 	"github.com/waxnerdhq/wn-server/internal/store"
 )
@@ -29,10 +30,35 @@ func (fakeScanner) ScanStatus(context.Context) (navidrome.ScanStatus, error) {
 	return navidrome.ScanStatus{Count: 12, FolderCount: 3}, nil
 }
 
+// fakeMatcher stands in for the match service. Apply blocks until release is
+// closed.
+type fakeMatcher struct {
+	started chan int64
+	release chan struct{}
+}
+
+func (f *fakeMatcher) Run(context.Context) (match.RunResult, error) {
+	return match.RunResult{Reported: true, Pending: 0}, nil
+}
+
+func (f *fakeMatcher) Apply(_ context.Context, id int64, _ string) (match.ApplyResult, error) {
+	f.started <- id
+	<-f.release
+	return match.ApplyResult{ID: id, Folder: "/music/x", CopiedTo: "/sorted/x"}, nil
+}
+
+func (f *fakeMatcher) Dismiss(context.Context, int64) (string, error) { return "/music/x", nil }
+
+func (f *fakeMatcher) Revert(context.Context, int64) (match.RevertResult, error) {
+	return match.RevertResult{}, errors.New("not used")
+}
+
 type env struct {
 	srv   *httptest.Server
 	st    *store.Store
 	owner store.Account
+	match *fakeMatcher
+	jobs  *match.Jobs
 }
 
 func newEnv(t *testing.T) *env {
@@ -52,8 +78,12 @@ func newEnv(t *testing.T) *env {
 	}
 	ready := make(chan struct{})
 	close(ready)
+	fake := &fakeMatcher{started: make(chan int64, 4), release: make(chan struct{})}
+	jobs := match.NewJobs(context.Background(), slog.New(slog.DiscardHandler))
 	srv := httptest.NewServer(New(Options{
 		Store:            st,
+		Match:            fake,
+		Jobs:             jobs,
 		Navidrome:        fakeScanner{},
 		Ready:            ready,
 		ServerName:       "test",
@@ -61,12 +91,19 @@ func newEnv(t *testing.T) *env {
 		Logger:           slog.New(slog.DiscardHandler),
 	}))
 	t.Cleanup(srv.Close)
-	return &env{srv: srv, st: st, owner: owner}
+	return &env{srv: srv, st: st, owner: owner, match: fake, jobs: jobs}
 }
 
 // do sends a request without following redirects. form, when not nil, is
 // sent as a urlencoded body.
 func (e *env) do(t *testing.T, method, path string, form url.Values, cookie *http.Cookie, origin string) *http.Response {
+	t.Helper()
+	resp, _ := e.doBody(t, method, path, form, cookie, origin)
+	return resp
+}
+
+// doBody is do with the response body.
+func (e *env) doBody(t *testing.T, method, path string, form url.Values, cookie *http.Cookie, origin string) (*http.Response, string) {
 	t.Helper()
 	var body io.Reader
 	if form != nil {
@@ -90,9 +127,9 @@ func (e *env) do(t *testing.T, method, path string, form url.Values, cookie *htt
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, _ = io.Copy(io.Discard, resp.Body)
+	b, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	return resp
+	return resp, string(b)
 }
 
 func sessionCookie(resp *http.Response) *http.Cookie {
@@ -250,5 +287,83 @@ func TestLimiterTotal(t *testing.T) {
 	}
 	if l.begin("192.0.2.1") {
 		t.Fatal("allowed a new address above the total")
+	}
+}
+
+func TestMatchPageGuard(t *testing.T) {
+	e := newEnv(t)
+	for _, tc := range []struct{ method, path string }{
+		{http.MethodGet, "/ui/match"},
+		{http.MethodPost, "/ui/match/run"},
+		{http.MethodPost, "/ui/match/1/apply"},
+	} {
+		resp := e.do(t, tc.method, tc.path, url.Values{}, nil, "")
+		if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/ui/login" {
+			t.Fatalf("%s %s without a cookie: status %d, location %q", tc.method, tc.path, resp.StatusCode, resp.Header.Get("Location"))
+		}
+	}
+}
+
+func TestMatchApplyJob(t *testing.T) {
+	const release = "1a2b3c4d-5e6f-7081-92a3-b4c5d6e7f809"
+	e := newEnv(t)
+	c := e.signIn(t)
+	id, err := e.st.RecordMatch(context.Background(), store.MatchLine{
+		Folder: "/music/Rip 2004", Decision: store.LineSkipped, Artist: "Various", Album: "Rip 2004", TrackCount: 11,
+		Candidates: []store.MatchCandidate{{ReleaseID: release, Artist: "Various Artists", Album: "Rip It Up", Year: 2004, Distance: 0.41}},
+	}, time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	resp, body := e.doBody(t, http.MethodGet, "/ui/match", nil, c, "")
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, "/music/Rip 2004") ||
+		!strings.Contains(body, "https://musicbrainz.org/release/"+release) || strings.Contains(body, "http-equiv=\"refresh\"") {
+		t.Fatalf("idle page: status %d\n%s", resp.StatusCode, body)
+	}
+
+	applyPath := fmt.Sprintf("/ui/match/%d/apply", id)
+	resp = e.do(t, http.MethodPost, applyPath, url.Values{"release": {release}}, c, e.srv.URL)
+	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/ui/match" {
+		t.Fatalf("apply: status %d, location %q", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	select {
+	case got := <-e.match.started:
+		if got != id {
+			t.Fatalf("job applied entry %d, want %d", got, id)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the apply job did not start")
+	}
+
+	// A second POST while the job runs answers 409.
+	for _, path := range []string{applyPath, "/ui/match/run", fmt.Sprintf("/ui/match/%d/dismiss", id)} {
+		resp, body = e.doBody(t, http.MethodPost, path, url.Values{}, c, "")
+		if resp.StatusCode != http.StatusConflict || !strings.Contains(body, "Another match job is running") {
+			t.Fatalf("POST %s while a job runs: status %d", path, resp.StatusCode)
+		}
+	}
+	resp, body = e.doBody(t, http.MethodGet, "/ui/match", nil, c, "")
+	if resp.StatusCode != http.StatusOK || !strings.Contains(body, "http-equiv=\"refresh\"") || !strings.Contains(body, "apply of entry") ||
+		!strings.Contains(body, "disabled") {
+		t.Fatalf("page while a job runs: status %d\n%s", resp.StatusCode, body)
+	}
+
+	// After the job, the page shows its result once.
+	close(e.match.release)
+	deadline := time.Now().Add(5 * time.Second)
+	for e.jobs.Status().Running != nil {
+		if time.Now().After(deadline) {
+			t.Fatal("the apply job did not finish")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	_, body = e.doBody(t, http.MethodGet, "/ui/match", nil, c, "")
+	if !strings.Contains(body, "applied entry") || strings.Contains(body, "http-equiv=\"refresh\"") {
+		t.Fatalf("page after the job:\n%s", body)
+	}
+	_, body = e.doBody(t, http.MethodGet, "/ui/match", nil, c, "")
+	if strings.Contains(body, "Last job") {
+		t.Fatalf("the result showed twice:\n%s", body)
 	}
 }

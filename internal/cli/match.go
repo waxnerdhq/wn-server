@@ -1,25 +1,21 @@
 package cli
 
 import (
-	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"os"
 	"os/signal"
-	"slices"
 	"strconv"
-	"strings"
 	"syscall"
 	"text/tabwriter"
-	"time"
 
 	"github.com/spf13/cobra"
 
 	"github.com/waxnerdhq/wn-server/internal/beets"
 	"github.com/waxnerdhq/wn-server/internal/config"
+	"github.com/waxnerdhq/wn-server/internal/match"
 	"github.com/waxnerdhq/wn-server/internal/navidrome"
 	"github.com/waxnerdhq/wn-server/internal/store"
 )
@@ -33,31 +29,27 @@ func newMatchCmd() *cobra.Command {
 			"Every album beets saw is recorded in the match queue. The subcommands list, apply, dismiss, and revert entries.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, st, err := openMatch(cmd)
+			svc, closeStore, err := openService(cmd)
 			if err != nil {
 				return err
 			}
-			defer st.Close()
+			defer closeStore()
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
-			r := beets.NewRunner(c, navidrome.NewClient(c.NavidromePort), slog.Default())
-			sum, err := r.Import(ctx, c.MusicFolders)
-			// Record what beets wrote, also after a cancel.
-			recErr := recordAlbums(context.WithoutCancel(ctx), st, sum.Albums, sum.MarkersWritten, slog.Default())
+			res, err := svc.Run(ctx)
 			out := cmd.OutOrStdout()
 			// A run that did not start, such as one the beets lock refused,
 			// prints neither the summary nor the queue count.
-			if err == nil || len(sum.Albums) > 0 {
-				printSummary(out, sum)
-				if n, cerr := st.CountMatches(context.WithoutCancel(ctx), store.MatchPending); cerr == nil {
-					if n == 0 {
-						fmt.Fprintln(out, "match queue: 0 pending")
-					} else {
-						fmt.Fprintf(out, "match queue: %d pending; `wn-server match list` shows them\n", n)
-					}
+			if res.Reported {
+				printSummary(out, res.Summary)
+				switch {
+				case res.Pending == 0:
+					fmt.Fprintln(out, "match queue: 0 pending")
+				case res.Pending > 0:
+					fmt.Fprintf(out, "match queue: %d pending; `wn-server match list` shows them\n", res.Pending)
 				}
 			}
-			return errors.Join(err, recErr)
+			return err
 		},
 	}
 	cmd.AddCommand(newMatchListCmd(), newMatchApplyCmd(), newMatchDismissCmd(), newMatchRevertCmd())
@@ -82,76 +74,29 @@ func openMatch(cmd *cobra.Command) (*config.Config, *store.Store, error) {
 	return c, st, nil
 }
 
-// openEntry loads the config, opens the store, and reads the entry whose id
-// is arg.
-func openEntry(cmd *cobra.Command, arg string) (*config.Config, *store.Store, store.MatchEntry, error) {
-	id, err := strconv.ParseInt(arg, 10, 64)
-	if err != nil || id <= 0 {
-		return nil, nil, store.MatchEntry{}, fmt.Errorf("entry id %q is not a positive number", arg)
-	}
+// openService loads the config, opens the store, and returns the match
+// service with the function that closes the store.
+func openService(cmd *cobra.Command) (*match.Service, func(), error) {
 	c, st, err := openMatch(cmd)
 	if err != nil {
-		return nil, nil, store.MatchEntry{}, err
+		return nil, nil, err
 	}
-	e, err := st.MatchEntry(cmd.Context(), id)
-	if err != nil {
-		st.Close()
-		if errors.Is(err, store.ErrMatchNotFound) {
-			err = fmt.Errorf("no match queue entry %d", id)
-		}
-		return nil, nil, store.MatchEntry{}, err
-	}
-	return c, st, e, nil
+	return match.NewService(c, st, navidrome.NewClient(c.NavidromePort), slog.Default()), func() { st.Close() }, nil
 }
 
-// recordAlbums records candidates lines in the match queue. markers holds
-// the folders whose .ndignore the run created. A line without a folder is
-// logged and skipped.
-func recordAlbums(ctx context.Context, st *store.Store, albums []beets.Album, markers []string, logger *slog.Logger) error {
-	now := time.Now()
-	var errs []error
-	for _, a := range albums {
-		if a.Folder == "" {
-			logger.Warn("candidates line has no folder; not recorded in the match queue", "decision", a.Decision, "error", a.Error)
-			continue
-		}
-		l := matchLine(a)
-		l.MarkerWritten = a.Decision == beets.DecisionApplied && slices.Contains(markers, a.Folder)
-		if _, err := st.RecordMatch(ctx, l, now); err != nil {
-			errs = append(errs, err)
-		}
+// parseEntryID parses the id argument of an entry command.
+func parseEntryID(arg string) (int64, error) {
+	id, err := strconv.ParseInt(arg, 10, 64)
+	if err != nil || id <= 0 {
+		return 0, fmt.Errorf("entry id %q is not a positive number", arg)
 	}
-	return errors.Join(errs...)
-}
-
-// matchLine converts a candidates line for the store. An applied line from
-// an older plugin without release_id takes the first candidate, which is
-// the one beets applies in quiet mode.
-func matchLine(a beets.Album) store.MatchLine {
-	l := store.MatchLine{
-		Folder:     a.Folder,
-		Decision:   a.Decision,
-		Artist:     a.Tags.Artist,
-		Album:      a.Tags.Album,
-		Year:       a.Tags.Year,
-		TrackCount: a.Tags.TrackCount,
-		ReleaseID:  a.ReleaseID,
-		CopiedTo:   a.CopiedTo,
-		Error:      a.Error,
-	}
-	for _, c := range a.Candidates {
-		l.Candidates = append(l.Candidates, store.MatchCandidate(c))
-	}
-	if l.Decision == beets.DecisionApplied && l.ReleaseID == "" && len(l.Candidates) > 0 {
-		l.ReleaseID = l.Candidates[0].ReleaseID
-	}
-	return l
+	return id, nil
 }
 
 // printSummary prints the counts and one line per skipped album with its
 // best candidate.
 func printSummary(w io.Writer, sum beets.Summary) {
-	fmt.Fprintf(w, "applied %d, skipped %d, duplicates %d, errors %d\n", sum.Applied, sum.Skipped, sum.Duplicate, sum.Errors)
+	fmt.Fprintln(w, match.SummaryLine(sum))
 	for _, a := range sum.Albums {
 		if a.Decision != beets.DecisionSkipped {
 			continue
@@ -267,78 +212,22 @@ func newMatchApplyCmd() *cobra.Command {
 			"The release is the entry's first candidate unless --release names another.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, st, e, err := openEntry(cmd, args[0])
+			id, err := parseEntryID(args[0])
 			if err != nil {
 				return err
 			}
-			defer st.Close()
-			if e.State != store.MatchPending && e.State != store.MatchDismissed {
-				return fmt.Errorf("entry %d is %s; only a pending or dismissed entry can be applied", e.ID, e.State)
+			svc, closeStore, err := openService(cmd)
+			if err != nil {
+				return err
 			}
-			release = strings.ToLower(strings.TrimSpace(release))
-			if release == "" {
-				if len(e.Candidates) == 0 {
-					return fmt.Errorf("entry %d has no candidates; pass --release <MusicBrainz release id>", e.ID)
-				}
-				release = e.Candidates[0].ReleaseID
-			}
-			if !beets.ValidReleaseID(release) {
-				return fmt.Errorf("release id %q is not a MusicBrainz id (a UUID)", release)
-			}
+			defer closeStore()
 			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
 			defer stop()
-			logger := slog.Default()
-			logger.Info("applying match", "id", e.ID, "folder", e.Folder, "release_id", release)
-			r := beets.NewRunner(c, navidrome.NewClient(c.NavidromePort), logger)
-			sum, runErr := r.Apply(ctx, e.Folder, release, c.MusicFolders)
-			if runErr != nil && len(sum.Albums) == 0 {
-				// beets did not run, or wrote nothing.
-				return runErr
-			}
-			// Only the entry's own applied line is used. With -S, any other
-			// line for the folder holds the requested release or no
-			// candidate. Other albums below the folder were skipped by the
-			// plugin for the same reason.
-			var applied []beets.Album
-			reason := "beets wrote no line for the folder"
-			for _, a := range sum.Albums {
-				if a.Folder != e.Folder {
-					continue
-				}
-				if a.Decision == beets.DecisionApplied {
-					applied = append(applied, a)
-					continue
-				}
-				reason = "decision " + a.Decision
-				if a.Error != "" {
-					reason += ": " + a.Error
-				}
-			}
-			bg := context.WithoutCancel(ctx)
-			if len(applied) == 0 {
-				msg := fmt.Sprintf("match apply: beets did not apply release %s (%s)", release, reason)
-				noteErr := st.NoteMatchError(bg, e.ID, msg, time.Now())
-				if runErr == nil {
-					runErr = fmt.Errorf("beets did not apply release %s to %s (%s); see the log for beets' output", release, e.Folder, reason)
-				}
-				return errors.Join(runErr, noteErr)
-			}
-			// MarkApplied leaves the tags and candidates alone, because this run
-			// looked up only the requested release.
-			a := applied[len(applied)-1]
-			if a.ReleaseID != "" {
-				release = a.ReleaseID
-			}
-			markerWritten := slices.Contains(sum.MarkersWritten, e.Folder)
-			if err := st.MarkApplied(bg, e.ID, release, a.CopiedTo, markerWritten, time.Now()); err != nil || runErr != nil {
-				return errors.Join(runErr, err)
-			}
-			got, err := st.MatchEntry(bg, e.ID)
+			res, err := svc.Apply(ctx, id, release)
 			if err != nil {
 				return err
 			}
-			logger.Info("applied match", "id", e.ID, "folder", e.Folder, "release_id", got.AppliedReleaseID, "copied_to", got.CopiedTo)
-			fmt.Fprintf(cmd.OutOrStdout(), "applied entry %d: %s copied to %s\n", e.ID, e.Folder, got.CopiedTo)
+			fmt.Fprintln(cmd.OutOrStdout(), res.Line())
 			return nil
 		},
 	}
@@ -352,18 +241,20 @@ func newMatchDismissCmd() *cobra.Command {
 		Short: "Mark a match queue entry as dismissed; nothing on disk changes",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			_, st, e, err := openEntry(cmd, args[0])
+			id, err := parseEntryID(args[0])
 			if err != nil {
 				return err
 			}
-			defer st.Close()
-			if e.State == store.MatchApplied {
-				return fmt.Errorf("entry %d is applied; run `wn-server match revert %d` first", e.ID, e.ID)
-			}
-			if err := st.SetMatchState(cmd.Context(), e.ID, store.MatchDismissed); err != nil {
+			svc, closeStore, err := openService(cmd)
+			if err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "dismissed entry %d: %s\n", e.ID, e.Folder)
+			defer closeStore()
+			folder, err := svc.Dismiss(cmd.Context(), id)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(cmd.OutOrStdout(), "dismissed entry %d: %s\n", id, folder)
 			return nil
 		},
 	}
@@ -378,41 +269,22 @@ func newMatchRevertCmd() *cobra.Command {
 			"lists the folder, so `wn-server match` does not offer it again. `wn-server match apply` tags it again.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			c, st, e, err := openEntry(cmd, args[0])
+			id, err := parseEntryID(args[0])
 			if err != nil {
 				return err
 			}
-			defer st.Close()
-			if e.State != store.MatchApplied {
-				return fmt.Errorf("entry %d is %s; only an applied entry can be reverted", e.ID, e.State)
-			}
-			if e.CopiedTo == "" {
-				return fmt.Errorf("entry %d has no copied_to; nothing to revert", e.ID)
-			}
-			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
-			defer stop()
-			logger := slog.Default()
-			logger.Info("reverting match", "id", e.ID, "folder", e.Folder, "release_id", e.AppliedReleaseID, "copied_to", e.CopiedTo)
-			r := beets.NewRunner(c, navidrome.NewClient(c.NavidromePort), logger)
-			if err := r.Remove(ctx, e.CopiedTo); err != nil {
+			svc, closeStore, err := openService(cmd)
+			if err != nil {
 				return err
 			}
-			// The copy is gone. The remaining steps run to the end.
-			bg := context.WithoutCancel(ctx)
-			// Only a marker that wn-server created is removed.
-			var markerErr error
-			if e.MarkerWritten {
-				if _, err := r.RemoveMarker(e.Folder, c.MusicFolders); err != nil {
-					markerErr = fmt.Errorf("remove .ndignore from %s: %w", e.Folder, err)
-				}
+			defer closeStore()
+			ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+			defer stop()
+			res, err := svc.Revert(ctx, id)
+			if res.Reverted {
+				fmt.Fprintf(cmd.OutOrStdout(), "%s `wn-server match apply %d` tags it again.\n", res.Line(), res.ID)
 			}
-			if err := st.RevertMatch(bg, e.ID); err != nil {
-				return errors.Join(err, markerErr)
-			}
-			r.Scan(bg)
-			logger.Info("reverted match", "id", e.ID, "folder", e.Folder, "release_id", e.AppliedReleaseID)
-			fmt.Fprintf(cmd.OutOrStdout(), "reverted entry %d; it is pending again. `wn-server match apply %d` tags it again.\n", e.ID, e.ID)
-			return markerErr
+			return err
 		},
 	}
 }

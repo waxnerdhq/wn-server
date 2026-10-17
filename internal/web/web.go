@@ -13,9 +13,11 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"strconv"
 	"strings"
 	"time"
 
+	"github.com/waxnerdhq/wn-server/internal/match"
 	"github.com/waxnerdhq/wn-server/internal/navidrome"
 	"github.com/waxnerdhq/wn-server/internal/store"
 	"github.com/waxnerdhq/wn-server/internal/wncloud"
@@ -55,6 +57,20 @@ type Store interface {
 	Sessions(ctx context.Context, accountID string) ([]store.Session, error)
 	RevokeSession(ctx context.Context, id string) error
 	RevokeSessionByToken(ctx context.Context, token string) (store.Session, error)
+	// MatchEntries returns the entries in the given states, or every entry
+	// when there are none.
+	MatchEntries(ctx context.Context, states ...store.MatchState) ([]store.MatchEntry, error)
+	// MatchEntry returns store.ErrMatchNotFound for an unknown id.
+	MatchEntry(ctx context.Context, id int64) (store.MatchEntry, error)
+	CountMatches(ctx context.Context, state store.MatchState) (int, error)
+}
+
+// Matcher runs the match actions. *match.Service implements it.
+type Matcher interface {
+	Run(ctx context.Context) (match.RunResult, error)
+	Apply(ctx context.Context, id int64, release string) (match.ApplyResult, error)
+	Dismiss(ctx context.Context, id int64) (folder string, err error)
+	Revert(ctx context.Context, id int64) (match.RevertResult, error)
 }
 
 // Scanner reports Navidrome's scan state. *navidrome.Client implements it.
@@ -67,6 +83,11 @@ type Options struct {
 	Store Store
 	// Navidrome is asked for the scan state once Ready is closed.
 	Navidrome Scanner
+	// Match runs the match actions. The match page needs it.
+	Match Matcher
+	// Jobs runs the actions of the match page in the background. New
+	// creates one when it is nil.
+	Jobs *match.Jobs
 	// Ready is closed when the supervisor reports ready. Until then the
 	// status page shows that Navidrome is starting.
 	Ready <-chan struct{}
@@ -83,13 +104,31 @@ type Options struct {
 //go:embed templates static
 var files embed.FS
 
-var funcs = template.FuncMap{"when": when}
+var funcs = template.FuncMap{"when": when, "distance": distance, "tags": tags}
 
 // when formats t in the server's time zone.
 func when(t time.Time) string { return t.Local().Format("2006-01-02 15:04") }
 
+// distance formats a candidate's distance from the existing tags.
+func distance(d float64) string { return strconv.FormatFloat(d, 'f', 3, 64) }
+
+// tags describes an entry's existing tags on one line.
+func tags(e store.MatchEntry) string {
+	or := func(s string) string {
+		if s == "" {
+			return "?"
+		}
+		return s
+	}
+	s := or(e.Artist) + " - " + or(e.Album)
+	if e.Year > 0 {
+		s += " (" + strconv.Itoa(e.Year) + ")"
+	}
+	return s + ", " + strconv.Itoa(e.TrackCount) + " tracks"
+}
+
 // pageNames are the templates in templates/, besides layout.html.
-var pageNames = []string{"login", "status", "account"}
+var pageNames = []string{"login", "status", "account", "match"}
 
 type server struct {
 	Options
@@ -104,6 +143,9 @@ type server struct {
 func New(o Options) http.Handler {
 	if o.Logger == nil {
 		o.Logger = slog.Default()
+	}
+	if o.Jobs == nil {
+		o.Jobs = match.NewJobs(context.Background(), o.Logger)
 	}
 	s := &server{Options: o, pages: map[string]*template.Template{}, limiter: newLimiter(time.Now), now: time.Now}
 	for _, name := range pageNames {
@@ -125,6 +167,11 @@ func New(o Options) http.Handler {
 	mux.HandleFunc("POST /ui/logout", s.logout)
 	mux.Handle("GET /ui/{$}", s.guard(s.statusPage))
 	mux.Handle("GET /ui/account", s.guard(s.accountPage))
+	mux.Handle("GET /ui/match", s.guard(s.matchPage))
+	mux.Handle("POST /ui/match/run", s.guard(s.matchRun))
+	mux.Handle("POST /ui/match/{id}/apply", s.guard(s.matchApply))
+	mux.Handle("POST /ui/match/{id}/dismiss", s.guard(s.matchDismiss))
+	mux.Handle("POST /ui/match/{id}/revert", s.guard(s.matchRevert))
 	mux.Handle("POST /ui/account/password/reset", s.guard(s.resetPassword))
 	mux.Handle("POST /ui/sessions/{id}/revoke", s.guard(s.revokeSession))
 	return securityHeaders(checkOrigin(mux))
@@ -269,7 +316,18 @@ type page struct {
 	SignedIn bool
 	// Banner is the wn-cloud outage notice, or empty.
 	Banner string
+	// Wide gives the page more width.
+	Wide bool
+	// RefreshURL, when set, makes the browser load that path again after
+	// RefreshSeconds.
+	RefreshURL string
 }
+
+// refreshSeconds is how often the match page reloads while a job runs.
+const refreshSeconds = 5
+
+// RefreshSeconds is the refresh interval that the layout reads.
+func (page) RefreshSeconds() int { return refreshSeconds }
 
 // signedIn returns the layout data of a page behind the guard.
 func (s *server) signedIn(title, nav string) page {
