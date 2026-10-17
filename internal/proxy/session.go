@@ -50,6 +50,8 @@ type sessions struct {
 	logger  *slog.Logger
 	limiter *limiter
 	now     func() time.Time
+	// cloudStatus records whether wn-cloud answered. It may be nil.
+	cloudStatus *wncloud.Status
 
 	mu              sync.Mutex
 	lastUnreachable time.Time
@@ -258,6 +260,9 @@ func (s *sessions) exchangeCode(ctx context.Context, addr, code, device string) 
 	}
 
 	userID, _, err := s.cloud.VerifyDeviceCode(ctx, cred.Token, cred.ServerID, code)
+	if !errors.Is(err, wncloud.ErrUnreachable) {
+		s.cloudStatus.MarkReachable()
+	}
 	switch {
 	case err == nil:
 	case errors.Is(err, wncloud.ErrInvalidGrant):
@@ -268,6 +273,7 @@ func (s *sessions) exchangeCode(ctx context.Context, addr, code, device string) 
 		if ctx.Err() != nil {
 			return "", store.Account{}, errCanceled
 		}
+		s.cloudStatus.MarkUnreachable(s.now())
 		s.logUnreachable(err)
 		return "", store.Account{}, errCloudDown
 	default:

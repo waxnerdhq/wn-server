@@ -22,6 +22,8 @@ import (
 	"github.com/waxnerdhq/wn-server/internal/navidrome"
 	"github.com/waxnerdhq/wn-server/internal/proxy"
 	"github.com/waxnerdhq/wn-server/internal/store"
+	"github.com/waxnerdhq/wn-server/internal/web"
+	"github.com/waxnerdhq/wn-server/internal/wncloud"
 )
 
 // Version is set at build time with -ldflags "-X .../internal/cli.Version=...".
@@ -224,8 +226,22 @@ func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.A
 	}
 	sup := navidrome.NewSupervisor(c, navidrome.Account{ID: owner.ID, Name: owner.Name}, logger)
 	target := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(c.NavidromePort))}
+	cloudStatus := &wncloud.Status{}
+	// The server name at wn-cloud is not stored. The UI shows the host name,
+	// which is the default of login --name.
+	hostName, _ := os.Hostname()
+	ui := web.New(web.Options{
+		Store:            st,
+		Navidrome:        navidrome.NewClient(c.NavidromePort),
+		Ready:            sup.Ready(),
+		CloudStatus:      cloudStatus,
+		ServerName:       hostName,
+		NavidromeVersion: navidrome.ServerVersion(),
+		Logger:           logger,
+	})
 	srv := &http.Server{
-		Handler:           proxy.New(target, sup.Ready(), st, newClient(c), logger),
+		Handler: proxy.New(target, sup.Ready(), st, newClient(c), logger,
+			proxy.WithUI(ui), proxy.WithCloudStatus(cloudStatus)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

@@ -1,0 +1,26 @@
+{{define "content"}}
+<h1>Account</h1>
+{{with .Notice}}<p class="notice" role="status">{{.}}</p>{{end}}
+<h2>App password</h2>
+<p>Subsonic clients sign in with the account name <code>{{.Name}}</code> and this app password.</p>
+<div class="row">
+<input id="app-password" class="mono" type="text" value="{{.AppPassword}}" readonly aria-label="App password">
+<button type="button" data-copy="app-password">Copy</button>
+</div>
+<form method="post" action="/ui/account/password/reset" data-confirm="Generate a new app password? Clients that use the current one stop working until they get the new one.">
+<button type="submit" class="danger">Regenerate</button>
+</form>
+<h2>Sessions</h2>
+<p>Apps and browsers signed in to this server. Revoking a session signs that device out.</p>
+<table>
+<thead><tr><th>Device</th><th>Created</th><th>Last seen</th><th></th></tr></thead>
+<tbody>
+{{range .Sessions}}<tr>
+<td>{{if .Device}}{{.Device}}{{else}}(no label){{end}}{{if .Current}} <span class="tag">this browser</span>{{end}}</td>
+<td>{{when .CreatedAt}}</td>
+<td>{{when .LastSeenAt}}</td>
+<td><form method="post" action="/ui/sessions/{{.ID}}/revoke"><button type="submit" class="danger">Revoke</button></form></td>
+</tr>
+{{end}}</tbody>
+</table>
+{{end}}
