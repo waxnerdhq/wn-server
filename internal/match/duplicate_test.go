@@ -17,8 +17,10 @@ import (
 )
 
 // dupEnv runs the match service with a shell script in place of beets. On
-// `import` the script copies next.jsonl to the candidates file. On `remove`
-// it deletes the album folder.
+// `import` the script copies next.jsonl to the candidates file, appends
+// forgotten.jsonl when that file exists (the plugin's `forgotten` lines), and
+// keeps a copy of beets.yaml as seen.yaml. On `remove` it deletes the album
+// folder.
 type dupEnv struct {
 	t     *testing.T
 	svc   *Service
@@ -43,7 +45,8 @@ func newDupEnv(t *testing.T) *dupEnv {
 	}
 	script := "#!/bin/sh\n" +
 		"case \"$3\" in\n" +
-		"import) cp \"$2\" '" + filepath.Join(e.data, "seen.yaml") + "'; cp '" + filepath.Join(e.data, "next.jsonl") + "' '" + filepath.Join(e.data, "beets-candidates.jsonl") + "' ;;\n" +
+		"import) cp \"$2\" '" + filepath.Join(e.data, "seen.yaml") + "'; cp '" + filepath.Join(e.data, "next.jsonl") + "' '" + filepath.Join(e.data, "beets-candidates.jsonl") + "'\n" +
+		"if [ -f '" + filepath.Join(e.data, "forgotten.jsonl") + "' ]; then cat '" + filepath.Join(e.data, "forgotten.jsonl") + "' >> '" + filepath.Join(e.data, "beets-candidates.jsonl") + "'; fi ;;\n" +
 		"remove) rm -r \"${7#path:}\" ;;\n" +
 		"*) exit 3 ;;\nesac\n"
 	beetsBin := filepath.Join(bin, "beets")
@@ -221,8 +224,9 @@ func TestRevertKeepsMarkersWhileAnotherEntryIsApplied(t *testing.T) {
 }
 
 // TestRevertForgetsFolderOnNextRun checks that the run after a revert lists
-// the folder in forget_folders, that the run after that does not, and that a
-// run which cannot start leaves the flag.
+// the folder in forget_folders, that the run after that does not, and that
+// only a `forgotten` line for the folder clears the flag: a run that cannot
+// start, or that stops before the plugin forgets, leaves it.
 func TestRevertForgetsFolderOnNextRun(t *testing.T) {
 	const r1 = "11111111-1111-1111-1111-111111111111"
 	e := newDupEnv(t)
@@ -252,14 +256,35 @@ func TestRevertForgetsFolderOnNextRun(t *testing.T) {
 		t.Fatal("a run that did not start cleared forget_pending")
 	}
 
+	// beets runs but writes no forgotten line, as when it stops before
+	// import_begin.
 	e.run(map[string]any{"folder": a, "decision": "skipped"})
 	seen, err := os.ReadFile(filepath.Join(e.data, "seen.yaml"))
 	if err != nil || !strings.Contains(string(seen), "forget_folders:") || !strings.Contains(string(seen), a) {
 		t.Fatalf("beets.yaml of the run after the revert: %v\n%s", err, seen)
 	}
-	if pending() != 0 {
-		t.Fatal("forget_pending stayed after the run")
+	if pending() != 1 {
+		t.Fatal("a run without a forgotten line cleared forget_pending")
 	}
+
+	// A forgotten line for another folder does not clear it either.
+	forgotten := filepath.Join(e.data, "forgotten.jsonl")
+	if err := os.WriteFile(forgotten, []byte(`{"decision":"forgotten","folder":"/elsewhere"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.run(map[string]any{"folder": a, "decision": "skipped"})
+	if pending() != 1 {
+		t.Fatal("a forgotten line for another folder cleared forget_pending")
+	}
+
+	if err := os.WriteFile(forgotten, []byte(`{"decision":"forgotten","folder":"`+a+`"}`+"\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	e.run(map[string]any{"folder": a, "decision": "skipped"})
+	if pending() != 0 {
+		t.Fatal("forget_pending stayed after the forgotten line")
+	}
+	os.Remove(forgotten)
 	if e.entry(a).State != store.MatchPending {
 		t.Fatalf("entry state = %s, want pending", e.entry(a).State)
 	}
@@ -267,6 +292,43 @@ func TestRevertForgetsFolderOnNextRun(t *testing.T) {
 	seen, _ = os.ReadFile(filepath.Join(e.data, "seen.yaml"))
 	if strings.Contains(string(seen), "forget_folders") {
 		t.Fatalf("the second run still lists forget_folders:\n%s", seen)
+	}
+}
+
+// TestApplyAfterRevertDoesNotForget checks that an entry reverted and then
+// applied again is not forgotten by the next full run.
+func TestApplyAfterRevertDoesNotForget(t *testing.T) {
+	const r1 = "11111111-1111-1111-1111-111111111111"
+	e := newDupEnv(t)
+	a := e.folder("a/album")
+	copied := e.copyDir("A")
+	line := map[string]any{"folder": a, "decision": "applied", "release_id": r1, "copied_to": copied}
+	e.run(line)
+	id := e.entry(a).ID
+	if _, err := e.svc.Revert(context.Background(), id); err != nil {
+		t.Fatal(err)
+	}
+	e.run(map[string]any{"folder": a, "decision": "skipped", "candidates": []any{map[string]any{"release_id": r1}}})
+	if err := os.MkdirAll(copied, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The fake beets answers the apply run with an applied line.
+	line["tags"], line["candidates"] = map[string]any{}, []any{}
+	data, _ := json.Marshal(line)
+	if err := os.WriteFile(filepath.Join(e.data, "next.jsonl"), append(data, '\n'), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.Apply(context.Background(), id, r1); err != nil {
+		t.Fatal(err)
+	}
+	got, err := e.st.ForgetPending(context.Background())
+	if err != nil || len(got) != 0 {
+		t.Fatalf("ForgetPending after revert and apply = %v, %v", got, err)
+	}
+	e.run(map[string]any{"folder": a, "decision": "skipped"})
+	seen, _ := os.ReadFile(filepath.Join(e.data, "seen.yaml"))
+	if strings.Contains(string(seen), "forget_folders") {
+		t.Fatalf("the run after the apply lists forget_folders:\n%s", seen)
 	}
 }
 

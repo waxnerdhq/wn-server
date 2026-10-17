@@ -85,23 +85,30 @@ func (r RunResult) Line() string {
 //
 // The folders of reverted entries (forget_pending) go to the plugin as
 // forget_folders, which removes them from beets' incremental history so this
-// run offers them again. Once beets has started, the flag is cleared, also
-// when the run fails. A run that did not start leaves it.
+// run offers them again. The plugin confirms each folder with a `forgotten`
+// line in the candidates file. The flag is cleared only for those folders,
+// also when the run fails afterwards. A folder without the line keeps it.
 func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	bg := context.WithoutCancel(ctx)
 	var forget []string
-	var forgetIDs []int64
+	forgetIDs := map[string]int64{}
 	pending, ferr := s.st.ForgetPending(bg)
 	if ferr != nil {
 		s.log.Warn("could not read the reverted folders; beets keeps them in its history on this run", "error", ferr)
 	}
 	for _, f := range pending {
 		forget = append(forget, f.Folder)
-		forgetIDs = append(forgetIDs, f.ID)
+		forgetIDs[f.Folder] = f.ID
 	}
 	sum, err := s.runner.Import(ctx, s.cfg.MusicFolders, forget)
-	if sum.Started && len(forgetIDs) > 0 {
-		if cerr := s.st.ClearForgetPending(bg, forgetIDs); cerr != nil {
+	var cleared []int64
+	for _, folder := range sum.Forgotten {
+		if id, ok := forgetIDs[folder]; ok {
+			cleared = append(cleared, id)
+		}
+	}
+	if len(cleared) > 0 {
+		if cerr := s.st.ClearForgetPending(bg, cleared); cerr != nil {
 			s.log.Warn("could not clear forget_pending; the next run forgets the folders again", "error", cerr)
 		}
 	}

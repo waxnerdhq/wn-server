@@ -90,10 +90,10 @@ type Summary struct {
 	// MarkersWritten holds the Folder of every applied album whose .ndignore
 	// this run created. A marker that already existed is not listed.
 	MarkersWritten []string
-	// Started is true when the beets process started. A run that stopped
-	// before that (the lock, the plugin check, writing beets.yaml) leaves it
-	// false.
-	Started bool
+	// Forgotten holds the folder of every `forgotten` line: a folder from
+	// forget_folders that the plugin confirmed is no longer in beets'
+	// incremental history.
+	Forgotten []string
 }
 
 // Scanner starts a Navidrome library scan.
@@ -160,8 +160,8 @@ func NewRunner(c *config.Config, scanner Scanner, logger *slog.Logger) *Runner {
 //
 // forget lists folders that the wn_candidates plugin removes from beets'
 // incremental history before the import reads it, so this run offers them
-// again. Summary.Started tells the caller whether beets ran, which is when
-// the plugin forgot them.
+// again. Summary.Forgotten lists the folders for which the plugin confirmed
+// that they are gone from the history.
 //
 // A failed scan is logged as a warning and does not fail the import. When
 // beets exits non-zero, the summary of what it did write is returned with
@@ -270,9 +270,8 @@ func (r *Runner) importRun(ctx context.Context, cfg Config, flags, paths, roots 
 
 	args := append(append([]string{"import", "-q"}, flags...), paths...)
 	r.Log.Info("running beets import", "bin", r.BeetsBin, "folders", len(paths))
-	started, runErr := r.runCmd(ctx, args...)
+	runErr := r.run(ctx, args...)
 	sum, err := r.readCandidates()
-	sum.Started = started
 	sum.MarkersWritten = r.writeMarkers(sum.Albums, roots)
 	if ctx.Err() != nil {
 		return sum, ctx.Err()
@@ -396,12 +395,6 @@ func resolveExisting(path string) string {
 
 // run starts `beet --config <beets.yaml> <args>` and waits for it.
 func (r *Runner) run(ctx context.Context, args ...string) error {
-	_, err := r.runCmd(ctx, args...)
-	return err
-}
-
-// runCmd is run that also reports whether the process started.
-func (r *Runner) runCmd(ctx context.Context, args ...string) (started bool, err error) {
 	cmd := exec.CommandContext(ctx, r.BeetsBin, append([]string{"--config", r.Config.Path()}, args...)...)
 	cmd.Env = r.env()
 	stdout := &lineWriter{log: r.Log, level: slog.LevelDebug}
@@ -411,20 +404,19 @@ func (r *Runner) runCmd(ctx context.Context, args ...string) (started bool, err 
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error { return syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL) }
 	cmd.WaitDelay = killWait
-	err = cmd.Run()
-	started = cmd.Process != nil
+	err := cmd.Run()
 	stdout.flush()
 	stderr.flush()
 	if err != nil {
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) {
 			if last := stderr.lastLine(); last != "" {
-				return started, fmt.Errorf("beets %s: %w: %s", args[0], err, last)
+				return fmt.Errorf("beets %s: %w: %s", args[0], err, last)
 			}
 		}
-		return started, fmt.Errorf("beets %s: %w", args[0], err)
+		return fmt.Errorf("beets %s: %w", args[0], err)
 	}
-	return started, nil
+	return nil
 }
 
 // env is the environment of the beets process. The directory of fpcalc_bin
@@ -467,11 +459,12 @@ func (r *Runner) readCandidates() (Summary, error) {
 		return Summary{}, fmt.Errorf("read candidates file: %w", err)
 	}
 	defer f.Close()
-	albums, malformed, err := parseCandidates(f)
+	albums, forgotten, malformed, err := parseCandidates(f)
 	if malformed > 0 {
 		r.Log.Warn("skipped malformed lines in the candidates file", "count", malformed, "file", r.Config.CandidatesPath())
 	}
 	sum := summarize(albums, malformed)
+	sum.Forgotten = forgotten
 	if err != nil {
 		return sum, fmt.Errorf("read candidates file: %w", err)
 	}
@@ -497,17 +490,24 @@ func summarize(albums []Album, malformed int) Summary {
 
 // ParseCandidates reads the JSON lines that the wn_candidates plugin writes.
 // Blank lines are ignored. Lines that are not a JSON object with a known
-// decision are skipped.
+// decision are skipped. A `forgotten` line is not an album and is left out.
 func ParseCandidates(r io.Reader) ([]Album, error) {
-	albums, _, err := parseCandidates(r)
+	albums, _, _, err := parseCandidates(r)
 	return albums, err
 }
 
-// parseCandidates is ParseCandidates that also counts the skipped lines.
-func parseCandidates(r io.Reader) ([]Album, int, error) {
+// DecisionForgotten is the decision of a line that confirms a folder of
+// forget_folders is gone from beets' incremental history. The line has only
+// the decision and the folder.
+const DecisionForgotten = "forgotten"
+
+// parseCandidates is ParseCandidates that also returns the folders of the
+// forgotten lines and counts the skipped lines.
+func parseCandidates(r io.Reader) ([]Album, []string, int, error) {
 	sc := bufio.NewScanner(r)
 	sc.Buffer(make([]byte, 64<<10), 4<<20)
 	var albums []Album
+	var forgotten []string
 	malformed := 0
 	for sc.Scan() {
 		line := bytes.TrimSpace(sc.Bytes())
@@ -522,11 +522,17 @@ func parseCandidates(r io.Reader) ([]Album, int, error) {
 		switch a.Decision {
 		case DecisionApplied, DecisionSkipped, DecisionDuplicate, DecisionError:
 			albums = append(albums, a)
+		case DecisionForgotten:
+			if a.Folder == "" {
+				malformed++
+				continue
+			}
+			forgotten = append(forgotten, a.Folder)
 		default:
 			malformed++
 		}
 	}
-	return albums, malformed, sc.Err()
+	return albums, forgotten, malformed, sc.Err()
 }
 
 // writeMarkers writes .ndignore into the original folder of every applied

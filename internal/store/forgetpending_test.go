@@ -45,4 +45,22 @@ func TestForgetPending(t *testing.T) {
 	if err != nil || len(got) != 1 || got[0].ID != b {
 		t.Fatalf("ForgetPending after clearing %d = %v, %v", a, got, err)
 	}
+
+	// Applying again clears the flag, with either apply path.
+	if err := s.MarkApplied(ctx, b, "r2", "/s/b", false, now); err != nil {
+		t.Fatal(err)
+	}
+	var flag int
+	if err := s.db.QueryRowContext(ctx, `SELECT forget_pending FROM match_queue WHERE id = ?`, b).Scan(&flag); err != nil || flag != 0 {
+		t.Fatalf("forget_pending after MarkApplied = %d, %v", flag, err)
+	}
+	if err := s.RevertMatch(ctx, a); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetMatchApplied(ctx, a, "r1", "/s/a", now, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.db.QueryRowContext(ctx, `SELECT forget_pending FROM match_queue WHERE id = ?`, a).Scan(&flag); err != nil || flag != 0 {
+		t.Fatalf("forget_pending after SetMatchApplied = %d, %v", flag, err)
+	}
 }

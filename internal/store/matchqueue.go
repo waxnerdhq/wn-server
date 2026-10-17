@@ -309,7 +309,7 @@ func (s *Store) SetMatchApplied(ctx context.Context, id int64, releaseID, copied
 // stays 1.
 func setApplied(ctx context.Context, db execer, id int64, releaseID, copiedTo string, at time.Time, markerWritten, keepMarker bool) error {
 	return checkOne(db.ExecContext(ctx,
-		`UPDATE match_queue SET state = ?, applied_release_id = ?, copied_to = ?, applied_at = ?,
+		`UPDATE match_queue SET state = ?, applied_release_id = ?, copied_to = ?, applied_at = ?, forget_pending = 0,
 		 marker_written = CASE WHEN ? THEN MAX(marker_written, ?) ELSE ? END WHERE id = ?`,
 		MatchApplied, releaseID, copiedTo, formatTime(at), keepMarker, markerWritten, markerWritten, id))
 }
@@ -322,7 +322,7 @@ func setApplied(ctx context.Context, db execer, id int64, releaseID, copiedTo st
 // the candidates stay, because that run looked up only the requested release.
 func (s *Store) MarkApplied(ctx context.Context, id int64, releaseID, copiedTo string, markerWritten bool, now time.Time) error {
 	err := checkOne(s.db.ExecContext(ctx,
-		`UPDATE match_queue SET state = ?, applied_release_id = ?, copied_to = ?, applied_at = ?,
+		`UPDATE match_queue SET state = ?, applied_release_id = ?, copied_to = ?, applied_at = ?, forget_pending = 0,
 		 marker_written = MAX(marker_written, ?), duplicate_of_release_id = NULL, last_seen = ?, last_error = NULL WHERE id = ?`,
 		MatchApplied, releaseID, copiedTo, formatTime(now), markerWritten, formatTime(now), id))
 	if err != nil {
@@ -346,9 +346,11 @@ type ForgetFolder struct {
 	Folder string
 }
 
-// ForgetPending returns the entries with forget_pending set, ordered by id.
+// ForgetPending returns the entries with forget_pending set that are not
+// applied, ordered by id. An applied entry's folder must stay in beets'
+// history.
 func (s *Store) ForgetPending(ctx context.Context) ([]ForgetFolder, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, folder FROM match_queue WHERE forget_pending = 1 ORDER BY id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, folder FROM match_queue WHERE forget_pending = 1 AND state != ? ORDER BY id`, MatchApplied)
 	if err != nil {
 		return nil, err
 	}

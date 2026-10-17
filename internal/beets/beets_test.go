@@ -82,12 +82,15 @@ func TestParseCandidates(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer f.Close()
-	albums, malformed, err := parseCandidates(f)
+	albums, forgotten, malformed, err := parseCandidates(f)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if malformed != 1 {
 		t.Errorf("malformed = %d, want 1", malformed)
+	}
+	if want := []string{"/music/Reverted"}; !reflect.DeepEqual(forgotten, want) {
+		t.Errorf("forgotten = %v, want %v", forgotten, want)
 	}
 	var decisions []string
 	for _, a := range albums {
@@ -173,7 +176,7 @@ func TestImportWithFakeBeets(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Import: %v", err)
 	}
-	if sum.Applied != 2 || sum.Skipped != 1 || len(sum.Albums) != 3 || !sum.Started {
+	if sum.Applied != 2 || sum.Skipped != 1 || len(sum.Albums) != 3 || sum.Malformed != 0 {
 		t.Fatalf("summary = %+v", sum)
 	}
 	if scan.calls != 1 {
