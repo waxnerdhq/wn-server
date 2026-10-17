@@ -207,7 +207,7 @@ The routes under `/api/v1/ratings` take `Authorization: Bearer <session>` and an
 
 #### Reconcile loop
 
-Changes made at wn-cloud, for example on waxnerd.com, reach wn-server through the reconcile loop. `serve` runs it once Navidrome is ready and then every 15 minutes. Each run drains the outbox first, so that a pending local change reaches wn-cloud before the pull. The run is skipped when no server credential is stored. With the server credential it calls `GET /ratings?since=<stored cursor>`, follows `more` until it is `false`, and stores `next` after each page. The cursor is kept in the `rating_sync` table. A login of another waxnerd user removes it, and the next run reads every rating.
+Changes made at wn-cloud, for example on waxnerd.com, reach wn-server through the reconcile loop. `serve` runs it once Navidrome is ready and then every 15 minutes. Each run drains the outbox first, so that a pending local change reaches wn-cloud before the pull. The run is skipped when no server credential is stored. In that state `serve` logs once at start, at info level, that it is not linked to wn-cloud and that rating writes wait in the outbox until `wn-server login`, and logs nothing about the drain or the reconcile loop on later ticks. With the server credential it calls `GET /ratings?since=<stored cursor>`, follows `more` until it is `false`, and stores `next` after each page. The cursor is kept in the `rating_sync` table. A login of another waxnerd user removes it, and the next run reads every rating.
 
 For each change:
 

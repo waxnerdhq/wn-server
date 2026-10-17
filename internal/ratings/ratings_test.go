@@ -1,12 +1,14 @@
 package ratings
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -220,4 +222,24 @@ func TestNotLinked(t *testing.T) {
 	if _, err := e.cloudRating(t); !errors.Is(err, wncloud.ErrNotFound) {
 		t.Fatalf("wn-cloud rating after the re-link: %v, want ErrNotFound", err)
 	}
+}
+
+func TestLogIfNotLinked(t *testing.T) {
+	ctx := context.Background()
+	for _, linked := range []bool{false, true} {
+		e := newEnv(t, linked)
+		var buf bytes.Buffer
+		e.svc.logger = slog.New(slog.NewTextHandler(&buf, nil))
+		e.svc.LogIfNotLinked(ctx)
+		if got := strings.Count(buf.String(), "not linked to wn-cloud"); got != btoi(!linked) {
+			t.Fatalf("linked=%v: %d log lines, output %q", linked, got, buf.String())
+		}
+	}
+}
+
+func btoi(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }

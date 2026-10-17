@@ -425,6 +425,19 @@ func (s *Service) drainOne(ctx context.Context, token string) (stop bool, err er
 	return stop, nil
 }
 
+// NotLinkedMessage is the info line that LogIfNotLinked writes.
+const NotLinkedMessage = "not linked to wn-cloud; rating writes wait in the outbox until wn-server login"
+
+// LogIfNotLinked logs NotLinkedMessage once when the store holds no server
+// credential. The drain and the reconcile loop do nothing in that state, so
+// serve calls this once at start. It logs nothing when a credential is
+// present or when the store cannot be read.
+func (s *Service) LogIfNotLinked(ctx context.Context) {
+	if _, err := s.store.ServerCredential(ctx); errors.Is(err, store.ErrNoServerCredential) {
+		s.logger.Info(NotLinkedMessage)
+	}
+}
+
 // Run drains the outbox at once, after every write while wn-cloud is not
 // recorded as unreachable, and every DrainInterval, until ctx is done.
 func (s *Service) Run(ctx context.Context) {
