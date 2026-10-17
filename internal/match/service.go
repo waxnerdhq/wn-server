@@ -89,7 +89,9 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	if recErr == nil {
 		// A cancelled run still marks the duplicates of the lines it
 		// recorded, but starts no scan.
-		recErr = s.markDuplicates(bg, sum.Albums, ctx.Err() == nil)
+		// Import scanned when it applied an album and did not fail.
+		scanned := err == nil && sum.Applied > 0
+		recErr = s.markDuplicates(bg, sum.Albums, ctx.Err() == nil && !scanned)
 	}
 	res := RunResult{Summary: sum, Pending: -1}
 	if err == nil || len(sum.Albums) > 0 {
@@ -216,7 +218,8 @@ func (s *Service) Apply(ctx context.Context, id int64, release string) (ApplyRes
 	s.log.Info("applied match", "id", e.ID, "folder", e.Folder, "release_id", got.AppliedReleaseID, "copied_to", got.CopiedTo)
 	// The entry is applied. A failure to mark earlier duplicates of the
 	// release does not undo that.
-	if err := s.markDuplicates(bg, sum.Albums, true); err != nil {
+	// The apply run scanned already.
+	if err := s.markDuplicates(bg, sum.Albums, false); err != nil {
 		s.log.Warn("could not mark the duplicate folders of the applied release", "id", e.ID, "release_id", release, "error", err)
 	}
 	return ApplyResult{ID: e.ID, Folder: e.Folder, ReleaseID: got.AppliedReleaseID, CopiedTo: got.CopiedTo}, nil
@@ -280,7 +283,12 @@ func (s *Service) Revert(ctx context.Context, id int64) (RevertResult, error) {
 		}
 	}
 	if e.AppliedReleaseID != "" {
-		if err := s.unmarkDuplicates(bg, e.AppliedReleaseID); err != nil {
+		// Another applied entry of the same release still hides them.
+		others, err := s.st.CountAppliedRelease(bg, e.AppliedReleaseID, e.ID)
+		if err == nil && others == 0 {
+			err = s.unmarkDuplicates(bg, e.AppliedReleaseID)
+		}
+		if err != nil {
 			markerErr = errors.Join(markerErr, err)
 		}
 	}
@@ -297,7 +305,8 @@ func (s *Service) Revert(ctx context.Context, id int64) (RevertResult, error) {
 // marker_written on the entry when it created the file. It considers the
 // duplicates among albums, the lines of the run just recorded, and the
 // duplicates of earlier runs whose release one of those lines applied. It
-// asks Navidrome to scan when it created a marker and scan is true.
+// asks Navidrome to scan when it created a marker and scan is true. A caller
+// that already scanned after its own change passes false.
 func (s *Service) markDuplicates(ctx context.Context, albums []beets.Album, scan bool) error {
 	duplicate, applied := map[string]bool{}, map[string]bool{}
 	for _, a := range albums {
@@ -326,7 +335,12 @@ func (s *Service) markDuplicates(ctx context.Context, albums []beets.Album, scan
 	if len(folders) == 0 {
 		return nil
 	}
-	written, err := s.runner.WriteDuplicateMarkers(folders, albums, s.cfg.MusicFolders)
+	// Albums of earlier runs that are not applied must stay visible too.
+	notApplied, err := s.st.NotAppliedFolders(ctx)
+	if err != nil {
+		return err
+	}
+	written, err := s.runner.WriteDuplicateMarkers(folders, albums, notApplied, s.cfg.MusicFolders)
 	if err != nil {
 		return err
 	}

@@ -15,8 +15,9 @@ wn-server reads the file named by the ``output`` option after
 - ``copied_to``: the album directory in the beets library. Only on
   ``applied`` lines.
 - ``release_id``: the MusicBrainz release that beets applied. On a
-  ``duplicate`` line, the release that beets chose for the album, which is
-  the release of the album already in the library. Only on ``applied`` and
+  ``duplicate`` line, the release that beets chose for the folder being
+  imported. beets decides duplicates by album artist and album, so the
+  library album can be another release. Only on ``applied`` and
   ``duplicate`` lines.
 - ``reason``: on the ``applied`` line of an album whose match the plugin
   chose. ``requested_release_id`` means the ``apply_release_id`` option chose

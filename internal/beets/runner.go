@@ -532,19 +532,25 @@ func (r *Runner) writeMarkers(albums []Album, roots []string) []string {
 // The rules are those of the applied folders: a folder that is a music
 // folder or outside the music folders gets no marker, an existing file is
 // not overwritten, and a folder gets no marker when an album in albums that
-// was not applied has its folder strictly below it. albums are the lines of
-// the run that holds the duplicates. It returns the folders whose marker it
-// created.
-func (r *Runner) WriteDuplicateMarkers(folders []string, albums []Album, musicFolders []string) ([]string, error) {
+// was not applied, or a folder in notApplied, lies strictly below it. albums
+// are the lines of the run that holds the duplicates. notApplied are the
+// folders of albums from earlier runs that are not applied. It returns the
+// folders whose marker it created.
+func (r *Runner) WriteDuplicateMarkers(folders []string, albums []Album, notApplied, musicFolders []string) ([]string, error) {
 	roots, err := absPaths(musicFolders)
 	if err != nil {
 		return nil, err
 	}
 	resolved := resolveAll(roots)
-	notApplied := notAppliedFolders(albums)
+	blockers := notAppliedFolders(albums)
+	for _, f := range notApplied {
+		if filepath.IsAbs(f) {
+			blockers = append(blockers, resolvePath(f))
+		}
+	}
 	var written []string
 	for _, f := range folders {
-		if r.markFolder(f, notApplied, resolved) {
+		if r.markFolder(f, blockers, resolved) {
 			r.Log.Info("wrote .ndignore into a duplicate folder", "folder", f)
 			written = append(written, f)
 		}

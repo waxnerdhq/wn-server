@@ -168,3 +168,54 @@ func TestDuplicateFoldersGetMarkers(t *testing.T) {
 		t.Fatal("the revert removed a marker of another release")
 	}
 }
+
+// copyDir creates an album copy in sorted_dir.
+func (e *dupEnv) copyDir(name string) string {
+	e.t.Helper()
+	dir := filepath.Join(e.data, "sorted", name)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		e.t.Fatal(err)
+	}
+	return dir
+}
+
+func TestRevertKeepsMarkersWhileAnotherEntryIsApplied(t *testing.T) {
+	const r1 = "11111111-1111-1111-1111-111111111111"
+	e := newDupEnv(t)
+	a, b, d := e.folder("a/album"), e.folder("b/album"), e.folder("d/album")
+	e.run(
+		map[string]any{"folder": a, "decision": "applied", "release_id": r1, "copied_to": e.copyDir("A")},
+		map[string]any{"folder": b, "decision": "applied", "release_id": r1, "copied_to": e.copyDir("B")},
+		map[string]any{"folder": d, "decision": "duplicate", "release_id": r1},
+	)
+	if !hasMarker(d) {
+		t.Fatal("the duplicate folder has no marker")
+	}
+	if _, err := e.svc.Revert(context.Background(), e.entry(a).ID); err != nil {
+		t.Fatal(err)
+	}
+	if !hasMarker(d) || !e.entry(d).MarkerWritten {
+		t.Fatal("the revert removed the duplicate marker while another entry of the release is applied")
+	}
+	if _, err := e.svc.Revert(context.Background(), e.entry(b).ID); err != nil {
+		t.Fatal(err)
+	}
+	if hasMarker(d) || e.entry(d).MarkerWritten {
+		t.Fatal("the duplicate marker stayed after the last applied entry was reverted")
+	}
+}
+
+func TestOldDuplicateWaitsForPendingEntryBelow(t *testing.T) {
+	const r2 = "22222222-2222-2222-2222-222222222222"
+	e := newDupEnv(t)
+	d, below, b := e.folder("d/album"), e.folder("d/album/cd2"), e.folder("e/album")
+	e.run(
+		map[string]any{"folder": d, "decision": "duplicate", "release_id": r2},
+		map[string]any{"folder": below, "decision": "skipped"},
+	)
+	// This run's lines do not mention the pending entry below d.
+	e.run(map[string]any{"folder": b, "decision": "applied", "release_id": r2, "copied_to": e.copyDir("B")})
+	if hasMarker(d) || e.entry(d).MarkerWritten {
+		t.Fatal("a duplicate folder got a marker that would hide a pending entry below it")
+	}
+}

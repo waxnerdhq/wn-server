@@ -316,11 +316,14 @@ func setApplied(ctx context.Context, db execer, id int64, releaseID, copiedTo st
 
 // MarkApplied records the applied line of a match apply run. It sets the
 // entry to applied with the release id, copied_to, applied_at, and
-// marker_written, sets last_seen to now, and clears last_error. The tags and
+// marker_written, sets last_seen to now, and clears last_error. A
+// marker_written of 1 stays 1, because the marker exists. It also clears
+// duplicate_of_release_id. The tags and
 // the candidates stay, because that run looked up only the requested release.
 func (s *Store) MarkApplied(ctx context.Context, id int64, releaseID, copiedTo string, markerWritten bool, now time.Time) error {
 	err := checkOne(s.db.ExecContext(ctx,
-		`UPDATE match_queue SET state = ?, applied_release_id = ?, copied_to = ?, applied_at = ?, marker_written = ?, last_seen = ?, last_error = NULL WHERE id = ?`,
+		`UPDATE match_queue SET state = ?, applied_release_id = ?, copied_to = ?, applied_at = ?,
+		 marker_written = MAX(marker_written, ?), duplicate_of_release_id = NULL, last_seen = ?, last_error = NULL WHERE id = ?`,
 		MatchApplied, releaseID, copiedTo, formatTime(now), markerWritten, formatTime(now), id))
 	if err != nil {
 		return fmt.Errorf("mark match %d applied: %w", id, err)
@@ -352,6 +355,34 @@ func (s *Store) MarkedDuplicates(ctx context.Context, releaseID string) ([]Match
 	return s.queryEntries(ctx,
 		`WHERE state != ? AND marker_written = 1 AND duplicate_of_release_id = ? ORDER BY id`,
 		MatchApplied, releaseID)
+}
+
+// CountAppliedRelease returns the number of applied entries other than
+// exceptID whose applied_release_id is releaseID.
+func (s *Store) CountAppliedRelease(ctx context.Context, releaseID string, exceptID int64) (int, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM match_queue WHERE state = ? AND applied_release_id = ? AND id != ?`,
+		MatchApplied, releaseID, exceptID).Scan(&n)
+	return n, err
+}
+
+// NotAppliedFolders returns the folders of the entries that are not applied.
+func (s *Store) NotAppliedFolders(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT folder FROM match_queue WHERE state != ?`, MatchApplied)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var f string
+		if err := rows.Scan(&f); err != nil {
+			return nil, err
+		}
+		out = append(out, f)
+	}
+	return out, rows.Err()
 }
 
 // SetMarkerWritten sets marker_written of an entry.
