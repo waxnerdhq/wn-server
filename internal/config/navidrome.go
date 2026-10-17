@@ -11,11 +11,11 @@ import (
 // navidromeConfig mirrors the Navidrome options wn-server sets. Names match
 // conf/configuration.go in Navidrome.
 type navidromeConfig struct {
-	Address     string
-	Port        int
-	MusicFolder string
-	DataFolder  string
-	ExtAuth     navidromeExtAuth
+	Address        string
+	UnixSocketPerm string
+	MusicFolder    string
+	DataFolder     string
+	ExtAuth        navidromeExtAuth
 
 	EnableInsightsCollector bool
 	EnableExternalServices  bool
@@ -31,6 +31,11 @@ func (c *Config) NavidromeDataDir() string {
 	return filepath.Join(c.DataDir, "navidrome")
 }
 
+// NavidromeSocketPath is the Unix socket Navidrome listens on.
+func (c *Config) NavidromeSocketPath() string {
+	return filepath.Join(c.DataDir, "navidrome.sock")
+}
+
 // NavidromeConfigPath is where WriteNavidrome puts navidrome.toml.
 func (c *Config) NavidromeConfigPath() string {
 	return filepath.Join(c.DataDir, "navidrome.toml")
@@ -44,15 +49,20 @@ func (c *Config) NavidromeConfigPath() string {
 // which is created on load and never moves. Changing it with the list of
 // music folders would collide with the libraries created through the API.
 // The supervisor adds every music folder through Navidrome's API.
+//
+// Navidrome listens on a Unix socket with mode 0600, so only the service
+// user can send it a Remote-User header. Navidrome reports the peer of a
+// Unix socket as "@", and its trusted source check accepts that peer only
+// when TrustedSources lists "@" exactly and Address starts with "unix:".
 func (c *Config) RenderNavidrome() ([]byte, error) {
 	body, err := toml.Marshal(navidromeConfig{
-		Address:     "127.0.0.1",
-		Port:        c.NavidromePort,
-		MusicFolder: c.SortedDir,
-		DataFolder:  c.NavidromeDataDir(),
+		Address:        "unix:" + c.NavidromeSocketPath(),
+		UnixSocketPerm: "0600",
+		MusicFolder:    c.SortedDir,
+		DataFolder:     c.NavidromeDataDir(),
 		ExtAuth: navidromeExtAuth{
 			UserHeader:     "Remote-User",
-			TrustedSources: "127.0.0.1/32",
+			TrustedSources: "@",
 		},
 		EnableInsightsCollector: false,
 		EnableExternalServices:  c.ExternalServices(),

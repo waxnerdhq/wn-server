@@ -3,11 +3,13 @@ package navidrome
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
 	"log/slog"
 	"net/http"
+	"os"
 	"os/exec"
-	"strconv"
 	"sync"
 	"syscall"
 	"time"
@@ -39,6 +41,7 @@ type Supervisor struct {
 	cfg    *config.Config
 	log    *slog.Logger
 	policy RestartPolicy
+	rt     http.RoundTripper
 	client *Client
 	owner  Account
 
@@ -47,9 +50,10 @@ type Supervisor struct {
 }
 
 // NewSupervisor returns a supervisor for the Navidrome described by cfg.
-// owner is the account whose Navidrome user must exist before ready. A nil
-// logger selects slog.Default.
-func NewSupervisor(cfg *config.Config, owner Account, logger *slog.Logger) *Supervisor {
+// owner is the account whose Navidrome user must exist before ready. rt is
+// the transport from NewTransport for cfg.NavidromeSocketPath. A nil logger
+// selects slog.Default.
+func NewSupervisor(cfg *config.Config, owner Account, rt http.RoundTripper, logger *slog.Logger) *Supervisor {
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -57,7 +61,8 @@ func NewSupervisor(cfg *config.Config, owner Account, logger *slog.Logger) *Supe
 		cfg:    cfg,
 		log:    logger,
 		policy: DefaultRestartPolicy(),
-		client: NewClient(cfg.NavidromePort),
+		rt:     rt,
+		client: NewClient(rt),
 		owner:  owner,
 		ready:  make(chan struct{}),
 	}
@@ -70,8 +75,12 @@ func (s *Supervisor) Ready() <-chan struct{} { return s.ready }
 // Run writes navidrome.toml and keeps Navidrome running until ctx is
 // cancelled. The caller checks the binary with VerifyBinary first. On
 // cancellation it sends SIGTERM, waits up to 10 s, then SIGKILL, and returns
-// nil. It returns an error only when navidrome.toml cannot be written.
+// nil. It returns an error only when the socket path is too long or
+// navidrome.toml cannot be written.
 func (s *Supervisor) Run(ctx context.Context) error {
+	if sock := s.cfg.NavidromeSocketPath(); len(sock) > maxSocketPath {
+		return fmt.Errorf("navidrome socket path %s is longer than %d bytes; use a shorter data directory", sock, maxSocketPath)
+	}
 	if err := s.cfg.WriteNavidrome(); err != nil {
 		return err
 	}
@@ -98,6 +107,13 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
+	// A socket file left by a killed child would answer nothing. Navidrome
+	// also removes it before it listens.
+	sock := s.cfg.NavidromeSocketPath()
+	if err := os.Remove(sock); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("remove stale navidrome socket: %w", err)
+	}
+
 	cmd := exec.CommandContext(runCtx, s.cfg.NavidromeBin, "-c", s.cfg.NavidromeConfigPath())
 	stdout, stderr := &lineWriter{log: s.log}, &lineWriter{log: s.log}
 	cmd.Stdout, cmd.Stderr = stdout, stderr
@@ -108,7 +124,7 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("start %s: %w", s.cfg.NavidromeBin, err)
 	}
-	s.log.Info("navidrome started", "pid", cmd.Process.Pid, "port", s.cfg.NavidromePort)
+	s.log.Info("navidrome started", "pid", cmd.Process.Pid, "socket", sock)
 
 	var wg sync.WaitGroup
 	wg.Add(1)
@@ -132,12 +148,13 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 	return err
 }
 
-// waitReady polls /ping until it answers 200, for up to readyTimeout.
+// waitReady polls /ping on the socket until it answers 200, for up to
+// readyTimeout. Until Navidrome listens, the dial fails and the poll retries.
 func (s *Supervisor) waitReady(ctx context.Context) error {
 	ctx, cancel := context.WithTimeout(ctx, readyTimeout)
 	defer cancel()
-	hc := &http.Client{Timeout: 2 * time.Second}
-	url := "http://127.0.0.1:" + strconv.Itoa(s.cfg.NavidromePort) + "/ping"
+	hc := &http.Client{Transport: s.rt, Timeout: 2 * time.Second}
+	url := Target().String() + "/ping"
 	for {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 		if err != nil {

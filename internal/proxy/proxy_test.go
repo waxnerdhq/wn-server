@@ -9,15 +9,18 @@ import (
 	"encoding/xml"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/waxnerdhq/wn-server/internal/navidrome"
 	"github.com/waxnerdhq/wn-server/internal/store"
 	"github.com/waxnerdhq/wn-server/internal/wncloud"
 	"github.com/waxnerdhq/wn-server/internal/wncloud/stub"
@@ -45,9 +48,27 @@ type env struct {
 	st    *store.Store
 	owner store.Account
 	cloud *stub.Stub
-	// target and cloudURL are the fake Navidrome and the wn-cloud stub.
-	target   *url.URL
+	// rt dials the fake Navidrome's Unix socket. cloudURL is the wn-cloud
+	// stub.
+	rt       http.RoundTripper
 	cloudURL string
+}
+
+// listenUnix listens on a Unix socket in a short temporary directory. macOS
+// limits socket paths to 104 bytes, and t.TempDir paths can be longer.
+func listenUnix(t *testing.T) (net.Listener, string) {
+	t.Helper()
+	dir, err := os.MkdirTemp("", "wn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.RemoveAll(dir) })
+	sock := filepath.Join(dir, "nd.sock")
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ln, sock
 }
 
 func newEnv(t *testing.T, backend http.Handler, ready bool) *env {
@@ -60,15 +81,16 @@ func newEnvOpts(t *testing.T, backend http.Handler, ready bool, opts func(*env) 
 	t.Helper()
 	ctx := context.Background()
 	var hits atomic.Int32
-	be := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	be := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
 		backend.ServeHTTP(w, r)
 	}))
+	ln, sock := listenUnix(t)
+	be.Listener.Close()
+	be.Listener = ln
+	be.Start()
 	t.Cleanup(be.Close)
-	target, err := url.Parse(be.URL)
-	if err != nil {
-		t.Fatal(err)
-	}
+	rt := navidrome.NewTransport(sock)
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), store.FileName))
 	if err != nil {
 		t.Fatal(err)
@@ -89,12 +111,12 @@ func newEnvOpts(t *testing.T, backend http.Handler, ready bool, opts func(*env) 
 		close(ch)
 	}
 	logger := slog.New(slog.DiscardHandler)
-	e := &env{hits: &hits, st: st, owner: owner, cloud: cloud, target: target, cloudURL: cloudSrv.URL}
+	e := &env{hits: &hits, st: st, owner: owner, cloud: cloud, rt: rt, cloudURL: cloudSrv.URL}
 	var o []Option
 	if opts != nil {
 		o = opts(e)
 	}
-	e.srv = httptest.NewServer(New(target, ch, st, wncloud.New(cloudSrv.URL, "test"), logger, o...))
+	e.srv = httptest.NewServer(New(rt, ch, st, wncloud.New(cloudSrv.URL, "test"), logger, o...))
 	t.Cleanup(e.srv.Close)
 	return e
 }

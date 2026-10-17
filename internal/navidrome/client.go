@@ -29,17 +29,19 @@ type Library struct {
 	Path string `json:"path"`
 }
 
-// Client calls Navidrome on loopback as wn-server's identity.
+// Client calls Navidrome on its Unix socket as wn-server's identity.
 type Client struct {
 	base string
 	user string
 	http *http.Client
 }
 
-// NewClient returns a client for the Navidrome child listening on
-// 127.0.0.1:port.
-func NewClient(port int) *Client {
-	return newClient("http://127.0.0.1:"+strconv.Itoa(port), Identity)
+// NewClient returns a client that reaches Navidrome through rt, a transport
+// from NewTransport.
+func NewClient(rt http.RoundTripper) *Client {
+	c := newClient(Target().String(), Identity)
+	c.http.Transport = rt
+	return c
 }
 
 func newClient(base, user string) *Client {
@@ -280,13 +282,13 @@ func (c *Client) idsByFilter(ctx context.Context, user, path, field, value strin
 }
 
 // SetRating sets the whole-star rating of a song or album as user, through
-// the Subsonic API on loopback. stars 0 clears the rating.
+// the Subsonic API on the socket. stars 0 clears the rating.
 func (c *Client) SetRating(ctx context.Context, user, id string, stars int) error {
 	return c.subsonic(ctx, user, "setRating", url.Values{"id": {id}, "rating": {strconv.Itoa(stars)}})
 }
 
 // SetStarred stars or unstars a song or album as user, through the Subsonic
-// API on loopback.
+// API on the socket.
 func (c *Client) SetStarred(ctx context.Context, user, id string, starred bool) error {
 	call := "unstar"
 	if starred {

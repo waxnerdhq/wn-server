@@ -33,7 +33,7 @@ func TestLoadDefaultsAndSortedDir(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if c.Listen != DefaultListen || c.NavidromePort != DefaultNavidromePort || c.WNCloudURL != DefaultWNCloudURL {
+	if c.Listen != DefaultListen || c.WNCloudURL != DefaultWNCloudURL {
 		t.Fatalf("defaults not applied: %+v", c)
 	}
 	if want := filepath.Join(dir, "sorted"); c.SortedDir != want {
@@ -64,6 +64,8 @@ func TestPaths(t *testing.T) {
 	}
 }
 
+// TestRenderNavidrome also loads the legacy navidrome_port key, which older
+// config files carry and which is ignored.
 func TestRenderNavidrome(t *testing.T) {
 	dir := t.TempDir()
 	music := t.TempDir()
@@ -79,19 +81,22 @@ func TestRenderNavidrome(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"Address = '127.0.0.1'",
-		"Port = 5000",
+		"Address = 'unix:" + filepath.Join(dir, "navidrome.sock") + "'",
+		"UnixSocketPerm = '0600'",
 		"MusicFolder = '" + c.SortedDir + "'",
 		"DataFolder = '" + filepath.Join(dir, "navidrome") + "'",
 		"[ExtAuth]",
 		"UserHeader = 'Remote-User'",
-		"TrustedSources = '127.0.0.1/32'",
+		"TrustedSources = '@'",
 		"EnableInsightsCollector = false",
 		"EnableExternalServices = true",
 	} {
 		if !strings.Contains(string(got), want) {
 			t.Errorf("navidrome.toml lacks %q:\n%s", want, got)
 		}
+	}
+	if strings.Contains(string(got), "Port") {
+		t.Errorf("navidrome.toml has a port:\n%s", got)
 	}
 }
 
@@ -123,17 +128,8 @@ func TestInitOmitsExternalServicesKey(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(body), "navidrome_external_services") {
+	if strings.Contains(string(body), "navidrome_external_services") || strings.Contains(string(body), "navidrome_port") {
 		t.Fatalf("init wrote the key:\n%s", body)
-	}
-}
-
-func TestLoadRejectsListenPortEqualToNavidromePort(t *testing.T) {
-	dir := t.TempDir()
-	music := t.TempDir()
-	_, err := Load(writeConfig(t, dir, "music_folders = ['"+music+"']\nlisten = '0.0.0.0:5000'\nnavidrome_port = 5000\n"))
-	if err == nil || !strings.Contains(err.Error(), "navidrome_port") {
-		t.Fatalf("got %v, want a port-clash error", err)
 	}
 }
 

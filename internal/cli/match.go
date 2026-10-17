@@ -81,7 +81,8 @@ func openService(cmd *cobra.Command) (*match.Service, func(), error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	return match.NewService(c, st, navidrome.NewClient(c.NavidromePort), slog.Default()), func() { st.Close() }, nil
+	nd := navidrome.NewClient(navidrome.NewTransport(c.NavidromeSocketPath()))
+	return match.NewService(c, st, nd, slog.Default()), func() { st.Close() }, nil
 }
 
 // parseEntryID parses the id argument of an entry command.

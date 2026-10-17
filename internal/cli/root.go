@@ -9,10 +9,8 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
-	"strconv"
 	"syscall"
 	"time"
 
@@ -230,8 +228,11 @@ func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.A
 	if err != nil {
 		return err
 	}
-	sup := navidrome.NewSupervisor(c, navidrome.Account{ID: owner.ID, Name: owner.Name}, logger)
-	target := &url.URL{Scheme: "http", Host: net.JoinHostPort("127.0.0.1", strconv.Itoa(c.NavidromePort))}
+	// One transport dials Navidrome's Unix socket for the proxy, the
+	// supervisor, and the client that the web UI, the match service, and
+	// the ratings service share.
+	ndTransport := navidrome.NewTransport(c.NavidromeSocketPath())
+	sup := navidrome.NewSupervisor(c, navidrome.Account{ID: owner.ID, Name: owner.Name}, ndTransport, logger)
 	cloudStatus := &wncloud.Status{}
 	// The server name at wn-cloud is not stored. The UI shows the host name,
 	// which is the default of login --name.
@@ -246,7 +247,7 @@ func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.A
 			logger.Warn("a match job did not stop in time", "wait", jobShutdownWait.String())
 		}
 	}()
-	ndClient := navidrome.NewClient(c.NavidromePort)
+	ndClient := navidrome.NewClient(ndTransport)
 	ui := web.New(web.Options{
 		Store:            st,
 		Navidrome:        ndClient,
@@ -261,7 +262,7 @@ func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.A
 	cloud := newClient(c)
 	rt := ratings.New(st, cloud, ndClient, cloudStatus, logger)
 	srv := &http.Server{
-		Handler: proxy.New(target, sup.Ready(), st, cloud, logger,
+		Handler: proxy.New(ndTransport, sup.Ready(), st, cloud, logger,
 			proxy.WithUI(ui), proxy.WithCloudStatus(cloudStatus), proxy.WithRatings(rt)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
