@@ -1,0 +1,25 @@
+{{define "layout"}}<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Title}} · wn-server</title>
+<link rel="stylesheet" href="/ui/static/style.css">
+<script src="/ui/static/ui.js" defer></script>
+</head>
+<body>
+<header>
+<span class="brand">wn-server</span>
+{{if .SignedIn}}<nav>
+<a href="/ui/"{{if eq .Nav "status"}} aria-current="page"{{end}}>Status</a>
+<a href="/ui/account"{{if eq .Nav "account"}} aria-current="page"{{end}}>Account</a>
+<form method="post" action="/ui/logout"><button type="submit" class="link">Sign out</button></form>
+</nav>{{end}}
+</header>
+{{with .Banner}}<div class="banner" role="alert">{{.}}</div>{{end}}
+<main>
+{{template "content" .}}
+</main>
+</body>
+</html>
+{{end}}

@@ -34,11 +34,13 @@ type accountIDKey struct{}
 
 // New returns a handler that forwards /rest/* with authentication and
 // /share/* without it to target, and serves wn-server's own /api/v1/*
-// routes. Every other path answers 404. Until ready is closed, /rest/* and
-// /share/* answer 503 and nothing is forwarded, so that no client can become
-// Navidrome's first user. cloud verifies device codes for
-// POST /api/v1/session. A nil logger selects slog.Default.
-func New(target *url.URL, ready <-chan struct{}, st Store, cloud Verifier, logger *slog.Logger) http.Handler {
+// routes. WithUI adds the web UI on / and /ui/*. Every other path answers
+// 404. Until ready is closed, /rest/* and /share/* answer 503 and nothing is
+// forwarded, so that no client can become Navidrome's first user. cloud
+// verifies device codes for POST /api/v1/session. A nil logger selects
+// slog.Default.
+func New(target *url.URL, ready <-chan struct{}, st Store, cloud Verifier, logger *slog.Logger, opts ...Option) http.Handler {
+	o := newOptions(opts)
 	if logger == nil {
 		logger = slog.Default()
 	}
@@ -46,9 +48,10 @@ func New(target *url.URL, ready <-chan struct{}, st Store, cloud Verifier, logge
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
 			// A client must not choose its Navidrome identity. A session in
-			// the Authorization header stays with wn-server.
+			// the Authorization header or in a cookie stays with wn-server.
 			r.Out.Header.Del(userHeader)
 			r.Out.Header.Del("Authorization")
+			r.Out.Header.Del("Cookie")
 			requestIdentity(r)
 			if id, ok := r.In.Context().Value(accountIDKey{}).(string); ok {
 				r.Out.Header.Set(userHeader, id)
@@ -68,6 +71,7 @@ func New(target *url.URL, ready <-chan struct{}, st Store, cloud Verifier, logge
 		},
 	}
 	sess := newSessions(st, cloud, logger)
+	sess.cloudStatus = o.cloudStatus
 	rest := gateReady(ready, subsonicAuth(st, sess, logger, rp))
 	share := gateReady(ready, rp)
 	api := sess.apiHandler()
@@ -81,6 +85,8 @@ func New(target *url.URL, ready <-chan struct{}, st Store, cloud Verifier, logge
 			share.ServeHTTP(w, r)
 		case strings.HasPrefix(p, "/api/v1/"):
 			api.ServeHTTP(w, r)
+		case isUIPath(p):
+			o.ui.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)
 		}

@@ -2,6 +2,7 @@
 // (/rest/*) after checking a wn-server session or the account's app
 // password, and public shares (/share/*) without a check, to Navidrome on
 // loopback once the supervisor reports ready. It serves wn-server's own
-// /api/v1/* routes, among them the device code exchange at /api/v1/session.
-// Every other path answers 404. Rating intercepts are added in later issues.
+// /api/v1/* routes, among them the device code exchange at /api/v1/session,
+// and passes / and /ui/* to the web UI handler given with WithUI. Every
+// other path answers 404. Rating intercepts are added in later issues.
 package proxy

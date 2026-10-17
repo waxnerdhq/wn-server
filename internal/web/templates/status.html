@@ -1,0 +1,10 @@
+{{define "content"}}
+<h1>Status</h1>
+<dl class="facts">
+<dt>Server name</dt><dd>{{.ServerName}}</dd>
+<dt>Owner account</dt><dd>{{.OwnerName}}</dd>
+<dt>Navidrome</dt><dd>{{.NavidromeVersion}}{{if not .NavidromeReady}} (starting){{end}}</dd>
+<dt>Library scan</dt><dd>{{.ScanState}}</dd>
+<dt>wn-cloud</dt><dd>{{if .Linked}}linked to waxnerd user <code>{{.WaxnerdUserID}}</code> as server <code>{{.ServerID}}</code>{{else}}not linked; run <code>wn-server login</code>{{end}}</dd>
+</dl>
+{{end}}

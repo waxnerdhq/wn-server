@@ -155,6 +155,40 @@ func (c *Client) StartScan(ctx context.Context) error {
 	return subsonicError(data)
 }
 
+// ScanStatus is the scan state that Navidrome reports on /rest/getScanStatus.
+type ScanStatus struct {
+	Scanning    bool      `json:"scanning"`
+	Count       int64     `json:"count"` // tracks
+	FolderCount int64     `json:"folderCount"`
+	LastScan    time.Time `json:"lastScan"` // zero when Navidrome has not scanned
+	Error       string    `json:"error"`
+}
+
+// ScanStatus returns the scan state. It calls the Subsonic route
+// /rest/getScanStatus as wn-server's identity, as StartScan does.
+func (c *Client) ScanStatus(ctx context.Context) (ScanStatus, error) {
+	q := url.Values{"v": {subsonicAPIVersion}, "c": {Identity}, "f": {"json"}}
+	data, err := c.do(ctx, http.MethodGet, "/rest/getScanStatus?"+q.Encode(), nil)
+	if err != nil {
+		return ScanStatus{}, err
+	}
+	if err := subsonicError(data); err != nil {
+		return ScanStatus{}, err
+	}
+	var resp struct {
+		R struct {
+			ScanStatus *ScanStatus `json:"scanStatus"`
+		} `json:"subsonic-response"`
+	}
+	if err := json.Unmarshal(data, &resp); err != nil {
+		return ScanStatus{}, fmt.Errorf("decode scan status: %w", err)
+	}
+	if resp.R.ScanStatus == nil {
+		return ScanStatus{}, errors.New("no scanStatus in getScanStatus response")
+	}
+	return *resp.R.ScanStatus, nil
+}
+
 // subsonicError returns the error in a Subsonic JSON response. Navidrome
 // sends Subsonic errors with HTTP status 200.
 func subsonicError(data []byte) error {
