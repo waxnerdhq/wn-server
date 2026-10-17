@@ -468,7 +468,7 @@ These restate decisions in `README.md` in terms of the routes above.
 - When wn-cloud is unreachable, the session request fails with an error that tells the client to try again later or to use the app password. The code is not spent unless wn-cloud answered 200, so the owner can retry with the same code while it is valid. If wn-cloud spent the code but the answer was lost, the owner gets a new code.
 - In local-only mode `POST /api/v1/session` is refused. There is no server credential to verify with.
 - Requests that carry a wn-server session or an app password never call wn-cloud.
-- Rate limits. wn-server allows at most 5 failed `POST /api/v1/session` attempts per client address per 10 minutes and at most 30 failed attempts in total per 10 minutes. It answers 429 beyond either limit, without calling wn-cloud. wn-cloud allows at most 10 failed verify calls per server credential per 10 minutes, answers 429, and logs them.
+- Rate limits. wn-server allows at most 5 failed `POST /api/v1/session` attempts per client address per 10 minutes and at most 10 failed attempts in total per 10 minutes. It answers 429 beyond either limit, without calling wn-cloud. wn-cloud allows at most 10 failed verify calls per server credential per 10 minutes, answers 429, and logs them.
 - Code space. A code has 8 characters from a 32-symbol alphabet without ambiguous glyphs, about 40 bits, and lives 10 minutes. Guessing is infeasible under these limits.
 
 ### Background tick
