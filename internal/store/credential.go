@@ -119,6 +119,10 @@ func (s *Store) Link(ctx context.Context, accountID string, c ServerCredential) 
 			return err
 		}
 		if prev != c.WaxnerdUserID {
+			// The cursor belongs to the previous user's ratings at wn-cloud.
+			if _, err := tx.ExecContext(ctx, `DELETE FROM rating_sync`); err != nil {
+				return err
+			}
 			return queueAllRatings(ctx, tx, accountID, time.Now())
 		}
 		return retryOutboxNow(ctx, tx, time.Now())

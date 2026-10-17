@@ -88,11 +88,18 @@ func bearerToken(r *http.Request) (string, bool) {
 
 // apiHandler serves wn-server's own /api/v1/* routes. POST /api/v1/session
 // needs no session. Every other route needs Authorization: Bearer with a
-// valid session.
-func (s *sessions) apiHandler() http.Handler {
+// valid session. The rating routes are added when rt is not nil. They reach
+// Navidrome, so they answer 503 until ready is closed.
+func (s *sessions) apiHandler(rt Ratings, ready <-chan struct{}) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/v1/session", s.exchange)
 	mux.HandleFunc("DELETE /api/v1/session", s.revoke)
+	if rt != nil {
+		gate := gateReadyJSON(ready)
+		(&ratingAPI{ratings: rt, logger: s.logger}).mount(mux, func(h http.Handler) http.Handler {
+			return s.requireSession(gate(h))
+		})
+	}
 	mux.Handle("/api/v1/", s.requireSession(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		writeAPIError(w, http.StatusNotFound, "not_found", "no such route")
 	})))
