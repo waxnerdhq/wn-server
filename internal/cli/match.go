@@ -45,14 +45,16 @@ func newMatchCmd() *cobra.Command {
 			// Record what beets wrote, also after a cancel.
 			recErr := recordAlbums(context.WithoutCancel(ctx), st, sum.Albums, sum.MarkersWritten, slog.Default())
 			out := cmd.OutOrStdout()
+			// A run that did not start, such as one the beets lock refused,
+			// prints neither the summary nor the queue count.
 			if err == nil || len(sum.Albums) > 0 {
 				printSummary(out, sum)
-			}
-			if n, cerr := st.CountMatches(context.WithoutCancel(ctx), store.MatchPending); cerr == nil {
-				if n == 0 {
-					fmt.Fprintln(out, "match queue: 0 pending")
-				} else {
-					fmt.Fprintf(out, "match queue: %d pending; `wn-server match list` shows them\n", n)
+				if n, cerr := st.CountMatches(context.WithoutCancel(ctx), store.MatchPending); cerr == nil {
+					if n == 0 {
+						fmt.Fprintln(out, "match queue: 0 pending")
+					} else {
+						fmt.Fprintf(out, "match queue: %d pending; `wn-server match list` shows them\n", n)
+					}
 				}
 			}
 			return errors.Join(err, recErr)
@@ -293,10 +295,9 @@ func newMatchApplyCmd() *cobra.Command {
 				// beets did not run, or wrote nothing.
 				return runErr
 			}
-			// Only the entry's own applied line is recorded. With -S, any
-			// other line for the folder holds the requested release or no
-			// candidate, so recording it would replace the entry's
-			// candidates. Other albums below the folder were skipped by the
+			// Only the entry's own applied line is used. With -S, any other
+			// line for the folder holds the requested release or no
+			// candidate. Other albums below the folder were skipped by the
 			// plugin for the same reason.
 			var applied []beets.Album
 			reason := "beets wrote no line for the folder"
@@ -322,7 +323,14 @@ func newMatchApplyCmd() *cobra.Command {
 				}
 				return errors.Join(runErr, noteErr)
 			}
-			if err := recordAlbums(bg, st, applied, sum.MarkersWritten, logger); err != nil || runErr != nil {
+			// MarkApplied leaves the tags and candidates alone, because this run
+			// looked up only the requested release.
+			a := applied[len(applied)-1]
+			if a.ReleaseID != "" {
+				release = a.ReleaseID
+			}
+			markerWritten := slices.Contains(sum.MarkersWritten, e.Folder)
+			if err := st.MarkApplied(bg, e.ID, release, a.CopiedTo, markerWritten, time.Now()); err != nil || runErr != nil {
 				return errors.Join(runErr, err)
 			}
 			got, err := st.MatchEntry(bg, e.ID)

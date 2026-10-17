@@ -299,6 +299,20 @@ func setApplied(ctx context.Context, db execer, id int64, releaseID, copiedTo st
 		MatchApplied, releaseID, copiedTo, formatTime(at), keepMarker, markerWritten, markerWritten, id))
 }
 
+// MarkApplied records the applied line of a match apply run. It sets the
+// entry to applied with the release id, copied_to, applied_at, and
+// marker_written, sets last_seen to now, and clears last_error. The tags and
+// the candidates stay, because that run looked up only the requested release.
+func (s *Store) MarkApplied(ctx context.Context, id int64, releaseID, copiedTo string, markerWritten bool, now time.Time) error {
+	err := checkOne(s.db.ExecContext(ctx,
+		`UPDATE match_queue SET state = ?, applied_release_id = ?, copied_to = ?, applied_at = ?, marker_written = ?, last_seen = ?, last_error = NULL WHERE id = ?`,
+		MatchApplied, releaseID, copiedTo, formatTime(now), markerWritten, formatTime(now), id))
+	if err != nil {
+		return fmt.Errorf("mark match %d applied: %w", id, err)
+	}
+	return nil
+}
+
 // RevertMatch sets an entry to pending and clears the applied fields.
 func (s *Store) RevertMatch(ctx context.Context, id int64) error {
 	return checkOne(s.db.ExecContext(ctx,

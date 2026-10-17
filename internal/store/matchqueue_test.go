@@ -152,3 +152,50 @@ func TestMatchMarkerAndNoteError(t *testing.T) {
 		t.Fatal("marker_written still set after revert")
 	}
 }
+
+func TestMarkAppliedKeepsCandidates(t *testing.T) {
+	ctx := context.Background()
+	s, err := Open(ctx, filepath.Join(t.TempDir(), FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	t0 := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	t1 := t0.Add(time.Hour)
+	cands := []MatchCandidate{{ReleaseID: "a", Distance: 0.2}, {ReleaseID: "b", Distance: 0.3}}
+	id, err := s.RecordMatch(ctx, MatchLine{Folder: "/m/x", Decision: LineSkipped, Artist: "Ar", Album: "Al", Year: 2001, TrackCount: 9, Candidates: cands}, t0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.NoteMatchError(ctx, id, "earlier failure", t0); err != nil {
+		t.Fatal(err)
+	}
+	check := func(when string, e MatchEntry) {
+		t.Helper()
+		if e.Artist != "Ar" || e.Album != "Al" || e.Year != 2001 || e.TrackCount != 9 || len(e.Candidates) != 2 || e.Candidates[0] != cands[0] || e.Candidates[1] != cands[1] {
+			t.Fatalf("tags or candidates changed %s: %+v", when, e)
+		}
+	}
+
+	if err := s.MarkApplied(ctx, id, "b", "/s/x", true, t1); err != nil {
+		t.Fatal(err)
+	}
+	e, _ := s.MatchEntry(ctx, id)
+	if e.State != MatchApplied || e.AppliedReleaseID != "b" || e.CopiedTo != "/s/x" || !e.AppliedAt.Equal(t1) || !e.LastSeen.Equal(t1) || !e.MarkerWritten || e.LastError != "" {
+		t.Fatalf("entry after MarkApplied = %+v", e)
+	}
+	check("by MarkApplied", e)
+
+	if err := s.RevertMatch(ctx, id); err != nil {
+		t.Fatal(err)
+	}
+	e, _ = s.MatchEntry(ctx, id)
+	if e.State != MatchPending {
+		t.Fatalf("state after revert = %s", e.State)
+	}
+	check("by the revert", e)
+
+	if err := s.MarkApplied(ctx, 999, "a", "/s/y", false, t1); !errors.Is(err, ErrMatchNotFound) {
+		t.Fatalf("MarkApplied(999) = %v, want ErrMatchNotFound", err)
+	}
+}
