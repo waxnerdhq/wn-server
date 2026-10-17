@@ -178,6 +178,8 @@ func (s *Supervisor) markReady(ctx context.Context) {
 		if err == nil {
 			if created {
 				s.log.Info("created owner's navidrome user", "account", s.owner.ID)
+			} else {
+				s.log.Info("owner's navidrome user exists", "account", s.owner.ID)
 			}
 			break
 		}

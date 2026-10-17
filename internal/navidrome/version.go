@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"sync/atomic"
 	"time"
 )
 
@@ -14,6 +15,26 @@ import (
 const PinnedVersion = "0.64.2"
 
 const versionTimeout = 10 * time.Second
+
+// serverVersion holds the full version string that VerifyBinary read.
+var serverVersion atomic.Pointer[string]
+
+// ServerVersion returns the version string Navidrome reports as
+// serverVersion in Subsonic responses, for example "0.64.2 (10114574)". It
+// is the output of `navidrome --version` that VerifyBinary read. Before
+// VerifyBinary has succeeded it returns PinnedVersion.
+func ServerVersion() string {
+	if v := serverVersion.Load(); v != nil {
+		return *v
+	}
+	return PinnedVersion
+}
+
+// fullVersion returns the output of `navidrome --version` without surrounding
+// space and without the leading "v" of the tag.
+func fullVersion(output string) string {
+	return strings.TrimPrefix(strings.Join(strings.Fields(output), " "), "v")
+}
 
 // ParseVersion extracts the version from the output of `navidrome --version`.
 // Navidrome prints consts.Version, which is the tag without its "v" followed
@@ -37,7 +58,7 @@ func CheckVersion(got string) error {
 }
 
 // VerifyBinary runs `bin --version` and checks the result against the pinned
-// version.
+// version. It keeps the full version string for ServerVersion.
 func VerifyBinary(ctx context.Context, bin string) error {
 	ctx, cancel := context.WithTimeout(ctx, versionTimeout)
 	defer cancel()
@@ -52,5 +73,7 @@ func VerifyBinary(ctx context.Context, bin string) error {
 	if err := CheckVersion(got); err != nil {
 		return fmt.Errorf("%s: %w", bin, err)
 	}
+	full := fullVersion(string(out))
+	serverVersion.Store(&full)
 	return nil
 }

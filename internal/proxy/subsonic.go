@@ -27,6 +27,7 @@ const (
 	errWrongCredential = 40
 	errMultipleAuth    = 43
 	errInvalidAPIKey   = 44
+	errNotAuthorized   = 50
 )
 
 // subsonicAPIVersion is the Subsonic API version Navidrome 0.64.2 reports.
@@ -82,7 +83,7 @@ func subsonicAuth(st Store, sess *sessions, logger *slog.Logger, next http.Handl
 				writeSubsonicError(w, params, errInvalidAPIKey, "Invalid API key")
 				return
 			}
-			forward(w, r, params, s.AccountID, next)
+			forwardAccount(w, r, params, st, logger, s.AccountID, "", next)
 			return
 		}
 
@@ -101,19 +102,32 @@ func subsonicAuth(st Store, sess *sessions, logger *slog.Logger, next http.Handl
 			if errors.Is(err, context.Canceled) {
 				return
 			}
-			if !errors.Is(err, store.ErrNotFound) {
+			if errors.Is(err, store.ErrNotFound) {
+				logger.Warn("subsonic sign-in failed", "remote", r.RemoteAddr, "user", truncate(user, maxLogUser), "reason", "missing_user")
+			} else {
 				logger.Error("look up account", "error", err)
 			}
 			writeSubsonicError(w, params, errWrongCredential, "Wrong username or password")
 			return
 		}
 		if !checkCredential(acct.AppPassword, pass, token, salt) {
-			logger.Warn("subsonic sign-in failed", "remote", r.RemoteAddr)
+			logger.Warn("subsonic sign-in failed", "remote", r.RemoteAddr, "user", truncate(user, maxLogUser), "reason", "bad_credentials")
 			writeSubsonicError(w, params, errWrongCredential, "Wrong username or password")
 			return
 		}
-		forward(w, r, params, acct.ID, next)
+		forwardAccount(w, r, params, st, logger, acct.ID, acct.Name, next)
 	})
+}
+
+// maxLogUser is the longest user name that a sign-in log line carries.
+const maxLogUser = 64
+
+// truncate returns s cut to at most n bytes, without a partial character.
+func truncate(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	return strings.ToValidUTF8(s[:n], "")
 }
 
 // conflicting reports whether a session comes with a second credential: an
@@ -227,7 +241,7 @@ func writeSubsonicError(w http.ResponseWriter, params url.Values, code int, mess
 		Status:        "failed",
 		Version:       subsonicAPIVersion,
 		Type:          "navidrome",
-		ServerVersion: navidrome.PinnedVersion,
+		ServerVersion: navidrome.ServerVersion(),
 		OpenSubsonic:  true,
 		Error:         subsonicError{Code: code, Message: message},
 	}

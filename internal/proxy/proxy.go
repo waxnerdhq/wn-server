@@ -49,10 +49,12 @@ func New(target *url.URL, ready <-chan struct{}, st Store, cloud Verifier, logge
 			// the Authorization header stays with wn-server.
 			r.Out.Header.Del(userHeader)
 			r.Out.Header.Del("Authorization")
+			requestIdentity(r)
 			if id, ok := r.In.Context().Value(accountIDKey{}).(string); ok {
 				r.Out.Header.Set(userHeader, id)
 			}
 		},
+		ModifyResponse: rewriteUserResponse,
 		// Flush after every write so audio and large bodies stream.
 		FlushInterval: -1,
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
