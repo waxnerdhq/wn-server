@@ -119,6 +119,8 @@ type statusData struct {
 	Linked           bool
 	WaxnerdUserID    string
 	ServerID         string
+	PendingMatches   int
+	MatchJobRunning  bool
 }
 
 // statusPage serves GET /ui/.
@@ -137,6 +139,12 @@ func (s *server) statusPage(w http.ResponseWriter, r *http.Request, _ store.Sess
 		NavidromeReady:   s.ready(),
 	}
 	data.ScanState = s.scanState(ctx, data.NavidromeReady)
+	data.PendingMatches, err = s.Store.CountMatches(ctx, store.MatchPending)
+	if err != nil {
+		s.internalError(w, r, "count pending matches", err)
+		return
+	}
+	data.MatchJobRunning = s.Jobs.Status().Running != nil
 	cred, err := s.Store.ServerCredential(ctx)
 	switch {
 	case err == nil:

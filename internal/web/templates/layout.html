@@ -4,7 +4,8 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{.Title}} · wn-server</title>
-<link rel="stylesheet" href="/ui/static/style.css">
+{{if .RefreshURL}}<meta http-equiv="refresh" content="{{.RefreshSeconds}};url={{.RefreshURL}}">
+{{end}}<link rel="stylesheet" href="/ui/static/style.css">
 <script src="/ui/static/ui.js" defer></script>
 </head>
 <body>
@@ -12,12 +13,13 @@
 <span class="brand">wn-server</span>
 {{if .SignedIn}}<nav>
 <a href="/ui/"{{if eq .Nav "status"}} aria-current="page"{{end}}>Status</a>
+<a href="/ui/match"{{if eq .Nav "match"}} aria-current="page"{{end}}>Match</a>
 <a href="/ui/account"{{if eq .Nav "account"}} aria-current="page"{{end}}>Account</a>
 <form method="post" action="/ui/logout"><button type="submit" class="link">Sign out</button></form>
 </nav>{{end}}
 </header>
 {{with .Banner}}<div class="banner" role="alert">{{.}}</div>{{end}}
-<main>
+<main{{if .Wide}} class="wide"{{end}}>
 {{template "content" .}}
 </main>
 </body>

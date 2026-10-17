@@ -19,6 +19,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/waxnerdhq/wn-server/internal/config"
+	"github.com/waxnerdhq/wn-server/internal/match"
 	"github.com/waxnerdhq/wn-server/internal/navidrome"
 	"github.com/waxnerdhq/wn-server/internal/proxy"
 	"github.com/waxnerdhq/wn-server/internal/store"
@@ -211,6 +212,10 @@ func newServeCmd() *cobra.Command {
 // shutdownGrace is how long the HTTP server gets to finish in-flight requests.
 const shutdownGrace = 5 * time.Second
 
+// jobShutdownWait is how long serve waits for a canceled match job to record
+// what beets did before the process exits.
+const jobShutdownWait = 30 * time.Second
+
 // serve runs the Navidrome supervisor and the proxy until ctx is cancelled
 // or one of them fails. The supervisor outlives the HTTP server: on a signal
 // the server drains first, then Navidrome is stopped, so in-flight streams
@@ -230,9 +235,22 @@ func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.A
 	// The server name at wn-cloud is not stored. The UI shows the host name,
 	// which is the default of login --name.
 	hostName, _ := os.Hostname()
+	// Match jobs from the web UI stop with ctx, and serve waits for one to
+	// finish before it returns.
+	jobsCtx, cancelJobs := context.WithCancel(ctx)
+	jobs := match.NewJobs(jobsCtx, logger)
+	defer func() {
+		cancelJobs()
+		if !jobs.Wait(jobShutdownWait) {
+			logger.Warn("a match job did not stop in time", "wait", jobShutdownWait.String())
+		}
+	}()
+	ndClient := navidrome.NewClient(c.NavidromePort)
 	ui := web.New(web.Options{
 		Store:            st,
-		Navidrome:        navidrome.NewClient(c.NavidromePort),
+		Navidrome:        ndClient,
+		Match:            match.NewService(c, st, ndClient, logger),
+		Jobs:             jobs,
 		Ready:            sup.Ready(),
 		CloudStatus:      cloudStatus,
 		ServerName:       hostName,

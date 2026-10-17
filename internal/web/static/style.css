@@ -45,6 +45,7 @@ nav { display: flex; align-items: center; gap: 1rem; margin-left: auto; }
 nav a { color: var(--fg); text-decoration: none; }
 nav a[aria-current="page"] { color: var(--accent); font-weight: 600; }
 main { max-width: 48rem; margin: 0 auto; padding: 1rem; }
+main.wide { max-width: 72rem; }
 h1 { font-size: 1.5rem; margin: 0.5rem 0 1rem; }
 h2 { font-size: 1.15rem; margin: 2rem 0 0.5rem; }
 code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
@@ -88,3 +89,10 @@ td form { margin: 0; }
   tr { display: grid; padding: 0.5rem 0; border-bottom: 1px solid var(--line); }
   td { border: 0; padding: 0.1rem 0; }
 }
+.muted { color: var(--muted); }
+.entries > tbody { border-bottom: 2px solid var(--line); }
+.entries .candidates { margin: 0 0 0.5rem 1rem; width: calc(100% - 1rem); }
+.entries .candidates td { padding: 0.25rem 0.5rem; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+.pre { white-space: pre-wrap; overflow-wrap: anywhere; }
+.actions { display: flex; align-items: center; gap: 1rem; flex-wrap: wrap; margin-bottom: 1rem; }

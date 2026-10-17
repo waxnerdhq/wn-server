@@ -1,0 +1,82 @@
+{{define "allfield"}}{{if .}}<input type="hidden" name="all" value="1">{{end}}{{end}}
+{{define "review"}}
+<tbody>
+<tr>
+<td><span class="mono">{{.Folder}}</span>{{with .LastError}}<br><span class="error pre">Last error: {{.}}</span>{{end}}</td>
+<td>{{tags .MatchEntry}}</td>
+<td>{{when .FirstSeen}}</td>
+<td>{{if .CanDismiss}}<form method="post" action="/ui/match/{{.ID}}/dismiss">{{template "allfield" .All}}<button type="submit" class="danger"{{if .Busy}} disabled{{end}}>Dismiss</button></form>{{end}}</td>
+</tr>
+<tr>
+<td colspan="4">
+{{if .Candidates}}{{$row := .}}<table class="candidates">
+<thead><tr><th>Artist</th><th>Album</th><th>Year</th><th>Label</th><th>Distance</th><th>MusicBrainz</th><th></th></tr></thead>
+<tbody>
+{{range .Candidates}}<tr>
+<td>{{.Artist}}</td>
+<td>{{.Album}}</td>
+<td>{{if .Year}}{{.Year}}{{end}}</td>
+<td>{{.Label}}</td>
+<td>{{distance .Distance}}</td>
+<td><a href="https://musicbrainz.org/release/{{.ReleaseID}}" target="_blank" rel="noopener">release page</a></td>
+<td><form method="post" action="/ui/match/{{$row.ID}}/apply"><input type="hidden" name="release" value="{{.ReleaseID}}">{{template "allfield" $row.All}}<button type="submit"{{if $row.Busy}} disabled{{end}}>Apply</button></form></td>
+</tr>
+{{end}}</tbody>
+</table>{{else}}<span class="muted">No candidates.</span>{{end}}
+</td>
+</tr>
+</tbody>
+{{end}}
+{{define "content"}}
+<h1>Match review</h1>
+{{with .Message}}<p class="error pre" role="alert">{{.}}</p>{{end}}
+{{with .Notice}}<p class="notice" role="status">{{.}}</p>{{end}}
+{{with .Running}}<p class="notice" role="status">Running: {{.Label}}, started {{when .Time}}. This page reloads every 5 seconds.</p>{{end}}
+{{with .Last}}{{if .Error}}<p class="error pre" role="alert">Last job: {{.Label}} failed at {{when .Time}}: {{.Error}}{{if .Summary}} ({{.Summary}}){{end}}</p>
+{{else}}<p class="notice" role="status">Last job: {{.Label}} finished at {{when .Time}}{{if .Summary}}: {{.Summary}}{{end}}</p>{{end}}{{end}}
+<div class="actions">
+<form method="post" action="/ui/match/run">{{template "allfield" .All}}<button type="submit"{{if .Busy}} disabled{{end}}>Run import</button></form>
+{{if .All}}<a href="/ui/match">Show pending entries only</a>{{else}}<a href="/ui/match?all=1">Show all entries</a>{{end}}
+</div>
+
+<h2>Pending ({{len .Pending}})</h2>
+{{if .Pending}}<table class="entries">
+<thead><tr><th>Folder</th><th>Tags</th><th>First seen</th><th></th></tr></thead>
+{{range .Pending}}{{template "review" .}}{{end}}
+</table>{{else}}<p class="muted">No pending entries.</p>{{end}}
+
+{{if .All}}
+<h2>Applied ({{len .Applied}})</h2>
+{{if .Applied}}<table>
+<thead><tr><th>Folder</th><th>Tags</th><th>Applied release</th><th></th></tr></thead>
+<tbody>
+{{range .Applied}}<tr>
+<td><span class="mono">{{.Folder}}</span><br><span class="muted mono">{{.CopiedTo}}</span></td>
+<td>{{tags .MatchEntry}}</td>
+<td><a href="https://musicbrainz.org/release/{{.AppliedReleaseID}}" target="_blank" rel="noopener">{{.AppliedReleaseID}}</a><br><span class="muted">{{when .AppliedAt}}</span></td>
+<td><form method="post" action="/ui/match/{{.ID}}/revert" data-confirm="Revert this entry? The copy in the sorted directory is deleted and the entry is pending again.">{{template "allfield" .All}}<button type="submit" class="danger"{{if .Busy}} disabled{{end}}>Revert</button></form></td>
+</tr>
+{{end}}</tbody>
+</table>{{else}}<p class="muted">No applied entries.</p>{{end}}
+
+<h2>Dismissed ({{len .Dismissed}})</h2>
+{{if .Dismissed}}<table class="entries">
+<thead><tr><th>Folder</th><th>Tags</th><th>First seen</th><th></th></tr></thead>
+{{range .Dismissed}}{{template "review" .}}{{end}}
+</table>{{else}}<p class="muted">No dismissed entries.</p>{{end}}
+
+<h2>Duplicates ({{len .Duplicates}})</h2>
+<p>Albums whose match is already in the beets library.</p>
+{{if .Duplicates}}<table>
+<thead><tr><th>Folder</th><th>Tags</th><th>First seen</th><th>Last seen</th></tr></thead>
+<tbody>
+{{range .Duplicates}}<tr>
+<td class="mono">{{.Folder}}</td>
+<td>{{tags .MatchEntry}}</td>
+<td>{{when .FirstSeen}}</td>
+<td>{{when .LastSeen}}</td>
+</tr>
+{{end}}</tbody>
+</table>{{else}}<p class="muted">No duplicates.</p>{{end}}
+{{end}}
+{{end}}
