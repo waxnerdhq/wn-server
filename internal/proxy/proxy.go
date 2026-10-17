@@ -16,27 +16,39 @@ import (
 // userHeader is the header Navidrome trusts to name the signed-in user.
 const userHeader = "Remote-User"
 
-// Accounts looks up an account by its Subsonic user name. It returns
-// store.ErrNotFound for an unknown name. *store.Store implements it.
-type Accounts interface {
+// Store is the part of the store that the proxy uses. *store.Store
+// implements it.
+type Store interface {
+	// AccountByName returns store.ErrNotFound for an unknown name.
 	AccountByName(ctx context.Context, name string) (store.Account, error)
+	Owner(ctx context.Context) (store.Account, error)
+	ServerCredential(ctx context.Context) (store.ServerCredential, error)
+	CreateSession(ctx context.Context, accountID, device string) (string, store.Session, error)
+	// SessionByToken returns store.ErrSessionNotFound for an unknown token.
+	SessionByToken(ctx context.Context, token string) (store.Session, error)
+	TouchSession(ctx context.Context, id string, at time.Time) error
+	RevokeSessionByToken(ctx context.Context, token string) (store.Session, error)
 }
 
 type accountIDKey struct{}
 
 // New returns a handler that forwards /rest/* with authentication and
-// /share/* without it to target. Every other path answers 404. Until ready is
-// closed it answers 503 and forwards nothing, so that no client can become
-// Navidrome's first user. A nil logger selects slog.Default.
-func New(target *url.URL, ready <-chan struct{}, accounts Accounts, logger *slog.Logger) http.Handler {
+// /share/* without it to target, and serves wn-server's own /api/v1/*
+// routes. Every other path answers 404. Until ready is closed, /rest/* and
+// /share/* answer 503 and nothing is forwarded, so that no client can become
+// Navidrome's first user. cloud verifies device codes for
+// POST /api/v1/session. A nil logger selects slog.Default.
+func New(target *url.URL, ready <-chan struct{}, st Store, cloud Verifier, logger *slog.Logger) http.Handler {
 	if logger == nil {
 		logger = slog.Default()
 	}
 	rp := &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
-			// A client must not choose its Navidrome identity.
+			// A client must not choose its Navidrome identity. A session in
+			// the Authorization header stays with wn-server.
 			r.Out.Header.Del(userHeader)
+			r.Out.Header.Del("Authorization")
 			if id, ok := r.In.Context().Value(accountIDKey{}).(string); ok {
 				r.Out.Header.Set(userHeader, id)
 			}
@@ -53,8 +65,10 @@ func New(target *url.URL, ready <-chan struct{}, accounts Accounts, logger *slog
 			w.WriteHeader(http.StatusBadGateway)
 		},
 	}
-	rest := gateReady(ready, subsonicAuth(accounts, logger, rp))
+	sess := newSessions(st, cloud, logger)
+	rest := gateReady(ready, subsonicAuth(st, sess, logger, rp))
 	share := gateReady(ready, rp)
+	api := sess.apiHandler()
 	return logRequests(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch p := r.URL.Path; {
 		case !isClean(p):
@@ -63,6 +77,8 @@ func New(target *url.URL, ready <-chan struct{}, accounts Accounts, logger *slog
 			rest.ServeHTTP(w, r)
 		case strings.HasPrefix(p, "/share/"):
 			share.ServeHTTP(w, r)
+		case strings.HasPrefix(p, "/api/v1/"):
+			api.ServeHTTP(w, r)
 		default:
 			http.NotFound(w, r)
 		}

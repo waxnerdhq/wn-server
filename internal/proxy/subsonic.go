@@ -25,6 +25,8 @@ const (
 	errGeneric         = 0
 	errMissingParam    = 10
 	errWrongCredential = 40
+	errMultipleAuth    = 43
+	errInvalidAPIKey   = 44
 )
 
 // subsonicAPIVersion is the Subsonic API version Navidrome 0.64.2 reports.
@@ -32,23 +34,58 @@ const subsonicAPIVersion = "1.16.1"
 
 // credentialParams are removed before forwarding. Navidrome ignores them when
 // Remote-User comes from a trusted source, and removing them keeps the app
-// password out of Navidrome's logs.
-var credentialParams = []string{"u", "p", "t", "s", "jwt"}
+// password and sessions out of Navidrome's logs.
+var credentialParams = []string{"u", "p", "t", "s", "jwt", "apiKey"}
+
+// apiKeyConflicts may not be sent together with apiKey, as in Navidrome.
+var apiKeyConflicts = []string{"u", "p", "t", "s", "jwt"}
 
 // maxFormBytes matches Navidrome's limit on a POSTed Subsonic form.
 const maxFormBytes = 10 << 20
 
-// subsonicAuth checks the Subsonic credentials in u plus t and s, or u plus
-// p, against accounts. On success it forwards the request with the account id
-// as Remote-User and without the credential parameters. On failure it
-// answers as Navidrome does: HTTP 200 with a Subsonic error body.
-func subsonicAuth(accounts Accounts, logger *slog.Logger, next http.Handler) http.Handler {
+// subsonicAuth checks a wn-server session, sent as the OpenSubsonic apiKey
+// parameter or as Authorization: Bearer, or else the Subsonic credentials in
+// u plus t and s, or u plus p, against the store. On success it forwards the
+// request with the account id as Remote-User and without the credential
+// parameters. On failure it answers as Navidrome does: HTTP 200 with a
+// Subsonic error body.
+func subsonicAuth(st Store, sess *sessions, logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		params, err := subsonicParams(w, r)
 		if err != nil {
 			writeSubsonicError(w, r.URL.Query(), errGeneric, err.Error())
 			return
 		}
+		apiKey := params.Get("apiKey")
+		bearer, hasBearer := bearerToken(r)
+		if apiKey != "" || hasBearer {
+			if conflicting(params, apiKey != "", hasBearer) {
+				logger.Warn("subsonic session sent with other credentials", "remote", r.RemoteAddr)
+				writeSubsonicError(w, params, errMultipleAuth, "Multiple conflicting authentication mechanisms provided")
+				return
+			}
+			token := apiKey
+			if hasBearer {
+				token = bearer
+			}
+			s, err := sess.check(r.Context(), token)
+			if err != nil {
+				if r.Context().Err() != nil {
+					return
+				}
+				if !errors.Is(err, store.ErrSessionNotFound) {
+					logger.Error("look up session", "error", err)
+					writeSubsonicError(w, params, errGeneric, "internal error")
+					return
+				}
+				logger.Warn("subsonic session unknown", "remote", r.RemoteAddr)
+				writeSubsonicError(w, params, errInvalidAPIKey, "Invalid API key")
+				return
+			}
+			forward(w, r, params, s.AccountID, next)
+			return
+		}
+
 		user := params.Get("u")
 		pass, token, salt := params.Get("p"), params.Get("t"), params.Get("s")
 		switch {
@@ -59,7 +96,7 @@ func subsonicAuth(accounts Accounts, logger *slog.Logger, next http.Handler) htt
 			writeSubsonicError(w, params, errMissingParam, "missing parameter: 'p', or 't' and 's'")
 			return
 		}
-		acct, err := accounts.AccountByName(r.Context(), user)
+		acct, err := st.AccountByName(r.Context(), user)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
 				return
@@ -75,25 +112,45 @@ func subsonicAuth(accounts Accounts, logger *slog.Logger, next http.Handler) htt
 			writeSubsonicError(w, params, errWrongCredential, "Wrong username or password")
 			return
 		}
-
-		for _, k := range credentialParams {
-			params.Del(k)
-		}
-		out := r.WithContext(context.WithValue(r.Context(), accountIDKey{}, acct.ID))
-		out.URL = new(url.URL)
-		*out.URL = *r.URL
-		out.URL.RawQuery = params.Encode()
-		if hasFormBody(r) {
-			// The form is now in the query. Navidrome merges a POST, PUT, or PATCH form
-			// into the query the same way, so an empty body is equivalent.
-			out.Body = http.NoBody
-			out.ContentLength = 0
-			out.Header = r.Header.Clone()
-			out.Header.Del("Content-Type")
-			out.Header.Del("Content-Length")
-		}
-		next.ServeHTTP(w, out)
+		forward(w, r, params, acct.ID, next)
 	})
+}
+
+// conflicting reports whether a session comes with a second credential: an
+// apiKey parameter together with a Bearer header, or either one together
+// with a Subsonic password or token parameter.
+func conflicting(params url.Values, hasKey, hasBearer bool) bool {
+	if hasKey && hasBearer {
+		return true
+	}
+	for _, k := range apiKeyConflicts {
+		if params.Has(k) {
+			return true
+		}
+	}
+	return false
+}
+
+// forward passes an authenticated request to next with the account id as
+// Remote-User and without the credential parameters.
+func forward(w http.ResponseWriter, r *http.Request, params url.Values, accountID string, next http.Handler) {
+	for _, k := range credentialParams {
+		params.Del(k)
+	}
+	out := r.WithContext(context.WithValue(r.Context(), accountIDKey{}, accountID))
+	out.URL = new(url.URL)
+	*out.URL = *r.URL
+	out.URL.RawQuery = params.Encode()
+	if hasFormBody(r) {
+		// The form is now in the query. Navidrome merges a POST, PUT, or PATCH form
+		// into the query the same way, so an empty body is equivalent.
+		out.Body = http.NoBody
+		out.ContentLength = 0
+		out.Header = r.Header.Clone()
+		out.Header.Del("Content-Type")
+		out.Header.Del("Content-Length")
+	}
+	next.ServeHTTP(w, out)
 }
 
 // subsonicParams returns the query parameters merged with a POSTed form (also

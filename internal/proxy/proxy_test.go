@@ -8,31 +8,28 @@ import (
 	"encoding/json"
 	"encoding/xml"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/waxnerdhq/wn-server/internal/store"
+	"github.com/waxnerdhq/wn-server/internal/wncloud"
+	"github.com/waxnerdhq/wn-server/internal/wncloud/stub"
 )
 
 const (
-	ownerID   = "0123456789abcdef"
-	ownerName = "owner"
-	ownerPass = "s3cretPassw0rd"
+	ownerName  = "owner"
+	ownerPass  = "s3cretPassw0rd"
+	waxnerdID  = "0192f1c4-3b7e-7d2a-9a10-5f4e2c1b8a70"
+	serverID   = "7f3c9a2e-1b4d-4e8f-9a6b-2c5d8e1f0a3b"
+	cloudToken = "wn_servercredential"
 )
-
-type fakeAccounts struct{}
-
-func (fakeAccounts) AccountByName(_ context.Context, name string) (store.Account, error) {
-	if name != ownerName {
-		return store.Account{}, store.ErrNotFound
-	}
-	return store.Account{ID: ownerID, Name: ownerName, AppPassword: ownerPass}, nil
-}
 
 // creds is a valid token-scheme query for the owner.
 func creds() string {
@@ -40,8 +37,19 @@ func creds() string {
 	return "u=" + ownerName + "&t=" + hex.EncodeToString(sum[:]) + "&s=abc123&v=1.16.1&c=test"
 }
 
-func newProxy(t *testing.T, backend http.Handler, ready bool) (*httptest.Server, *atomic.Int32) {
+// env is a proxy in front of a fake Navidrome, with a real store and the
+// wn-cloud stub.
+type env struct {
+	srv   *httptest.Server
+	hits  *atomic.Int32
+	st    *store.Store
+	owner store.Account
+	cloud *stub.Stub
+}
+
+func newEnv(t *testing.T, backend http.Handler, ready bool) *env {
 	t.Helper()
+	ctx := context.Background()
 	var hits atomic.Int32
 	be := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		hits.Add(1)
@@ -52,23 +60,45 @@ func newProxy(t *testing.T, backend http.Handler, ready bool) (*httptest.Server,
 	if err != nil {
 		t.Fatal(err)
 	}
+	st, err := store.Open(ctx, filepath.Join(t.TempDir(), store.FileName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	owner, err := st.CreateOwner(ctx, ownerName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.SetAppPassword(ctx, owner.ID, ownerPass); err != nil {
+		t.Fatal(err)
+	}
+	cloud := stub.New()
+	cloudSrv := httptest.NewServer(cloud)
+	t.Cleanup(cloudSrv.Close)
 	ch := make(chan struct{})
 	if ready {
 		close(ch)
 	}
-	srv := httptest.NewServer(New(target, ch, fakeAccounts{}, nil))
+	logger := slog.New(slog.DiscardHandler)
+	srv := httptest.NewServer(New(target, ch, st, wncloud.New(cloudSrv.URL, "test"), logger))
 	t.Cleanup(srv.Close)
-	return srv, &hits
+	return &env{srv: srv, hits: &hits, st: st, owner: owner, cloud: cloud}
+}
+
+func newProxy(t *testing.T, backend http.Handler, ready bool) (*httptest.Server, *atomic.Int32) {
+	t.Helper()
+	e := newEnv(t, backend, ready)
+	return e.srv, e.hits
 }
 
 func TestRemoteUserIsAccountID(t *testing.T) {
 	var got []string
 	var query url.Values
-	srv, _ := newProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	e := newEnv(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		got = r.Header.Values("Remote-User")
 		query = r.URL.Query()
 	}), true)
-	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/rest/ping.view?"+creds(), nil)
+	req, _ := http.NewRequest(http.MethodGet, e.srv.URL+"/rest/ping.view?"+creds(), nil)
 	req.Header.Set("Remote-User", "admin")
 	req.Header.Add("remote-user", "other")
 	resp, err := http.DefaultClient.Do(req)
@@ -76,8 +106,8 @@ func TestRemoteUserIsAccountID(t *testing.T) {
 		t.Fatal(err)
 	}
 	resp.Body.Close()
-	if len(got) != 1 || got[0] != ownerID {
-		t.Fatalf("backend received Remote-User %v, want [%s]", got, ownerID)
+	if len(got) != 1 || got[0] != e.owner.ID {
+		t.Fatalf("backend received Remote-User %v, want [%s]", got, e.owner.ID)
 	}
 	for _, k := range []string{"u", "t", "s"} {
 		if query.Has(k) {
