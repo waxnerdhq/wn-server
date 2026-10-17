@@ -242,6 +242,73 @@ func (c *Client) ScanStatus(ctx context.Context) (ScanStatus, error) {
 	return *resp.R.ScanStatus, nil
 }
 
+// maxLookup is the most items a lookup by MusicBrainz id returns. A subject
+// matches one item in a library, or a few when the library holds copies.
+const maxLookup = 50
+
+// AlbumsByMBID returns the ids of the albums with the MusicBrainz release id
+// mbid, as user. It uses the native API filter mbz_album_id, which Navidrome
+// compares exactly.
+func (c *Client) AlbumsByMBID(ctx context.Context, user, mbid string) ([]string, error) {
+	return c.idsByFilter(ctx, user, "/api/album", "mbz_album_id", mbid)
+}
+
+// SongsByMBID returns the ids of the media files with the MusicBrainz track
+// id mbid (the release track id, not the recording id), as user. It uses
+// the native API filter mbz_release_track_id.
+func (c *Client) SongsByMBID(ctx context.Context, user, mbid string) ([]string, error) {
+	return c.idsByFilter(ctx, user, "/api/song", "mbz_release_track_id", mbid)
+}
+
+func (c *Client) idsByFilter(ctx context.Context, user, path, field, value string) ([]string, error) {
+	filter, err := json.Marshal(map[string]string{field: value})
+	if err != nil {
+		return nil, err
+	}
+	q := url.Values{"filter": {string(filter)}, "_start": {"0"}, "_end": {strconv.Itoa(maxLookup)}}
+	var items []struct {
+		ID string `json:"id"`
+	}
+	if err := c.getJSON(ctx, user, path+"?"+q.Encode(), &items); err != nil {
+		return nil, err
+	}
+	ids := make([]string, 0, len(items))
+	for _, it := range items {
+		ids = append(ids, it.ID)
+	}
+	return ids, nil
+}
+
+// SetRating sets the whole-star rating of a song or album as user, through
+// the Subsonic API on loopback. stars 0 clears the rating.
+func (c *Client) SetRating(ctx context.Context, user, id string, stars int) error {
+	return c.subsonic(ctx, user, "setRating", url.Values{"id": {id}, "rating": {strconv.Itoa(stars)}})
+}
+
+// SetStarred stars or unstars a song or album as user, through the Subsonic
+// API on loopback.
+func (c *Client) SetStarred(ctx context.Context, user, id string, starred bool) error {
+	call := "unstar"
+	if starred {
+		call = "star"
+	}
+	return c.subsonic(ctx, user, call, url.Values{"id": {id}})
+}
+
+// subsonic calls a Subsonic route as user and returns the error in its
+// answer. The call goes to Navidrome directly, so wn-server's rating
+// intercept does not see it.
+func (c *Client) subsonic(ctx context.Context, user, call string, params url.Values) error {
+	params.Set("v", subsonicAPIVersion)
+	params.Set("c", Identity)
+	params.Set("f", "json")
+	data, err := c.doAs(ctx, user, http.MethodGet, "/rest/"+call+"?"+params.Encode(), nil)
+	if err != nil {
+		return err
+	}
+	return subsonicError(data)
+}
+
 // subsonicError returns the error in a Subsonic JSON response. Navidrome
 // sends Subsonic errors with HTTP status 200.
 func subsonicError(data []byte) error {

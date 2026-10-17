@@ -80,7 +80,7 @@ func New(target *url.URL, ready <-chan struct{}, st Store, cloud Verifier, logge
 	sess.cloudStatus = o.cloudStatus
 	rest := gateReady(ready, subsonicAuth(st, sess, logger, interceptRatings(o.ratings, logger, rp)))
 	share := gateReady(ready, rp)
-	api := sess.apiHandler()
+	api := sess.apiHandler(o.ratings, ready)
 	return logRequests(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch p := r.URL.Path; {
 		case !isClean(p):

@@ -334,6 +334,8 @@ func (s *server) signedIn(title, nav string) page {
 	p := page{Title: title, Nav: nav, SignedIn: true}
 	if since, ok := s.CloudStatus.UnreachableSince(); ok {
 		p.Banner = "wn-cloud unreachable since " + since.Local().Format("2006-01-02 15:04 MST")
+	} else if s.CloudStatus.CredentialRejected() {
+		p.Banner = "server credential rejected by wn-cloud: run `wn-server logout`, then `wn-server login`"
 	}
 	return p
 }

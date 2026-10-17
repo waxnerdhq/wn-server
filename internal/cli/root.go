@@ -273,6 +273,7 @@ func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.A
 	srvDone := make(chan error, 1)
 	go func() { srvDone <- srv.Serve(ln) }()
 	go rt.Run(ctx)
+	go rt.RunReconcile(ctx, sup.Ready())
 	logger.Info("listening", "addr", ln.Addr().String())
 
 	shutdownServer := func() {

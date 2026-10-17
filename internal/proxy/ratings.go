@@ -14,6 +14,7 @@ import (
 	"strings"
 
 	"github.com/waxnerdhq/wn-server/internal/ratings"
+	"github.com/waxnerdhq/wn-server/internal/store"
 )
 
 // Ratings records the rating changes of intercepted Subsonic calls.
@@ -22,6 +23,12 @@ type Ratings interface {
 	Resolve(ctx context.Context, accountID, id string) (ratings.Subject, error)
 	SetHalfStars(ctx context.Context, accountID string, sub ratings.Subject, halfStars *int) error
 	SetLike(ctx context.Context, accountID string, sub ratings.Subject, likeLevel *string) error
+	// The rating API uses the rest.
+	Patch(ctx context.Context, accountID string, sub ratings.Subject, p ratings.Patch) (store.Rating, error)
+	Clear(ctx context.Context, accountID string, sub ratings.Subject) (store.Rating, error)
+	Get(ctx context.Context, accountID string, sub ratings.Subject) (store.Rating, error)
+	SetMirror(ctx context.Context, accountID, id string, halfStars *int, likeLevel *string) error
+	Changes(ctx context.Context, accountID, since string, limit int) (changes []store.RatingChange, next string, err error)
 }
 
 // maxRatingBody is the largest setRating, star, or unstar response that is

@@ -29,10 +29,12 @@ const (
 	LikeLove = "love"
 )
 
-// Intervals of the outbox drain.
+// Intervals of the outbox drain and the reconcile loop.
 const (
 	// DrainInterval is the time between two drains of the outbox.
 	DrainInterval = time.Minute
+	// ReconcileInterval is the time between two runs of the reconcile loop.
+	ReconcileInterval = 15 * time.Minute
 	// firstBackoff is the wait after the first failed attempt of an entry.
 	// Each further failure doubles it, up to maxBackoff.
 	firstBackoff = time.Minute
@@ -88,6 +90,7 @@ func FromSubsonic(rating int) (halfStars *int, ok bool) {
 // Store is the part of the store that the service uses. *store.Store
 // implements it.
 type Store interface {
+	Owner(ctx context.Context) (store.Account, error)
 	Rating(ctx context.Context, accountID, kind, mbid string) (store.Rating, error)
 	PutRating(ctx context.Context, r store.Rating) error
 	ServerCredential(ctx context.Context) (store.ServerCredential, error)
@@ -95,6 +98,10 @@ type Store interface {
 	NextOutbox(ctx context.Context, now time.Time) (store.OutboxEntry, error)
 	DeleteOutbox(ctx context.Context, id, version int64) error
 	FailOutbox(ctx context.Context, id, version int64, attempts int, nextAt time.Time, lastError string) error
+	ApplyRemoteRating(ctx context.Context, accountID string, r store.Rating, deleted bool) (store.RemoteResult, error)
+	RatingSyncCursor(ctx context.Context) (string, error)
+	SetRatingSyncCursor(ctx context.Context, cursor string) error
+	RatingChanges(ctx context.Context, accountID string, after *store.ChangeCursor, limit int) ([]store.RatingChange, error)
 }
 
 // Cloud is the part of the wn-cloud client that the service uses.
@@ -102,19 +109,25 @@ type Store interface {
 type Cloud interface {
 	PutRating(ctx context.Context, token, kind, mbid string, halfStars *int, likeLevel *string) (wncloud.Rating, error)
 	DeleteRating(ctx context.Context, token, kind, mbid string) error
+	ListRatings(ctx context.Context, token, since string, limit int) (wncloud.RatingChanges, error)
 }
 
-// Navidrome looks up songs and albums as a Navidrome user.
-// *navidrome.Client implements it.
+// Navidrome looks up songs and albums and sets their rounded rating and
+// starred flag, as a Navidrome user. *navidrome.Client implements it.
 type Navidrome interface {
 	Song(ctx context.Context, user, id string) (navidrome.Song, error)
 	Album(ctx context.Context, user, id string) (navidrome.Album, error)
+	SongsByMBID(ctx context.Context, user, mbid string) ([]string, error)
+	AlbumsByMBID(ctx context.Context, user, mbid string) ([]string, error)
+	SetRating(ctx context.Context, user, id string, stars int) error
+	SetStarred(ctx context.Context, user, id string, starred bool) error
 }
 
 // Service records ratings. A write goes to the local store and the outbox,
-// and the drain sends it to wn-cloud. Store writes run one at a time. The
-// drain sends without holding the lock and removes or delays an entry only
-// when it did not change during the send.
+// and the drain sends it to wn-cloud. The reconcile loop brings changes from
+// wn-cloud into the local store and into Navidrome. Store writes run one at
+// a time. The drain sends without holding the lock and removes or delays an
+// entry only when it did not change during the send.
 type Service struct {
 	store  Store
 	cloud  Cloud
@@ -124,6 +137,8 @@ type Service struct {
 	now    func() time.Time
 
 	mu sync.Mutex
+	// drainMu lets one drain run at a time.
+	drainMu sync.Mutex
 	// kick asks Run to drain at once.
 	kick chan struct{}
 
@@ -181,7 +196,8 @@ func (s *Service) Set(ctx context.Context, accountID, kind, mbid string, halfSta
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	r := store.Rating{AccountID: accountID, Kind: kind, MBID: strings.ToLower(mbid), HalfStars: halfStars, LikeLevel: likeLevel}
-	return s.write(ctx, r)
+	_, err := s.write(ctx, r)
+	return err
 }
 
 // Delete clears the account's rating of a subject, as Set with both values
@@ -193,18 +209,23 @@ func (s *Service) Delete(ctx context.Context, accountID, kind, mbid string) erro
 // SetHalfStars sets the half stars of a rating and keeps its like level.
 // nil clears the stars.
 func (s *Service) SetHalfStars(ctx context.Context, accountID string, sub Subject, halfStars *int) error {
-	return s.update(ctx, accountID, sub, halfStars, nil, func(r *store.Rating) { r.HalfStars = halfStars })
+	_, err := s.update(ctx, accountID, sub, halfStars, nil, func(r *store.Rating) { r.HalfStars = halfStars })
+	return err
 }
 
 // SetLike sets the like level of a rating and keeps its half stars. nil
 // clears the like level.
 func (s *Service) SetLike(ctx context.Context, accountID string, sub Subject, likeLevel *string) error {
-	return s.update(ctx, accountID, sub, nil, likeLevel, func(r *store.Rating) { r.LikeLevel = likeLevel })
+	_, err := s.update(ctx, accountID, sub, nil, likeLevel, func(r *store.Rating) { r.LikeLevel = likeLevel })
+	return err
 }
 
-func (s *Service) update(ctx context.Context, accountID string, sub Subject, halfStars *int, likeLevel *string, change func(*store.Rating)) error {
+// update changes the stored rating of a subject with change and writes it.
+// halfStars and likeLevel are the values that change sets, for validation.
+// It returns the rating as stored.
+func (s *Service) update(ctx context.Context, accountID string, sub Subject, halfStars *int, likeLevel *string, change func(*store.Rating)) (store.Rating, error) {
 	if err := validate(sub.Kind, sub.MBID, halfStars, likeLevel); err != nil {
-		return err
+		return store.Rating{}, err
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -214,7 +235,7 @@ func (s *Service) update(ctx context.Context, accountID string, sub Subject, hal
 		r, err = store.Rating{AccountID: accountID, Kind: sub.Kind, MBID: mbid}, nil
 	}
 	if err != nil {
-		return err
+		return store.Rating{}, err
 	}
 	change(&r)
 	r.UpdatedAt = time.Time{}
@@ -235,13 +256,14 @@ func validate(kind, mbid string, halfStars *int, likeLevel *string) error {
 	return nil
 }
 
-// write stores r and queues it in the outbox, due at once. s.mu is held.
-func (s *Service) write(ctx context.Context, r store.Rating) error {
+// write stores r and queues it in the outbox, due at once. It returns r
+// with its update time. s.mu is held.
+func (s *Service) write(ctx context.Context, r store.Rating) (store.Rating, error) {
 	if r.UpdatedAt.IsZero() {
 		r.UpdatedAt = s.now()
 	}
 	if err := s.store.PutRating(ctx, r); err != nil {
-		return fmt.Errorf("store rating: %w", err)
+		return store.Rating{}, fmt.Errorf("store rating: %w", err)
 	}
 	now := s.now()
 	e := store.OutboxEntry{
@@ -249,7 +271,7 @@ func (s *Service) write(ctx context.Context, r store.Rating) error {
 		Deleted: r.Cleared(), CreatedAt: now, NextAt: now,
 	}
 	if err := s.store.EnqueueRating(ctx, e); err != nil {
-		return err
+		return store.Rating{}, err
 	}
 	if _, down := s.status.UnreachableSince(); !down {
 		select {
@@ -257,7 +279,7 @@ func (s *Service) write(ctx context.Context, r store.Rating) error {
 		default:
 		}
 	}
-	return nil
+	return r, nil
 }
 
 // send writes one entry to wn-cloud and records in the status whether
@@ -269,12 +291,27 @@ func (s *Service) send(ctx context.Context, token string, e store.OutboxEntry) e
 	} else {
 		_, err = s.cloud.PutRating(ctx, token, e.Kind, e.MBID, e.HalfStars, e.LikeLevel)
 	}
+	s.noteCloud(err)
+	return err
+}
+
+// noteCloud records in the status the outcome of a call to wn-cloud: whether
+// wn-cloud answered, and whether it refused the server credential with 401.
+// Only a 2xx answer shows that the credential works, so only that clears the
+// rejected state. Any other outcome, such as 400, 403, or 429, leaves it as
+// it was.
+func (s *Service) noteCloud(err error) {
 	if errors.Is(err, wncloud.ErrUnreachable) {
 		s.status.MarkUnreachable(s.now())
-	} else {
-		s.status.MarkReachable()
+		return
 	}
-	return err
+	s.status.MarkReachable()
+	switch {
+	case errors.Is(err, wncloud.ErrUnauthorized):
+		s.status.SetCredentialRejected(true)
+	case err == nil:
+		s.status.SetCredentialRejected(false)
+	}
 }
 
 // failure logs a failed write of e and returns the attempt count, the time
@@ -328,7 +365,7 @@ func (s *Service) logUnreachable(err error) {
 	}
 	s.logMu.Unlock()
 	if !quiet {
-		s.logger.Warn("wn-cloud is unreachable; rating writes wait in the outbox", "error", err)
+		s.logger.Warn("wn-cloud is unreachable; rating writes wait in the outbox and the rating sync waits", "error", err)
 	}
 }
 
@@ -339,6 +376,8 @@ func (s *Service) logUnreachable(err error) {
 // wn-cloud, a refused credential, or a rate limit stops the drain. Without a
 // server credential Drain does nothing.
 func (s *Service) Drain(ctx context.Context) error {
+	s.drainMu.Lock()
+	defer s.drainMu.Unlock()
 	cred, err := s.store.ServerCredential(ctx)
 	if errors.Is(err, store.ErrNoServerCredential) {
 		return nil
