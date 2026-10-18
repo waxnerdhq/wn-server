@@ -155,6 +155,36 @@ func TestRemoteUserIsAccountID(t *testing.T) {
 	}
 }
 
+func TestForwardedHeadersComeFromTheRequest(t *testing.T) {
+	var got http.Header
+	srv, _ := newProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+	}), true)
+	req, _ := http.NewRequest(http.MethodGet, srv.URL+"/share/x", nil)
+	req.Host = "music.lan:4533"
+	req.Header.Set("X-Forwarded-Host", "evil.example")
+	req.Header.Set("X-Forwarded-Proto", "https")
+	req.Header.Set("X-Forwarded-For", "10.0.0.9")
+	req.Header.Set("X-Forwarded-Scheme", "https")
+	req.Header.Set("Forwarded", "for=10.0.0.9")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	if v := got.Values("X-Forwarded-Host"); len(v) != 1 || v[0] != "music.lan:4533" {
+		t.Fatalf("X-Forwarded-Host %v, want [music.lan:4533]", v)
+	}
+	if v := got.Values("X-Forwarded-Proto"); len(v) != 1 || v[0] != "http" {
+		t.Fatalf("X-Forwarded-Proto %v, want [http]", v)
+	}
+	for _, h := range []string{"X-Forwarded-For", "X-Forwarded-Scheme", "Forwarded"} {
+		if v := got.Values(h); len(v) != 0 {
+			t.Fatalf("backend received %s %v", h, v)
+		}
+	}
+}
+
 func TestShareStripsRemoteUser(t *testing.T) {
 	var got []string
 	srv, hits := newProxy(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
