@@ -50,6 +50,21 @@ func New(rt http.RoundTripper, ready <-chan struct{}, st Store, cloud Verifier, 
 		Transport: rt,
 		Rewrite: func(r *httputil.ProxyRequest) {
 			r.SetURL(target)
+			// Navidrome builds share links and public image URLs from
+			// X-Forwarded-Host and X-Forwarded-Proto, else from Host, which
+			// is localhost on the socket. Both come from this request, not
+			// from the client's headers. X-Forwarded-For is never set:
+			// Navidrome checks it against its trusted sources for the
+			// Remote-User sign-in.
+			for _, h := range []string{"Forwarded", "X-Forwarded-For", "X-Forwarded-Host", "X-Forwarded-Proto", "X-Forwarded-Scheme"} {
+				r.Out.Header.Del(h)
+			}
+			r.Out.Header.Set("X-Forwarded-Host", r.In.Host)
+			if r.In.TLS != nil {
+				r.Out.Header.Set("X-Forwarded-Proto", "https")
+			} else {
+				r.Out.Header.Set("X-Forwarded-Proto", "http")
+			}
 			// A client must not choose its Navidrome identity. A session in
 			// the Authorization header or in a cookie stays with wn-server.
 			r.Out.Header.Del(userHeader)
