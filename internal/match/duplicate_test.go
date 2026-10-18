@@ -1,6 +1,7 @@
 package match
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -280,7 +281,12 @@ func TestRevertForgetsFolderOnNextRun(t *testing.T) {
 	if err := os.WriteFile(forgotten, []byte(`{"decision":"forgotten","folder":"`+a+`"}`+"\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	var logs bytes.Buffer
+	e.svc.log = slog.New(slog.NewTextHandler(&logs, nil))
 	e.run(map[string]any{"folder": a, "decision": "skipped"})
+	if !strings.Contains(logs.String(), "forgot folder from beets' history") {
+		t.Fatalf("no log line for the forgotten folder:\n%s", logs.String())
+	}
 	if pending() != 0 {
 		t.Fatal("forget_pending stayed after the forgotten line")
 	}

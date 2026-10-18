@@ -112,14 +112,17 @@ func (s *Supervisor) Run(ctx context.Context) error {
 // it instead of restarting.
 var ErrSocketInUse = errors.New("another Navidrome is listening on the socket")
 
-// staleDialTimeout is how long removeStaleSocket waits for a connection.
+// staleDialTimeout is how long CheckSocket waits for a connection.
 const staleDialTimeout = 500 * time.Millisecond
 
-// removeStaleSocket removes the socket file that a stopped child left. It
+// CheckSocket removes the socket file that a stopped child left. It
 // first dials the socket: a dead child's file gives ECONNREFUSED, and an
 // absent file gives ENOENT. A successful dial gives ErrSocketInUse and
 // leaves the file. Navidrome also removes the file before it listens.
-func removeStaleSocket(sock string) error {
+//
+// serve calls it before it binds the proxy port, and runOnce calls it before
+// each start of the child.
+func CheckSocket(sock string) error {
 	if conn, err := net.DialTimeout("unix", sock, staleDialTimeout); err == nil {
 		conn.Close()
 		return fmt.Errorf("%w: %s", ErrSocketInUse, sock)
@@ -136,7 +139,7 @@ func (s *Supervisor) runOnce(ctx context.Context) error {
 	defer cancel()
 
 	sock := s.cfg.NavidromeSocketPath()
-	if err := removeStaleSocket(sock); err != nil {
+	if err := CheckSocket(sock); err != nil {
 		return err
 	}
 

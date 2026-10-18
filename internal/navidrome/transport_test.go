@@ -47,6 +47,34 @@ func TestRunRefusesSocketInUse(t *testing.T) {
 	}
 }
 
+// TestCheckSocket checks the three states of the socket path: absent is fine,
+// a stale file is removed, and a listener gives ErrSocketInUse.
+func TestCheckSocket(t *testing.T) {
+	sock := filepath.Join(shortTempDir(t), "nd.sock")
+	if err := CheckSocket(sock); err != nil {
+		t.Fatalf("absent socket: %v", err)
+	}
+	ln, err := net.Listen("unix", sock)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := CheckSocket(sock); !errors.Is(err, ErrSocketInUse) {
+		t.Fatalf("listening socket: %v, want ErrSocketInUse", err)
+	}
+	// Closing a UnixListener removes the file, so keep it.
+	ln.(*net.UnixListener).SetUnlinkOnClose(false)
+	ln.Close()
+	if _, err := os.Stat(sock); err != nil {
+		t.Fatalf("stale socket file missing: %v", err)
+	}
+	if err := CheckSocket(sock); err != nil {
+		t.Fatalf("stale socket: %v", err)
+	}
+	if _, err := os.Stat(sock); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("stale socket file not removed: %v", err)
+	}
+}
+
 // TestWaitReadyOnSocket starts listening on the socket after the poll has
 // begun, as Navidrome does once its migrations finish.
 func TestWaitReadyOnSocket(t *testing.T) {

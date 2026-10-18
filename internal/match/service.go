@@ -102,9 +102,17 @@ func (s *Service) Run(ctx context.Context) (RunResult, error) {
 	}
 	sum, err := s.runner.Import(ctx, s.cfg.MusicFolders, forget)
 	var cleared []int64
+	confirmed := map[string]bool{}
 	for _, folder := range sum.Forgotten {
 		if id, ok := forgetIDs[folder]; ok {
 			cleared = append(cleared, id)
+			confirmed[folder] = true
+			s.log.Info("forgot folder from beets' history", "folder", folder)
+		}
+	}
+	for _, folder := range forget {
+		if !confirmed[folder] {
+			s.log.Warn("beets did not confirm the forget; the next run tries again", "folder", folder)
 		}
 	}
 	if len(cleared) > 0 {
