@@ -225,4 +225,20 @@ func TestDeviceCodes(t *testing.T) {
 	if st := c.do("POST", path, owner, map[string]string{"code": code}, nil); st != 200 {
 		t.Fatalf("verify after 403: %d", st)
 	}
+
+	// The 403 above was the first failure of other. Nine more reach the limit.
+	// The rate limit is checked first: a valid code and a malformed id both
+	// get 429, and the owner's credential is not affected.
+	for range 9 {
+		c.do("POST", path, other, map[string]string{"code": "K7QM-4XPA"}, nil)
+	}
+	code = s.IssueDeviceCode(serverID, otherID)
+	for _, p := range []string{path, "/servers/not-a-uuid/device-codes/verify"} {
+		if st := c.do("POST", p, other, map[string]string{"code": code}, &e); st != 429 || e.Code != "rate_limited" {
+			t.Fatalf("verify over the limit at %s: %d %+v", p, st, e)
+		}
+	}
+	if st := c.do("POST", path, owner, map[string]string{"code": "K7QM-4XPA"}, &e); st != 400 || e.Code != "invalid_grant" {
+		t.Fatalf("verify by owner while other is limited: %d %+v", st, e)
+	}
 }
