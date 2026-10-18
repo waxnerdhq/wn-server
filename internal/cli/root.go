@@ -237,8 +237,15 @@ func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.A
 	if err := checkDataDirMode(c.DataDir); err != nil {
 		return err
 	}
-	// Check the binary before binding, so a mismatch logs no listening line.
+	if c.LegacyNavidromePort != 0 {
+		logger.Warn("navidrome_port in config.toml is ignored; Navidrome listens on a Unix socket. Remove the key.", "port", c.LegacyNavidromePort)
+	}
+	// Check the binary and the socket before binding, so a mismatch or a
+	// second serve logs no listening line.
 	if err := navidrome.VerifyBinary(ctx, c.NavidromeBin); err != nil {
+		return err
+	}
+	if err := navidrome.CheckSocket(c.NavidromeSocketPath()); err != nil {
 		return err
 	}
 	ln, err := net.Listen("tcp", c.Listen)
