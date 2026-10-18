@@ -11,6 +11,7 @@ import (
 	"net/url"
 	"regexp"
 	"strconv"
+	"strings"
 	"time"
 )
 
@@ -50,6 +51,11 @@ func newClient(base, user string) *Client {
 
 // ErrNotFound is returned when Navidrome answers 404.
 var ErrNotFound = errors.New("not found in navidrome")
+
+// ErrFilterIgnored is returned by a lookup by MusicBrainz id when the answer
+// holds an item whose id differs from the one asked for. Navidrome then did
+// not apply the filter, and the answer cannot be trusted.
+var ErrFilterIgnored = errors.New("navidrome ignored the lookup filter")
 
 func (c *Client) do(ctx context.Context, method, path string, body any) ([]byte, error) {
 	return c.doAs(ctx, c.user, method, path, body)
@@ -249,34 +255,40 @@ func (c *Client) ScanStatus(ctx context.Context) (ScanStatus, error) {
 const maxLookup = 50
 
 // AlbumsByMBID returns the ids of the albums with the MusicBrainz release id
-// mbid, as user. It uses the native API filter mbz_album_id, which Navidrome
-// compares exactly.
+// mbid, as user. It sends mbz_album_id as a query parameter of the native
+// API, which Navidrome compares exactly.
 func (c *Client) AlbumsByMBID(ctx context.Context, user, mbid string) ([]string, error) {
-	return c.idsByFilter(ctx, user, "/api/album", "mbz_album_id", mbid)
+	return c.idsByMBID(ctx, user, "/api/album", "mbz_album_id", "mbzAlbumId", mbid)
 }
 
 // SongsByMBID returns the ids of the media files with the MusicBrainz track
-// id mbid (the release track id, not the recording id), as user. It uses
-// the native API filter mbz_release_track_id.
+// id mbid (the release track id, not the recording id), as user. It sends
+// mbz_release_track_id as a query parameter of the native API.
 func (c *Client) SongsByMBID(ctx context.Context, user, mbid string) ([]string, error) {
-	return c.idsByFilter(ctx, user, "/api/song", "mbz_release_track_id", mbid)
+	return c.idsByMBID(ctx, user, "/api/song", "mbz_release_track_id", "mbzReleaseTrackId", mbid)
 }
 
-func (c *Client) idsByFilter(ctx context.Context, user, path, field, value string) ([]string, error) {
-	filter, err := json.Marshal(map[string]string{field: value})
-	if err != nil {
-		return nil, err
-	}
-	q := url.Values{"filter": {string(filter)}, "_start": {"0"}, "_end": {strconv.Itoa(maxLookup)}}
-	var items []struct {
-		ID string `json:"id"`
-	}
+// idsByMBID asks the native API for the items whose field equals mbid. The
+// field goes in as a top-level query parameter, as Navidrome's web UI sends
+// it. A parameter named filter would be read as a field name and ignored.
+// Navidrome stores MusicBrainz ids in lower case. The answer is checked: if
+// an item carries another id in jsonField, the filter did not apply, and the
+// call returns ErrFilterIgnored and no ids.
+func (c *Client) idsByMBID(ctx context.Context, user, path, field, jsonField, mbid string) ([]string, error) {
+	mbid = strings.ToLower(mbid)
+	q := url.Values{field: {mbid}, "_start": {"0"}, "_end": {strconv.Itoa(maxLookup)}}
+	var items []map[string]any
 	if err := c.getJSON(ctx, user, path+"?"+q.Encode(), &items); err != nil {
 		return nil, err
 	}
 	ids := make([]string, 0, len(items))
 	for _, it := range items {
-		ids = append(ids, it.ID)
+		got, _ := it[jsonField].(string)
+		if !strings.EqualFold(got, mbid) {
+			return nil, fmt.Errorf("GET %s: %w", path, ErrFilterIgnored)
+		}
+		id, _ := it["id"].(string)
+		ids = append(ids, id)
 	}
 	return ids, nil
 }

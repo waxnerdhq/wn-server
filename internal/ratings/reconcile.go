@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/waxnerdhq/wn-server/internal/navidrome"
 	"github.com/waxnerdhq/wn-server/internal/store"
 	"github.com/waxnerdhq/wn-server/internal/wncloud"
 )
@@ -37,6 +38,10 @@ type ReconcileResult struct {
 	NotInLibrary int
 	// PushFailed is the number of Navidrome lookups or items that failed.
 	PushFailed int
+
+	// filterIgnoredLogged is set once the run has logged that Navidrome
+	// ignored a lookup filter.
+	filterIgnoredLogged bool
 }
 
 // Reconcile brings the owner's rating changes at wn-cloud into the local
@@ -188,10 +193,19 @@ func (s *Service) pushRemote(ctx context.Context, accountID string, r store.Rati
 	}
 	ids, err := lookup(ctx, accountID, r.MBID)
 	if err != nil {
-		if ctx.Err() == nil {
-			s.logger.Warn("rating sync: look up the subject in Navidrome failed", "kind", r.Kind, "mbid", r.MBID, "error", err)
-			res.PushFailed++
+		if ctx.Err() != nil {
+			return
 		}
+		res.PushFailed++
+		if errors.Is(err, navidrome.ErrFilterIgnored) {
+			// Every later lookup of the run fails the same way: log it once.
+			if !res.filterIgnoredLogged {
+				res.filterIgnoredLogged = true
+				s.logger.Warn("rating sync: Navidrome ignored the lookup filter", "error", err)
+			}
+			return
+		}
+		s.logger.Warn("rating sync: look up the subject in Navidrome failed", "kind", r.Kind, "mbid", r.MBID, "error", err)
 		return
 	}
 	if len(ids) == 0 {
