@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -53,6 +54,9 @@ func TestRatingAPIPut(t *testing.T) {
 	}
 	if r.Kind != "release" || r.MBID != releaseMBID || r.HalfStars == nil || *r.HalfStars != 7 || r.LikeLevel == nil || *r.LikeLevel != "love" || r.UpdatedAt == "" {
 		t.Fatalf("PUT answered %+v", r)
+	}
+	if !regexp.MustCompile(`^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d\.\d{6}Z$`).MatchString(r.UpdatedAt) {
+		t.Fatalf("updated_at %q, want UTC with six fractional digits", r.UpdatedAt)
 	}
 	if got := value(e.local(t, "release", releaseMBID)); got != "7/love" {
 		t.Fatalf("local rating %s, want 7/love", got)

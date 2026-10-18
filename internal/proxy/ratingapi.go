@@ -32,17 +32,28 @@ type ratingAPI struct {
 	logger  *slog.Logger
 }
 
+// apiTimeLayout is the store's time layout: UTC with six fractional digits.
+const apiTimeLayout = "2006-01-02T15:04:05.000000Z"
+
+// apiTime marshals as UTC truncated to microseconds, the string the store
+// writes and wn-cloud answers, whatever zone the time carries.
+type apiTime time.Time
+
+func (t apiTime) MarshalJSON() ([]byte, error) {
+	return []byte(`"` + time.Time(t).UTC().Format(apiTimeLayout) + `"`), nil
+}
+
 // ratingBody is a rating as the API answers it.
 type ratingBody struct {
-	Kind      string    `json:"kind"`
-	MBID      string    `json:"mbid"`
-	HalfStars *int      `json:"half_stars"`
-	LikeLevel *string   `json:"like_level"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Kind      string  `json:"kind"`
+	MBID      string  `json:"mbid"`
+	HalfStars *int    `json:"half_stars"`
+	LikeLevel *string `json:"like_level"`
+	UpdatedAt apiTime `json:"updated_at"`
 }
 
 func bodyOf(r store.Rating) ratingBody {
-	return ratingBody{Kind: r.Kind, MBID: r.MBID, HalfStars: r.HalfStars, LikeLevel: r.LikeLevel, UpdatedAt: r.UpdatedAt}
+	return ratingBody{Kind: r.Kind, MBID: r.MBID, HalfStars: r.HalfStars, LikeLevel: r.LikeLevel, UpdatedAt: apiTime(r.UpdatedAt)}
 }
 
 // mount adds the rating routes to mux. wrap puts the session check and the
@@ -244,12 +255,12 @@ func (a *ratingAPI) get(w http.ResponseWriter, r *http.Request) {
 
 // changeBody is a row of GET /api/v1/ratings/changes.
 type changeBody struct {
-	Kind      string    `json:"kind"`
-	MBID      string    `json:"mbid"`
-	HalfStars *int      `json:"half_stars"`
-	LikeLevel *string   `json:"like_level"`
-	Deleted   bool      `json:"deleted"`
-	UpdatedAt time.Time `json:"updated_at"`
+	Kind      string  `json:"kind"`
+	MBID      string  `json:"mbid"`
+	HalfStars *int    `json:"half_stars"`
+	LikeLevel *string `json:"like_level"`
+	Deleted   bool    `json:"deleted"`
+	UpdatedAt apiTime `json:"updated_at"`
 }
 
 // changes serves GET /api/v1/ratings/changes?since=: the local rating rows
@@ -281,7 +292,7 @@ func (a *ratingAPI) changes(w http.ResponseWriter, r *http.Request) {
 	changes := make([]changeBody, 0, len(rows))
 	for _, c := range rows {
 		changes = append(changes, changeBody{
-			Kind: c.Kind, MBID: c.MBID, HalfStars: c.HalfStars, LikeLevel: c.LikeLevel, Deleted: c.Deleted, UpdatedAt: c.UpdatedAt,
+			Kind: c.Kind, MBID: c.MBID, HalfStars: c.HalfStars, LikeLevel: c.LikeLevel, Deleted: c.Deleted, UpdatedAt: apiTime(c.UpdatedAt),
 		})
 	}
 	writeJSON(w, http.StatusOK, struct {
