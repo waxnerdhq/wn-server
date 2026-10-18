@@ -1,7 +1,7 @@
 // Package stub serves the wn-cloud routes described in docs/wn-cloud-api.md
 // from memory, for tests. It is the executable form of that document, not a
-// second wn-cloud: it keeps no history, has no rate limits, and checks only
-// what the document says each route checks.
+// second wn-cloud: it keeps no history, and checks only what the document says
+// each route checks. Its one rate limit is the one of the verify route.
 //
 // Use it with httptest:
 //
@@ -42,6 +42,11 @@ import (
 const (
 	codeTTL       = 120 * time.Second
 	deviceCodeTTL = 10 * time.Minute
+
+	// failureLimit failed verify calls of one bearer in failureWindow make
+	// every later verify call of that bearer answer 429 rate_limited.
+	failureLimit  = 10
+	failureWindow = 10 * time.Minute
 )
 
 // deviceAlphabet is the alphabet of device codes: no 0, O, 1, or I.
@@ -105,6 +110,7 @@ type Stub struct {
 	servers  map[string]*server
 	devices  map[string]*deviceCode // SHA-256 of the normalized code
 	ratings  map[ratingKey]*rating
+	failures map[string][]time.Time // bearer to the times of its failed verify calls
 	signedIn string
 	last     time.Time
 }
@@ -112,13 +118,14 @@ type Stub struct {
 // New returns an empty stub.
 func New() *Stub {
 	s := &Stub{
-		mux:     http.NewServeMux(),
-		users:   map[string]*user{},
-		tokens:  map[string]string{},
-		codes:   map[string]*authCode{},
-		servers: map[string]*server{},
-		devices: map[string]*deviceCode{},
-		ratings: map[ratingKey]*rating{},
+		mux:      http.NewServeMux(),
+		users:    map[string]*user{},
+		tokens:   map[string]string{},
+		codes:    map[string]*authCode{},
+		servers:  map[string]*server{},
+		devices:  map[string]*deviceCode{},
+		ratings:  map[ratingKey]*rating{},
+		failures: map[string][]time.Time{},
 	}
 	s.mux.HandleFunc("GET /cli/auth", s.cliAuth)
 	s.mux.HandleFunc("POST /cli/token", s.cliToken)
@@ -472,36 +479,64 @@ func deviceHash(normalized string) string {
 	return base64.RawURLEncoding.EncodeToString(sum[:])
 }
 
+// recentFailures returns the failed verify calls of the bearer in the
+// window, and drops the older ones.
+func (s *Stub) recentFailures(bearer string) int {
+	cutoff := s.now().Add(-failureWindow)
+	kept := s.failures[bearer][:0]
+	for _, t := range s.failures[bearer] {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	s.failures[bearer] = kept
+	return len(kept)
+}
+
+// verifyDeviceCode runs the checks in wn-cloud's order: the rate limit, the
+// UUID of :id, the owner, the body, the spend. Each 400 and 403 after the
+// rate limit records a failure of the bearer; a 429 records none. A body that
+// is not JSON records none either, because wn-cloud's express.json() answers
+// it before the route runs.
 func (s *Stub) verifyDeviceCode(w http.ResponseWriter, r *http.Request) {
 	u := s.authUser(w, r)
 	if u == nil {
 		return
 	}
+	bearer := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	if s.recentFailures(bearer) >= failureLimit {
+		writeError(w, http.StatusTooManyRequests, "rate_limited", "Too many failed verify calls. Wait 10 minutes.")
+		return
+	}
+	refuse := func(status int, code, msg string) {
+		s.failures[bearer] = append(s.failures[bearer], s.now())
+		writeError(w, status, code, msg)
+	}
 	id := r.PathValue("id")
 	if !uuidRE.MatchString(id) {
-		writeError(w, http.StatusBadRequest, "invalid_request", "id is not a UUID")
+		refuse(http.StatusBadRequest, "invalid_request", "id must be a UUID")
 		return
 	}
-	srv := s.servers[id]
+	srv := s.servers[strings.ToLower(id)]
 	if srv == nil || srv.ownerID != u.id {
-		writeError(w, http.StatusForbidden, "forbidden", "The caller does not own this server")
+		refuse(http.StatusForbidden, "forbidden", "The caller does not own this server")
 		return
 	}
-	var body struct {
-		Code string `json:"code"`
-	}
+	var body any
 	if err := decode(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid_request", "The body is not valid JSON")
+		writeError(w, http.StatusBadRequest, "invalid_request", "The body could not be read as JSON")
 		return
 	}
-	code := normalizeDeviceCode(body.Code)
+	obj, _ := body.(map[string]any)
+	raw, _ := obj["code"].(string)
+	code := normalizeDeviceCode(raw)
 	if !deviceRE.MatchString(code) {
-		writeError(w, http.StatusBadRequest, "invalid_request", "code must be 8 characters of the device code alphabet")
+		refuse(http.StatusBadRequest, "invalid_request", "code must be 8 characters of the device code alphabet")
 		return
 	}
 	dc := s.devices[deviceHash(code)]
 	if dc == nil || dc.used || dc.serverID != srv.id || s.now().After(dc.expires) || s.users[dc.userID] == nil {
-		writeError(w, http.StatusBadRequest, "invalid_grant", "The code is invalid, expired or already used")
+		refuse(http.StatusBadRequest, "invalid_grant", "The code is unknown, expired, used, or for another server")
 		return
 	}
 	dc.used = true
