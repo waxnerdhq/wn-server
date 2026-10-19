@@ -1,5 +1,6 @@
 {{define "content"}}
 <h1>Status</h1>
+{{with .Notice}}<p class="notice" role="status">{{.}}</p>{{end}}
 <dl class="facts">
 <dt>Server name</dt><dd>{{.ServerName}}</dd>
 <dt>Owner account</dt><dd>{{.OwnerName}}</dd>
@@ -7,6 +8,10 @@
 <dt>Library scan</dt><dd>{{.ScanState}}</dd>
 <dt>Match queue</dt><dd><a href="/ui/match">{{.PendingMatches}} pending</a>{{if .MatchJobRunning}}; a match job is running{{end}}</dd>
 <dt>wn-cloud</dt><dd>{{if .Linked}}linked to waxnerd user <code>{{.WaxnerdUserID}}</code> as server <code>{{.ServerID}}</code>{{else}}not linked; run <code>wn-server login</code>{{end}}</dd>
-<dt>Relay</dt><dd>{{.RelayText}}{{if .RelayURL}}<a href="{{.RelayURL}}">{{.RelayURL}}</a>{{end}}</dd>
+<dt>Relay</dt><dd>{{.RelayText}}{{if .RelayURL}}<a href="{{.RelayURL}}">{{.RelayURL}}</a>{{else if .RelayAddress}} (address <code>{{.RelayAddress}}</code>){{end}}</dd>
 </dl>
+<form method="post" action="/ui/relay"{{if .RelayOn}} data-confirm="Switch the relay off? Browsers that reach this server through the relay lose the connection."{{end}}>
+<input type="hidden" name="enabled" value="{{if .RelayOn}}0{{else}}1{{end}}">
+<button type="submit"{{if .RelayOn}} class="danger"{{end}}>{{if .RelayOn}}Disable relay{{else}}Enable relay{{end}}</button>
+</form>
 {{end}}

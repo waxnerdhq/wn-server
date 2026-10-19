@@ -282,6 +282,7 @@ func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.A
 		Ready:            sup.Ready(),
 		CloudStatus:      cloudStatus,
 		Relay:            relayState.State,
+		RelayConfig:      c.Relay,
 		ServerName:       hostName,
 		NavidromeVersion: navidrome.ServerVersion(),
 		Logger:           logger,

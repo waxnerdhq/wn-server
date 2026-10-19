@@ -55,6 +55,11 @@ type Options struct {
 	ConnectURL func() (string, bool)
 	// Version is sent as Wn-Server-Version.
 	Version string
+	// Enabled answers whether the tunnel should be open. Run reads it on the
+	// poll of Credential, from a second goroutine as well, so it must be safe
+	// for concurrent use. While it answers false Run dials nothing, holds no
+	// tunnel, and reports Off. Nil means true.
+	Enabled func() bool
 	// OnState is called on every change of the state, never concurrently
 	// with itself. It may be nil.
 	OnState func(State)
@@ -119,8 +124,41 @@ func (e *statusError) Error() string {
 }
 
 // Run keeps the tunnel open until ctx ends. On ctx end it closes the tunnel;
-// in-flight requests end as on http.Server.Shutdown.
+// in-flight requests end as on http.Server.Shutdown. While Options.Enabled
+// answers false it holds no tunnel and reports Off. When Enabled turns false,
+// Run closes the tunnel the way a ctx end does; when it turns true again, Run
+// dials again.
 func (r *Relay) Run(ctx context.Context) {
+	for ctx.Err() == nil {
+		if r.opts.Enabled != nil && !r.opts.Enabled() {
+			r.set(Off, "", "")
+			if !sleep(ctx, r.cfg.waitPoll) {
+				return
+			}
+			continue
+		}
+		ectx, cancel := context.WithCancel(ctx)
+		if r.opts.Enabled != nil {
+			go r.watchEnabled(ectx, cancel)
+		}
+		r.dial(ectx)
+		cancel()
+	}
+}
+
+// watchEnabled calls cancel when Enabled answers false, until ctx ends.
+func (r *Relay) watchEnabled(ctx context.Context, cancel context.CancelFunc) {
+	for sleep(ctx, r.cfg.waitPoll) {
+		if !r.opts.Enabled() {
+			cancel()
+			return
+		}
+	}
+}
+
+// dial keeps the tunnel open until ctx ends. Run ends ctx when Enabled turns
+// false.
+func (r *Relay) dial(ctx context.Context) {
 	backoff := r.cfg.backoffMin
 	// refused is the token that the edge refused with 400, 401, 403, or 409.
 	// The package does not dial with it again.
@@ -142,7 +180,7 @@ func (r *Relay) Run(ctx context.Context) {
 			continue
 		}
 		switch r.state.Name {
-		case "", Waiting, CredentialRejected, Refused, UpdateRequired:
+		case "", Off, Waiting, CredentialRejected, Refused, UpdateRequired:
 			r.set(Connecting, "", "")
 		}
 

@@ -58,6 +58,13 @@ type Store interface {
 	Sessions(ctx context.Context, accountID string) ([]store.Session, error)
 	RevokeSession(ctx context.Context, id string) error
 	RevokeSessionByToken(ctx context.Context, token string) (store.Session, error)
+	// RelayEnabled answers the owner's relay switch; set is false when the
+	// owner has not set it.
+	RelayEnabled(ctx context.Context) (enabled, set bool, err error)
+	SetRelayEnabled(ctx context.Context, enabled bool) error
+	// RelaySettings returns store.ErrNoRelaySettings before serve has stored
+	// the relay settings.
+	RelaySettings(ctx context.Context) (store.RelaySettings, error)
 	// MatchEntries returns the entries in the given states, or every entry
 	// when there are none.
 	MatchEntries(ctx context.Context, states ...store.MatchState) ([]store.MatchEntry, error)
@@ -97,6 +104,9 @@ type Options struct {
 	// Relay answers the relay package's current state for the status page.
 	// Nil shows the state off.
 	Relay func() relay.State
+	// RelayConfig is the config key relay. It applies while the owner has not
+	// set the relay switch on the status page.
+	RelayConfig bool
 	// ServerName is shown on the status page.
 	ServerName string
 	// NavidromeVersion is the version that serve checked at start.
@@ -170,6 +180,7 @@ func New(o Options) http.Handler {
 	mux.HandleFunc("POST /ui/login", s.login)
 	mux.HandleFunc("POST /ui/logout", s.logout)
 	mux.Handle("GET /ui/{$}", s.guard(s.statusPage))
+	mux.Handle("POST /ui/relay", s.guard(s.relaySwitch))
 	mux.Handle("GET /ui/account", s.guard(s.accountPage))
 	mux.Handle("GET /ui/match", s.guard(s.matchPage))
 	mux.Handle("POST /ui/match/run", s.guard(s.matchRun))

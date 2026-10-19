@@ -33,7 +33,8 @@ type RelaySettings struct {
 	FetchedAt  time.Time
 }
 
-// SetRelaySettings stores the relay settings, replacing any stored ones.
+// SetRelaySettings stores the relay settings, replacing any stored ones. It
+// keeps the owner's relay switch.
 func (s *Store) SetRelaySettings(ctx context.Context, r RelaySettings) error {
 	addrs := r.Addresses
 	if addrs == nil {
@@ -44,7 +45,9 @@ func (s *Store) SetRelaySettings(ctx context.Context, r RelaySettings) error {
 		return err
 	}
 	_, err = s.db.ExecContext(ctx,
-		`INSERT OR REPLACE INTO relay_settings (id, connect_url, host, addresses, fetched_at) VALUES (1, ?, ?, ?, ?)`,
+		`INSERT INTO relay_settings (id, connect_url, host, addresses, fetched_at) VALUES (1, ?, ?, ?, ?)
+		 ON CONFLICT (id) DO UPDATE SET connect_url = excluded.connect_url, host = excluded.host,
+		   addresses = excluded.addresses, fetched_at = excluded.fetched_at`,
 		r.ConnectURL, r.Host, string(body), r.FetchedAt.UTC().Format(time.RFC3339))
 	if err != nil {
 		return fmt.Errorf("set relay settings: %w", err)
@@ -52,14 +55,15 @@ func (s *Store) SetRelaySettings(ctx context.Context, r RelaySettings) error {
 	return nil
 }
 
-// RelaySettings returns the stored relay settings, or ErrNoRelaySettings.
+// RelaySettings returns the stored relay settings, or ErrNoRelaySettings. A
+// row that only holds the owner's relay switch counts as no settings.
 func (s *Store) RelaySettings(ctx context.Context) (RelaySettings, error) {
 	var (
 		r              RelaySettings
 		addrs, fetched string
 	)
 	err := s.db.QueryRowContext(ctx,
-		`SELECT connect_url, host, addresses, fetched_at FROM relay_settings WHERE id = 1`).
+		`SELECT connect_url, host, addresses, fetched_at FROM relay_settings WHERE id = 1 AND connect_url <> ''`).
 		Scan(&r.ConnectURL, &r.Host, &addrs, &fetched)
 	if errors.Is(err, sql.ErrNoRows) {
 		return RelaySettings{}, ErrNoRelaySettings
@@ -74,6 +78,35 @@ func (s *Store) RelaySettings(ctx context.Context) (RelaySettings, error) {
 		return RelaySettings{}, fmt.Errorf("relay settings: bad fetched_at: %w", err)
 	}
 	return r, nil
+}
+
+// SetRelayEnabled stores the owner's relay switch, which overrides the config
+// key relay. It creates the relay_settings row when serve has not stored the
+// relay settings yet; that row has an empty connect_url and an empty
+// addresses list.
+func (s *Store) SetRelayEnabled(ctx context.Context, enabled bool) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO relay_settings (id, connect_url, host, addresses, fetched_at, enabled) VALUES (1, '', '', '[]', ?, ?)
+		 ON CONFLICT (id) DO UPDATE SET enabled = excluded.enabled`,
+		time.Time{}.Format(time.RFC3339), enabled)
+	if err != nil {
+		return fmt.Errorf("set relay enabled: %w", err)
+	}
+	return nil
+}
+
+// RelayEnabled returns the owner's relay switch. set is false when the owner
+// has not set it, and the config key relay applies.
+func (s *Store) RelayEnabled(ctx context.Context) (enabled, set bool, err error) {
+	var v sql.NullBool
+	err = s.db.QueryRowContext(ctx, `SELECT enabled FROM relay_settings WHERE id = 1`).Scan(&v)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, false, nil
+	}
+	if err != nil {
+		return false, false, fmt.Errorf("read relay enabled: %w", err)
+	}
+	return v.Bool, v.Valid, nil
 }
 
 // RelayState is the relay package's last state as serve wrote it.

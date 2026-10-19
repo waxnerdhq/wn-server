@@ -162,12 +162,14 @@ func (e *edge) client(i int) *http.Client {
 
 // harness runs a Relay against an edge and records its states.
 type harness struct {
-	edge   *edge
-	relay  *Relay
-	token  atomic.Value
-	reads  atomic.Int32
-	cancel context.CancelFunc
-	done   chan struct{}
+	edge  *edge
+	relay *Relay
+	token atomic.Value
+	// enabled answers Options.Enabled. It starts true.
+	enabled atomic.Bool
+	reads   atomic.Int32
+	cancel  context.CancelFunc
+	done    chan struct{}
 
 	mu     sync.Mutex
 	states []State
@@ -177,6 +179,7 @@ func start(t *testing.T, e *edge, h http.Handler, tune func(*config)) *harness {
 	t.Helper()
 	hs := &harness{edge: e, done: make(chan struct{})}
 	hs.token.Store("token-1")
+	hs.enabled.Store(true)
 	hs.relay = New(Options{
 		Handler: h,
 		Credential: func() (string, string, bool) {
@@ -185,6 +188,7 @@ func start(t *testing.T, e *edge, h http.Handler, tune func(*config)) *harness {
 			return tok, testServerID, tok != ""
 		},
 		ConnectURL: func() (string, bool) { return e.url(), true },
+		Enabled:    hs.enabled.Load,
 		Version:    "v1.2.3",
 		OnState: func(s State) {
 			hs.mu.Lock()
@@ -460,4 +464,33 @@ func TestReplacement(t *testing.T) {
 	if string(b) != "ok" {
 		t.Fatalf("body %q", b)
 	}
+}
+
+func TestEnabledToggle(t *testing.T) {
+	e := newEdge(t)
+	h := start(t, e, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.WriteString(w, "ok")
+	}), nil)
+	waitFor(t, "connected", func() bool { return h.last().Name == Connected })
+
+	// Turning Enabled off closes the tunnel and reports off.
+	h.enabled.Store(false)
+	waitFor(t, "off", func() bool { return h.last().Name == Off })
+	waitFor(t, "tunnel closed", func() bool { return e.session(0).IsClosed() })
+	time.Sleep(50 * time.Millisecond)
+	if n := e.dials(); n != 1 {
+		t.Fatalf("dials = %d while disabled, want 1", n)
+	}
+
+	// Turning it on dials again without a restart.
+	h.enabled.Store(true)
+	waitFor(t, "second tunnel", func() bool { return e.dials() == 2 && h.last().Name == Connected })
+	if names := fmt.Sprint(h.names()); names != "[connecting connected off connecting connected]" {
+		t.Fatalf("states = %s", names)
+	}
+	res, err := e.client(1).Get("http://" + testHost + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res.Body.Close()
 }
