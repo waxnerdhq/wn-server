@@ -142,6 +142,7 @@ func TestSessions(t *testing.T) {
 		t.Fatalf("token %q", token)
 	}
 	got, err := s.SessionByToken(ctx, token)
+	created.AccountKind = KindOwner
 	if err != nil || got != created || got.AccountID != owner.ID || got.Device != "phone" {
 		t.Fatalf("SessionByToken = %+v, %v; want %+v", got, err, created)
 	}

@@ -26,6 +26,8 @@ type Session struct {
 	Device     string // the client's label, or empty
 	CreatedAt  time.Time
 	LastSeenAt time.Time
+	// AccountKind is the kind of the account. Only SessionByToken sets it.
+	AccountKind string
 }
 
 // newSessionToken returns SessionTokenPrefix followed by 32 bytes from
@@ -94,14 +96,30 @@ func scanSession(row scanner) (Session, error) {
 	return sess, nil
 }
 
-// SessionByToken returns the session whose token hash is the hash of token.
-// It returns ErrSessionNotFound for an unknown or revoked token.
+// SessionByToken returns the session whose token hash is the hash of token,
+// with the kind of its account. It returns ErrSessionNotFound for an unknown
+// or revoked token and for a session of a disabled account.
 func (s *Store) SessionByToken(ctx context.Context, token string) (Session, error) {
 	if !strings.HasPrefix(token, SessionTokenPrefix) {
 		return Session{}, ErrSessionNotFound
 	}
-	return scanSession(s.db.QueryRowContext(ctx,
-		`SELECT `+sessionColumns+` FROM sessions WHERE token_hash = ?`, hashSessionToken(token)))
+	var kind string
+	sess, err := scanSession(scanWithKind{s.db.QueryRowContext(ctx,
+		`SELECT s.id, s.account_id, s.device, s.created_at, s.last_seen_at, a.kind
+		FROM sessions s JOIN accounts a ON a.id = s.account_id
+		WHERE s.token_hash = ? AND a.disabled = 0`, hashSessionToken(token)), &kind})
+	sess.AccountKind = kind
+	return sess, err
+}
+
+// scanWithKind scans the session columns followed by the account kind.
+type scanWithKind struct {
+	row  scanner
+	kind *string
+}
+
+func (k scanWithKind) Scan(dest ...any) error {
+	return k.row.Scan(append(dest, k.kind)...)
 }
 
 // TouchSession sets the last seen time of the session.

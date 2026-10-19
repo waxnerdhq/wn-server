@@ -97,6 +97,12 @@ type server struct {
 	relayLastSeen  time.Time
 }
 
+// member is a row of server_members.
+type member struct {
+	role      string
+	createdAt time.Time
+}
+
 type deviceCode struct {
 	serverID, userID string
 	expires          time.Time
@@ -124,9 +130,9 @@ type Stub struct {
 	servers  map[string]*server
 	devices  map[string]*deviceCode // SHA-256 of the normalized code
 	ratings  map[ratingKey]*rating
-	failures map[string][]time.Time       // bearer to the times of its failed verify calls
-	members  map[string]map[string]string // server id to user id to role
-	connect  string                       // relay.connect_url
+	failures map[string][]time.Time        // bearer to the times of its failed verify calls
+	members  map[string]map[string]*member // server id to user id
+	connect  string                        // relay.connect_url
 	signedIn string
 	last     time.Time
 }
@@ -142,7 +148,7 @@ func New() *Stub {
 		devices:  map[string]*deviceCode{},
 		ratings:  map[ratingKey]*rating{},
 		failures: map[string][]time.Time{},
-		members:  map[string]map[string]string{},
+		members:  map[string]map[string]*member{},
 		connect:  defaultConnectURL,
 	}
 	s.mux.HandleFunc("GET /cli/auth", s.cliAuth)
@@ -150,6 +156,7 @@ func New() *Stub {
 	s.mux.HandleFunc("POST /cli/logout", s.cliLogout)
 	s.mux.HandleFunc("POST /servers", s.createServer)
 	s.mux.HandleFunc("GET /servers/{id}", s.getServer)
+	s.mux.HandleFunc("GET /servers/{id}/members", s.listMembers)
 	s.mux.HandleFunc("POST /servers/{id}/device-codes/verify", s.verifyDeviceCode)
 	s.mux.HandleFunc("PUT /ratings/{kind}/{mbid}", s.putRating)
 	s.mux.HandleFunc("DELETE /ratings/{kind}/{mbid}", s.deleteRating)
@@ -226,10 +233,33 @@ func (s *Stub) Members(serverID string) map[string]string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	out := map[string]string{}
-	for u, role := range s.members[serverID] {
-		out[u] = role
+	for u, m := range s.members[serverID] {
+		out[u] = m.role
 	}
 	return out
+}
+
+// AddMember adds a member row with the role owner or listener, as the
+// acceptance of an invite does for a listener. An existing row keeps its
+// creation time.
+func (s *Stub) AddMember(serverID, userID, role string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.members[serverID] == nil {
+		s.members[serverID] = map[string]*member{}
+	}
+	if m := s.members[serverID][userID]; m != nil {
+		m.role = role
+		return
+	}
+	s.members[serverID][userID] = &member{role: role, createdAt: s.now()}
+}
+
+// RemoveMember deletes a member row, as the owner's removal does.
+func (s *Stub) RemoveMember(serverID, userID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.members[serverID], userID)
 }
 
 // IssueDeviceCode issues a device code for the server as the user, as the
@@ -494,7 +524,7 @@ func (s *Stub) cliLogout(w http.ResponseWriter, r *http.Request) {
 // addServer stores a server and its owner member row.
 func (s *Stub) addServer(srv *server) {
 	s.servers[srv.id] = srv
-	s.members[srv.id] = map[string]string{srv.ownerID: "owner"}
+	s.members[srv.id] = map[string]*member{srv.ownerID: {role: "owner", createdAt: srv.createdAt}}
 }
 
 // nullTime is nil for a zero time and the time in the cursor layout
@@ -544,6 +574,50 @@ func (s *Stub) getServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.serverJSON(srv))
+}
+
+// listMembers answers GET /servers/{id}/members: the bearer check, the
+// UUID, the owner. The members are ordered by creation, the owner first. A
+// member's name is the local part of the user's email.
+func (s *Stub) listMembers(w http.ResponseWriter, r *http.Request) {
+	u := s.authUser(w, r)
+	if u == nil {
+		return
+	}
+	id := r.PathValue("id")
+	if !uuidRE.MatchString(id) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "id must be a UUID")
+		return
+	}
+	srv := s.servers[strings.ToLower(id)]
+	if srv == nil || srv.ownerID != u.id {
+		writeError(w, http.StatusForbidden, "forbidden", "The caller does not own this server")
+		return
+	}
+	ids := make([]string, 0, len(s.members[srv.id]))
+	for uid := range s.members[srv.id] {
+		ids = append(ids, uid)
+	}
+	sort.Slice(ids, func(i, j int) bool {
+		a, b := s.members[srv.id][ids[i]], s.members[srv.id][ids[j]]
+		if (a.role == "owner") != (b.role == "owner") {
+			return a.role == "owner"
+		}
+		if !a.createdAt.Equal(b.createdAt) {
+			return a.createdAt.Before(b.createdAt)
+		}
+		return ids[i] < ids[j]
+	})
+	list := make([]map[string]string, 0, len(ids))
+	for _, uid := range ids {
+		m := s.members[srv.id][uid]
+		name := uid
+		if usr := s.users[uid]; usr != nil {
+			name, _, _ = strings.Cut(usr.email, "@")
+		}
+		list = append(list, map[string]string{"user_id": uid, "name": name, "role": m.role, "created_at": m.createdAt.Format(cursorLayout)})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"members": list})
 }
 
 func (s *Stub) createServer(w http.ResponseWriter, r *http.Request) {
@@ -647,7 +721,14 @@ func (s *Stub) verifyDeviceCode(w http.ResponseWriter, r *http.Request) {
 	}
 	dc.used = true
 	issuer := s.users[dc.userID]
-	writeJSON(w, http.StatusOK, map[string]string{"user_id": issuer.id, "email": issuer.email})
+	answer := map[string]string{"user_id": issuer.id, "email": issuer.email}
+	// The device code page issues codes for owned and member servers only.
+	// A code of a user without a member row, which IssueDeviceCode allows,
+	// gets no role.
+	if m := s.members[srv.id][issuer.id]; m != nil {
+		answer["role"] = m.role
+	}
+	writeJSON(w, http.StatusOK, answer)
 }
 
 // Ratings.

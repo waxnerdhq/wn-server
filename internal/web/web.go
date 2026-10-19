@@ -276,6 +276,11 @@ func (s *server) session(r *http.Request) (sess store.Session, ok bool, err erro
 	if err != nil {
 		return store.Session{}, false, err
 	}
+	// The web UI is the owner's. A listener's session from the device code
+	// exchange does not open it.
+	if sess.AccountKind != store.KindOwner {
+		return store.Session{}, false, nil
+	}
 	return sess, true, nil
 }
 

@@ -3,7 +3,9 @@ package proxy
 import (
 	"net/http"
 	"strings"
+	"time"
 
+	"github.com/waxnerdhq/wn-server/internal/navidrome"
 	"github.com/waxnerdhq/wn-server/internal/wncloud"
 )
 
@@ -15,10 +17,12 @@ type options struct {
 	cloudStatus *wncloud.Status
 	ratings     Ratings
 	maxBitrate  int
+	navidrome   navidrome.ListenerAPI
+	now         func() time.Time
 }
 
 func newOptions(opts []Option) options {
-	o := options{ui: http.NotFoundHandler()}
+	o := options{ui: http.NotFoundHandler(), now: time.Now}
 	for _, opt := range opts {
 		opt(&o)
 	}
@@ -49,6 +53,18 @@ func WithRatings(rt Ratings) Option {
 // cap.
 func WithRelayMaxBitrate(kbps int) Option {
 	return func(o *options) { o.maxBitrate = kbps }
+}
+
+// WithNavidromeUsers lets members of the server sign in as listeners with a
+// device code. nd creates each listener's Navidrome user at the first
+// sign-in. Without this option a listener's sign-in answers 500 internal.
+func WithNavidromeUsers(nd navidrome.ListenerAPI) Option {
+	return func(o *options) { o.navidrome = nd }
+}
+
+// withNow sets the clock of the session exchange, for tests.
+func withNow(now func() time.Time) Option {
+	return func(o *options) { o.now = now }
 }
 
 // isUIPath reports whether p belongs to the handler given with WithUI.

@@ -290,7 +290,8 @@ func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.A
 	cloud := newClient(c)
 	rt := ratings.New(st, cloud, ndClient, cloudStatus, logger)
 	handler := proxy.New(ndTransport, sup.Ready(), st, cloud, logger,
-		proxy.WithUI(ui), proxy.WithCloudStatus(cloudStatus), proxy.WithRatings(rt), proxy.WithRelayMaxBitrate(c.RelayMaxBitrate))
+		proxy.WithUI(ui), proxy.WithCloudStatus(cloudStatus), proxy.WithRatings(rt), proxy.WithRelayMaxBitrate(c.RelayMaxBitrate),
+		proxy.WithNavidromeUsers(ndClient))
 	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second}
 
 	// The relay serves tunneled requests with the same handler. It never
@@ -314,6 +315,7 @@ func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.A
 	rt.LogIfNotLinked(ctx)
 	go rt.Run(ctx)
 	go rt.RunReconcile(ctx, sup.Ready())
+	go (&membersRefresher{st: st, cloud: cloud, cloudStatus: cloudStatus, logger: logger, now: time.Now}).run(ctx)
 	logger.Info("listening", "addr", ln.Addr().String())
 
 	shutdownServer := func() {

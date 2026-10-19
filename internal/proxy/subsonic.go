@@ -88,6 +88,12 @@ func subsonicAuth(st Store, sess *sessions, lim *loginLimiter, logger *slog.Logg
 				writeSubsonicError(w, params, errInvalidAPIKey, "Invalid API key")
 				return
 			}
+			if s.AccountKind != store.KindOwner && ratingCall(r.URL.Path) != "" {
+				// Ratings of listeners are not stored yet (WAX-998). The
+				// call would write the owner's outbox.
+				writeSubsonicError(w, params, errNotAuthorized, "User is not authorized for the given operation")
+				return
+			}
 			forwardAccount(w, r, params, st, logger, s.AccountID, "", next)
 			return
 		}
@@ -123,7 +129,9 @@ func subsonicAuth(st Store, sess *sessions, lim *loginLimiter, logger *slog.Logg
 			writeSubsonicError(w, params, errWrongCredential, "Wrong username or password")
 			return
 		}
-		if !checkCredential(acct.AppPassword, pass, token, salt) {
+		// Only the owner signs in with an app password. A listener's password
+		// is never shown, and the store holds its hash.
+		if acct.Kind != store.KindOwner || !checkCredential(acct.AppPassword, pass, token, salt) {
 			lim.fail(addr)
 			logger.Warn("subsonic sign-in failed", "remote", addr, "user", truncate(user, maxLogUser), "reason", "bad_credentials")
 			writeSubsonicError(w, params, errWrongCredential, "Wrong username or password")

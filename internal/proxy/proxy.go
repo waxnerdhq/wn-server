@@ -26,6 +26,8 @@ const userHeader = "Remote-User"
 type Store interface {
 	// AccountByName returns store.ErrNotFound for an unknown name.
 	AccountByName(ctx context.Context, name string) (store.Account, error)
+	// AccountByID returns store.ErrNotFound for an unknown id.
+	AccountByID(ctx context.Context, id string) (store.Account, error)
 	Owner(ctx context.Context) (store.Account, error)
 	ServerCredential(ctx context.Context) (store.ServerCredential, error)
 	CreateSession(ctx context.Context, accountID, device string) (string, store.Session, error)
@@ -33,6 +35,12 @@ type Store interface {
 	SessionByToken(ctx context.Context, token string) (store.Session, error)
 	TouchSession(ctx context.Context, id string, at time.Time) error
 	RevokeSessionByToken(ctx context.Context, token string) (store.Session, error)
+	// ListenerByUserID returns store.ErrNotFound when the waxnerd user has
+	// no listener account.
+	ListenerByUserID(ctx context.Context, userID string) (store.Account, error)
+	CreateListener(ctx context.Context, userID, email string) (store.Account, error)
+	IsMember(ctx context.Context, userID string) (bool, error)
+	MembersRefreshedAt(ctx context.Context) (at time.Time, ok bool, err error)
 }
 
 type accountIDKey struct{}
@@ -43,7 +51,8 @@ type accountIDKey struct{}
 // WithUI adds the web UI on / and /ui/*. Every other path answers 404. Until
 // ready is closed, /rest/* and /share/* answer 503 and nothing is forwarded,
 // so that no client can become Navidrome's first user. cloud verifies device
-// codes for POST /api/v1/session. WithRatings adds the rating intercept on
+// codes for POST /api/v1/session. WithNavidromeUsers lets listeners sign
+// in. WithRatings adds the rating intercept on
 // setRating, star, and unstar. WithRelayMaxBitrate caps relayed streams. A nil logger selects slog.Default.
 func New(rt http.RoundTripper, ready <-chan struct{}, st Store, cloud Verifier, logger *slog.Logger, opts ...Option) http.Handler {
 	o := newOptions(opts)
@@ -98,8 +107,10 @@ func New(rt http.RoundTripper, ready <-chan struct{}, st Store, cloud Verifier, 
 			w.WriteHeader(http.StatusBadGateway)
 		},
 	}
-	sess := newSessions(st, cloud, logger)
+	sess := newSessions(st, cloud, logger, o.now)
 	sess.cloudStatus = o.cloudStatus
+	sess.users = o.navidrome
+	sess.ready = ready
 	rest := gateReady(ready, subsonicAuth(st, sess, newLoginLimiter(time.Now), logger, capBitrate(o.maxBitrate, interceptRatings(o.ratings, logger, rp))))
 	share := gateReady(ready, rp)
 	api := sess.apiHandler(o.ratings, ready)

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -51,24 +52,95 @@ func (c *Client) CreateUser(ctx context.Context, u User) error {
 // every request arrives through the proxy with Remote-User. It reports
 // whether it created the user.
 func EnsureAccountUser(ctx context.Context, api UserAPI, accountID, displayName string) (bool, error) {
+	u, err := findUser(ctx, api, accountID)
+	if err != nil || u != nil {
+		return false, err
+	}
+	return true, createUser(ctx, api, accountID, displayName, true)
+}
+
+// ListenerAPI is the part of Client that EnsureListenerUser uses.
+type ListenerAPI interface {
+	UserAPI
+	ListLibraries(ctx context.Context) ([]Library, error)
+	SetUserLibraries(ctx context.Context, userID string, libraryIDs []int) error
+}
+
+// SetUserLibraries sets the libraries of a non-admin user
+// (PUT /api/user/:id/library). userID is Navidrome's user id. The route is
+// admin only, and Navidrome refuses an empty list.
+func (c *Client) SetUserLibraries(ctx context.Context, userID string, libraryIDs []int) error {
+	_, err := c.do(ctx, http.MethodPut, "/api/user/"+url.PathEscape(userID)+"/library", map[string][]int{"libraryIds": libraryIDs})
+	return err
+}
+
+// EnsureListenerUser creates the Navidrome user for a listener account when
+// it does not exist, as EnsureAccountUser does for the owner, but without
+// admin. It then gives the user every library, because Navidrome gives a new
+// non-admin user only the libraries marked for new users. It reports whether
+// it created the user.
+func EnsureListenerUser(ctx context.Context, api ListenerAPI, accountID, displayName string) (bool, error) {
+	u, err := findUser(ctx, api, accountID)
+	if err != nil {
+		return false, err
+	}
+	created := false
+	if u == nil {
+		if err := createUser(ctx, api, accountID, displayName, false); err != nil {
+			return false, err
+		}
+		created = true
+		if u, err = findUser(ctx, api, accountID); err != nil {
+			return true, err
+		}
+		if u == nil {
+			return true, fmt.Errorf("user %s not listed after it was created", accountID)
+		}
+	}
+	if u.IsAdmin {
+		return created, nil
+	}
+	libs, err := api.ListLibraries(ctx)
+	if err != nil {
+		return created, fmt.Errorf("list libraries: %w", err)
+	}
+	if len(libs) == 0 {
+		return created, nil
+	}
+	ids := make([]int, len(libs))
+	for i, l := range libs {
+		ids[i] = l.ID
+	}
+	if err := api.SetUserLibraries(ctx, u.ID, ids); err != nil {
+		return created, fmt.Errorf("set libraries of user %s: %w", accountID, err)
+	}
+	return created, nil
+}
+
+// findUser returns the Navidrome user named accountID, or nil.
+func findUser(ctx context.Context, api UserAPI, accountID string) (*User, error) {
 	users, err := api.ListUsers(ctx)
 	if err != nil {
-		return false, fmt.Errorf("list users: %w", err)
+		return nil, fmt.Errorf("list users: %w", err)
 	}
 	for _, u := range users {
 		// Navidrome compares user names without regard to case.
 		if strings.EqualFold(u.UserName, accountID) {
-			return false, nil
+			return &u, nil
 		}
 	}
-	err = api.CreateUser(ctx, User{
+	return nil, nil
+}
+
+func createUser(ctx context.Context, api UserAPI, accountID, displayName string, admin bool) error {
+	err := api.CreateUser(ctx, User{
 		UserName: accountID,
 		Name:     displayName,
-		IsAdmin:  true,
+		IsAdmin:  admin,
 		Password: rand.Text(),
 	})
 	if err != nil {
-		return false, fmt.Errorf("create user %s: %w", accountID, err)
+		return fmt.Errorf("create user %s: %w", accountID, err)
 	}
-	return true, nil
+	return nil
 }

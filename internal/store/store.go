@@ -1,5 +1,5 @@
 // Package store is wn-server's SQLite database. It holds the owner account,
-// the server credential, the sessions of first-party clients, the match
+// the listener accounts, the cached member list, the server credential, the sessions of first-party clients, the match
 // queue, the local rating store, the rating outbox, the relay settings from
 // wn-cloud, and the relay state.
 package store
@@ -43,13 +43,29 @@ var (
 //go:embed migrations/*.sql
 var migrationFS embed.FS
 
-// Account is a wn-server account. v1 has one, the owner.
+// Account kinds.
+const (
+	// KindOwner is the account that init creates.
+	KindOwner = "owner"
+	// KindListener is an account of a member of the server, created at the
+	// member's first device code sign-in.
+	KindListener = "listener"
+)
+
+// Account is a wn-server account: the owner, or a listener.
 type Account struct {
-	ID            string // 16 hex characters; Navidrome's Remote-User value
-	Name          string // Subsonic user name
-	AppPassword   string
-	WaxnerdUserID string // empty until wn-server login links the account
-	CreatedAt     time.Time
+	ID   string // 16 hex characters; Navidrome's Remote-User value
+	Name string // Subsonic user name
+	// AppPassword is the owner's app password as-is. For a listener it is
+	// the SHA-256 hash of a password that is never shown.
+	AppPassword string
+	// WaxnerdUserID is empty for the owner until wn-server login links the
+	// account. A listener always has one.
+	WaxnerdUserID string
+	Kind          string // KindOwner or KindListener
+	// Disabled is true for a listener who is not in the cached member list.
+	Disabled  bool
+	CreatedAt time.Time
 }
 
 // Store is an open wn-server database.
@@ -177,7 +193,7 @@ func (s *Store) CreateOwner(ctx context.Context, name string) (Account, error) {
 	if err != nil {
 		return Account{}, err
 	}
-	a := Account{ID: id, Name: name, AppPassword: pw, CreatedAt: time.Now().UTC().Truncate(time.Second)}
+	a := Account{ID: id, Name: name, AppPassword: pw, Kind: KindOwner, CreatedAt: time.Now().UTC().Truncate(time.Second)}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return Account{}, err
@@ -199,9 +215,14 @@ func (s *Store) CreateOwner(ctx context.Context, name string) (Account, error) {
 	return a, tx.Commit()
 }
 
-// Owner returns the owner account, which is the first account created.
+// Owner returns the owner account.
 func (s *Store) Owner(ctx context.Context) (Account, error) {
-	return s.one(ctx, `ORDER BY created_at, rowid LIMIT 1`)
+	return s.one(ctx, `WHERE kind = 'owner' ORDER BY created_at, rowid LIMIT 1`)
+}
+
+// AccountByID returns the account with the given id.
+func (s *Store) AccountByID(ctx context.Context, id string) (Account, error) {
+	return s.one(ctx, `WHERE id = ?`, id)
 }
 
 // AccountByName returns the account with the given name. Names compare
@@ -217,8 +238,8 @@ func (s *Store) one(ctx context.Context, clause string, args ...any) (Account, e
 		created string
 	)
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, app_password, waxnerd_user_id, created_at FROM accounts `+clause, args...).
-		Scan(&a.ID, &a.Name, &a.AppPassword, &waxnerd, &created)
+		`SELECT id, name, app_password, waxnerd_user_id, kind, disabled, created_at FROM accounts `+clause, args...).
+		Scan(&a.ID, &a.Name, &a.AppPassword, &waxnerd, &a.Kind, &a.Disabled, &created)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Account{}, ErrNotFound
 	}

@@ -56,7 +56,9 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, "look up account", err)
 		return
 	}
-	if err != nil || subtle.ConstantTimeCompare([]byte(password), []byte(acct.AppPassword)) != 1 {
+	// Only the owner signs in to the web UI. A listener's stored password is
+	// a hash, which must not work as a password either.
+	if err != nil || acct.Kind != store.KindOwner || subtle.ConstantTimeCompare([]byte(password), []byte(acct.AppPassword)) != 1 {
 		logger.Warn("web sign-in failed", "remote", addr, "reason", "bad_credentials")
 		data.Message = "Wrong account name or app password."
 		s.render(w, r, http.StatusUnauthorized, "login", data)

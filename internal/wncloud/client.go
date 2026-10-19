@@ -147,23 +147,39 @@ func (c *Client) RegisterServer(ctx context.Context, token, name string) (server
 	return out.ID, nil
 }
 
+// Roles of a server member, in the verify answer and the member list.
+const (
+	RoleOwner    = "owner"
+	RoleListener = "listener"
+)
+
+// Verified is the answer of POST /servers/:id/device-codes/verify: the user
+// who issued the code and the user's role at the server.
+type Verified struct {
+	UserID string `json:"user_id"`
+	Email  string `json:"email"`
+	// Role is RoleOwner or RoleListener. An answer without a role, from a
+	// wn-cloud that predates the members routes, is read as RoleOwner.
+	Role string `json:"role"`
+}
+
 // VerifyDeviceCode checks a device code for a server and spends it
 // (POST /servers/:id/device-codes/verify). It returns the user who issued
-// the code.
-func (c *Client) VerifyDeviceCode(ctx context.Context, token, serverID, code string) (userID, email string, err error) {
+// the code and the user's role.
+func (c *Client) VerifyDeviceCode(ctx context.Context, token, serverID, code string) (Verified, error) {
 	const op = "POST /servers/:id/device-codes/verify"
-	var out struct {
-		UserID string `json:"user_id"`
-		Email  string `json:"email"`
-	}
+	var out Verified
 	path := "/servers/" + url.PathEscape(serverID) + "/device-codes/verify"
 	if err := c.do(ctx, op, http.MethodPost, path, token, map[string]string{"code": code}, http.StatusOK, &out); err != nil {
-		return "", "", err
+		return Verified{}, err
 	}
 	if out.UserID == "" {
-		return "", "", &Error{Op: op, Status: http.StatusOK, Kind: ErrUnexpected, Message: "user_id missing"}
+		return Verified{}, &Error{Op: op, Status: http.StatusOK, Kind: ErrUnexpected, Message: "user_id missing"}
 	}
-	return out.UserID, out.Email, nil
+	if out.Role == "" {
+		out.Role = RoleOwner
+	}
+	return out, nil
 }
 
 // do sends one request. It returns nil when the status is want and the body

@@ -2,7 +2,7 @@
 
 This document lists every wn-cloud route that wn-server calls, and the wn-cloud page that issues device codes so that first-party clients can sign in to a wn-server. wn-cloud is the v2 server in `../v2`. wn-cloud implements every route listed here, and this document states what it does on v2's `main` after v2 #91 (merge `527ff35`). Where wn-cloud made a choice that an earlier version of this document left open, the choice is recorded at the route. The package `internal/wncloud/stub` serves the same routes from memory for tests.
 
-**Scope.** v1 of wn-server has one account, the owner. wn-server holds one wn-cloud credential: the server credential, which is the owner's CLI token. Listeners, invites, and server membership are not in v1. Listener sign-in depends on Waxnerd Relay, which is specified in [relay.md](relay.md). The routes for members, invites, and listeners are designed there and are added to this document when they are built.
+**Scope.** wn-server has one owner account and a listener account for each member of the server who has signed in. wn-server holds one wn-cloud credential: the server credential, which is the owner's CLI token. wn-server reads the member list with `GET /servers/:id/members` and the user's role from the verify answer (see [Members](#members-wax-936-wax-992)). The invite routes (`POST /servers/:id/invites` and the rest) are specified in [relay.md](relay.md) section 11 and built in WAX-936; wn-server does not call them.
 
 Third-party Subsonic clients do not use the device code. They sign in with the owner's name and app password through the Subsonic token scheme, checked by wn-server locally. wn-cloud is not involved.
 
@@ -20,6 +20,7 @@ Every route below is in v2's `main`, except the relay routes, which name their o
 | `POST /servers` | WAX-932 (v2 #91) | wn-server |
 | `POST /servers/:id/device-codes/verify` | WAX-932 (v2 #91) | wn-server |
 | `GET /servers/:id` | WAX-981 (not built yet) | wn-server, with `relay = true` |
+| `GET /servers/:id/members` | WAX-936 (not built yet) | wn-server, every 5 minutes |
 | `GET /v1/tunnel` on the edge | WAX-986 (not built yet) | wn-server's relay package |
 | `PUT /ratings/:kind/:mbid` | WAX-942 (v2 #90) | wn-server |
 | `DELETE /ratings/:kind/:mbid` | WAX-942 (v2 #90) | wn-server |
@@ -260,11 +261,11 @@ wn-server rule: `wn-server login` calls it once, when the data directory has no 
 
 First-party clients (wn-mobile, wn-desktop) obtain a wn-server session with a device code. wn-cloud issues the code for one server. The client never holds a wn-cloud token.
 
-1. The owner, signed in at wn-cloud in any browser, opens the device code page and picks a server.
+1. The owner or a member, signed in at wn-cloud in any browser, opens the device code page and picks a server.
 2. wn-cloud shows a code. The owner enters it in the client.
 3. The client posts the code to wn-server's `POST /api/v1/session`.
-4. wn-server calls `POST /servers/:id/device-codes/verify` with the server credential. wn-cloud spends the code and answers with the user who issued it.
-5. wn-server checks that the user id is the owner's and issues its own session. Nothing from wn-cloud is stored for the device.
+4. wn-server calls `POST /servers/:id/device-codes/verify` with the server credential. wn-cloud spends the code and answers with the user who issued it and the user's role.
+5. wn-server accepts the owner, and a listener in its cached member list, and issues its own session. Nothing from wn-cloud is stored for the device.
 
 ### The device code page (wn-cloud UI)
 
@@ -299,7 +300,7 @@ Checks a device code for a server and spends it.
 }
 ```
 
-`user_id` and `email` belong to the user who issued the code.
+`user_id` and `email` belong to the user who issued the code. WAX-992 adds `role`, `owner` or `listener`, the user's role at the server (see [Members](#members-wax-936-wax-992)). wn-server reads an answer without `role` as `owner`.
 
 The checks run in this order, and the first that fails answers (`verifyDeviceCode` in `web/src/servers.ts`, near line 221):
 
@@ -322,6 +323,8 @@ Errors:
 | 429 | `rate_limited` | The credential has 10 or more failed verify calls in the last 10 minutes. The limit is checked before the code, so a valid code is refused too. |
 
 The route also answers the 401 and 403 answers of the bearer check.
+
+A 200 is not always a session. wn-server answers its client 403 `not_a_member` when the user is not the owner and is not a listener in the cached member list, and counts that as a failed exchange (see [Rules](#rules-wn-server-applies)).
 
 Rate limit. The failures are rows of the table `device_code_failures` (`token_hash`, `failed_at`), so the count holds across wn-cloud's web replicas. The key is the SHA-256 hash of the bearer in hex, or the user id for a call with a browser session. Recording a failure deletes every failure row older than 10 minutes. The count and the insert are two statements, so two concurrent failing calls at a count of 9 both pass: at most one failure over the limit. Each failure writes one log line with the error code, the server id, and the user id, never the code, the bearer, or the email.
 
@@ -396,6 +399,43 @@ wn-server rule: the relay package dials while `relay = true`, a server credentia
 ### In wn-cloud (WAX-981, WAX-986)
 
 WAX-981 adds `servers.relay_enabled`, `servers.relay_until`, `servers.relay_connected_at`, `servers.relay_session_id`, `servers.relay_last_seen_at`, `servers.relay_streams`, the table `relay_usage (server_id, month date, bytes bigint, primary key (server_id, month))`, and the table `server_members` with the owner rows. `POST /servers` inserts the owner row and answers the server object with the relay fields. The route is in `web/src/servers.ts`. WAX-986 adds the edge in `relay/`. It reads Postgres with the web service's `DATABASE_URL`, and writes `servers.relay_connected_at` and `servers.relay_last_seen_at`.
+
+## Members (WAX-936, WAX-992)
+
+A server has members: its owner and the listeners the owner invited. The table `server_members (server_id, user_id, role, created_at)` holds them, `role` in `owner` or `listener` (WAX-981 creates it with the owner rows). wn-server reads the list and caches it, so that listeners keep working through an outage of up to 30 days. The design is in [relay.md](relay.md) section 5. The invite routes (`POST /servers/:id/invites`, `DELETE /servers/:id/invites/:inviteId`, `DELETE /servers/:id/members/:userId`, `GET /invites`, and the accept and decline routes) are specified in [relay.md](relay.md) section 11 and built in WAX-936. wn-server does not call them.
+
+Member object:
+
+```json
+{ "user_id": "0192f1c4-...", "name": "ada", "role": "listener", "created_at": "2026-11-02T10:00:00.123456Z" }
+```
+
+### `GET /servers/:id/members` (WAX-936)
+
+Lists the members of a server.
+
+- Authentication: bearer (the server credential), or a browser session of the owner. The caller must own `:id`.
+- Path parameters: `:id`, a UUID.
+- Query parameters: none.
+- Response 200: `{ "members": [ ...member objects... ] }` ordered by `created_at`. The owner row comes first.
+
+Errors:
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `invalid_request` | `:id` is not a UUID. |
+| 403 | `forbidden` | The caller does not own `:id`, or no server has that id. |
+
+The route also answers the 401 and 403 answers of the bearer check.
+
+wn-server rule: with a server credential, `serve` calls it at start, every 5 minutes, and within 10 seconds of a new server credential. A successful call replaces the cached list in the table `members` and records its time in `members_refresh`. A failed call changes nothing. Listeners are served from the list for 30 days after that time, then refused with 503 `cloud_unreachable` until a call succeeds. A listener removed from the list loses their sessions at the refresh that no longer holds them, and the listener's account is disabled until the user is in the list again. A 401 shows the credential banner on the web UI, as on the other routes.
+
+### Changes to existing routes (WAX-992)
+
+- `POST /servers/:id/device-codes/verify` answers `role` (`owner` or `listener`) next to `user_id` and `email`. The check order is unchanged.
+- The device code page (`GET` and `POST /devices`) lists servers the user owns or is a member of, with the role shown, and `POST /devices` accepts a server the user is a member of. A server the user neither owns nor is a member of gets the page with an error line and status 400, as today for a server the user does not own.
+
+wn-server rules: a `listener` role is accepted only when the cached list holds the user id, else 403 `not_a_member`, which counts as a failure against the limit of the path the request came in on (LAN or relay). The owner's user id is accepted whatever the role says.
 
 ## Ratings (WAX-942)
 
@@ -555,7 +595,7 @@ These restate decisions in `README.md` in terms of the routes above.
 ### Device code exchange
 
 - wn-server calls `POST /servers/:id/device-codes/verify` once for each `POST /api/v1/session`, with the stored server id and the server credential. It does not retry. Nothing is cached.
-- On 200, wn-server compares `user_id` with the owner's waxnerd user id. Any other user is refused. wn-server stores nothing from the answer.
+- On 200, wn-server accepts the owner's waxnerd user id whatever `role` says. Another user is accepted when `role` is `listener` and the cached member list holds `user_id`; at the first sign-in wn-server creates a listener account named after the local part of `email`. Any other user is refused with 403 `not_a_member`. A listener is refused with 503 `cloud_unreachable` when the last successful refresh of the member list is more than 30 days old or none has succeeded. wn-server stores nothing else from the answer.
 - On 400, the session request is refused. The client tells the owner to get a new code.
 - On 401, the session request is refused, and the web UI tells the owner to run `wn-server login` again.
 - On 403, the session request is refused and wn-server logs an error. The stored server id does not belong to the server credential's user.
@@ -563,7 +603,7 @@ These restate decisions in `README.md` in terms of the routes above.
 - When wn-cloud is unreachable, the session request fails with an error that tells the client to try again later or to use the app password. The code is not spent unless wn-cloud answered 200, so the owner can retry with the same code while it is valid. If wn-cloud spent the code but the answer was lost, the owner gets a new code.
 - In local-only mode `POST /api/v1/session` is refused. There is no server credential to verify with.
 - Requests that carry a wn-server session or an app password never call wn-cloud.
-- Rate limits. wn-server allows at most 5 failed `POST /api/v1/session` attempts per client address per 10 minutes and at most 10 failed attempts in total per 10 minutes. It answers 429 beyond either limit, without calling wn-cloud. wn-cloud answers every verify call of the server credential with 429 once 10 failed calls are recorded in the last 10 minutes, and logs each failure. wn-cloud also counts its 403 `forbidden` answers, which wn-server does not count, and its count survives a restart of wn-server.
+- Rate limits. wn-server counts LAN and relayed `POST /api/v1/session` requests apart. It allows at most 5 failed attempts per LAN client address and 5 in total for LAN requests, and at most 2 failed attempts per relayed client address and 5 in total for relayed requests, each per 10 minutes. The two totals add up to 10. It answers 429 beyond either limit, without calling wn-cloud. wn-cloud answers every verify call of the server credential with 429 once 10 failed calls are recorded in the last 10 minutes, and logs each failure. wn-cloud also counts its 403 `forbidden` answers, which wn-server does not count, and its count survives a restart of wn-server.
 - Code space. A code has 8 characters from a 32-symbol alphabet without ambiguous glyphs, about 40 bits, and lives 10 minutes. Guessing is infeasible under these limits.
 
 ### Background tick
@@ -576,6 +616,7 @@ These restate decisions in `README.md` in terms of the routes above.
 
 - Sessions already issued keep working. wn-server checks them against its own store and does not call wn-cloud.
 - The owner is never refused because wn-cloud is unreachable. There is no cut-off.
+- Listeners are served from the cached member list for 30 days after its last successful refresh. After that, new listener sessions are refused with 503 `cloud_unreachable` until a refresh succeeds. Sessions already issued keep working until a refresh removes the listener.
 - `POST /api/v1/session` and `wn-server login` fail while wn-cloud is unreachable, because they need `POST /servers/:id/device-codes/verify` or `POST /cli/token`. The app password keeps working.
 - Rating writes go to the outbox.
 - wn-server records the time of the first unreachable answer after a successful call. The web UI shows a banner "wn-cloud unreachable since <time>" until a call succeeds.

@@ -39,7 +39,7 @@ func TestSubsonicLoginLimit(t *testing.T) {
 	forwarded := 0
 	storeFails := false
 	st := failingStore{Store: e.st, fail: &storeFails}
-	h := subsonicAuth(st, newSessions(st, nil, logger), lim, logger,
+	h := subsonicAuth(st, newSessions(st, nil, logger, time.Now), lim, logger,
 		http.HandlerFunc(func(http.ResponseWriter, *http.Request) { forwarded++ }))
 	// call sends a request from addr and returns the Subsonic error code, or
 	// 0 when the request was forwarded.
@@ -145,7 +145,7 @@ func TestSubsonicLoginLimitCountsRelayedClientsSeparately(t *testing.T) {
 	logger := slog.New(slog.DiscardHandler)
 	lim := newLoginLimiter(time.Now)
 	forwarded := 0
-	h := subsonicAuth(e.st, newSessions(e.st, nil, logger), lim, logger,
+	h := subsonicAuth(e.st, newSessions(e.st, nil, logger, time.Now), lim, logger,
 		http.HandlerFunc(func(http.ResponseWriter, *http.Request) { forwarded++ }))
 	// Every request has the TCP peer address of the relay edge.
 	call := func(client, query string) bool {

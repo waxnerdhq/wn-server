@@ -12,16 +12,22 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/waxnerdhq/wn-server/internal/navidrome"
 	"github.com/waxnerdhq/wn-server/internal/relayreq"
 	"github.com/waxnerdhq/wn-server/internal/store"
 	"github.com/waxnerdhq/wn-server/internal/wncloud"
 )
 
 // Limits of the local rate limit on failed POST /api/v1/session requests.
+// LAN and relayed requests have their own limits. The two totals together
+// are the 10 failed verify calls that wn-cloud allows per server credential.
 const (
-	exchangeWindow      = 10 * time.Minute
-	exchangeMaxPerAddr  = 5
-	exchangeMaxTotal    = 10
+	exchangeWindow     = 10 * time.Minute
+	exchangeMaxPerAddr = 5
+	exchangeMaxTotal   = 5
+	// relayedMaxPerAddr and relayedMaxTotal limit relayed requests.
+	relayedMaxPerAddr   = 2
+	relayedMaxTotal     = 5
 	exchangeReadTimeout = 10 * time.Second
 	maxDeviceLength     = 100
 	maxSessionBodyBytes = 4 << 10
@@ -31,6 +37,9 @@ const (
 	// unreachableLogInterval is the least time between two log lines about
 	// wn-cloud being unreachable.
 	unreachableLogInterval = time.Minute
+	// memberListMaxAge is how long after the last successful refresh of the
+	// member list listeners get sessions.
+	memberListMaxAge = 30 * 24 * time.Hour
 )
 
 // deviceCodeAlphabet is the alphabet of wn-cloud device codes.
@@ -38,27 +47,39 @@ const deviceCodeAlphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
 
 // Verifier verifies a device code at wn-cloud. *wncloud.Client implements it.
 type Verifier interface {
-	VerifyDeviceCode(ctx context.Context, token, serverID, code string) (userID, email string, err error)
+	VerifyDeviceCode(ctx context.Context, token, serverID, code string) (wncloud.Verified, error)
 }
 
 type sessionKey struct{}
 
 // sessions issues, checks, and revokes wn-server sessions.
 type sessions struct {
-	store   Store
-	cloud   Verifier
-	logger  *slog.Logger
-	limiter *limiter
+	store  Store
+	cloud  Verifier
+	logger *slog.Logger
+	// lan and relayed limit failed exchanges of LAN and relayed requests.
+	lan     *limiter
+	relayed *limiter
 	now     func() time.Time
 	// cloudStatus records whether wn-cloud answered. It may be nil.
 	cloudStatus *wncloud.Status
+	// users creates the Navidrome users of listeners. It may be nil; then
+	// listeners cannot sign in.
+	users navidrome.ListenerAPI
+	// ready is closed when the supervisor reports ready. A listener's first
+	// sign-in waits for it, because it creates a Navidrome user.
+	ready <-chan struct{}
 
 	mu              sync.Mutex
 	lastUnreachable time.Time
 }
 
-func newSessions(st Store, cloud Verifier, logger *slog.Logger) *sessions {
-	return &sessions{store: st, cloud: cloud, logger: logger, limiter: newLimiter(time.Now), now: time.Now}
+func newSessions(st Store, cloud Verifier, logger *slog.Logger, now func() time.Time) *sessions {
+	return &sessions{
+		store: st, cloud: cloud, logger: logger, now: now,
+		lan:     newLimiter(now, exchangeMaxPerAddr, exchangeMaxTotal),
+		relayed: newLimiter(now, relayedMaxPerAddr, relayedMaxTotal),
+	}
 }
 
 // check returns the session for token and records its use. It returns
@@ -97,7 +118,7 @@ func (s *sessions) apiHandler(rt Ratings, ready <-chan struct{}) http.Handler {
 	if rt != nil {
 		gate := gateReadyJSON(ready)
 		(&ratingAPI{ratings: rt, logger: s.logger}).mount(mux, func(h http.Handler) http.Handler {
-			return s.requireSession(gate(h))
+			return s.requireSession(ownerOnly(gate(h)))
 		})
 	}
 	mux.Handle("/api/v1/", s.requireSession(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -129,6 +150,19 @@ func (s *sessions) requireSession(next http.Handler) http.Handler {
 		ctx := context.WithValue(r.Context(), sessionKey{}, sess)
 		ctx = context.WithValue(ctx, accountIDKey{}, sess.AccountID)
 		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// ownerOnly answers 403 not_available to a listener's session. Ratings of
+// listeners are not stored yet (WAX-998), and the rating routes write the
+// owner's outbox.
+func ownerOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if sess, _ := r.Context().Value(sessionKey{}).(store.Session); sess.AccountKind != store.KindOwner {
+			writeAPIError(w, http.StatusForbidden, "not_available", "ratings of listeners are not available yet")
+			return
+		}
+		next.ServeHTTP(w, r)
 	})
 }
 
@@ -166,13 +200,16 @@ type exchangeError struct {
 }
 
 var (
-	errNotLinked    = &exchangeError{http.StatusConflict, "not_linked", "this server is not linked to waxnerd; run `wn-server login` on the server", false}
-	errBadCode      = &exchangeError{http.StatusUnauthorized, "invalid_code", "the code is invalid, expired, or already used; get a new code", true}
-	errNotOwner     = &exchangeError{http.StatusForbidden, "not_owner", "the code was issued by a waxnerd user who does not own this server", true}
-	errNotAvailable = &exchangeError{http.StatusForbidden, "not_available", "the device code exchange is not available through the relay; the web UI signs in with the app password", false}
-	errLimited      = &exchangeError{http.StatusTooManyRequests, "rate_limited", "too many failed attempts; try again later", false}
-	errCloud        = &exchangeError{http.StatusBadGateway, "cloud_error", "wn-cloud refused this server's credential; the owner must run `wn-server logout`, then `wn-server login`", false}
-	errCloudDown    = &exchangeError{http.StatusServiceUnavailable, "cloud_unreachable", "wn-cloud is unreachable; try again later or use the app password", false}
+	errNotLinked = &exchangeError{http.StatusConflict, "not_linked", "this server is not linked to waxnerd; run `wn-server login` on the server", false}
+	errBadCode   = &exchangeError{http.StatusUnauthorized, "invalid_code", "the code is invalid, expired, or already used; get a new code", true}
+	errNotMember = &exchangeError{http.StatusForbidden, "not_a_member", "the code was issued by a waxnerd user who is not a member of this server", true}
+	errLimited   = &exchangeError{http.StatusTooManyRequests, "rate_limited", "too many failed attempts; try again later", false}
+	errCloud     = &exchangeError{http.StatusBadGateway, "cloud_error", "wn-cloud refused this server's credential; the owner must run `wn-server logout`, then `wn-server login`", false}
+	errCloudDown = &exchangeError{http.StatusServiceUnavailable, "cloud_unreachable", "wn-cloud is unreachable; try again later or use the app password", false}
+	// errMembersStale refuses a listener while the member list is older
+	// than memberListMaxAge or was never read.
+	errMembersStale = &exchangeError{http.StatusServiceUnavailable, "cloud_unreachable", "the member list of this server could not be read from wn-cloud for 30 days; try again later", false}
+	errStarting     = &exchangeError{http.StatusServiceUnavailable, "starting", "wn-server is starting; try again shortly", false}
 	// errCanceled is a verification that ended because the client went
 	// away. It counts, because wn-cloud may have seen the code.
 	errCanceled   = &exchangeError{http.StatusServiceUnavailable, "cloud_unreachable", "the request was canceled", true}
@@ -198,14 +235,12 @@ type exchangeAccount struct {
 }
 
 // exchange serves POST /api/v1/session: it verifies a device code at
-// wn-cloud and issues a session for the owner. A relayed request is refused
-// with 403 not_available.
+// wn-cloud and issues a session for the owner or for a listener. LAN and
+// relayed requests count against their own limits.
 func (s *sessions) exchange(w http.ResponseWriter, r *http.Request) {
-	// v1 does not offer the exchange through the relay. The answer is not a
-	// failure of the client and does not reach wn-cloud.
+	lim := s.lan
 	if relayreq.IsRelayed(r.Context()) {
-		writeAPIError(w, errNotAvailable.status, errNotAvailable.code, errNotAvailable.message)
-		return
+		lim = s.relayed
 	}
 	// The server sets only ReadHeaderTimeout. A slow body must not hold the
 	// handler.
@@ -213,18 +248,18 @@ func (s *sessions) exchange(w http.ResponseWriter, r *http.Request) {
 	addr := relayreq.ClientAddr(r)
 	code, device, xerr := readExchange(w, r)
 	if xerr != nil {
-		s.limiter.fail(addr)
+		lim.fail(addr)
 		s.refuse(w, r, addr, xerr)
 		return
 	}
-	if !s.limiter.acquire(addr) {
+	if !lim.acquire(addr) {
 		s.refuse(w, r, addr, errLimited)
 		return
 	}
 	failed := false
-	defer func() { s.limiter.release(addr, failed) }()
+	defer func() { lim.release(addr, failed) }()
 
-	token, owner, xerr := s.exchangeCode(r.Context(), addr, code, device)
+	token, acct, xerr := s.exchangeCode(r.Context(), addr, code, device)
 	if r.Context().Err() != nil {
 		failed = true
 		return
@@ -235,7 +270,7 @@ func (s *sessions) exchange(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	writeJSON(w, http.StatusOK, exchangeResponse{Token: token, Account: exchangeAccount{ID: owner.ID, Name: owner.Name}})
+	writeJSON(w, http.StatusOK, exchangeResponse{Token: token, Account: exchangeAccount{ID: acct.ID, Name: acct.Name}})
 }
 
 // readExchange decodes and validates the request body. It returns the
@@ -274,7 +309,7 @@ func (s *sessions) exchangeCode(ctx context.Context, addr, code, device string) 
 		return "", store.Account{}, errNotLinked
 	}
 
-	userID, _, err := s.cloud.VerifyDeviceCode(ctx, cred.Token, cred.ServerID, code)
+	v, err := s.cloud.VerifyDeviceCode(ctx, cred.Token, cred.ServerID, code)
 	if !errors.Is(err, wncloud.ErrUnreachable) {
 		s.cloudStatus.MarkReachable()
 	}
@@ -298,17 +333,77 @@ func (s *sessions) exchangeCode(ctx context.Context, addr, code, device string) 
 		}
 		return "", store.Account{}, errCloud
 	}
-	if userID != owner.WaxnerdUserID {
-		return "", store.Account{}, errNotOwner
+	// The owner is accepted whatever the role says, so that nothing at
+	// wn-cloud can refuse the owner.
+	acct := owner
+	if v.UserID != owner.WaxnerdUserID {
+		if v.Role != wncloud.RoleListener {
+			return "", store.Account{}, errNotMember
+		}
+		var xerr *exchangeError
+		if acct, xerr = s.listener(ctx, addr, v); xerr != nil {
+			return "", store.Account{}, xerr
+		}
 	}
 
-	token, sess, err := s.store.CreateSession(ctx, owner.ID, device)
+	token, sess, err := s.store.CreateSession(ctx, acct.ID, device)
 	if err != nil {
 		s.log(ctx).Error("create session", "remote", addr, "error", err)
 		return "", store.Account{}, errInternal
 	}
-	s.log(ctx).Info("session created", "session", sess.ID, "account", owner.ID, "device", device)
-	return token, owner, nil
+	s.log(ctx).Info("session created", "session", sess.ID, "account", acct.ID, "kind", acct.Kind, "device", device)
+	return token, acct, nil
+}
+
+// listener checks a verified listener against the cached member list and
+// returns the listener's account. On the first sign-in it creates the
+// account. Every sign-in makes sure the listener's Navidrome user exists.
+func (s *sessions) listener(ctx context.Context, addr string, v wncloud.Verified) (store.Account, *exchangeError) {
+	at, ok, err := s.store.MembersRefreshedAt(ctx)
+	if err != nil {
+		s.log(ctx).Error("read the member list refresh time", "remote", addr, "error", err)
+		return store.Account{}, errInternal
+	}
+	if !ok || s.now().Sub(at) > memberListMaxAge {
+		s.log(ctx).Warn("listener refused: the member list is too old", "remote", addr, "refreshed_at", at)
+		return store.Account{}, errMembersStale
+	}
+	member, err := s.store.IsMember(ctx, v.UserID)
+	if err != nil {
+		s.log(ctx).Error("read the member list", "remote", addr, "error", err)
+		return store.Account{}, errInternal
+	}
+	if !member {
+		return store.Account{}, errNotMember
+	}
+	select {
+	case <-s.ready:
+	default:
+		return store.Account{}, errStarting
+	}
+	if s.users == nil {
+		s.log(ctx).Error("listener sign-in without a navidrome client", "remote", addr)
+		return store.Account{}, errInternal
+	}
+	acct, err := s.store.ListenerByUserID(ctx, v.UserID)
+	if errors.Is(err, store.ErrNotFound) {
+		if acct, err = s.store.CreateListener(ctx, v.UserID, v.Email); err == nil {
+			s.log(ctx).Info("listener account created", "account", acct.ID, "name", acct.Name)
+		}
+	}
+	if err != nil {
+		s.log(ctx).Error("read or create the listener account", "remote", addr, "error", err)
+		return store.Account{}, errInternal
+	}
+	created, err := navidrome.EnsureListenerUser(ctx, s.users, acct.ID, acct.Name)
+	if err != nil {
+		s.log(ctx).Error("create the listener's navidrome user", "account", acct.ID, "remote", addr, "error", err)
+		return store.Account{}, errInternal
+	}
+	if created {
+		s.log(ctx).Info("created listener's navidrome user", "account", acct.ID)
+	}
+	return acct, nil
 }
 
 // log returns the sessions' logger, with relay=true when ctx carries the
@@ -324,7 +419,7 @@ func (s *sessions) log(ctx context.Context) *slog.Logger {
 // line never carries the code.
 func (s *sessions) refuse(w http.ResponseWriter, r *http.Request, addr string, e *exchangeError) {
 	switch e {
-	case errCloudDown, errCloud, errInternal:
+	case errCloudDown, errCloud, errInternal, errMembersStale:
 		// Logged where they happen, with their cause.
 	default:
 		s.log(r.Context()).Warn("session exchange failed", "reason", e.code, "remote", addr)
@@ -403,17 +498,19 @@ func writeUnauthorized(w http.ResponseWriter) {
 // address and in total. An exchange in progress counts as a failure until it
 // ends, so that parallel attempts cannot pass the limit.
 type limiter struct {
-	now func() time.Time
+	now     func() time.Time
+	perAddr int
+	total   int
 
 	mu           sync.Mutex
 	failures     map[string][]time.Time
-	total        []time.Time
+	all          []time.Time
 	pending      map[string]int
 	pendingTotal int
 }
 
-func newLimiter(now func() time.Time) *limiter {
-	return &limiter{now: now, failures: map[string][]time.Time{}, pending: map[string]int{}}
+func newLimiter(now func() time.Time, perAddr, total int) *limiter {
+	return &limiter{now: now, perAddr: perAddr, total: total, failures: map[string][]time.Time{}, pending: map[string]int{}}
 }
 
 // acquire reports whether an exchange from addr may proceed. When it
@@ -422,8 +519,8 @@ func (l *limiter) acquire(addr string) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.prune()
-	if len(l.failures[addr])+l.pending[addr] >= exchangeMaxPerAddr ||
-		len(l.total)+l.pendingTotal >= exchangeMaxTotal {
+	if len(l.failures[addr])+l.pending[addr] >= l.perAddr ||
+		len(l.all)+l.pendingTotal >= l.total {
 		return false
 	}
 	l.pending[addr]++
@@ -438,13 +535,13 @@ func (l *limiter) fail(addr string) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.prune()
-	if len(l.failures[addr])+l.pending[addr] >= exchangeMaxPerAddr ||
-		len(l.total)+l.pendingTotal >= exchangeMaxTotal {
+	if len(l.failures[addr])+l.pending[addr] >= l.perAddr ||
+		len(l.all)+l.pendingTotal >= l.total {
 		return
 	}
 	now := l.now()
 	l.failures[addr] = append(l.failures[addr], now)
-	l.total = append(l.total, now)
+	l.all = append(l.all, now)
 }
 
 // release ends an exchange. A failed exchange is recorded.
@@ -458,15 +555,15 @@ func (l *limiter) release(addr string, failed bool) {
 	if failed {
 		now := l.now()
 		l.failures[addr] = append(l.failures[addr], now)
-		l.total = append(l.total, now)
+		l.all = append(l.all, now)
 	}
 }
 
 // prune drops failures older than the window. The map holds at most
-// exchangeMaxTotal live failures, so it stays small.
+// l.total live failures, so it stays small.
 func (l *limiter) prune() {
 	cutoff := l.now().Add(-exchangeWindow)
-	l.total = dropBefore(l.total, cutoff)
+	l.all = dropBefore(l.all, cutoff)
 	for addr, list := range l.failures {
 		if list = dropBefore(list, cutoff); len(list) == 0 {
 			delete(l.failures, addr)
