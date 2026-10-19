@@ -166,12 +166,13 @@ type exchangeError struct {
 }
 
 var (
-	errNotLinked = &exchangeError{http.StatusConflict, "not_linked", "this server is not linked to waxnerd; run `wn-server login` on the server", false}
-	errBadCode   = &exchangeError{http.StatusUnauthorized, "invalid_code", "the code is invalid, expired, or already used; get a new code", true}
-	errNotOwner  = &exchangeError{http.StatusForbidden, "not_owner", "the code was issued by a waxnerd user who does not own this server", true}
-	errLimited   = &exchangeError{http.StatusTooManyRequests, "rate_limited", "too many failed attempts; try again later", false}
-	errCloud     = &exchangeError{http.StatusBadGateway, "cloud_error", "wn-cloud refused this server's credential; the owner must run `wn-server logout`, then `wn-server login`", false}
-	errCloudDown = &exchangeError{http.StatusServiceUnavailable, "cloud_unreachable", "wn-cloud is unreachable; try again later or use the app password", false}
+	errNotLinked    = &exchangeError{http.StatusConflict, "not_linked", "this server is not linked to waxnerd; run `wn-server login` on the server", false}
+	errBadCode      = &exchangeError{http.StatusUnauthorized, "invalid_code", "the code is invalid, expired, or already used; get a new code", true}
+	errNotOwner     = &exchangeError{http.StatusForbidden, "not_owner", "the code was issued by a waxnerd user who does not own this server", true}
+	errNotAvailable = &exchangeError{http.StatusForbidden, "not_available", "the device code exchange is not available through the relay; the web UI signs in with the app password", false}
+	errLimited      = &exchangeError{http.StatusTooManyRequests, "rate_limited", "too many failed attempts; try again later", false}
+	errCloud        = &exchangeError{http.StatusBadGateway, "cloud_error", "wn-cloud refused this server's credential; the owner must run `wn-server logout`, then `wn-server login`", false}
+	errCloudDown    = &exchangeError{http.StatusServiceUnavailable, "cloud_unreachable", "wn-cloud is unreachable; try again later or use the app password", false}
 	// errCanceled is a verification that ended because the client went
 	// away. It counts, because wn-cloud may have seen the code.
 	errCanceled   = &exchangeError{http.StatusServiceUnavailable, "cloud_unreachable", "the request was canceled", true}
@@ -197,8 +198,15 @@ type exchangeAccount struct {
 }
 
 // exchange serves POST /api/v1/session: it verifies a device code at
-// wn-cloud and issues a session for the owner.
+// wn-cloud and issues a session for the owner. A relayed request is refused
+// with 403 not_available.
 func (s *sessions) exchange(w http.ResponseWriter, r *http.Request) {
+	// v1 does not offer the exchange through the relay. The answer is not a
+	// failure of the client and does not reach wn-cloud.
+	if relayreq.IsRelayed(r.Context()) {
+		writeAPIError(w, errNotAvailable.status, errNotAvailable.code, errNotAvailable.message)
+		return
+	}
 	// The server sets only ReadHeaderTimeout. A slow body must not hold the
 	// handler.
 	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(exchangeReadTimeout))

@@ -256,22 +256,22 @@ func TestLimiter(t *testing.T) {
 	now := time.Unix(1_800_000_000, 0)
 	l := newLimiter(func() time.Time { return now })
 	for range signInMaxPerAddr {
-		if !l.begin("a") {
+		if !l.begin("a", false) {
 			t.Fatal("refused below the limit")
 		}
 	}
-	if l.begin("a") {
+	if l.begin("a", false) {
 		t.Fatal("allowed above the limit")
 	}
-	if !l.begin("b") {
+	if !l.begin("b", false) {
 		t.Fatal("refused another address")
 	}
-	l.forget("a")
-	if !l.begin("a") {
+	l.forget("a", false)
+	if !l.begin("a", false) {
 		t.Fatal("forget did not free a slot")
 	}
 	now = now.Add(signInWindow + time.Second)
-	if !l.begin("a") {
+	if !l.begin("a", false) {
 		t.Fatal("the window did not expire")
 	}
 	if limitKey("2001:db8::1") != limitKey("2001:db8::2") {
@@ -282,12 +282,40 @@ func TestLimiter(t *testing.T) {
 func TestLimiterTotal(t *testing.T) {
 	l := newLimiter(time.Now)
 	for i := range signInMaxTotal {
-		if !l.begin(fmt.Sprintf("10.0.%d.%d", i/250, i%250)) {
+		if !l.begin(fmt.Sprintf("10.0.%d.%d", i/250, i%250), false) {
 			t.Fatalf("refused attempt %d below the total", i)
 		}
 	}
-	if l.begin("192.0.2.1") {
+	if l.begin("192.0.2.1", false) {
 		t.Fatal("allowed a new address above the total")
+	}
+}
+
+func TestLimiterSplitTotals(t *testing.T) {
+	fill := func(l *limiter, relayed bool) {
+		for i := range signInMaxTotal {
+			if !l.begin(fmt.Sprintf("10.0.%d.%d", i/250, i%250), relayed) {
+				t.Fatalf("refused attempt %d below the total, relayed=%v", i, relayed)
+			}
+		}
+	}
+	for _, relayed := range []bool{false, true} {
+		l := newLimiter(time.Now)
+		fill(l, relayed)
+		if l.begin("192.0.2.1", relayed) {
+			t.Fatalf("allowed above the total, relayed=%v", relayed)
+		}
+		if !l.begin("192.0.2.1", !relayed) {
+			t.Fatalf("a full pool locked the other class, relayed=%v", relayed)
+		}
+	}
+	// The same address counts separately in each class.
+	l := newLimiter(time.Now)
+	for range signInMaxPerAddr {
+		l.begin("192.0.2.2", false)
+	}
+	if l.begin("192.0.2.2", false) || !l.begin("192.0.2.2", true) {
+		t.Fatal("LAN failures of an address counted against the same address relayed")
 	}
 }
 
