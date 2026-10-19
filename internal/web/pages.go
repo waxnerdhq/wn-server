@@ -195,9 +195,9 @@ func (s *server) statusPage(w http.ResponseWriter, r *http.Request, _ store.Sess
 	}
 	switch r.URL.Query().Get("done") {
 	case "relay-on":
-		data.Notice = "The relay is switched on. The relay line changes within 10 seconds."
+		data.Notice = "The relay is switched on. The relay line changes within about 20 seconds."
 	case "relay-off":
-		data.Notice = "The relay is switched off. The relay line changes within 10 seconds."
+		data.Notice = "The relay is switched off. The relay line changes within about 15 seconds."
 	}
 	cred, err := s.Store.ServerCredential(ctx)
 	switch {
