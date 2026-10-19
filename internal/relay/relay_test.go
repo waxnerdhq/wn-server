@@ -130,10 +130,16 @@ func (e *edge) conn(i int) *holdConn {
 }
 
 // holdConn stops reading once hold is set, so the edge answers no ping: a
-// silent drop as wn-server sees it.
+// silent drop as wn-server sees it. With dropThird set it discards every
+// third ping frame instead, so the edge answers two of every three pings.
+// The second mode reads whole 12-byte yamux headers and assumes that the
+// session carries pings only, which holds while the test opens no stream.
 type holdConn struct {
 	net.Conn
 	hold      atomic.Bool
+	dropThird atomic.Bool
+	pings     atomic.Int32 // ping frames read
+	pending   []byte       // the rest of a header that Read has not returned; used by one reader only
 	closed    chan struct{}
 	closeOnce sync.Once
 }
@@ -143,7 +149,22 @@ func (c *holdConn) Read(p []byte) (int, error) {
 		<-c.closed
 		return 0, io.EOF
 	}
-	return c.Conn.Read(p)
+	if !c.dropThird.Load() && len(c.pending) == 0 {
+		return c.Conn.Read(p)
+	}
+	for len(c.pending) == 0 {
+		hdr := make([]byte, 12)
+		if _, err := io.ReadFull(c.Conn, hdr); err != nil {
+			return 0, err
+		}
+		if hdr[1] == 2 && c.pings.Add(1)%3 == 0 { // type ping
+			continue
+		}
+		c.pending = hdr
+	}
+	n := copy(p, c.pending)
+	c.pending = c.pending[n:]
+	return n, nil
 }
 
 func (c *holdConn) Close() error {
@@ -446,11 +467,21 @@ func TestReplacement(t *testing.T) {
 		c.writeTimeout = 20 * time.Millisecond
 	})
 	waitFor(t, "connected", func() bool { return h.last().Name == Connected })
-	// The first tunnel goes silent. wn-server sees the keepalive fail and
-	// opens a second tunnel, and the edge closes the first one.
+	// The first tunnel goes silent. wn-server misses three pongs in a row,
+	// closes the session, and opens a second tunnel, and the edge closes the
+	// first one.
 	e.conn(0).hold.Store(true)
 	waitFor(t, "second tunnel", func() bool { return e.dials() == 2 && h.last().Name == Connected })
 	waitFor(t, "first session closed", func() bool { return e.session(0).IsClosed() })
+	if names := fmt.Sprint(h.names()); names != "[connecting connected unreachable connected]" {
+		t.Fatalf("states = %s", names)
+	}
+	h.mu.Lock()
+	st := h.states[2]
+	h.mu.Unlock()
+	if st.Err != "tunnel closed: 3 keepalive pongs missed" {
+		t.Fatalf("unreachable error = %q", st.Err)
+	}
 	time.Sleep(100 * time.Millisecond)
 	if n := e.dials(); n != 2 || h.last().Name != Connected {
 		t.Fatalf("dials = %d, state %s after the replacement", n, h.last().Name)
@@ -463,6 +494,23 @@ func TestReplacement(t *testing.T) {
 	res.Body.Close()
 	if string(b) != "ok" {
 		t.Fatalf("body %q", b)
+	}
+}
+
+func TestMissedPongsBelowLimit(t *testing.T) {
+	e := newEdge(t)
+	h := start(t, e, http.NotFoundHandler(), func(c *config) {
+		c.keepAlive = 10 * time.Millisecond
+		c.writeTimeout = 10 * time.Millisecond
+	})
+	waitFor(t, "connected", func() bool { return h.last().Name == Connected })
+	// The edge answers two of every three pings: a miss now and then, never
+	// three in a row. The session stays.
+	conn := e.conn(0)
+	conn.dropThird.Store(true)
+	waitFor(t, "twelve pings", func() bool { return conn.pings.Load() >= 12 })
+	if n := e.dials(); n != 1 || h.last().Name != Connected || e.session(0).IsClosed() {
+		t.Fatalf("dials = %d, state %s, closed %v", n, h.last().Name, e.session(0).IsClosed())
 	}
 }
 
