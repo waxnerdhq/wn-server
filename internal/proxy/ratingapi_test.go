@@ -3,10 +3,15 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"regexp"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/waxnerdhq/wn-server/internal/store"
 )
 
 type apiRating struct {
@@ -204,5 +209,122 @@ func TestRatingAPIChanges(t *testing.T) {
 	}
 	if got := e.api(t, http.MethodGet, "/api/v1/ratings/changes", "", "", nil); got != http.StatusUnauthorized {
 		t.Fatalf("changes without a session: %d, want 401", got)
+	}
+}
+
+// A listener's ratings are written to the listener's rows, as the
+// listener's Navidrome user, and never reach the owner's rows or the outbox.
+func TestListenerRatings(t *testing.T) {
+	ctx := context.Background()
+	e := newRatingEnv(t)
+	owner := e.session(t)
+	acct, err := e.st.CreateListener(ctx, "0192f1c4-0000-7000-8000-000000000001", "ada@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.nd.listener = acct.ID
+	if _, err := e.st.ReplaceMembers(ctx, []store.Member{{UserID: "0192f1c4-0000-7000-8000-000000000001", Role: "listener"}}, time.Now()); err != nil {
+		t.Fatal(err)
+	}
+	ls, _, err := e.st.CreateListenerSession(ctx, acct.ID, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	row := func(account, kind, mbid string) string {
+		t.Helper()
+		r, err := e.st.Rating(ctx, account, kind, mbid)
+		if errors.Is(err, store.ErrRatingNotFound) {
+			return "none"
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		return value(r.HalfStars, r.LikeLevel)
+	}
+	outbox := func() int {
+		t.Helper()
+		box, err := e.st.Outbox(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return len(box)
+	}
+
+	// The owner rates the album: one row, one outbox entry.
+	e.call(t, "setRating.view?id="+matchedAlbum+"&rating=5")
+	if got := row(e.owner.ID, "release", releaseMBID); got != "10/nil" || outbox() != 1 {
+		t.Fatalf("owner's row %s, outbox %d; want 10/nil and 1", got, outbox())
+	}
+
+	// A listener's Subsonic calls change the listener's rows only.
+	for _, q := range []string{"setRating.view?id=" + matchedAlbum + "&rating=2", "star.view?id=" + matchedSong} {
+		resp, err := http.Get(e.srv.URL + "/rest/" + q + "&apiKey=" + ls + "&f=json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		if !strings.Contains(string(body), `"status":"ok"`) {
+			t.Fatalf("%s: %s", q, body)
+		}
+	}
+	if got := row(acct.ID, "release", releaseMBID); got != "4/nil" {
+		t.Fatalf("listener's album row %s, want 4/nil", got)
+	}
+	if got := row(acct.ID, "track", trackMBID); got != "nil/love" {
+		t.Fatalf("listener's song row %s, want nil/love", got)
+	}
+	if got := row(e.owner.ID, "release", releaseMBID); got != "10/nil" {
+		t.Fatalf("owner's album row %s after the listener's call, want 10/nil", got)
+	}
+	if got := row(e.owner.ID, "track", trackMBID); got != "none" {
+		t.Fatalf("owner's song row %s after the listener's call, want none", got)
+	}
+	if outbox() != 1 {
+		t.Fatalf("outbox has %d entries after the listener's calls, want 1", outbox())
+	}
+	for i, u := range e.nd.users[1:] {
+		if u != acct.ID {
+			t.Fatalf("Navidrome call %d ran as %q, want the listener %q", i+1, u, acct.ID)
+		}
+	}
+
+	// The rating API answers the caller's rows.
+	var got struct {
+		Ratings map[string]apiRating `json:"ratings"`
+	}
+	ids := "/api/v1/ratings?ids=" + matchedAlbum + "," + matchedSong
+	if code := e.api(t, http.MethodGet, ids, ls, "", &got); code != http.StatusOK || len(got.Ratings) != 2 ||
+		*got.Ratings[matchedAlbum].HalfStars != 4 || *got.Ratings[matchedSong].LikeLevel != "love" {
+		t.Fatalf("listener GET: %d %+v", code, got.Ratings)
+	}
+	got.Ratings = nil
+	if code := e.api(t, http.MethodGet, ids, owner, "", &got); code != http.StatusOK || len(got.Ratings) != 1 || *got.Ratings[matchedAlbum].HalfStars != 10 {
+		t.Fatalf("owner GET: %d %+v", code, got.Ratings)
+	}
+	var feed struct {
+		Changes []apiRating `json:"changes"`
+	}
+	if code := e.api(t, http.MethodGet, "/api/v1/ratings/changes", ls, "", &feed); code != http.StatusOK || len(feed.Changes) != 2 {
+		t.Fatalf("listener changes: %d %+v", code, feed.Changes)
+	}
+	for _, c := range feed.Changes {
+		if c.HalfStars != nil && *c.HalfStars == 10 {
+			t.Fatalf("listener's feed holds the owner's row: %+v", c)
+		}
+	}
+
+	// PUT and DELETE write the listener's rows and queue nothing.
+	if code := e.api(t, http.MethodPut, "/api/v1/ratings/"+matchedAlbum, ls, `{"half_stars":6}`, nil); code != http.StatusOK {
+		t.Fatalf("listener PUT: %d", code)
+	}
+	if code := e.api(t, http.MethodDelete, "/api/v1/ratings/"+matchedSong, ls, "", nil); code != http.StatusNoContent {
+		t.Fatalf("listener DELETE: %d", code)
+	}
+	if a, s := row(acct.ID, "release", releaseMBID), row(acct.ID, "track", trackMBID); a != "6/nil" || s != "none" {
+		t.Fatalf("listener's rows %s and %s, want 6/nil and none", a, s)
+	}
+	if got := row(e.owner.ID, "release", releaseMBID); got != "10/nil" || outbox() != 1 {
+		t.Fatalf("owner's row %s, outbox %d after the listener's PUT and DELETE; want 10/nil and 1", got, outbox())
 	}
 }

@@ -20,8 +20,9 @@ type Patch struct {
 }
 
 // Patch applies p to the account's rating of a subject, writes the result
-// to the local store and the outbox, and returns the rating as stored. A
-// rating that ends with neither value is cleared.
+// to the local store, and to the outbox when the account is the owner's, and
+// returns the rating as stored. A rating that ends with neither value is
+// cleared.
 func (s *Service) Patch(ctx context.Context, accountID string, sub Subject, p Patch) (store.Rating, error) {
 	return s.update(ctx, accountID, sub, p.HalfStars, p.LikeLevel, func(r *store.Rating) {
 		if p.SetHalfStars {

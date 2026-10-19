@@ -135,7 +135,7 @@ func (s *sessions) apiHandler(rt Ratings, ready <-chan struct{}) http.Handler {
 	if rt != nil {
 		gate := gateReadyJSON(ready)
 		(&ratingAPI{ratings: rt, logger: s.logger}).mount(mux, func(h http.Handler) http.Handler {
-			return s.requireSession(ownerOnly(gate(h)))
+			return s.requireSession(gate(h))
 		})
 	}
 	mux.Handle("/api/v1/", s.requireSession(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -171,19 +171,6 @@ func (s *sessions) requireSession(next http.Handler) http.Handler {
 		ctx := context.WithValue(r.Context(), sessionKey{}, sess)
 		ctx = context.WithValue(ctx, accountIDKey{}, sess.AccountID)
 		next.ServeHTTP(w, r.WithContext(ctx))
-	})
-}
-
-// ownerOnly answers 403 not_available to a listener's session. Ratings of
-// listeners are not stored yet (WAX-998), and the rating routes write the
-// owner's outbox.
-func ownerOnly(next http.Handler) http.Handler {
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if sess, _ := r.Context().Value(sessionKey{}).(store.Session); sess.AccountKind != store.KindOwner {
-			writeAPIError(w, http.StatusForbidden, "not_available", "ratings of listeners are not available yet")
-			return
-		}
-		next.ServeHTTP(w, r)
 	})
 }
 

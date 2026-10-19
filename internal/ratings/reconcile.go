@@ -45,7 +45,8 @@ type ReconcileResult struct {
 }
 
 // Reconcile brings the owner's rating changes at wn-cloud into the local
-// store and into Navidrome. It calls GET /ratings?since= with the stored
+// store and into Navidrome. It reads and writes the owner's rows only; the
+// rows of listeners are never touched. It calls GET /ratings?since= with the stored
 // cursor and the server credential, follows the pages, and stores the cursor
 // after each page. Each change overwrites the local values, unless an outbox
 // entry of the subject is newer than the change. Applied changes are pushed
