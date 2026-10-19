@@ -44,7 +44,7 @@ type accountIDKey struct{}
 // ready is closed, /rest/* and /share/* answer 503 and nothing is forwarded,
 // so that no client can become Navidrome's first user. cloud verifies device
 // codes for POST /api/v1/session. WithRatings adds the rating intercept on
-// setRating, star, and unstar. A nil logger selects slog.Default.
+// setRating, star, and unstar. WithRelayMaxBitrate caps relayed streams. A nil logger selects slog.Default.
 func New(rt http.RoundTripper, ready <-chan struct{}, st Store, cloud Verifier, logger *slog.Logger, opts ...Option) http.Handler {
 	o := newOptions(opts)
 	if logger == nil {
@@ -100,7 +100,7 @@ func New(rt http.RoundTripper, ready <-chan struct{}, st Store, cloud Verifier, 
 	}
 	sess := newSessions(st, cloud, logger)
 	sess.cloudStatus = o.cloudStatus
-	rest := gateReady(ready, subsonicAuth(st, sess, newLoginLimiter(time.Now), logger, interceptRatings(o.ratings, logger, rp)))
+	rest := gateReady(ready, subsonicAuth(st, sess, newLoginLimiter(time.Now), logger, capBitrate(o.maxBitrate, interceptRatings(o.ratings, logger, rp))))
 	share := gateReady(ready, rp)
 	api := sess.apiHandler(o.ratings, ready)
 	return logRequests(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

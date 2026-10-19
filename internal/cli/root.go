@@ -287,7 +287,7 @@ func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.A
 	rt := ratings.New(st, cloud, ndClient, cloudStatus, logger)
 	srv := &http.Server{
 		Handler: proxy.New(ndTransport, sup.Ready(), st, cloud, logger,
-			proxy.WithUI(ui), proxy.WithCloudStatus(cloudStatus), proxy.WithRatings(rt)),
+			proxy.WithUI(ui), proxy.WithCloudStatus(cloudStatus), proxy.WithRatings(rt), proxy.WithRelayMaxBitrate(c.RelayMaxBitrate)),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 

@@ -36,6 +36,10 @@ type Config struct {
 	SortedDir      string   `toml:"sorted_dir,omitempty"`
 	AcoustIDAPIKey string   `toml:"acoustid_api_key,omitempty"`
 
+	// RelayMaxBitrate is the bitrate cap in kbps for streams that arrive
+	// through the relay. 0 means no cap.
+	RelayMaxBitrate int `toml:"relay_max_bitrate,omitempty"`
+
 	// LegacyNavidromePort holds navidrome_port, which init wrote before
 	// Navidrome moved to a Unix socket. It is read so that older config
 	// files still load, and it is ignored.
@@ -166,6 +170,9 @@ func (c *Config) validate() error {
 	}
 	if u, err := url.Parse(c.WNCloudURL); err != nil || u.Scheme == "" || u.Host == "" {
 		return fmt.Errorf("wn_cloud_url %q is not a URL", c.WNCloudURL)
+	}
+	if c.RelayMaxBitrate < 0 {
+		return fmt.Errorf("relay_max_bitrate %d must not be negative", c.RelayMaxBitrate)
 	}
 	if !filepath.IsAbs(c.SortedDir) {
 		return fmt.Errorf("sorted_dir %q must be an absolute path", c.SortedDir)
