@@ -17,6 +17,7 @@ import (
 	"strings"
 
 	"github.com/waxnerdhq/wn-server/internal/navidrome"
+	"github.com/waxnerdhq/wn-server/internal/relayreq"
 	"github.com/waxnerdhq/wn-server/internal/store"
 )
 
@@ -54,6 +55,8 @@ const maxFormBytes = 10 << 20
 // check. A missing credential and a session do not count.
 func subsonicAuth(st Store, sess *sessions, lim *loginLimiter, logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		addr := relayreq.ClientAddr(r)
+		logger := requestLogger(logger, r)
 		params, err := subsonicParams(w, r)
 		if err != nil {
 			writeSubsonicError(w, r.URL.Query(), errGeneric, err.Error())
@@ -63,7 +66,7 @@ func subsonicAuth(st Store, sess *sessions, lim *loginLimiter, logger *slog.Logg
 		bearer, hasBearer := bearerToken(r)
 		if apiKey != "" || hasBearer {
 			if conflicting(params, apiKey != "", hasBearer) {
-				logger.Warn("subsonic session sent with other credentials", "remote", r.RemoteAddr)
+				logger.Warn("subsonic session sent with other credentials", "remote", addr)
 				writeSubsonicError(w, params, errMultipleAuth, "Multiple conflicting authentication mechanisms provided")
 				return
 			}
@@ -81,7 +84,7 @@ func subsonicAuth(st Store, sess *sessions, lim *loginLimiter, logger *slog.Logg
 					writeSubsonicError(w, params, errGeneric, "internal error")
 					return
 				}
-				logger.Warn("subsonic session unknown", "remote", r.RemoteAddr)
+				logger.Warn("subsonic session unknown", "remote", addr)
 				writeSubsonicError(w, params, errInvalidAPIKey, "Invalid API key")
 				return
 			}
@@ -99,7 +102,6 @@ func subsonicAuth(st Store, sess *sessions, lim *loginLimiter, logger *slog.Logg
 			writeSubsonicError(w, params, errMissingParam, "missing parameter: 'p', or 't' and 's'")
 			return
 		}
-		addr := remoteHost(r)
 		if limited, warn := lim.limited(addr); limited {
 			if warn {
 				logger.Warn("subsonic sign-in rate limited", "remote", addr)
@@ -114,7 +116,7 @@ func subsonicAuth(st Store, sess *sessions, lim *loginLimiter, logger *slog.Logg
 			}
 			if errors.Is(err, store.ErrNotFound) {
 				lim.fail(addr)
-				logger.Warn("subsonic sign-in failed", "remote", r.RemoteAddr, "user", truncate(user, maxLogUser), "reason", "missing_user")
+				logger.Warn("subsonic sign-in failed", "remote", addr, "user", truncate(user, maxLogUser), "reason", "missing_user")
 			} else {
 				logger.Error("look up account", "error", err)
 			}
@@ -123,7 +125,7 @@ func subsonicAuth(st Store, sess *sessions, lim *loginLimiter, logger *slog.Logg
 		}
 		if !checkCredential(acct.AppPassword, pass, token, salt) {
 			lim.fail(addr)
-			logger.Warn("subsonic sign-in failed", "remote", r.RemoteAddr, "user", truncate(user, maxLogUser), "reason", "bad_credentials")
+			logger.Warn("subsonic sign-in failed", "remote", addr, "user", truncate(user, maxLogUser), "reason", "bad_credentials")
 			writeSubsonicError(w, params, errWrongCredential, "Wrong username or password")
 			return
 		}

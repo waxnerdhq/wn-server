@@ -16,6 +16,7 @@ import (
 
 	"github.com/waxnerdhq/wn-server/internal/match"
 	"github.com/waxnerdhq/wn-server/internal/navidrome"
+	"github.com/waxnerdhq/wn-server/internal/relayreq"
 	"github.com/waxnerdhq/wn-server/internal/store"
 )
 
@@ -380,5 +381,31 @@ func TestMatchAllShowsDuplicateRelease(t *testing.T) {
 	resp, body := e.doBody(t, http.MethodGet, "/ui/match?all=1", nil, c, "")
 	if resp.StatusCode != http.StatusOK || !strings.Contains(body, "https://musicbrainz.org/release/"+release) {
 		t.Fatalf("all view: status %d\n%s", resp.StatusCode, body)
+	}
+}
+
+func TestCookieSecureForRelayedRequest(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		relayed bool
+		want    bool
+	}{{"plain", false, false}, {"relayed", true, true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := httptest.NewRequest(http.MethodPost, "/ui/login", nil)
+			if tc.relayed {
+				r = r.WithContext(relayreq.WithRelay(r.Context(), "203.0.113.9"))
+			}
+			for name, write := range map[string]func(http.ResponseWriter){
+				"set":   func(w http.ResponseWriter) { setCookie(w, r, "token") },
+				"clear": func(w http.ResponseWriter) { clearCookie(w, r) },
+			} {
+				rec := httptest.NewRecorder()
+				write(rec)
+				c := sessionCookie(rec.Result())
+				if c == nil || c.Secure != tc.want {
+					t.Fatalf("%s cookie: %+v, want Secure=%v", name, c, tc.want)
+				}
+			}
+		})
 	}
 }

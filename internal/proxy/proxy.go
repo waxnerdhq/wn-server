@@ -10,8 +10,13 @@ import (
 	"time"
 
 	"github.com/waxnerdhq/wn-server/internal/navidrome"
+	"github.com/waxnerdhq/wn-server/internal/relayreq"
 	"github.com/waxnerdhq/wn-server/internal/store"
 )
+
+// relayClientHeader is the header the relay edge sets to the client's
+// address. The relay package moves it into the request context.
+const relayClientHeader = "X-Relay-Client"
 
 // userHeader is the header Navidrome trusts to name the signed-in user.
 const userHeader = "Remote-User"
@@ -60,7 +65,7 @@ func New(rt http.RoundTripper, ready <-chan struct{}, st Store, cloud Verifier, 
 				r.Out.Header.Del(h)
 			}
 			r.Out.Header.Set("X-Forwarded-Host", r.In.Host)
-			if r.In.TLS != nil {
+			if r.In.TLS != nil || relayreq.IsRelayed(r.In.Context()) {
 				r.Out.Header.Set("X-Forwarded-Proto", "https")
 			} else {
 				r.Out.Header.Set("X-Forwarded-Proto", "http")
@@ -99,6 +104,10 @@ func New(rt http.RoundTripper, ready <-chan struct{}, st Store, cloud Verifier, 
 	share := gateReady(ready, rp)
 	api := sess.apiHandler(o.ratings, ready)
 	return logRequests(logger, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// A relayed request carries its client address in the context. A
+		// header of this name from any client means nothing, and it must
+		// reach neither the logs nor Navidrome.
+		r.Header.Del(relayClientHeader)
 		switch p := r.URL.Path; {
 		case !isClean(p):
 			http.NotFound(w, r)
@@ -141,14 +150,23 @@ func gateReady(ready <-chan struct{}, next http.Handler) http.Handler {
 	})
 }
 
-// logRequests logs one debug line per request. It logs the path only, never
-// the query string, which carries Subsonic credentials.
+// requestLogger returns logger with relay=true when r is a relayed request.
+func requestLogger(logger *slog.Logger, r *http.Request) *slog.Logger {
+	if relayreq.IsRelayed(r.Context()) {
+		return logger.With("relay", true)
+	}
+	return logger
+}
+
+// logRequests logs one debug line per request with the client address, and
+// relay=true for a relayed request. It logs the path only, never the query
+// string, which carries Subsonic credentials.
 func logRequests(logger *slog.Logger, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
 		sw := &statusWriter{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(sw, r)
-		logger.Debug("request", "method", r.Method, "path", r.URL.Path, "status", sw.status, "duration", time.Since(start))
+		requestLogger(logger, r).Debug("request", "remote", relayreq.ClientAddr(r), "method", r.Method, "path", r.URL.Path, "status", sw.status, "duration", time.Since(start))
 	})
 }
 

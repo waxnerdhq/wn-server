@@ -9,6 +9,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/waxnerdhq/wn-server/internal/relayreq"
 	"github.com/waxnerdhq/wn-server/internal/store"
 )
 
@@ -37,11 +38,12 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	name, password := r.PostForm.Get("name"), r.PostForm.Get("password")
-	addr := remoteHost(r)
+	addr := relayreq.ClientAddr(r)
+	logger := s.requestLogger(r)
 	data := loginData{page: page{Title: "Sign in"}, Name: name}
 
 	if !s.limiter.begin(addr) {
-		s.Logger.Warn("web sign-in failed", "remote", addr, "reason", "rate_limited")
+		logger.Warn("web sign-in failed", "remote", addr, "reason", "rate_limited")
 		data.Message = "Too many failed sign-ins. Try again in a few minutes."
 		s.render(w, r, http.StatusTooManyRequests, "login", data)
 		return
@@ -53,7 +55,7 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err != nil || subtle.ConstantTimeCompare([]byte(password), []byte(acct.AppPassword)) != 1 {
-		s.Logger.Warn("web sign-in failed", "remote", addr, "reason", "bad_credentials")
+		logger.Warn("web sign-in failed", "remote", addr, "reason", "bad_credentials")
 		data.Message = "Wrong account name or app password."
 		s.render(w, r, http.StatusUnauthorized, "login", data)
 		return
@@ -65,7 +67,7 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		s.internalError(w, r, "create session", err)
 		return
 	}
-	s.Logger.Info("web sign-in", "account", acct.ID, "session", sess.ID, "remote", addr)
+	logger.Info("web sign-in", "account", acct.ID, "session", sess.ID, "remote", addr)
 	// A session that the browser already holds would be left without a cookie.
 	if c, err := r.Cookie(CookieName); err == nil && c.Value != "" {
 		_, _ = s.Store.RevokeSessionByToken(r.Context(), c.Value)

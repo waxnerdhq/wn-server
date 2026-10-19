@@ -16,11 +16,13 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/waxnerdhq/wn-server/internal/navidrome"
+	"github.com/waxnerdhq/wn-server/internal/relayreq"
 	"github.com/waxnerdhq/wn-server/internal/store"
 	"github.com/waxnerdhq/wn-server/internal/wncloud"
 	"github.com/waxnerdhq/wn-server/internal/wncloud/stub"
@@ -395,4 +397,93 @@ func TestStreamsChunks(t *testing.T) {
 	wait(readLine(), "one\n")
 	close(firstRead)
 	wait(readLine(), "two\n")
+}
+
+// lockedBuffer is a log sink that the handler and the test goroutine share.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+func TestRelayedRequestForwardsHTTPSAndLogsRelay(t *testing.T) {
+	var got http.Header
+	e := newEnv(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+	}), true)
+	var logs lockedBuffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	ready := make(chan struct{})
+	close(ready)
+	h := New(e.rt, ready, e.st, wncloud.New(e.cloudURL, "test"), logger)
+	do := func(relayed bool) {
+		t.Helper()
+		got = nil
+		req := httptest.NewRequest(http.MethodGet, "/share/x", nil)
+		req.RemoteAddr = "192.168.1.5:40000"
+		if relayed {
+			req = req.WithContext(relayreq.WithRelay(req.Context(), "203.0.113.9"))
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if got == nil {
+			t.Fatalf("backend not reached, status %d", rec.Code)
+		}
+	}
+
+	do(false)
+	if v := got.Get("X-Forwarded-Proto"); v != "http" {
+		t.Fatalf("plain request: X-Forwarded-Proto %q, want http", v)
+	}
+	if strings.Contains(logs.String(), "relay=true") {
+		t.Fatalf("plain request logged as relayed: %s", logs.String())
+	}
+
+	do(true)
+	if v := got.Get("X-Forwarded-Proto"); v != "https" {
+		t.Fatalf("relayed request: X-Forwarded-Proto %q, want https", v)
+	}
+	if out := logs.String(); !strings.Contains(out, "relay=true") || !strings.Contains(out, "remote=203.0.113.9") {
+		t.Fatalf("relayed request log lacks relay=true and the forwarded address: %s", out)
+	}
+}
+
+func TestRelayClientHeaderWithoutMarkIsIgnoredAndDropped(t *testing.T) {
+	var got http.Header
+	e := newEnv(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		got = r.Header.Clone()
+	}), true)
+	var logs lockedBuffer
+	logger := slog.New(slog.NewTextHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	ready := make(chan struct{})
+	close(ready)
+	h := New(e.rt, ready, e.st, wncloud.New(e.cloudURL, "test"), logger)
+	req := httptest.NewRequest(http.MethodGet, "/share/x", nil)
+	req.RemoteAddr = "192.168.1.5:40000"
+	req.Header.Set("X-Relay-Client", "203.0.113.9")
+	h.ServeHTTP(httptest.NewRecorder(), req)
+	if got == nil {
+		t.Fatal("backend not reached")
+	}
+	if v := got.Values("X-Relay-Client"); len(v) != 0 {
+		t.Fatalf("backend received X-Relay-Client %v", v)
+	}
+	if v := got.Get("X-Forwarded-Proto"); v != "http" {
+		t.Fatalf("X-Forwarded-Proto %q, want http", v)
+	}
+	out := logs.String()
+	if !strings.Contains(out, "remote=192.168.1.5") || strings.Contains(out, "203.0.113.9") || strings.Contains(out, "relay=true") {
+		t.Fatalf("log line: %s", out)
+	}
 }
