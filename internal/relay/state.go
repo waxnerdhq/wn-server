@@ -7,9 +7,9 @@ import "time"
 type StateName string
 
 const (
-	// Off means relay is switched off in config.toml. The package never
-	// produces it. It exists so that the CLI and the web UI render the off
-	// line through State.Text as well.
+	// Off means relay is switched off, by the config key or by the web UI's
+	// toggle. The package produces it while Options.Enabled answers false.
+	// The CLI and the web UI render the off line through State.Text as well.
 	Off StateName = "off"
 	// Waiting means no server credential or no edge address is available yet.
 	Waiting StateName = "waiting"

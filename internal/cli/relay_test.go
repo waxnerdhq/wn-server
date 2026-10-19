@@ -182,4 +182,49 @@ func TestRelayWiring(t *testing.T) {
 			t.Fatalf("state %+v and %d dials without a credential, want waiting and none", s, edge.dials.Load())
 		}
 	})
+
+	t.Run("stored switch overrides relay", func(t *testing.T) {
+		// relay = true and the switch off: nothing is dialed and wn-cloud is
+		// not called.
+		if out, err := run(same, "login", "--name", "n"); err != nil {
+			t.Fatalf("login: %v\n%s", err, out)
+		}
+		edge := newTestEdge(t)
+		cloud.stub.SetRelayConnectURL(edge.url())
+		c := load()
+		c.Relay, c.RelayEdgeURL = true, edge.url()
+		st, err := store.Open(context.Background(), store.Path(filepath.Dir(cfg)))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := st.SetRelayEnabled(context.Background(), false); err != nil {
+			t.Fatal(err)
+		}
+		// A call of GET /servers/:id would replace this stored address.
+		sentinel := store.RelaySettings{ConnectURL: "https://sentinel.test/v1/tunnel", Host: "sentinel.test", FetchedAt: time.Unix(1, 0).UTC()}
+		if err := st.SetRelaySettings(context.Background(), sentinel); err != nil {
+			t.Fatal(err)
+		}
+		st.Close()
+		st, holder, _ := startWiring(t, cfg, c)
+		time.Sleep(200 * time.Millisecond)
+		if s := holder.State(); s.Name != relay.Off || edge.dials.Load() != 0 {
+			t.Fatalf("state %+v and %d dials with the switch off, want off and none", s, edge.dials.Load())
+		}
+		if after, err := st.RelaySettings(context.Background()); err != nil || after.ConnectURL != sentinel.ConnectURL {
+			t.Fatalf("relay off called wn-cloud for the relay settings: %+v, %v", after, err)
+		}
+
+		// relay = false and the switch on: the relay dials.
+		edge2 := newTestEdge(t)
+		c2 := load()
+		c2.RelayEdgeURL = edge2.url()
+		if err := st.SetRelayEnabled(context.Background(), true); err != nil {
+			t.Fatal(err)
+		}
+		_, holder2, _ := startWiring(t, cfg, c2)
+		waitUntil(t, "a dial and the state unreachable", func() bool {
+			return edge2.dials.Load() > 0 && holder2.State().Name == relay.Unreachable
+		})
+	})
 }

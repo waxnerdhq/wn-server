@@ -459,3 +459,57 @@ func TestStatusPageRelayLine(t *testing.T) {
 		t.Fatalf("status page lacks %q:\n%s", want, body)
 	}
 }
+
+func TestRelaySwitch(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t, func(o *Options) { o.RelayConfig = true })
+	c := e.signIn(t)
+	_, body := e.doBody(t, http.MethodGet, "/ui/", nil, c, "")
+	if !strings.Contains(body, "Disable relay") {
+		t.Fatalf("with relay = true and no switch, the page lacks the disable button:\n%s", body)
+	}
+	if resp := e.do(t, http.MethodPost, "/ui/relay", url.Values{"enabled": {"0"}}, c, "http://evil.example"); resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("cross origin: status %d, want 403", resp.StatusCode)
+	}
+	if resp := e.do(t, http.MethodPost, "/ui/relay", url.Values{"enabled": {"0"}}, nil, e.srv.URL); resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/ui/login" {
+		t.Fatalf("without a session: status %d, location %q", resp.StatusCode, resp.Header.Get("Location"))
+	}
+	if resp := e.do(t, http.MethodPost, "/ui/relay", url.Values{"enabled": {"maybe"}}, c, e.srv.URL); resp.StatusCode != http.StatusBadRequest {
+		t.Fatalf("bad value: status %d, want 400", resp.StatusCode)
+	}
+	if _, set, err := e.st.RelayEnabled(ctx); err != nil || set {
+		t.Fatalf("a refused request set the switch: %v, %v", set, err)
+	}
+
+	resp := e.do(t, http.MethodPost, "/ui/relay", url.Values{"enabled": {"0"}}, c, e.srv.URL)
+	if resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("switch off: status %d, want 303", resp.StatusCode)
+	}
+	if on, set, err := e.st.RelayEnabled(ctx); err != nil || !set || on {
+		t.Fatalf("stored switch = %v, %v, %v; want set and off", on, set, err)
+	}
+	_, body = e.doBody(t, http.MethodGet, resp.Header.Get("Location"), nil, c, "")
+	if !strings.Contains(body, "Enable relay") || strings.Contains(body, "Disable relay") || !strings.Contains(body, "switched off") {
+		t.Fatalf("page after switching off:\n%s", body)
+	}
+
+	// The relay address shows next to the state while the relay is not connected.
+	err := e.st.SetRelaySettings(ctx, store.RelaySettings{ConnectURL: "https://c.test/v1/tunnel", Host: "id.relay.test", FetchedAt: time.Now()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, body = e.doBody(t, http.MethodGet, "/ui/", nil, c, "")
+	if !strings.Contains(body, "relay: off (address <code>https://id.relay.test</code>)") {
+		t.Fatalf("page lacks the stored relay address:\n%s", body)
+	}
+
+	if resp := e.do(t, http.MethodPost, "/ui/relay", url.Values{"enabled": {"1"}}, c, e.srv.URL); resp.StatusCode != http.StatusSeeOther {
+		t.Fatalf("switch on: status %d, want 303", resp.StatusCode)
+	}
+	if on, set, err := e.st.RelayEnabled(ctx); err != nil || !set || !on {
+		t.Fatalf("stored switch = %v, %v, %v; want set and on", on, set, err)
+	}
+	if rs, err := e.st.RelaySettings(ctx); err != nil || rs.Host != "id.relay.test" {
+		t.Fatalf("the switch changed the relay settings: %+v, %v", rs, err)
+	}
+}

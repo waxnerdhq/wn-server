@@ -129,6 +129,13 @@ type statusData struct {
 	// the relay address and RelayText is the line without it.
 	RelayText string
 	RelayURL  string
+	// RelayAddress is the stored relay address while the relay is not
+	// connected and wn-cloud has given one.
+	RelayAddress string
+	// RelayOn is whether the relay is switched on: the owner's switch, else
+	// the config key.
+	RelayOn bool
+	Notice  string
 }
 
 // relayLine returns the relay line, split before the relay address when the
@@ -169,6 +176,29 @@ func (s *server) statusPage(w http.ResponseWriter, r *http.Request, _ store.Sess
 	}
 	data.MatchJobRunning = s.Jobs.Status().Running != nil
 	data.RelayText, data.RelayURL = s.relayLine()
+	if data.RelayURL == "" {
+		rs, err := s.Store.RelaySettings(ctx)
+		switch {
+		case err == nil:
+			if rs.Host != "" {
+				data.RelayAddress = "https://" + rs.Host
+			}
+		case !errors.Is(err, store.ErrNoRelaySettings):
+			s.internalError(w, r, "read relay settings", err)
+			return
+		}
+	}
+	data.RelayOn, err = s.relayOn(ctx)
+	if err != nil {
+		s.internalError(w, r, "read relay switch", err)
+		return
+	}
+	switch r.URL.Query().Get("done") {
+	case "relay-on":
+		data.Notice = "The relay is switched on. The relay line changes within about 20 seconds."
+	case "relay-off":
+		data.Notice = "The relay is switched off. The relay line changes within about 15 seconds."
+	}
 	cred, err := s.Store.ServerCredential(ctx)
 	switch {
 	case err == nil:
@@ -178,6 +208,48 @@ func (s *server) statusPage(w http.ResponseWriter, r *http.Request, _ store.Sess
 		return
 	}
 	s.render(w, r, http.StatusOK, "status", data)
+}
+
+// relayOn answers whether the relay is switched on: the owner's switch, else
+// the config key.
+func (s *server) relayOn(ctx context.Context) (bool, error) {
+	enabled, set, err := s.Store.RelayEnabled(ctx)
+	if err != nil {
+		return false, err
+	}
+	if !set {
+		return s.RelayConfig, nil
+	}
+	return enabled, nil
+}
+
+// relaySwitch serves POST /ui/relay. The form field enabled is 1 or 0. The
+// relay package reads the switch within 10 seconds, so no restart is needed.
+func (s *server) relaySwitch(w http.ResponseWriter, r *http.Request, sess store.Session) {
+	r.Body = http.MaxBytesReader(w, r.Body, maxFormBytes)
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "bad form", http.StatusBadRequest)
+		return
+	}
+	var enabled bool
+	switch r.PostForm.Get("enabled") {
+	case "1":
+		enabled = true
+	case "0":
+	default:
+		http.Error(w, "enabled must be 1 or 0", http.StatusBadRequest)
+		return
+	}
+	if err := s.Store.SetRelayEnabled(r.Context(), enabled); err != nil {
+		s.internalError(w, r, "set relay switch", err)
+		return
+	}
+	s.Logger.Info("relay switch set", "enabled", enabled, "account", sess.AccountID, "session", sess.ID)
+	done := "relay-off"
+	if enabled {
+		done = "relay-on"
+	}
+	http.Redirect(w, r, "/ui/?done="+done, http.StatusSeeOther)
 }
 
 func (s *server) ready() bool {

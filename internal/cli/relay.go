@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/waxnerdhq/wn-server/internal/config"
@@ -57,24 +58,58 @@ type relayWiring struct {
 	holder      *relayHolder
 	logger      *slog.Logger
 	now         func() time.Time
+	// lastEnabled is the last answer of enabled: 0 before the first one, 1
+	// for off, 2 for on. A failed read of the store repeats it.
+	lastEnabled atomic.Int32
+}
+
+// enabled answers whether the relay is switched on: the owner's switch from
+// the web UI's status page when it is set, else the config key relay. It is
+// safe for concurrent use. A failed read of the store answers the last
+// value, so that a store error does not close the tunnel.
+func (w *relayWiring) enabled() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), relayStateWriteTimeout)
+	defer cancel()
+	on, set, err := w.st.RelayEnabled(ctx)
+	if err != nil {
+		w.logger.Error("read the relay switch", "error", err)
+		switch w.lastEnabled.Load() {
+		case 1:
+			return false
+		case 2:
+			return true
+		}
+		return w.cfg.Relay
+	}
+	if !set {
+		on = w.cfg.Relay
+	}
+	if on {
+		w.lastEnabled.Store(2)
+	} else {
+		w.lastEnabled.Store(1)
+	}
+	return on
 }
 
 // start writes the first relay state, off or waiting, so that wn-server
-// status shows no state of an earlier run. With relay = true it starts the
-// calls of GET /servers/:id and the relay package, which serves tunneled
-// requests with handler. The returned channel is closed when both have
-// stopped after ctx ended and the state off is written. With relay = false
-// nothing is dialed and the channel is closed at once.
+// status shows no state of an earlier run. It starts the calls of
+// GET /servers/:id and the relay package, which serves tunneled requests
+// with handler. Both run whether the relay is on or off, because the owner
+// can switch it on from the web UI without a restart. While it is off, which
+// is the default (relay = false and no switch set), nothing is dialed and
+// wn-cloud is not called. The returned channel is closed when both have
+// stopped after ctx ended and the state off is written.
 func (w *relayWiring) start(ctx context.Context, handler http.Handler) <-chan struct{} {
 	done := make(chan struct{})
-	if !w.cfg.Relay {
+	if w.enabled() {
+		w.write(relay.State{Name: relay.Waiting, Since: w.now()})
+	} else {
 		w.write(relay.State{Name: relay.Off, Since: w.now()})
-		close(done)
-		return done
 	}
-	w.write(relay.State{Name: relay.Waiting, Since: w.now()})
 	rl := relay.New(relay.Options{
 		Handler:    handler,
+		Enabled:    w.enabled,
 		Credential: func() (string, string, bool) { return w.credential(ctx) },
 		ConnectURL: func() (string, bool) { return w.connectURL(ctx) },
 		Version:    Version,
@@ -160,8 +195,9 @@ func (w *relayWiring) connectURL(ctx context.Context) (string, bool) {
 }
 
 // fetchLoop calls GET /servers/:id at start, every hour, and within
-// relayCredentialPoll of a new server credential, until ctx ends. It closes
-// first after its first pass.
+// relayCredentialPoll of a new server credential, until ctx ends. It makes no
+// call while the relay is off, and calls within relayCredentialPoll of the
+// relay being switched on. It closes first after its first pass.
 func (w *relayWiring) fetchLoop(ctx context.Context, first chan<- struct{}) {
 	t := time.NewTicker(relayCredentialPoll)
 	defer t.Stop()
@@ -172,6 +208,8 @@ func (w *relayWiring) fetchLoop(ctx context.Context, first chan<- struct{}) {
 	for {
 		cred, err := w.st.ServerCredential(ctx)
 		switch {
+		case !w.enabled():
+			token = ""
 		case err == nil:
 			if cred.Token != token || !w.now().Before(next) {
 				token = cred.Token

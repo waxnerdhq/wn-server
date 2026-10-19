@@ -82,7 +82,7 @@ A second tunnel for the same server id replaces the first. The edge closes the e
 
 ### The edge address
 
-wn-server does not derive the edge address from `wn_cloud_url`. With `relay = true`, `serve` calls `GET /servers/:id` (section 11) with the server credential at start, every hour, and within 10 seconds of a server credential appearing in the store, and stores `relay.connect_url`, `relay.host`, and `addresses`. The relay package reads the stored `connect_url` through `Options.ConnectURL`. When wn-cloud is unreachable and a value is stored, the relay package dials the stored address, so a wn-cloud outage does not stop a reconnect. When nothing is stored, the relay package waits for the next successful call. The config key `relay_edge_url` overrides the stored value, for a test edge.
+wn-server does not derive the edge address from `wn_cloud_url`. While the relay is on (`relay = true` with no switch set, or the switch on), `serve` calls `GET /servers/:id` (section 11) with the server credential at start, every hour, and within 10 seconds of a server credential appearing in the store, and stores `relay.connect_url`, `relay.host`, and `addresses`. The relay package reads the stored `connect_url` through `Options.ConnectURL`. When wn-cloud is unreachable and a value is stored, the relay package dials the stored address, so a wn-cloud outage does not stop a reconnect. When nothing is stored, the relay package waits for the next successful call. The config key `relay_edge_url` overrides the stored value, for a test edge.
 
 ### What the owner sees
 
@@ -90,7 +90,7 @@ wn-server does not derive the edge address from `wn_cloud_url`. With `relay = tr
 
 | State | Text |
 |---|---|
-| `relay = false`, or not set | `relay: off` |
+| `relay = false` or not set with no switch set, or the switch off | `relay: off` |
 | no server credential, or no edge address stored yet | `relay: waiting for wn-server login` |
 | dialing, no failure yet | `relay: connecting` |
 | in backoff after a drop, a dial failure, a 429, or a 503 | `relay: unreachable since <time>: <last error>` |
@@ -110,7 +110,7 @@ The server page at wn-cloud shows: connected or not, last seen, streams in progr
 | `relay_edge_url` | empty | Overrides the edge address that `GET /servers/:id` gives. For tests. |
 | `relay_max_bitrate` | `0` | Transcoding ceiling in kbps for relayed `/rest/stream` requests. `0` means no cap. Built after milestone 1 (section 9). |
 
-A toggle on the web UI's status page that writes `relay` without a restart is planned after v1. In v1 the owner edits `config.toml` and restarts.
+The status page of the web UI has an enable relay and disable relay form for the owner. It stores a switch in the column `enabled` of the `relay_settings` row (migration 012), which is null until the owner sets it. While the column is null the key `relay` applies; once set it overrides the key, and the key is not written. The relay package reads the switch through `Options.Enabled` on the same 10 second poll as the credential: when it turns false the package closes the tunnel the way a context end does and reports `off`, and when it turns true the package dials again. The call of `GET /servers/:id` runs only while the switch is on, so with it off nothing is dialed and wn-cloud is not called. The status page shows the relay host next to the state: the connected host, else `relay_settings.host` when wn-cloud has given one.
 
 ### The relay package
 
@@ -281,7 +281,7 @@ The edge writes `servers.relay_connected_at`, `servers.relay_session_id`, `serve
 - The tunnel is authenticated once with the server credential, which identifies the owner, and names the server id. The edge refuses a server the token's user does not own. A second tunnel for the same server replaces the first, so a stolen credential could take over a server's relay host; `wn-server logout` revokes the token at wn-cloud and ends that.
 - Rate limits at the edge: 600 requests per minute per client IP, 32 in-flight requests per server, 1 MiB bodies. wn-server's sign-in limiters key by the forwarded client address with split totals for relayed requests.
 - Logging. The edge logs one line per request with the time, the server id, the client IP, the method, the path without the query string, the status, the bytes sent, and the duration. It never logs the query string, because Subsonic clients put `p`, `t`, `s`, and `apiKey` in it, and never logs the `Authorization` or `Cookie` headers. Handshake lines carry the server id and the user id, never the bearer. wn-server's request log lines for relayed requests carry `relay=true` and the forwarded client address.
-- The relay is off by default. A server with `relay = false` never dials the edge.
+- The relay is off by default. A server with `relay = false` and no switch set on the status page never dials the edge.
 
 ## 11. wn-cloud contract additions
 
@@ -332,7 +332,7 @@ The route also answers the 401 and 403 answers of the bearer check.
 
 The checks run in this order: the bearer check (401), `:id` is a UUID (400), the caller owns the server (403). The route has no rate limit, as `POST /servers` has none.
 
-wn-server rule: `serve` calls it at start when `relay = true`, every hour, and within 10 seconds of a server credential appearing in the store. It stores `relay.connect_url`, `relay.host`, and `addresses`, and uses the stored values when wn-cloud is unreachable. A 401 sets the shared wn-cloud status to "credential rejected" and the next call runs in one hour; the relay package itself stops dialing when the edge answers 401 for the same token.
+wn-server rule: `serve` calls it at start while the relay is on, every hour, and within 10 seconds of a server credential appearing in the store. It stores `relay.connect_url`, `relay.host`, and `addresses`, and uses the stored values when wn-cloud is unreachable. A 401 sets the shared wn-cloud status to "credential rejected" and the next call runs in one hour; the relay package itself stops dialing when the edge answers 401 for the same token.
 
 #### `GET /v1/tunnel` on the edge (WAX-relay)
 
@@ -489,7 +489,7 @@ Decided by the owner on 2026-10-18, with the alternatives that were considered.
 | 8 | The host label | The server UUID. | A short label assigned at registration; can be added later as an alias. |
 | 9 | The edge address in wn-server | Read from `GET /servers/:id`, cached in the store, `relay_edge_url` overrides. | A fixed default derived from `wn_cloud_url`. |
 | 10 | The TLS mark and the client address | `internal/relayreq` context value set only by the relay package; `X-Relay-Client` from the edge, moved into the context and deleted; the LAN path strips it. | A synthetic `r.TLS` on the request. |
-| 11 | The relay switch | `relay = true` in `config.toml`, default false; a web UI toggle later. | Always dial when linked and let the edge refuse. |
+| 11 | The relay switch | `relay = true` in `config.toml`, default false; a switch on the web UI's status page overrides it without a restart. | Always dial when linked and let the edge refuse. |
 | 12 | Device code exchange through the relay in v1 | 403 `not_available` on a relayed request. The listener milestone opens it with 5 LAN and 5 relayed failures per 10 minutes, 5 per LAN address as today and 2 per relayed address. | Open in v1 with the split. |
 | 13 | Other limit totals | Web sign-in: 100 LAN and 100 relayed failures per 10 minutes. Per-address limits key by the forwarded address. | One shared total. |
 | 14 | Caps at the edge | 32 in-flight, 6 audio, 200 GB soft and 300 GB hard per month, 1 MiB body, 600 requests per minute per client IP, 12 listeners. | Other numbers; the values are edge config. |
@@ -523,7 +523,6 @@ Still open, to be settled by the first cluster issue: whether Traefik's entrypoi
 | Third-party Subsonic clients through the relay | Not blocked. The owner's app password works at the relay host. The bitrate cap, when built, applies to them. |
 | Direct connections (Plex-like) | The addresses list has a `kind` field and an order. wn-server will publish LAN and direct addresses to wn-cloud; the client picks the first that answers. The relayed mark and the forwarded address are per request, so a server that serves both paths needs no change in the handlers. |
 | Per-server TLS for direct connections | Not designed. A direct address needs a certificate the client trusts; the relay host's certificate belongs to the edge. The `addresses` entry can carry a certificate fingerprint or a wn-cloud-issued name later. |
-| A web UI toggle for relay | `relay` is a config key read at start. The relay package's `Run` waits for a credential and can wait for the switch the same way, so a toggle needs no change in the package. |
 | More than one edge replica | The edge writes `relay_connected_at` and `relay_last_seen_at` to Postgres already. A registry table and forwarding between pods are added when needed. |
 | Payments | The entitlement columns are the gate. A provider's webhook writes them later. |
 | Audio playback in the web UI | Separate work outside this project. The relay passes audio for any client that requests it. |
