@@ -2,13 +2,13 @@
 
 This document lists every wn-cloud route that wn-server calls, and the wn-cloud page that issues device codes so that first-party clients can sign in to a wn-server. wn-cloud is the v2 server in `../v2`. wn-cloud implements every route listed here, and this document states what it does on v2's `main` after v2 #91 (merge `527ff35`). Where wn-cloud made a choice that an earlier version of this document left open, the choice is recorded at the route. The package `internal/wncloud/stub` serves the same routes from memory for tests.
 
-**Scope.** v1 of wn-server has one account, the owner. wn-server holds one wn-cloud credential: the server credential, which is the owner's CLI token. Listeners, invites, and server membership are not in v1. Listener sign-in depends on waxnerd relay, which is not specified yet. The routes for listeners return after relay is specified.
+**Scope.** v1 of wn-server has one account, the owner. wn-server holds one wn-cloud credential: the server credential, which is the owner's CLI token. Listeners, invites, and server membership are not in v1. Listener sign-in depends on Waxnerd Relay, which is specified in [relay.md](relay.md). The routes for members, invites, and listeners are designed there and are added to this document when they are built.
 
 Third-party Subsonic clients do not use the device code. They sign in with the owner's name and app password through the Subsonic token scheme, checked by wn-server locally. wn-cloud is not involved.
 
 First-party clients (wn-mobile, wn-desktop) never hold or send a wn-cloud CLI token to wn-server. The owner gets a short device code from a page at wn-cloud, and the client posts it to wn-server. wn-server verifies the code with the server credential. See [Device codes](#device-codes-wax-932).
 
-Every route below is in v2's `main`. The column "Added" names the change that added it. "existing" means the route was in v2 before wn-server's work.
+Every route below is in v2's `main`, except the relay routes, which name their open issue. The column "Added" names the change that added it. "existing" means the route was in v2 before wn-server's work.
 
 | Route | Added | Called by |
 |---|---|---|
@@ -19,6 +19,8 @@ Every route below is in v2's `main`. The column "Added" names the change that ad
 | `POST /cli/token` without `redirect_port` | WAX-933 (v2 #89) | wn-server |
 | `POST /servers` | WAX-932 (v2 #91) | wn-server |
 | `POST /servers/:id/device-codes/verify` | WAX-932 (v2 #91) | wn-server |
+| `GET /servers/:id` | WAX-981 (not built yet) | wn-server, with `relay = true` |
+| `GET /v1/tunnel` on the edge | WAX-986 (not built yet) | wn-server's relay package |
 | `PUT /ratings/:kind/:mbid` | WAX-942 (v2 #90) | wn-server |
 | `DELETE /ratings/:kind/:mbid` | WAX-942 (v2 #90) | wn-server |
 | `GET /ratings/:kind/:mbid` | WAX-942 (v2 #90) | wn-server |
@@ -211,11 +213,22 @@ Server object:
   "id": "0193a0b2-77c1-7f00-8e21-3d9c5b6a4f10",
   "owner_id": "0192f1c4-3b7e-7d2a-9a10-5f4e2c1b8a70",
   "name": "living-room",
-  "created_at": "2026-10-16T12:00:00.123456Z"
+  "created_at": "2026-10-16T12:00:00.123456Z",
+  "relay": {
+    "enabled": true,
+    "until": null,
+    "connect_url": "https://connect.relay.waxnerd.com/v1/tunnel",
+    "host": "0193a0b2-77c1-7f00-8e21-3d9c5b6a4f10.relay.waxnerd.com",
+    "connected": true,
+    "last_seen_at": "2026-10-18T12:00:00.123456Z"
+  },
+  "addresses": [
+    { "kind": "relay", "url": "https://0193a0b2-77c1-7f00-8e21-3d9c5b6a4f10.relay.waxnerd.com" }
+  ]
 }
 ```
 
-`created_at` carries microseconds, as the rating objects do. The table is `servers` (`web/migrations/1792327731628_servers-and-device-codes.sql`).
+`created_at` carries microseconds, as the rating objects do. The fields `relay` and `addresses` come with WAX-981 and are described in [Relay](#relay-wax-981-wax-986). The table is `servers` (`web/migrations/1792327731628_servers-and-device-codes.sql`).
 
 ### `POST /servers` (WAX-932)
 
@@ -231,7 +244,8 @@ Registers a server under the caller, who becomes its owner.
 
 The body is a JSON object. `name` is a string of 1 to 100 characters after trimming, with no control characters (U+0000 to U+001F and U+007F to U+009F). wn-cloud counts the length in UTF-16 code units, as JavaScript does. It stores the trimmed name.
 
-- Response 201: the server object.
+- Response 201: the server object, with `relay.enabled` false.
+- wn-cloud inserts the caller's owner row into `server_members` with the server (WAX-981).
 - Each call creates a new server. Names need not be unique. The route has no rate limit.
 
 Errors:
@@ -316,6 +330,72 @@ wn-server rule: see [Rules](#rules-wn-server-applies), device code exchange.
 ### In wn-cloud (WAX-932)
 
 v2 #91 added the tables `servers`, `device_codes` (`id`, `server_id`, `user_id`, `code_hash` unique, `created_at`, `expires_at`, `used_at`), and `device_code_failures` in `web/migrations/1792327731628_servers-and-device-codes.sql`. A `device_codes` row is deleted with its server or its user. The routes are in `web/src/servers.ts`, the shared error answers in `web/src/jsonBody.ts`, and the page in `web/src/pages.ts` and `web/views/devices.eta`.
+
+## Relay (WAX-981, WAX-986)
+
+Waxnerd Relay gives a server a public address, `https://<server id>.relay.waxnerd.com`, through a tunnel that wn-server opens to the edge, a service in wn-cloud. The design is in [relay.md](relay.md). WAX-981 adds `GET /servers/:id` and the relay columns to wn-cloud. WAX-986 adds the edge with `GET /v1/tunnel`. Neither is in v2's `main` yet.
+
+The server object of [Servers](#servers-wax-932) carries the fields `relay` and `addresses`. `relay.enabled` is true when `relay_enabled` is true and `relay_until` is null, in the future, or within the 7-day grace period after it. `relay.until` is `relay_until` or null. `relay.connect_url` is the edge's tunnel URL. `relay.host` is the relay host. `relay.connected` is true when `relay_connected_at` is not null. `relay.last_seen_at` is `relay_last_seen_at` or null. `addresses` lists the connection candidates of the server. v1 has one entry, `{ "kind": "relay", "url": "https://<id>.relay.waxnerd.com" }`. Later kinds, such as `lan` and `direct`, come before `relay`, and a client tries the entries in order.
+
+### `GET /servers/:id` (WAX-981)
+
+Answers one server.
+
+- Authentication: bearer (the server credential). The bearer's user must own `:id`. A browser session of the owner is also accepted.
+- Path parameters: `:id`, a UUID.
+- Query parameters: none.
+- Response 200: the server object with the `relay` and `addresses` fields.
+
+Errors:
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `invalid_request` | `:id` is not a UUID. |
+| 403 | `forbidden` | The caller does not own `:id`, or no server has that id. |
+
+The route also answers the 401 and 403 answers of the bearer check.
+
+The checks run in this order: the bearer check (401), `:id` is a UUID (400), the caller owns the server (403). The route has no rate limit, as `POST /servers` has none.
+
+wn-server rule: with `relay = true`, `serve` calls it at start, every hour, and within 10 seconds of a server credential appearing in the store. It stores `relay.connect_url`, `relay.host`, and `addresses` in the table `relay_settings`, and dials the stored `connect_url` when wn-cloud is unreachable. The config key `relay_edge_url` replaces the stored `connect_url`, for a test edge. A 401 marks the server credential as refused for the web UI, as on the other routes, and the edge's own 401 stops the relay package. A failed call is retried after 5 minutes.
+
+### `GET /v1/tunnel` on the edge (WAX-986)
+
+The tunnel handshake. The host is the one in `relay.connect_url` from `GET /servers/:id`, `connect.relay.waxnerd.com`, not the API host.
+
+- Authentication: bearer (the server credential). The bearer's user must own the server in `Wn-Server-Id`.
+- Request headers: `Upgrade: wn-relay/1`, `Connection: Upgrade`, `Wn-Server-Id` (a UUID), `Wn-Server-Version`.
+- Transport: TLS with ALPN `http/1.1`, verified against the system roots, and one HTTP/1.1 request on the connection.
+- Response 101 with `Wn-Relay-Host` (`<id>.relay.waxnerd.com`) and `Wn-Relay-Session` (the session id). After the response both sides speak yamux on the connection. The edge opens streams, and wn-server accepts them and serves HTTP/1.1 on each.
+
+The checks run in this order, and the first that fails answers. The steps 2 to 5 count as a failed handshake for the rate limit.
+
+1. The headers: `Upgrade` names a protocol the edge speaks (else 409), and `Wn-Server-Id` is a UUID (else 400).
+2. The rate limit: 10 or more failed handshakes from this client address in the last 10 minutes answer 429. The count is in memory in the edge.
+3. The bearer check, as for any CLI token (401).
+4. The token's user owns the server (403).
+5. The entitlement: `relay.enabled` as above (402).
+
+Errors:
+
+| Status | Code | When |
+|---|---|---|
+| 400 | `invalid_request` | A header is missing or malformed, or `Wn-Server-Id` is not a UUID. |
+| 402 | `relay_not_enabled` | The server is not entitled, or the grace period has ended. |
+| 403 | `forbidden` | The token's user does not own the server, or no server has that id. |
+| 409 | `unsupported_protocol` | The edge does not speak the `Upgrade` protocol version. |
+| 429 | `rate_limited` | 10 or more failed handshakes from the client address in 10 minutes. |
+| 503 | `cloud_unavailable` | Postgres does not answer. |
+
+The route also answers the 401 and 403 answers of the bearer check.
+
+A second tunnel for the same server id replaces the first, and the edge closes the earlier session. Relayed requests carry `X-Relay-Client` with the client's IP address and no other header that the client did not send. The edge removes incoming `X-Relay-Client`, `Forwarded`, and `X-Forwarded-*` headers.
+
+wn-server rule: the relay package dials while `relay = true`, a server credential is stored, and an edge address is known. On 400, 401, 403, and 409 it stops dialing until the server credential changes. On 402 it dials again every 10 minutes. On 429, 503, a dial failure, and a dropped tunnel it backs off from 1 second to 5 minutes. `serve` writes each state to the table `relay_state`, and `wn-server status` prints it (README, Web UI).
+
+### In wn-cloud (WAX-981, WAX-986)
+
+WAX-981 adds `servers.relay_enabled`, `servers.relay_until`, `servers.relay_connected_at`, `servers.relay_session_id`, `servers.relay_last_seen_at`, `servers.relay_streams`, the table `relay_usage (server_id, month date, bytes bigint, primary key (server_id, month))`, and the table `server_members` with the owner rows. `POST /servers` inserts the owner row and answers the server object with the relay fields. The route is in `web/src/servers.ts`. WAX-986 adds the edge in `relay/`. It reads Postgres with the web service's `DATABASE_URL`, and writes `servers.relay_connected_at` and `servers.relay_last_seen_at`.
 
 ## Ratings (WAX-942)
 

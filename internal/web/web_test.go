@@ -16,6 +16,7 @@ import (
 
 	"github.com/waxnerdhq/wn-server/internal/match"
 	"github.com/waxnerdhq/wn-server/internal/navidrome"
+	"github.com/waxnerdhq/wn-server/internal/relay"
 	"github.com/waxnerdhq/wn-server/internal/relayreq"
 	"github.com/waxnerdhq/wn-server/internal/store"
 )
@@ -62,7 +63,7 @@ type env struct {
 	jobs  *match.Jobs
 }
 
-func newEnv(t *testing.T) *env {
+func newEnv(t *testing.T, opts ...func(*Options)) *env {
 	t.Helper()
 	ctx := context.Background()
 	st, err := store.Open(ctx, filepath.Join(t.TempDir(), store.FileName))
@@ -81,7 +82,7 @@ func newEnv(t *testing.T) *env {
 	close(ready)
 	fake := &fakeMatcher{started: make(chan int64, 4), release: make(chan struct{})}
 	jobs := match.NewJobs(context.Background(), slog.New(slog.DiscardHandler))
-	srv := httptest.NewServer(New(Options{
+	o := Options{
 		Store:            st,
 		Match:            fake,
 		Jobs:             jobs,
@@ -90,7 +91,11 @@ func newEnv(t *testing.T) *env {
 		ServerName:       "test",
 		NavidromeVersion: navidrome.PinnedVersion,
 		Logger:           slog.New(slog.DiscardHandler),
-	}))
+	}
+	for _, f := range opts {
+		f(&o)
+	}
+	srv := httptest.NewServer(New(o))
 	t.Cleanup(srv.Close)
 	return &env{srv: srv, st: st, owner: owner, match: fake, jobs: jobs}
 }
@@ -435,5 +440,22 @@ func TestCookieSecureForRelayedRequest(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestStatusPageRelayLine(t *testing.T) {
+	e := newEnv(t)
+	_, body := e.doBody(t, http.MethodGet, "/ui/", nil, e.signIn(t), "")
+	if !strings.Contains(body, "relay: off") {
+		t.Fatalf("status page without a relay lacks the off line:\n%s", body)
+	}
+	since := time.Now()
+	e = newEnv(t, func(o *Options) {
+		o.Relay = func() relay.State { return relay.State{Name: relay.Connected, Since: since, Host: "id.relay.test"} }
+	})
+	_, body = e.doBody(t, http.MethodGet, "/ui/", nil, e.signIn(t), "")
+	want := "relay: connected since " + since.Local().Format("2006-01-02 15:04 MST") + ` at <a href="https://id.relay.test">https://id.relay.test</a>`
+	if !strings.Contains(body, want) {
+		t.Fatalf("status page lacks %q:\n%s", want, body)
 	}
 }

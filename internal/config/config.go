@@ -36,6 +36,14 @@ type Config struct {
 	SortedDir      string   `toml:"sorted_dir,omitempty"`
 	AcoustIDAPIKey string   `toml:"acoustid_api_key,omitempty"`
 
+	// Relay makes serve open the relay tunnel when a server credential
+	// exists. Default false.
+	Relay bool `toml:"relay,omitempty"`
+	// RelayEdgeURL replaces the edge address that GET /servers/:id gives,
+	// for a test edge. A full https URL such as
+	// https://edge.test:8443/v1/tunnel. Empty means the stored address.
+	RelayEdgeURL string `toml:"relay_edge_url,omitempty"`
+
 	// RelayMaxBitrate is the bitrate cap in kbps for streams that arrive
 	// through the relay. 0 means no cap.
 	RelayMaxBitrate int `toml:"relay_max_bitrate,omitempty"`
@@ -170,6 +178,11 @@ func (c *Config) validate() error {
 	}
 	if u, err := url.Parse(c.WNCloudURL); err != nil || u.Scheme == "" || u.Host == "" {
 		return fmt.Errorf("wn_cloud_url %q is not a URL", c.WNCloudURL)
+	}
+	if c.RelayEdgeURL != "" {
+		if u, err := url.Parse(c.RelayEdgeURL); err != nil || u.Scheme != "https" || u.Host == "" {
+			return fmt.Errorf("relay_edge_url %q is not an https URL", c.RelayEdgeURL)
+		}
 	}
 	if c.RelayMaxBitrate < 0 {
 		return fmt.Errorf("relay_max_bitrate %d must not be negative", c.RelayMaxBitrate)

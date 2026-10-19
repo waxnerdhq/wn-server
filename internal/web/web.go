@@ -18,6 +18,7 @@ import (
 
 	"github.com/waxnerdhq/wn-server/internal/match"
 	"github.com/waxnerdhq/wn-server/internal/navidrome"
+	"github.com/waxnerdhq/wn-server/internal/relay"
 	"github.com/waxnerdhq/wn-server/internal/relayreq"
 	"github.com/waxnerdhq/wn-server/internal/store"
 	"github.com/waxnerdhq/wn-server/internal/wncloud"
@@ -93,6 +94,9 @@ type Options struct {
 	Ready <-chan struct{}
 	// CloudStatus is read for the wn-cloud outage banner. It may be nil.
 	CloudStatus *wncloud.Status
+	// Relay answers the relay package's current state for the status page.
+	// Nil shows the state off.
+	Relay func() relay.State
 	// ServerName is shown on the status page.
 	ServerName string
 	// NavidromeVersion is the version that serve checked at start.

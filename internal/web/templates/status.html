@@ -7,5 +7,6 @@
 <dt>Library scan</dt><dd>{{.ScanState}}</dd>
 <dt>Match queue</dt><dd><a href="/ui/match">{{.PendingMatches}} pending</a>{{if .MatchJobRunning}}; a match job is running{{end}}</dd>
 <dt>wn-cloud</dt><dd>{{if .Linked}}linked to waxnerd user <code>{{.WaxnerdUserID}}</code> as server <code>{{.ServerID}}</code>{{else}}not linked; run <code>wn-server login</code>{{end}}</dd>
+<dt>Relay</dt><dd>{{.RelayText}}{{if .RelayURL}}<a href="{{.RelayURL}}">{{.RelayURL}}</a>{{end}}</dd>
 </dl>
 {{end}}

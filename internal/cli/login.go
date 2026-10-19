@@ -237,7 +237,7 @@ func logout(ctx context.Context, out, errOut io.Writer, st *store.Store, owner s
 func newStatusCmd() *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
-		Short: "Print the owner account and whether it is linked to waxnerd",
+		Short: "Print the owner account, whether it is linked to waxnerd, and the relay state",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := loadConfig(cmd)
@@ -265,6 +265,16 @@ func newStatusCmd() *cobra.Command {
 				fmt.Fprintf(out, "linked at: %s\n", cred.CreatedAt.Format(time.RFC3339))
 			}
 			fmt.Fprintf(out, "wn-cloud: %s\n", c.WNCloudURL)
+			// The relay line is the state that serve wrote last.
+			rs, err := st.RelayState(ctx)
+			switch {
+			case errors.Is(err, store.ErrNoRelayState):
+				fmt.Fprintln(out, "relay: no state written; wn-server serve has not run")
+			case err != nil:
+				return err
+			default:
+				fmt.Fprintln(out, relayStateLine(rs))
+			}
 			return nil
 		},
 	}
