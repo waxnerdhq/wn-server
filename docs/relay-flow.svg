@@ -1,0 +1,210 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1400" height="1500" viewBox="0 0 1400 1500" font-family="Helvetica, Arial, sans-serif" font-size="13">
+  <defs>
+    <marker id="arr" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#222"/>
+    </marker>
+    <marker id="arrb" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#1d4ed8"/>
+    </marker>
+  </defs>
+  <style>
+    .lane { fill:#f3f4f6; stroke:#9ca3af; }
+    .lane-nd { fill:#fef3c7; stroke:#d97706; }
+    .lane-ws { fill:#dbeafe; stroke:#2563eb; }
+    .lane-wc { fill:#dcfce7; stroke:#16a34a; }
+    .lane-ed { fill:#fce7f3; stroke:#db2777; }
+    .lt { font-size:15px; font-weight:bold; text-anchor:middle; fill:#111; }
+    .ls { font-size:12px; text-anchor:middle; fill:#374151; }
+    .life { stroke:#9ca3af; stroke-dasharray:4 4; }
+    .msg { stroke:#222; stroke-width:1.4; marker-end:url(#arr); fill:none; }
+    .msgb { stroke:#1d4ed8; stroke-width:1.4; marker-end:url(#arrb); fill:none; }
+    .lbl { text-anchor:middle; fill:#111; }
+    .num { font-weight:bold; fill:#1d4ed8; }
+    .h { font-size:18px; font-weight:bold; fill:#111; }
+    .note { fill:#fffbeb; stroke:#d97706; }
+    .notet { font-size:12px; fill:#111; }
+    .self { fill:#eef2ff; stroke:#4f46e5; }
+  </style>
+
+  <!-- ===================== Section A ===================== -->
+  <text x="40" y="40" class="h">A. The tunnel:  wn-server serve  with  relay = true  (v1)</text>
+
+  <!-- lane headers -->
+  <rect x="50" y="60" width="200" height="56" rx="6" class="lane"/>
+  <text x="150" y="83" class="lt">Owner's browser</text>
+  <text x="150" y="103" class="ls">outside the home</text>
+
+  <rect x="310" y="60" width="200" height="56" rx="6" class="lane-ed"/>
+  <text x="410" y="83" class="lt">The edge</text>
+  <text x="410" y="103" class="ls">wn-cloud, relay-edge, holds the TLS cert</text>
+
+  <rect x="570" y="60" width="200" height="56" rx="6" class="lane-ws"/>
+  <text x="670" y="83" class="lt">wn-server</text>
+  <text x="670" y="103" class="ls">relay package + reverse proxy, at home</text>
+
+  <rect x="830" y="60" width="200" height="56" rx="6" class="lane-wc"/>
+  <text x="930" y="83" class="lt">wn-cloud API</text>
+  <text x="930" y="103" class="ls">v2 web service + Postgres</text>
+
+  <rect x="1090" y="60" width="200" height="56" rx="6" class="lane-nd"/>
+  <text x="1190" y="83" class="lt">Navidrome</text>
+  <text x="1190" y="103" class="ls">child process, Unix socket only</text>
+
+  <!-- lifelines -->
+  <line x1="150" y1="116" x2="150" y2="440" class="life"/>
+  <line x1="410" y1="116" x2="410" y2="440" class="life"/>
+  <line x1="670" y1="116" x2="670" y2="440" class="life"/>
+  <line x1="930" y1="116" x2="930" y2="440" class="life"/>
+  <line x1="1190" y1="116" x2="1190" y2="440" class="life"/>
+
+  <!-- 1 wn-server -> wn-cloud API -->
+  <line x1="670" y1="160" x2="930" y2="160" class="msg"/>
+  <text x="800" y="138" class="lbl"><tspan class="num">1</tspan> GET /servers/:id with the server credential</text>
+  <text x="800" y="153" class="lbl" font-size="11">→ relay.connect_url, relay.host, addresses; stored, reused when wn-cloud is unreachable</text>
+
+  <!-- 2 wn-server -> edge -->
+  <line x1="670" y1="215" x2="410" y2="215" class="msg"/>
+  <text x="540" y="193" class="lbl"><tspan class="num">2</tspan> TLS to connect.relay.waxnerd.com:443, then GET /v1/tunnel</text>
+  <text x="540" y="208" class="lbl" font-size="11">Bearer &lt;server credential&gt;, Upgrade: wn-relay/1, Wn-Server-Id: &lt;server id&gt;</text>
+
+  <!-- 3 edge -> wn-cloud API (Postgres) -->
+  <line x1="410" y1="270" x2="930" y2="270" class="msg"/>
+  <text x="670" y="248" class="lbl"><tspan class="num">3</tspan> token check as for any CLI token; the token's user owns the server id;</text>
+  <text x="670" y="263" class="lbl" font-size="11">relay_enabled and relay_until on servers (7-day grace). Else 401, 402 relay_not_enabled, 403, 409.</text>
+
+  <!-- 4 edge -> wn-server -->
+  <line x1="410" y1="325" x2="670" y2="325" class="msg"/>
+  <text x="540" y="303" class="lbl"><tspan class="num">4</tspan> 101 Switching Protocols, Wn-Relay-Host: &lt;id&gt;.relay.waxnerd.com</text>
+  <text x="540" y="318" class="lbl" font-size="11">both sides start yamux; the edge opens streams, wn-server serves them with http.Server</text>
+
+  <!-- 5 self: keepalive -->
+  <rect x="320" y="350" width="440" height="40" rx="6" class="self"/>
+  <text x="540" y="367" class="lbl"><tspan class="num">5</tspan> keepalive ping every 30 s; last_seen_at written every 60 s;</text>
+  <text x="540" y="383" class="lbl" font-size="11">credential and entitlement re-checked every 10 min; a drop reconnects with backoff and jitter</text>
+
+  <!-- 6 edge -> wn-cloud API -->
+  <line x1="410" y1="425" x2="930" y2="425" class="msg"/>
+  <text x="670" y="415" class="lbl"><tspan class="num">6</tspan> servers.relay_connected_at, relay_last_seen_at, relay_streams; relay_usage per month</text>
+
+  <!-- note -->
+  <rect x="50" y="455" width="1240" height="46" rx="6" class="note"/>
+  <text x="70" y="474" class="notet">Result: one outbound connection from the home, authenticated once with the credential wn-server already holds. A second tunnel for the same server replaces the first.</text>
+  <text x="70" y="492" class="notet">wn-server status shows: connected since &lt;time&gt; at https://&lt;id&gt;.relay.waxnerd.com. The LAN path is unchanged; a failure of the tunnel never stops serve.</text>
+
+  <!-- ===================== Section B ===================== -->
+  <text x="40" y="560" class="h">B. The owner opens the web UI from outside the home  (v1). The edge checks nothing per request.</text>
+
+  <rect x="50" y="580" width="200" height="56" rx="6" class="lane"/>
+  <text x="150" y="603" class="lt">Owner's browser</text>
+  <text x="150" y="623" class="ls">outside the home</text>
+
+  <rect x="310" y="580" width="200" height="56" rx="6" class="lane-ed"/>
+  <text x="410" y="603" class="lt">The edge</text>
+  <text x="410" y="623" class="ls">TLS ends here</text>
+
+  <rect x="570" y="580" width="200" height="56" rx="6" class="lane-ws"/>
+  <text x="670" y="603" class="lt">wn-server</text>
+  <text x="670" y="623" class="ls">relay package + reverse proxy</text>
+
+  <rect x="830" y="580" width="200" height="56" rx="6" class="lane-wc"/>
+  <text x="930" y="603" class="lt">wn-cloud API</text>
+  <text x="930" y="623" class="ls">not called per request</text>
+
+  <rect x="1090" y="580" width="200" height="56" rx="6" class="lane-nd"/>
+  <text x="1190" y="603" class="lt">Navidrome</text>
+  <text x="1190" y="623" class="ls">Unix socket</text>
+
+  <line x1="150" y1="636" x2="150" y2="980" class="life"/>
+  <line x1="410" y1="636" x2="410" y2="980" class="life"/>
+  <line x1="670" y1="636" x2="670" y2="980" class="life"/>
+  <line x1="930" y1="636" x2="930" y2="980" class="life"/>
+  <line x1="1190" y1="636" x2="1190" y2="980" class="life"/>
+
+  <!-- 1 browser -> edge -->
+  <line x1="150" y1="680" x2="410" y2="680" class="msgb"/>
+  <text x="280" y="658" class="lbl"><tspan class="num">1</tspan> GET https://&lt;id&gt;.relay.waxnerd.com/ui/</text>
+  <text x="280" y="673" class="lbl" font-size="11">wildcard certificate; routed by host; caps checked (in-flight, audio, egress, body, per-IP rate)</text>
+
+  <!-- 2 edge -> wn-server -->
+  <line x1="410" y1="730" x2="670" y2="730" class="msgb"/>
+  <text x="540" y="708" class="lbl"><tspan class="num">2</tspan> same request on a yamux stream, header X-Relay-Client: &lt;client IP&gt;</text>
+  <text x="540" y="723" class="lbl" font-size="11">no session, no password, no account is checked here</text>
+
+  <!-- 3 self: relay package -->
+  <rect x="580" y="750" width="440" height="40" rx="6" class="self"/>
+  <text x="800" y="767" class="lbl"><tspan class="num">3</tspan> relay package: moves X-Relay-Client into the context, marks the request relayed,</text>
+  <text x="800" y="783" class="lbl" font-size="11">hands it to the proxy handler in process; r.TLS != nil || relayed is the TLS-terminated test</text>
+
+  <!-- 4 wn-server -> browser: sign-in -->
+  <line x1="670" y1="830" x2="150" y2="830" class="msgb" stroke-dasharray="6 4"/>
+  <text x="410" y="808" class="lbl"><tspan class="num">4</tspan> sign-in form: account name + app password → Set-Cookie wn_session; Secure; Path=/ui/</text>
+  <text x="410" y="823" class="lbl" font-size="11">Origin checked against r.Host = the relay host; limiter keyed by the forwarded client address</text>
+
+  <!-- 5 wn-server -> navidrome -->
+  <line x1="670" y1="880" x2="1190" y2="880" class="msgb"/>
+  <text x="930" y="858" class="lbl"><tspan class="num">5</tspan> /rest/* on the socket with Remote-User, X-Forwarded-Host: &lt;id&gt;.relay.waxnerd.com,</text>
+  <text x="930" y="873" class="lbl" font-size="11">X-Forwarded-Proto: https; share links therefore carry the relay host</text>
+
+  <!-- 6 response -->
+  <line x1="1190" y1="930" x2="150" y2="930" class="msgb" stroke-dasharray="6 4"/>
+  <text x="670" y="920" class="lbl"><tspan class="num">6</tspan> response passes back unchanged; the edge counts bytes and audio responses per tunnel</text>
+
+  <rect x="50" y="995" width="1240" height="46" rx="6" class="note"/>
+  <text x="70" y="1014" class="notet">Authentication is wn-server's. A third-party Subsonic client uses the same address with the app password. POST /api/v1/session answers 403 not_available through the relay in v1.</text>
+  <text x="70" y="1032" class="notet">wn-server's router is the allowlist: /rest/*, /share/*, /api/v1/*, /, /ui/*. The edge refuses Upgrade (400), other methods (405), bodies over 1 MiB (413), and a host with no tunnel (502).</text>
+
+  <!-- ===================== Section C ===================== -->
+  <text x="40" y="1100" class="h">C. A listener signs in from a first-party client  (after v1, designed, not built)</text>
+
+  <rect x="50" y="1120" width="200" height="56" rx="6" class="lane"/>
+  <text x="150" y="1143" class="lt">Listener's client</text>
+  <text x="150" y="1163" class="ls">first-party app, outside the home</text>
+
+  <rect x="310" y="1120" width="200" height="56" rx="6" class="lane-ed"/>
+  <text x="410" y="1143" class="lt">The edge</text>
+  <text x="410" y="1163" class="ls">forwards, checks nothing</text>
+
+  <rect x="570" y="1120" width="200" height="56" rx="6" class="lane-ws"/>
+  <text x="670" y="1143" class="lt">wn-server</text>
+  <text x="670" y="1163" class="ls">checks membership itself</text>
+
+  <rect x="830" y="1120" width="200" height="56" rx="6" class="lane-wc"/>
+  <text x="930" y="1143" class="lt">wn-cloud API</text>
+  <text x="930" y="1163" class="ls">members, invites, device codes</text>
+
+  <rect x="1090" y="1120" width="200" height="56" rx="6" class="lane-nd"/>
+  <text x="1190" y="1143" class="lt">Navidrome</text>
+  <text x="1190" y="1163" class="ls">one non-admin user per listener</text>
+
+  <line x1="150" y1="1176" x2="150" y2="1420" class="life"/>
+  <line x1="410" y1="1176" x2="410" y2="1420" class="life"/>
+  <line x1="670" y1="1176" x2="670" y2="1420" class="life"/>
+  <line x1="930" y1="1176" x2="930" y2="1420" class="life"/>
+  <line x1="1190" y1="1176" x2="1190" y2="1420" class="life"/>
+
+  <!-- 1 client -> wn-cloud -->
+  <line x1="150" y1="1215" x2="930" y2="1215" class="msg"/>
+  <text x="540" y="1193" class="lbl"><tspan class="num">1</tspan> the owner invited the listener and the listener accepted at wn-cloud (listener row in server_members, cap 12)</text>
+  <text x="540" y="1208" class="lbl" font-size="11">the client signs in with the listener's waxnerd account, reads the server's addresses, and gets a device code bound to the server</text>
+
+  <!-- 2 client -> edge -> wn-server -->
+  <line x1="150" y1="1265" x2="670" y2="1265" class="msgb"/>
+  <text x="410" y="1255" class="lbl"><tspan class="num">2</tspan> POST /api/v1/session with the code at the relay host; the edge forwards it down the tunnel</text>
+
+  <!-- 3 wn-server -> wn-cloud -->
+  <line x1="670" y1="1310" x2="930" y2="1310" class="msg"/>
+  <text x="800" y="1288" class="lbl"><tspan class="num">3</tspan> POST /servers/:id/device-codes/verify → user_id, role</text>
+  <text x="800" y="1303" class="lbl" font-size="11">accepted only when the cached member list (refreshed every 5 min) holds the user</text>
+
+  <!-- 4 wn-server -> navidrome -->
+  <line x1="670" y1="1355" x2="1190" y2="1355" class="msg"/>
+  <text x="930" y="1345" class="lbl"><tspan class="num">4</tspan> first sign-in: listener account in wn-server + non-admin Navidrome user (native API)</text>
+
+  <!-- 5 wn-server -> client -->
+  <line x1="670" y1="1400" x2="150" y2="1400" class="msgb"/>
+  <text x="410" y="1390" class="lbl"><tspan class="num">5</tspan> wn-server session for the listener; every later request is checked locally and forwarded with Remote-User</text>
+
+  <rect x="50" y="1435" width="1240" height="46" rx="6" class="note"/>
+  <text x="70" y="1454" class="notet">The owner is never refused. A listener is served from the cached member list for 30 days of wn-cloud outage, then refused until a refresh succeeds (WAX-945, decision 2).</text>
+  <text x="70" y="1472" class="notet">The web UI stays owner-only. A listener's ratings stay local until first-party clients write them to wn-cloud with the listener's own account.</text>
+</svg>
