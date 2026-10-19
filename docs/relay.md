@@ -332,7 +332,7 @@ The route also answers the 401 and 403 answers of the bearer check.
 
 The checks run in this order: the bearer check (401), `:id` is a UUID (400), the caller owns the server (403). The route has no rate limit, as `POST /servers` has none.
 
-wn-server rule: `serve` calls it at start when `relay = true`, every hour, and within 10 seconds of a server credential appearing in the store. It stores `relay.connect_url`, `relay.host`, and `addresses`, and uses the stored values when wn-cloud is unreachable. A 401 stops the relay package as it stops the background tick.
+wn-server rule: `serve` calls it at start when `relay = true`, every hour, and within 10 seconds of a server credential appearing in the store. It stores `relay.connect_url`, `relay.host`, and `addresses`, and uses the stored values when wn-cloud is unreachable. A 401 sets the shared wn-cloud status to "credential rejected" and the next call runs in one hour; the relay package itself stops dialing when the edge answers 401 for the same token.
 
 #### `GET /v1/tunnel` on the edge (WAX-relay)
 

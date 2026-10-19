@@ -47,6 +47,14 @@ const (
 	// every later verify call of that bearer answer 429 rate_limited.
 	failureLimit  = 10
 	failureWindow = 10 * time.Minute
+
+	// relayGrace is how long relay.enabled stays true after relay_until.
+	relayGrace = 7 * 24 * time.Hour
+	// defaultConnectURL is relay.connect_url until SetRelayConnectURL
+	// changes it.
+	defaultConnectURL = "https://connect.relay.waxnerd.com/v1/tunnel"
+	// relayDomain is the parent domain of every relay host.
+	relayDomain = "relay.waxnerd.com"
 )
 
 // deviceAlphabet is the alphabet of device codes: no 0, O, 1, or I.
@@ -81,6 +89,12 @@ type authCode struct {
 type server struct {
 	id, ownerID, name string
 	createdAt         time.Time
+
+	// The relay columns of wn-cloud's servers table. A zero time is null.
+	relayEnabled   bool
+	relayUntil     time.Time
+	relayConnected bool
+	relayLastSeen  time.Time
 }
 
 type deviceCode struct {
@@ -110,7 +124,9 @@ type Stub struct {
 	servers  map[string]*server
 	devices  map[string]*deviceCode // SHA-256 of the normalized code
 	ratings  map[ratingKey]*rating
-	failures map[string][]time.Time // bearer to the times of its failed verify calls
+	failures map[string][]time.Time       // bearer to the times of its failed verify calls
+	members  map[string]map[string]string // server id to user id to role
+	connect  string                       // relay.connect_url
 	signedIn string
 	last     time.Time
 }
@@ -126,11 +142,14 @@ func New() *Stub {
 		devices:  map[string]*deviceCode{},
 		ratings:  map[ratingKey]*rating{},
 		failures: map[string][]time.Time{},
+		members:  map[string]map[string]string{},
+		connect:  defaultConnectURL,
 	}
 	s.mux.HandleFunc("GET /cli/auth", s.cliAuth)
 	s.mux.HandleFunc("POST /cli/token", s.cliToken)
 	s.mux.HandleFunc("POST /cli/logout", s.cliLogout)
 	s.mux.HandleFunc("POST /servers", s.createServer)
+	s.mux.HandleFunc("GET /servers/{id}", s.getServer)
 	s.mux.HandleFunc("POST /servers/{id}/device-codes/verify", s.verifyDeviceCode)
 	s.mux.HandleFunc("PUT /ratings/{kind}/{mbid}", s.putRating)
 	s.mux.HandleFunc("DELETE /ratings/{kind}/{mbid}", s.deleteRating)
@@ -165,11 +184,52 @@ func (s *Stub) AddToken(token, userID string) {
 	s.tokens[token] = userID
 }
 
-// AddServer registers a server under ownerID.
+// AddServer registers a server under ownerID, with its owner member row.
 func (s *Stub) AddServer(id, ownerID, name string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.servers[id] = &server{id: id, ownerID: ownerID, name: name, createdAt: s.now()}
+	s.addServer(&server{id: id, ownerID: ownerID, name: name, createdAt: s.now()})
+}
+
+// SetRelay sets the server's relay_enabled and relay_until. A zero until is
+// null.
+func (s *Stub) SetRelay(serverID string, enabled bool, until time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if srv := s.servers[serverID]; srv != nil {
+		srv.relayEnabled, srv.relayUntil = enabled, until
+	}
+}
+
+// SetRelayConnected sets whether a tunnel of the server is open. Connecting
+// also sets relay_last_seen_at to now; disconnecting keeps it.
+func (s *Stub) SetRelayConnected(serverID string, connected bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if srv := s.servers[serverID]; srv != nil {
+		srv.relayConnected = connected
+		if connected {
+			srv.relayLastSeen = s.now()
+		}
+	}
+}
+
+// SetRelayConnectURL sets relay.connect_url for every server.
+func (s *Stub) SetRelayConnectURL(url string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.connect = url
+}
+
+// Members returns the server's member rows as user id to role.
+func (s *Stub) Members(serverID string) map[string]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string]string{}
+	for u, role := range s.members[serverID] {
+		out[u] = role
+	}
+	return out
 }
 
 // IssueDeviceCode issues a device code for the server as the user, as the
@@ -431,13 +491,59 @@ func (s *Stub) cliLogout(w http.ResponseWriter, r *http.Request) {
 
 // Servers.
 
-func serverJSON(srv *server) map[string]any {
+// addServer stores a server and its owner member row.
+func (s *Stub) addServer(srv *server) {
+	s.servers[srv.id] = srv
+	s.members[srv.id] = map[string]string{srv.ownerID: "owner"}
+}
+
+// nullTime is nil for a zero time and the time in the cursor layout
+// otherwise.
+func nullTime(t time.Time) any {
+	if t.IsZero() {
+		return nil
+	}
+	return t.Format(cursorLayout)
+}
+
+func (s *Stub) serverJSON(srv *server) map[string]any {
+	host := srv.id + "." + relayDomain
+	enabled := srv.relayEnabled && (srv.relayUntil.IsZero() || s.now().Before(srv.relayUntil.Add(relayGrace)))
 	return map[string]any{
 		"id":         srv.id,
 		"owner_id":   srv.ownerID,
 		"name":       srv.name,
-		"created_at": srv.createdAt,
+		"created_at": srv.createdAt.Format(cursorLayout),
+		"relay": map[string]any{
+			"enabled":      enabled,
+			"until":        nullTime(srv.relayUntil),
+			"connect_url":  s.connect,
+			"host":         host,
+			"connected":    srv.relayConnected,
+			"last_seen_at": nullTime(srv.relayLastSeen),
+		},
+		"addresses": []map[string]string{{"kind": "relay", "url": "https://" + host}},
 	}
+}
+
+// getServer answers GET /servers/{id}: the bearer check, the UUID, the
+// owner.
+func (s *Stub) getServer(w http.ResponseWriter, r *http.Request) {
+	u := s.authUser(w, r)
+	if u == nil {
+		return
+	}
+	id := r.PathValue("id")
+	if !uuidRE.MatchString(id) {
+		writeError(w, http.StatusBadRequest, "invalid_request", "id must be a UUID")
+		return
+	}
+	srv := s.servers[strings.ToLower(id)]
+	if srv == nil || srv.ownerID != u.id {
+		writeError(w, http.StatusForbidden, "forbidden", "The caller does not own this server")
+		return
+	}
+	writeJSON(w, http.StatusOK, s.serverJSON(srv))
 }
 
 func (s *Stub) createServer(w http.ResponseWriter, r *http.Request) {
@@ -458,8 +564,8 @@ func (s *Stub) createServer(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	srv := &server{id: newUUID(), ownerID: u.id, name: name, createdAt: s.now()}
-	s.servers[srv.id] = srv
-	writeJSON(w, http.StatusCreated, serverJSON(srv))
+	s.addServer(srv)
+	writeJSON(w, http.StatusCreated, s.serverJSON(srv))
 }
 
 // Device codes.

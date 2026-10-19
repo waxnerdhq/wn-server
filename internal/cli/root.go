@@ -229,8 +229,9 @@ func checkDataDirMode(dir string) error {
 	return nil
 }
 
-// serve runs the Navidrome supervisor and the proxy until ctx is cancelled
-// or one of them fails. The supervisor outlives the HTTP server: on a signal
+// serve runs the Navidrome supervisor, the proxy, and, with relay = true,
+// the relay package until ctx is cancelled or the supervisor or the proxy
+// fails. The supervisor outlives the HTTP server: on a signal
 // the server drains first, then Navidrome is stopped, so in-flight streams
 // are not cut by an early SIGTERM to Navidrome.
 func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.Account, logger *slog.Logger) error {
@@ -272,6 +273,7 @@ func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.A
 		}
 	}()
 	ndClient := navidrome.NewClient(ndTransport)
+	relayState := &relayHolder{}
 	ui := web.New(web.Options{
 		Store:            st,
 		Navidrome:        ndClient,
@@ -279,17 +281,28 @@ func serve(ctx context.Context, c *config.Config, st *store.Store, owner store.A
 		Jobs:             jobs,
 		Ready:            sup.Ready(),
 		CloudStatus:      cloudStatus,
+		Relay:            relayState.State,
 		ServerName:       hostName,
 		NavidromeVersion: navidrome.ServerVersion(),
 		Logger:           logger,
 	})
 	cloud := newClient(c)
 	rt := ratings.New(st, cloud, ndClient, cloudStatus, logger)
-	srv := &http.Server{
-		Handler: proxy.New(ndTransport, sup.Ready(), st, cloud, logger,
-			proxy.WithUI(ui), proxy.WithCloudStatus(cloudStatus), proxy.WithRatings(rt), proxy.WithRelayMaxBitrate(c.RelayMaxBitrate)),
-		ReadHeaderTimeout: 10 * time.Second,
-	}
+	handler := proxy.New(ndTransport, sup.Ready(), st, cloud, logger,
+		proxy.WithUI(ui), proxy.WithCloudStatus(cloudStatus), proxy.WithRatings(rt), proxy.WithRelayMaxBitrate(c.RelayMaxBitrate))
+	srv := &http.Server{Handler: handler, ReadHeaderTimeout: 10 * time.Second}
+
+	// The relay serves tunneled requests with the same handler. It never
+	// stops serve. serve waits for it, so that its last state is written
+	// before the store closes.
+	relayCtx, cancelRelay := context.WithCancel(ctx)
+	relayDone := (&relayWiring{
+		cfg: c, st: st, cloud: cloud, cloudStatus: cloudStatus, holder: relayState, logger: logger, now: time.Now,
+	}).start(relayCtx, handler)
+	defer func() {
+		cancelRelay()
+		<-relayDone
+	}()
 
 	supCtx, cancelSup := context.WithCancel(context.WithoutCancel(ctx))
 	defer cancelSup()

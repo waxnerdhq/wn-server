@@ -179,3 +179,25 @@ func TestRelayMaxBitrate(t *testing.T) {
 		t.Errorf("negative value: err %v", err)
 	}
 }
+
+func TestRelayKeys(t *testing.T) {
+	music := t.TempDir()
+	c, err := Load(writeConfig(t, t.TempDir(), "music_folders = ['"+music+"']\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Relay || c.RelayEdgeURL != "" {
+		t.Errorf("defaults relay=%v relay_edge_url=%q, want false and empty", c.Relay, c.RelayEdgeURL)
+	}
+	c, err = Load(writeConfig(t, t.TempDir(), "music_folders = ['"+music+"']\nrelay = true\nrelay_edge_url = 'https://edge.test:8443/v1/tunnel'\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !c.Relay || c.RelayEdgeURL != "https://edge.test:8443/v1/tunnel" {
+		t.Errorf("got relay=%v relay_edge_url=%q", c.Relay, c.RelayEdgeURL)
+	}
+	_, err = Load(writeConfig(t, t.TempDir(), "music_folders = ['"+music+"']\nrelay_edge_url = 'http://edge.test/v1/tunnel'\n"))
+	if err == nil || !strings.Contains(err.Error(), "relay_edge_url") {
+		t.Errorf("http URL: err %v", err)
+	}
+}

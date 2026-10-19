@@ -10,6 +10,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/waxnerdhq/wn-server/internal/wncloud/stub"
 )
@@ -91,12 +92,43 @@ func TestClient(t *testing.T) {
 		t.Fatalf("VerifyDeviceCode on another server = %v, want ErrForbidden", err)
 	}
 
+	// GetServer: the default relay fields, the seeded ones, a server the
+	// caller does not own, and the owner member row of POST /servers.
+	got, err := c.GetServer(ctx, token, serverID)
+	if err != nil || got.ID != serverID || got.OwnerID != ownerID || got.Relay.Enabled || got.Relay.Until != nil ||
+		got.Relay.Host != serverID+".relay.waxnerd.com" || got.Relay.ConnectURL != "https://connect.relay.waxnerd.com/v1/tunnel" ||
+		len(got.Addresses) != 1 || got.Addresses[0] != (Address{Kind: "relay", URL: "https://" + serverID + ".relay.waxnerd.com"}) {
+		t.Fatalf("GetServer = %+v, %v", got, err)
+	}
+	until := time.Now().Add(-6 * 24 * time.Hour).UTC().Truncate(time.Microsecond)
+	s.SetRelay(serverID, true, until)
+	s.SetRelayConnected(serverID, true)
+	s.SetRelayConnectURL("https://edge.test:8443/v1/tunnel")
+	got, err = c.GetServer(ctx, token, serverID)
+	if err != nil || !got.Relay.Enabled || got.Relay.Until == nil || !got.Relay.Until.Equal(until) || !got.Relay.Connected ||
+		got.Relay.LastSeenAt == nil || got.Relay.ConnectURL != "https://edge.test:8443/v1/tunnel" {
+		t.Fatalf("GetServer after seeding = %+v, %v", got, err)
+	}
+	s.SetRelay(serverID, true, time.Now().Add(-8*24*time.Hour))
+	if got, err = c.GetServer(ctx, token, serverID); err != nil || got.Relay.Enabled {
+		t.Fatalf("GetServer after the grace period = %+v, %v", got.Relay, err)
+	}
+	if _, err := c.GetServer(ctx, token, "0193a0b2-77c1-7f00-8e21-3d9c5b6a4f10"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("GetServer on another server = %v, want ErrForbidden", err)
+	}
+	if m := s.Members(serverID); len(m) != 1 || m[ownerID] != "owner" {
+		t.Fatalf("members = %v, want the owner row", m)
+	}
+
 	// Logout: success, then the revoked token.
 	if err := c.Logout(ctx, token); err != nil {
 		t.Fatalf("Logout = %v", err)
 	}
 	if err := c.Logout(ctx, token); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("second Logout = %v, want ErrUnauthorized", err)
+	}
+	if _, err := c.GetServer(ctx, token, serverID); !errors.Is(err, ErrUnauthorized) {
+		t.Fatalf("GetServer with a revoked token = %v, want ErrUnauthorized", err)
 	}
 }
 

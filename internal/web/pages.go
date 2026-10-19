@@ -9,6 +9,7 @@ import (
 	"strings"
 	"unicode"
 
+	"github.com/waxnerdhq/wn-server/internal/relay"
 	"github.com/waxnerdhq/wn-server/internal/relayreq"
 	"github.com/waxnerdhq/wn-server/internal/store"
 )
@@ -124,6 +125,25 @@ type statusData struct {
 	ServerID         string
 	PendingMatches   int
 	MatchJobRunning  bool
+	// RelayText is the relay line. When the relay is connected, RelayURL is
+	// the relay address and RelayText is the line without it.
+	RelayText string
+	RelayURL  string
+}
+
+// relayLine returns the relay line, split before the relay address when the
+// relay is connected, so the page can show the address as a link.
+func (s *server) relayLine() (text, url string) {
+	st := relay.State{Name: relay.Off}
+	if s.Relay != nil {
+		st = s.Relay()
+	}
+	text = st.Text()
+	if st.Name == relay.Connected && st.Host != "" {
+		url = "https://" + st.Host
+		text = strings.TrimSuffix(text, url)
+	}
+	return text, url
 }
 
 // statusPage serves GET /ui/.
@@ -148,6 +168,7 @@ func (s *server) statusPage(w http.ResponseWriter, r *http.Request, _ store.Sess
 		return
 	}
 	data.MatchJobRunning = s.Jobs.Status().Running != nil
+	data.RelayText, data.RelayURL = s.relayLine()
 	cred, err := s.Store.ServerCredential(ctx)
 	switch {
 	case err == nil:
