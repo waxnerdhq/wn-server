@@ -42,8 +42,8 @@ const Protocol = "wn-relay/1"
 // missedPongLimit is the number of pings in a row without a pong after which
 // the package closes the session. A ping is sent every config.keepAlive and
 // waits config.writeTimeout for the pong, so with the defaults a silent drop
-// is seen within about 110 seconds (docs/relay.md, section 3). The values are
-// not configuration keys.
+// is seen 90 to 120 seconds after the last pong (docs/relay.md, section 3).
+// The values are not configuration keys.
 const missedPongLimit = 3
 
 // clientHeader carries the client's address from the edge.
@@ -403,8 +403,8 @@ func (r *Relay) serve(ctx context.Context, conn net.Conn) error {
 }
 
 // heartbeat pings the peer every config.keepAlive. A ping that gets no pong
-// within config.writeTimeout, or that cannot be written, is a miss, and a pong
-// resets the count. After missedPongLimit misses in a row heartbeat stores an
+// within config.writeTimeout, or whose write times out, is a miss, and a pong
+// resets the count. A write error closes the session, which ends the loop. After missedPongLimit misses in a row heartbeat stores an
 // error that names them in missed and closes sess. It returns when sess is
 // closed or ctx ends.
 func (r *Relay) heartbeat(ctx context.Context, sess *yamux.Session, missed *atomic.Pointer[error]) {
