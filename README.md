@@ -166,6 +166,8 @@ While wn-cloud is unreachable, every signed-in page shows the banner "wn-cloud u
 
 Waxnerd Relay, a paid wn-cloud feature, gives a wn-server a public address through a tunnel it opens to wn-cloud, so the owner reaches this web UI from outside the home. The design is in [docs/relay.md](docs/relay.md). Listeners, invites, and listener sign-in are designed there and built after relay v1.
 
+The package `internal/relay` dials the edge over TLS, runs the `GET /v1/tunnel` handshake with the server credential, and serves the requests that come down the yamux session with the same HTTP handler as the LAN listener, each marked as relayed with the client's address through `internal/relayreq`. It reconnects with backoff after a drop, stops after a refusal until the credential changes, and reports its state with the texts of the table "What the owner sees" in [docs/relay.md](docs/relay.md). `serve` does not start it yet; that wiring is separate work.
+
 ### Ratings and favorites
 
 wn-cloud is the source of truth for the owner's ratings. Ratings use waxnerd's 10-point scale (5 stars with half stars). Releases and tracks also carry a favorite mark. Likes and comments may follow on the same model.
