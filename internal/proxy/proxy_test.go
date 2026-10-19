@@ -45,7 +45,9 @@ func creds() string {
 // env is a proxy in front of a fake Navidrome, with a real store and the
 // wn-cloud stub.
 type env struct {
-	srv   *httptest.Server
+	srv *httptest.Server
+	// h is the proxy handler that srv serves, for relayed requests.
+	h     http.Handler
 	hits  *atomic.Int32
 	st    *store.Store
 	owner store.Account
@@ -118,7 +120,8 @@ func newEnvOpts(t *testing.T, backend http.Handler, ready bool, opts func(*env) 
 	if opts != nil {
 		o = opts(e)
 	}
-	e.srv = httptest.NewServer(New(rt, ch, st, wncloud.New(cloudSrv.URL, "test"), logger, o...))
+	e.h = New(rt, ch, st, wncloud.New(cloudSrv.URL, "test"), logger, o...)
+	e.srv = httptest.NewServer(e.h)
 	t.Cleanup(e.srv.Close)
 	return e
 }

@@ -206,6 +206,29 @@ func TestGuard(t *testing.T) {
 	}
 }
 
+func TestListenerCannotOpenTheUI(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	acct, err := e.st.CreateListener(ctx, "0192f1c4-3b7e-7d2a-9a10-5f4e2c1b8a71", "ada@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The stored hash does not work as a password at the form.
+	resp := e.do(t, http.MethodPost, "/ui/login", url.Values{"name": {acct.Name}, "password": {acct.AppPassword}}, nil, "")
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("listener sign-in: status %d, want 401", resp.StatusCode)
+	}
+	// A listener's session from the device code exchange does not open it.
+	token, _, err := e.st.CreateSession(ctx, acct.ID, "phone")
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp = e.do(t, http.MethodGet, "/ui/", nil, &http.Cookie{Name: CookieName, Value: token}, "")
+	if resp.StatusCode != http.StatusSeeOther || resp.Header.Get("Location") != "/ui/login" {
+		t.Fatalf("listener session: status %d, location %q", resp.StatusCode, resp.Header.Get("Location"))
+	}
+}
+
 func TestOriginCheck(t *testing.T) {
 	e := newEnv(t)
 	c := e.signIn(t)

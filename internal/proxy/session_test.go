@@ -1,22 +1,22 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"io"
-	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/waxnerdhq/wn-server/internal/navidrome"
 	"github.com/waxnerdhq/wn-server/internal/relayreq"
 	"github.com/waxnerdhq/wn-server/internal/store"
-	"github.com/waxnerdhq/wn-server/internal/wncloud"
 )
 
 // link stores the server credential, as wn-server login does, and registers
@@ -104,7 +104,7 @@ func TestSessionExchange(t *testing.T) {
 	e.exchange(t, "K7QM-4XPA", http.StatusUnauthorized, "invalid_code")
 	const otherID = "11111111-2222-4333-8444-555555555555"
 	e.cloud.AddUser(otherID, "other@example.com")
-	e.exchange(t, e.cloud.IssueDeviceCode(serverID, otherID), http.StatusForbidden, "not_owner")
+	e.exchange(t, e.cloud.IssueDeviceCode(serverID, otherID), http.StatusForbidden, "not_a_member")
 
 	ctx := context.Background()
 	// A server credential that wn-cloud does not know.
@@ -188,36 +188,6 @@ func TestSessionExchangeRateLimit(t *testing.T) {
 	e.exchange(t, code, http.StatusTooManyRequests, "rate_limited")
 }
 
-func TestSessionExchangeRefusedThroughRelay(t *testing.T) {
-	e := newEnv(t, http.NotFoundHandler(), true)
-	e.link(t)
-	ready := make(chan struct{})
-	close(ready)
-	h := New(e.rt, ready, e.st, wncloud.New(e.cloudURL, "test"), slog.New(slog.DiscardHandler))
-	code := e.cloud.IssueDeviceCode(serverID, waxnerdID)
-	body, _ := json.Marshal(map[string]string{"code": code, "device": "test phone"})
-	// More requests than the limits allow: none counts.
-	for range 2 * exchangeMaxTotal {
-		req := httptest.NewRequest(http.MethodPost, "/api/v1/session", bytes.NewReader(body))
-		req.RemoteAddr = "192.168.1.5:40000"
-		req = req.WithContext(relayreq.WithRelay(req.Context(), "203.0.113.9"))
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, req)
-		var eb apiError
-		if rec.Code != http.StatusForbidden || json.Unmarshal(rec.Body.Bytes(), &eb) != nil || eb.Code != "not_available" || eb.Error == "" {
-			t.Fatalf("relayed exchange: status %d, body %s", rec.Code, rec.Body)
-		}
-	}
-	// The code was not spent and the LAN limit was not used.
-	req := httptest.NewRequest(http.MethodPost, "/api/v1/session", bytes.NewReader(body))
-	req.RemoteAddr = "192.168.1.5:40000"
-	rec := httptest.NewRecorder()
-	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("LAN exchange after relayed refusals: status %d, body %s", rec.Code, rec.Body)
-	}
-}
-
 func TestLimiterCountsRelayedClientsSeparately(t *testing.T) {
 	// Two relayed clients share one TCP peer address, the relay edge's.
 	req := func(client string) *http.Request {
@@ -228,8 +198,8 @@ func TestLimiterCountsRelayedClientsSeparately(t *testing.T) {
 		}
 		return r
 	}
-	l := newLimiter(time.Now)
-	for range exchangeMaxPerAddr {
+	l := newLimiter(time.Now, relayedMaxPerAddr, relayedMaxTotal)
+	for range relayedMaxPerAddr {
 		l.fail(relayreq.ClientAddr(req("203.0.113.9")))
 	}
 	if l.acquire(relayreq.ClientAddr(req("203.0.113.9"))) {
@@ -245,8 +215,9 @@ func TestLimiterCountsRelayedClientsSeparately(t *testing.T) {
 }
 
 func TestLimiter(t *testing.T) {
+	const perAddr, total = 5, 10
 	now := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
-	l := newLimiter(func() time.Time { return now })
+	l := newLimiter(func() time.Time { return now }, perAddr, total)
 	fail := func(addr string) bool {
 		if !l.acquire(addr) {
 			return false
@@ -262,8 +233,8 @@ func TestLimiter(t *testing.T) {
 		l.release("a", false)
 	}
 	// The total limit holds across addresses.
-	for i := range exchangeMaxTotal {
-		if !fail(string(rune('a' + i/exchangeMaxPerAddr))) {
+	for i := range total {
+		if !fail(string(rune('a' + i/perAddr))) {
 			t.Fatalf("failure %d refused", i)
 		}
 	}
@@ -276,12 +247,239 @@ func TestLimiter(t *testing.T) {
 		t.Fatal("failures did not expire")
 	}
 	// An exchange in progress counts until it ends.
-	for range exchangeMaxPerAddr - 1 {
+	for range perAddr - 1 {
 		if !l.acquire("b") {
 			t.Fatal("pending refused early")
 		}
 	}
 	if !l.acquire("b") || l.acquire("b") {
 		t.Fatal("pending exchanges not counted")
+	}
+}
+
+// userNavidrome serves the native user and library routes that a listener's
+// first sign-in calls, and records the Remote-User of every /rest/ call.
+type userNavidrome struct {
+	mu         sync.Mutex
+	users      []navidrome.User
+	libraries  map[string][]int // Navidrome user id to library ids
+	remoteUser string
+}
+
+func (f *userNavidrome) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	switch {
+	case r.Method == http.MethodGet && r.URL.Path == "/api/user":
+		_ = json.NewEncoder(w).Encode(f.users)
+	case r.Method == http.MethodPost && r.URL.Path == "/api/user":
+		var u navidrome.User
+		_ = json.NewDecoder(r.Body).Decode(&u)
+		u.ID = "nd" + u.UserName
+		f.users = append(f.users, u)
+		_ = json.NewEncoder(w).Encode(map[string]string{"id": u.ID})
+	case r.Method == http.MethodGet && r.URL.Path == "/api/library":
+		_, _ = w.Write([]byte(`[{"id":1,"name":"Music","path":"/music"},{"id":2,"name":"Other","path":"/other"}]`))
+	case r.Method == http.MethodPut && strings.HasPrefix(r.URL.Path, "/api/user/"):
+		var body struct {
+			LibraryIDs []int `json:"libraryIds"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		f.libraries[strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/user/"), "/library")] = body.LibraryIDs
+		_, _ = w.Write([]byte(`[]`))
+	default:
+		f.remoteUser = r.Header.Get("Remote-User")
+		_, _ = w.Write([]byte(`<subsonic-response status="ok"/>`))
+	}
+}
+
+// relayed sends a request through the proxy handler as the relay package
+// does, from the relayed client address client.
+func (e *env) relayed(t *testing.T, method, path, client, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.RemoteAddr = "127.0.0.1:40000"
+	req = req.WithContext(relayreq.WithRelay(req.Context(), client))
+	rec := httptest.NewRecorder()
+	e.h.ServeHTTP(rec, req)
+	return rec
+}
+
+// relayedExchange posts a code through the relay and checks the answer.
+func (e *env) relayedExchange(t *testing.T, client, code string, wantStatus int, wantCode string) exchangeResponse {
+	t.Helper()
+	body, _ := json.Marshal(map[string]string{"code": code, "device": "listener phone"})
+	rec := e.relayed(t, http.MethodPost, "/api/v1/session", client, string(body))
+	if rec.Code != wantStatus {
+		t.Fatalf("relayed exchange: status %d, want %d; body %s", rec.Code, wantStatus, rec.Body)
+	}
+	var out exchangeResponse
+	if wantStatus != http.StatusOK {
+		var eb apiError
+		if err := json.Unmarshal(rec.Body.Bytes(), &eb); err != nil || eb.Code != wantCode {
+			t.Fatalf("relayed exchange: body %s, want code %s", rec.Body, wantCode)
+		}
+		return out
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func TestListenerSignInThroughRelay(t *testing.T) {
+	const (
+		listenerID = "0192f1c4-3b7e-7d2a-9a10-5f4e2c1b8a71"
+		strangerID = "0192f1c4-3b7e-7d2a-9a10-5f4e2c1b8a72"
+	)
+	ctx := context.Background()
+	now := time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC)
+	nd := &userNavidrome{libraries: map[string][]int{}}
+	e := newEnvOpts(t, nd, true, func(e *env) []Option {
+		return []Option{WithNavidromeUsers(navidrome.NewClient(e.rt)), withNow(func() time.Time { return now })}
+	})
+	e.link(t)
+	e.cloud.AddUser(listenerID, "ada@example.com")
+	e.cloud.AddMember(serverID, listenerID, "listener")
+	e.cloud.AddUser(strangerID, "eve@example.com")
+	e.cloud.AddMember(serverID, strangerID, "listener")
+
+	// Before any refresh of the member list a listener is refused as for an
+	// outage, and the failure does not count.
+	e.relayedExchange(t, "203.0.113.9", e.cloud.IssueDeviceCode(serverID, listenerID), http.StatusServiceUnavailable, "cloud_unreachable")
+	members := []store.Member{{UserID: waxnerdID, Role: "owner"}, {UserID: listenerID, Role: "listener"}}
+	if _, err := e.st.ReplaceMembers(ctx, members, now); err != nil {
+		t.Fatal(err)
+	}
+
+	// A listener in the cached list gets a session through the relay.
+	out := e.relayedExchange(t, "203.0.113.9", e.cloud.IssueDeviceCode(serverID, listenerID), http.StatusOK, "")
+	acct, err := e.st.ListenerByUserID(ctx, listenerID)
+	if err != nil || out.Account.ID != acct.ID || out.Account.Name != "ada" || acct.Kind != store.KindListener {
+		t.Fatalf("answer %+v, account %+v, %v", out, acct, err)
+	}
+	if len(nd.users) != 1 || nd.users[0].UserName != acct.ID || nd.users[0].IsAdmin || nd.users[0].Name != "ada" {
+		t.Fatalf("navidrome users %+v, want one non-admin user named after the account id", nd.users)
+	}
+	if libs := nd.libraries["nd"+acct.ID]; len(libs) != 2 {
+		t.Fatalf("listener libraries %v, want both", libs)
+	}
+	// The proxy forwards with the listener's Remote-User.
+	if rec := e.relayed(t, http.MethodGet, "/rest/ping.view?apiKey="+out.Token, "203.0.113.9", ""); rec.Code != http.StatusOK || nd.remoteUser != acct.ID {
+		t.Fatalf("listener ping: status %d, Remote-User %q", rec.Code, nd.remoteUser)
+	}
+	// Rating writes and the web UI are the owner's.
+	nd.remoteUser = ""
+	if c := subsonicCode(t, e, "/rest/setRating.view?id=x&rating=5&apiKey="+out.Token, ""); c != errNotAuthorized {
+		t.Fatalf("listener setRating: error %d, want %d", c, errNotAuthorized)
+	}
+	if c := subsonicCode(t, e, "/rest/ping.view?u=ada&p="+acct.AppPassword, ""); c != errWrongCredential {
+		t.Fatalf("listener password sign-in: error %d, want %d", c, errWrongCredential)
+	}
+	// A second sign-in reuses the account and the Navidrome user.
+	e.relayedExchange(t, "203.0.113.9", e.cloud.IssueDeviceCode(serverID, listenerID), http.StatusOK, "")
+	if len(nd.users) != 1 {
+		t.Fatalf("navidrome users %+v after a second sign-in", nd.users)
+	}
+
+	// A member at wn-cloud who is not in the cached list is refused, and it
+	// counts: 2 failures per relayed address.
+	for range relayedMaxPerAddr {
+		e.relayedExchange(t, "203.0.113.10", e.cloud.IssueDeviceCode(serverID, strangerID), http.StatusForbidden, "not_a_member")
+	}
+	e.relayedExchange(t, "203.0.113.10", e.cloud.IssueDeviceCode(serverID, listenerID), http.StatusTooManyRequests, "rate_limited")
+
+	// 31 days after the last refresh a listener is refused and the owner
+	// is served.
+	now = now.Add(31 * 24 * time.Hour)
+	e.relayedExchange(t, "203.0.113.9", e.cloud.IssueDeviceCode(serverID, listenerID), http.StatusServiceUnavailable, "cloud_unreachable")
+	e.relayedExchange(t, "203.0.113.9", e.cloud.IssueDeviceCode(serverID, waxnerdID), http.StatusOK, "")
+	e.exchange(t, e.cloud.IssueDeviceCode(serverID, waxnerdID), http.StatusOK, "")
+
+	// A refresh without the listener ends the session; re-adding enables
+	// the account again.
+	res, err := e.st.ReplaceMembers(ctx, members[:1], now)
+	if err != nil || len(res.Disabled) != 1 || res.SessionsEnded != 2 {
+		t.Fatalf("refresh = %+v, %v", res, err)
+	}
+	if c := subsonicCode(t, e, "/rest/ping.view?apiKey="+out.Token, ""); c != errInvalidAPIKey {
+		t.Fatalf("removed listener: error %d, want %d", c, errInvalidAPIKey)
+	}
+	if res, err := e.st.ReplaceMembers(ctx, members, now); err != nil || len(res.Enabled) != 1 {
+		t.Fatalf("refresh with the listener back = %+v, %v", res, err)
+	}
+	e.relayedExchange(t, "203.0.113.9", e.cloud.IssueDeviceCode(serverID, listenerID), http.StatusOK, "")
+}
+
+func TestListenerSessionRefusedAfterMemberListBound(t *testing.T) {
+	const listenerID = "0192f1c4-3b7e-7d2a-9a10-5f4e2c1b8a71"
+	ctx := context.Background()
+	now := time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC)
+	nd := &userNavidrome{libraries: map[string][]int{}}
+	e := newEnvOpts(t, nd, true, func(e *env) []Option {
+		return []Option{WithNavidromeUsers(navidrome.NewClient(e.rt)), withNow(func() time.Time { return now })}
+	})
+	e.link(t)
+	e.cloud.AddUser(listenerID, "ada@example.com")
+	e.cloud.AddMember(serverID, listenerID, "listener")
+	members := []store.Member{{UserID: waxnerdID, Role: "owner"}, {UserID: listenerID, Role: "listener"}}
+	if _, err := e.st.ReplaceMembers(ctx, members, now); err != nil {
+		t.Fatal(err)
+	}
+	listener := e.exchange(t, e.cloud.IssueDeviceCode(serverID, listenerID), http.StatusOK, "").Token
+	owner := e.exchange(t, e.cloud.IssueDeviceCode(serverID, waxnerdID), http.StatusOK, "").Token
+
+	works := func(label string) {
+		t.Helper()
+		if c := subsonicCode(t, e, "/rest/ping.view?apiKey="+listener, ""); c != -1 {
+			t.Fatalf("%s: listener /rest/ping error %d", label, c)
+		}
+		if status, b := e.do(t, http.MethodGet, "/api/v1/nothing", listener, ""); status != http.StatusNotFound {
+			t.Fatalf("%s: listener /api/v1 status %d, body %s", label, status, b)
+		}
+	}
+	ownerWorks := func() {
+		t.Helper()
+		if c := subsonicCode(t, e, "/rest/ping.view?apiKey="+owner, ""); c != -1 {
+			t.Fatalf("owner /rest/ping error %d", c)
+		}
+		if status, b := e.do(t, http.MethodGet, "/api/v1/nothing", owner, ""); status != http.StatusNotFound {
+			t.Fatalf("owner /api/v1 status %d, body %s", status, b)
+		}
+	}
+	works("fresh")
+	ownerWorks()
+
+	now = now.Add(31 * 24 * time.Hour)
+	if c := subsonicCode(t, e, "/rest/ping.view?apiKey="+listener, ""); c != errGeneric {
+		t.Fatalf("stale listener /rest/ping: error %d, want %d", c, errGeneric)
+	}
+	status, b := e.do(t, http.MethodGet, "/api/v1/nothing", listener, "")
+	var eb apiError
+	if status != http.StatusServiceUnavailable || json.Unmarshal(b, &eb) != nil || eb.Code != "cloud_unreachable" {
+		t.Fatalf("stale listener /api/v1: status %d, body %s", status, b)
+	}
+	ownerWorks()
+
+	if _, err := e.st.ReplaceMembers(ctx, members, now); err != nil {
+		t.Fatal(err)
+	}
+	works("after a refresh")
+	ownerWorks()
+
+	// A refresh that removes the listener between the member check and the
+	// insert leaves no session.
+	if _, err := e.st.ReplaceMembers(ctx, members[:1], now); err != nil {
+		t.Fatal(err)
+	}
+	acct, err := e.st.ListenerByUserID(ctx, listenerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := e.st.CreateListenerSession(ctx, acct.ID, "late"); !errors.Is(err, store.ErrAccountDisabled) {
+		t.Fatalf("CreateListenerSession for a disabled listener: %v", err)
+	}
+	if list, err := e.st.Sessions(ctx, acct.ID); err != nil || len(list) != 0 {
+		t.Fatalf("sessions of the disabled listener = %v, %v", list, err)
 	}
 }

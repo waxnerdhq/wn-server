@@ -26,6 +26,8 @@ type Session struct {
 	Device     string // the client's label, or empty
 	CreatedAt  time.Time
 	LastSeenAt time.Time
+	// AccountKind is the kind of the account. Only SessionByToken sets it.
+	AccountKind string
 }
 
 // newSessionToken returns SessionTokenPrefix followed by 32 bytes from
@@ -44,9 +46,27 @@ func hashSessionToken(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// ErrAccountDisabled is returned by CreateListenerSession when the account
+// is disabled or is no longer in the cached member list.
+var ErrAccountDisabled = errors.New("account disabled")
+
 // CreateSession creates a session for the account and returns its token.
 // The token is returned only here. The store keeps its hash.
 func (s *Store) CreateSession(ctx context.Context, accountID, device string) (string, Session, error) {
+	return s.createSession(ctx, accountID, device, false)
+}
+
+// CreateListenerSession creates a session for a listener account as
+// CreateSession does, but only when, in the same statement, the account is
+// enabled and its waxnerd user is in the cached member list. Otherwise it
+// returns ErrAccountDisabled and stores nothing. A refresh of the member
+// list that runs between the caller's checks and the insert cannot leave a
+// session behind for a removed listener.
+func (s *Store) CreateListenerSession(ctx context.Context, accountID, device string) (string, Session, error) {
+	return s.createSession(ctx, accountID, device, true)
+}
+
+func (s *Store) createSession(ctx context.Context, accountID, device string, listener bool) (string, Session, error) {
 	id, err := newID()
 	if err != nil {
 		return "", Session{}, err
@@ -57,11 +77,24 @@ func (s *Store) CreateSession(ctx context.Context, accountID, device string) (st
 	}
 	now := time.Now().UTC().Truncate(time.Second)
 	sess := Session{ID: id, AccountID: accountID, Device: device, CreatedAt: now, LastSeenAt: now}
-	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO sessions (id, account_id, token_hash, device, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		sess.ID, sess.AccountID, hashSessionToken(token), sess.Device, now.Format(time.RFC3339), now.Format(time.RFC3339))
+	ts := now.Format(time.RFC3339)
+	var res sql.Result
+	if listener {
+		res, err = s.db.ExecContext(ctx,
+			`INSERT INTO sessions (id, account_id, token_hash, device, created_at, last_seen_at)
+			SELECT ?, a.id, ?, ?, ?, ? FROM accounts a
+			WHERE a.id = ? AND a.disabled = 0 AND a.waxnerd_user_id IN (SELECT user_id FROM members)`,
+			sess.ID, hashSessionToken(token), sess.Device, ts, ts, accountID)
+	} else {
+		res, err = s.db.ExecContext(ctx,
+			`INSERT INTO sessions (id, account_id, token_hash, device, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?)`,
+			sess.ID, sess.AccountID, hashSessionToken(token), sess.Device, ts, ts)
+	}
 	if err != nil {
 		return "", Session{}, fmt.Errorf("create session: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return "", Session{}, ErrAccountDisabled
 	}
 	return token, sess, nil
 }
@@ -94,14 +127,30 @@ func scanSession(row scanner) (Session, error) {
 	return sess, nil
 }
 
-// SessionByToken returns the session whose token hash is the hash of token.
-// It returns ErrSessionNotFound for an unknown or revoked token.
+// SessionByToken returns the session whose token hash is the hash of token,
+// with the kind of its account. It returns ErrSessionNotFound for an unknown
+// or revoked token and for a session of a disabled account.
 func (s *Store) SessionByToken(ctx context.Context, token string) (Session, error) {
 	if !strings.HasPrefix(token, SessionTokenPrefix) {
 		return Session{}, ErrSessionNotFound
 	}
-	return scanSession(s.db.QueryRowContext(ctx,
-		`SELECT `+sessionColumns+` FROM sessions WHERE token_hash = ?`, hashSessionToken(token)))
+	var kind string
+	sess, err := scanSession(scanWithKind{s.db.QueryRowContext(ctx,
+		`SELECT s.id, s.account_id, s.device, s.created_at, s.last_seen_at, a.kind
+		FROM sessions s JOIN accounts a ON a.id = s.account_id
+		WHERE s.token_hash = ? AND a.disabled = 0`, hashSessionToken(token)), &kind})
+	sess.AccountKind = kind
+	return sess, err
+}
+
+// scanWithKind scans the session columns followed by the account kind.
+type scanWithKind struct {
+	row  scanner
+	kind *string
+}
+
+func (k scanWithKind) Scan(dest ...any) error {
+	return k.row.Scan(append(dest, k.kind)...)
 }
 
 // TouchSession sets the last seen time of the session.

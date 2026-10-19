@@ -84,11 +84,17 @@ func TestClient(t *testing.T) {
 
 	// VerifyDeviceCode: success, then a server the caller does not own.
 	dc := s.IssueDeviceCode(serverID, ownerID)
-	gotUser, email, err := c.VerifyDeviceCode(ctx, token, serverID, dc)
-	if err != nil || gotUser != ownerID || email != "owner@example.com" {
-		t.Fatalf("VerifyDeviceCode = %q, %q, %v", gotUser, email, err)
+	v, err := c.VerifyDeviceCode(ctx, token, serverID, dc)
+	if err != nil || v != (Verified{UserID: ownerID, Email: "owner@example.com", Role: RoleOwner}) {
+		t.Fatalf("VerifyDeviceCode = %+v, %v", v, err)
 	}
-	if _, _, err := c.VerifyDeviceCode(ctx, token, "0193a0b2-77c1-7f00-8e21-3d9c5b6a4f10", dc); !errors.Is(err, ErrForbidden) {
+	const listenerID = "0192f1c4-3b7e-7d2a-9a10-5f4e2c1b8a71"
+	s.AddUser(listenerID, "ada@example.com")
+	s.AddMember(serverID, listenerID, "listener")
+	if v, err := c.VerifyDeviceCode(ctx, token, serverID, s.IssueDeviceCode(serverID, listenerID)); err != nil || v.Role != RoleListener {
+		t.Fatalf("VerifyDeviceCode of a listener = %+v, %v", v, err)
+	}
+	if _, err := c.VerifyDeviceCode(ctx, token, "0193a0b2-77c1-7f00-8e21-3d9c5b6a4f10", dc); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("VerifyDeviceCode on another server = %v, want ErrForbidden", err)
 	}
 
@@ -116,8 +122,19 @@ func TestClient(t *testing.T) {
 	if _, err := c.GetServer(ctx, token, "0193a0b2-77c1-7f00-8e21-3d9c5b6a4f10"); !errors.Is(err, ErrForbidden) {
 		t.Fatalf("GetServer on another server = %v, want ErrForbidden", err)
 	}
-	if m := s.Members(serverID); len(m) != 1 || m[ownerID] != "owner" {
-		t.Fatalf("members = %v, want the owner row", m)
+	// ListMembers: the owner first, then the listener; after the removal
+	// the owner only; another server is forbidden.
+	ms, err := c.ListMembers(ctx, token, serverID)
+	if err != nil || len(ms) != 2 || ms[0].UserID != ownerID || ms[0].Role != RoleOwner || ms[1].UserID != listenerID ||
+		ms[1].Role != RoleListener || ms[1].Name != "ada" || ms[1].CreatedAt.IsZero() {
+		t.Fatalf("ListMembers = %+v, %v", ms, err)
+	}
+	s.RemoveMember(serverID, listenerID)
+	if ms, err := c.ListMembers(ctx, token, serverID); err != nil || len(ms) != 1 || ms[0].UserID != ownerID {
+		t.Fatalf("ListMembers after the removal = %+v, %v", ms, err)
+	}
+	if _, err := c.ListMembers(ctx, token, "0193a0b2-77c1-7f00-8e21-3d9c5b6a4f10"); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("ListMembers on another server = %v, want ErrForbidden", err)
 	}
 
 	// Logout: success, then the revoked token.

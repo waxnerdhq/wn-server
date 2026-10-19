@@ -47,8 +47,8 @@ func forwardAccount(w http.ResponseWriter, r *http.Request, params url.Values, s
 		return
 	}
 	if name == "" {
-		owner, err := st.Owner(r.Context())
-		if err != nil || owner.ID != accountID {
+		acct, err := st.AccountByID(r.Context(), accountID)
+		if err != nil {
 			if r.Context().Err() != nil {
 				return
 			}
@@ -56,11 +56,12 @@ func forwardAccount(w http.ResponseWriter, r *http.Request, params url.Values, s
 			writeSubsonicError(w, params, errGeneric, "internal error")
 			return
 		}
-		name = owner.Name
+		name = acct.Name
 	}
 	if call == "getUser" && params.Has("username") {
 		// The owner's Navidrome user is an admin. Only the account itself may
-		// be asked for, so that the wn-server user is not exposed.
+		// be asked for, so that the wn-server user and other accounts are
+		// not exposed.
 		switch u := params.Get("username"); {
 		case strings.EqualFold(u, name), strings.EqualFold(u, accountID):
 			params.Set("username", accountID)
