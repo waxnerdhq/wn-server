@@ -123,8 +123,9 @@ type Navidrome interface {
 	SetStarred(ctx context.Context, user, id string, starred bool) error
 }
 
-// Service records ratings. A write goes to the local store and the outbox,
-// and the drain sends it to wn-cloud. The reconcile loop brings changes from
+// Service records ratings. A write by the owner goes to the local store and
+// the outbox, and the drain sends it to wn-cloud. A write by a listener goes
+// to the local store only. The reconcile loop brings the owner's changes from
 // wn-cloud into the local store and into Navidrome. Store writes run one at
 // a time. The drain sends without holding the lock and removes or delays an
 // entry only when it did not change during the send.
@@ -186,9 +187,10 @@ func subjectOf(kind, mbid string) (Subject, error) {
 }
 
 // Set replaces the account's rating of a subject with both values. Both nil
-// clears the rating. It writes the local store and queues the value in the
-// outbox. Run sends it to wn-cloud with the server credential. Without a
-// server credential the entry waits in the outbox until wn-server login.
+// clears the rating. It writes the local store. For the owner it also queues
+// the value in the outbox, and Run sends it to wn-cloud with the server
+// credential; without a server credential the entry waits in the outbox until
+// wn-server login. For a listener nothing is queued.
 func (s *Service) Set(ctx context.Context, accountID, kind, mbid string, halfStars *int, likeLevel *string) error {
 	if err := validate(kind, mbid, halfStars, likeLevel); err != nil {
 		return err
@@ -256,14 +258,23 @@ func validate(kind, mbid string, halfStars *int, likeLevel *string) error {
 	return nil
 }
 
-// write stores r and queues it in the outbox, due at once. It returns r
-// with its update time. s.mu is held.
+// write stores r and, when r is the owner's, queues it in the outbox, due at
+// once. The outbox sends with the server credential as the owner, so a
+// listener's rating never enters it. It returns r with its update time. s.mu
+// is held.
 func (s *Service) write(ctx context.Context, r store.Rating) (store.Rating, error) {
+	owner, err := s.store.Owner(ctx)
+	if err != nil {
+		return store.Rating{}, fmt.Errorf("read owner: %w", err)
+	}
 	if r.UpdatedAt.IsZero() {
 		r.UpdatedAt = s.now()
 	}
 	if err := s.store.PutRating(ctx, r); err != nil {
 		return store.Rating{}, fmt.Errorf("store rating: %w", err)
+	}
+	if r.AccountID != owner.ID {
+		return r, nil
 	}
 	now := s.now()
 	e := store.OutboxEntry{

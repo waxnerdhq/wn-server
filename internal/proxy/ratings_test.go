@@ -31,13 +31,16 @@ const (
 // rating calls. It records the rating calls it received.
 type fakeNavidrome struct {
 	owner string
-	mu    sync.Mutex
-	calls []string
+	// listener is a second Navidrome user that the lookups accept.
+	listener string
+	mu       sync.Mutex
+	calls    []string
+	users    []string
 }
 
 func (f *fakeNavidrome) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if strings.HasPrefix(r.URL.Path, "/api/") {
-		if r.Header.Get("Remote-User") != f.owner {
+		if u := r.Header.Get("Remote-User"); u != f.owner && (f.listener == "" || u != f.listener) {
 			http.Error(w, "wrong user", http.StatusUnauthorized)
 			return
 		}
@@ -56,6 +59,7 @@ func (f *fakeNavidrome) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	f.mu.Lock()
 	f.calls = append(f.calls, strings.TrimPrefix(r.URL.Path, "/rest/")+"?"+r.URL.RawQuery)
+	f.users = append(f.users, r.Header.Get("Remote-User"))
 	f.mu.Unlock()
 	w.Header().Set("Content-Type", "application/json")
 	if r.URL.Query().Get("id") == refusedSong {

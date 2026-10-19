@@ -275,3 +275,37 @@ func TestReconcileCredentialAndOutage(t *testing.T) {
 		t.Fatal("status is reachable after a 503")
 	}
 }
+
+// A listener's writes stay out of the outbox, and the owner's reconcile
+// neither reads nor changes the listener's rows.
+func TestListenerRatingsStayLocal(t *testing.T) {
+	ctx := context.Background()
+	e, _ := reconcileEnv(t)
+	listener, err := e.st.CreateListener(ctx, "0192f1c4-0000-7000-8000-000000000001", "ada@example.com")
+	if err != nil {
+		t.Fatal(err)
+	}
+	two, love := 2, LikeLove
+	if err := e.svc.Set(ctx, listener.ID, KindRelease, releaseID, &two, &love); err != nil {
+		t.Fatal(err)
+	}
+	if box, _ := e.st.Outbox(ctx); len(box) != 0 {
+		t.Fatalf("outbox %+v after a listener's write", box)
+	}
+	if len(e.svc.kick) != 0 {
+		t.Fatal("a listener's write kicked the drain")
+	}
+
+	// The owner's rating of the same subject arrives from wn-cloud.
+	e.cloud.AddRating(waxnerdID, KindRelease, releaseID, 9, "")
+	if err := e.svc.Reconcile(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := e.local(t, KindRelease, releaseID); got != "9/nil" {
+		t.Fatalf("owner's rating %s, want 9/nil", got)
+	}
+	r, err := e.st.Rating(ctx, listener.ID, KindRelease, releaseID)
+	if err != nil || r.HalfStars == nil || *r.HalfStars != 2 || r.LikeLevel == nil || *r.LikeLevel != LikeLove {
+		t.Fatalf("listener's rating %+v, %v; want 2 half stars and love", r, err)
+	}
+}

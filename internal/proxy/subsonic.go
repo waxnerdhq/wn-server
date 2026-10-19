@@ -92,12 +92,6 @@ func subsonicAuth(st Store, sess *sessions, lim *loginLimiter, logger *slog.Logg
 				writeSubsonicError(w, params, errInvalidAPIKey, "Invalid API key")
 				return
 			}
-			if s.AccountKind != store.KindOwner && ratingCall(r.URL.Path) != "" {
-				// Ratings of listeners are not stored yet (WAX-998). The
-				// call would write the owner's outbox.
-				writeSubsonicError(w, params, errNotAuthorized, "User is not authorized for the given operation")
-				return
-			}
 			forwardAccount(w, r, params, st, logger, s.AccountID, "", next)
 			return
 		}

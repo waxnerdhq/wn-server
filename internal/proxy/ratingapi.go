@@ -147,7 +147,8 @@ func parsePatch(w http.ResponseWriter, r *http.Request) (ratings.Patch, string) 
 func isNull(raw json.RawMessage) bool { return bytes.Equal(bytes.TrimSpace(raw), []byte("null")) }
 
 // put serves PUT /api/v1/ratings/{subsonicId}: it changes the rating in the
-// local store and the outbox, then sets Navidrome's rounded mirror.
+// local store, and the outbox for the owner, then sets Navidrome's rounded
+// mirror. A listener's rating stays in the local store.
 func (a *ratingAPI) put(w http.ResponseWriter, r *http.Request) {
 	accountID, _ := r.Context().Value(accountIDKey{}).(string)
 	id := r.PathValue("id")
@@ -191,8 +192,8 @@ func (a *ratingAPI) delete(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// mirror sets Navidrome's rounded values. The rating is already stored and
-// queued for wn-cloud, so a failure is logged and the client still gets its
+// mirror sets Navidrome's rounded values. The rating is already stored, so a
+// failure is logged and the client still gets its
 // answer.
 func (a *ratingAPI) mirror(ctx context.Context, accountID, id string, sub ratings.Subject, half *int, like *string) {
 	if err := a.ratings.SetMirror(ctx, accountID, id, half, like); err != nil {

@@ -368,11 +368,7 @@ func TestListenerSignInThroughRelay(t *testing.T) {
 	if rec := e.relayed(t, http.MethodGet, "/rest/ping.view?apiKey="+out.Token, "203.0.113.9", ""); rec.Code != http.StatusOK || nd.remoteUser != acct.ID {
 		t.Fatalf("listener ping: status %d, Remote-User %q", rec.Code, nd.remoteUser)
 	}
-	// Rating writes and the web UI are the owner's.
-	nd.remoteUser = ""
-	if c := subsonicCode(t, e, "/rest/setRating.view?id=x&rating=5&apiKey="+out.Token, ""); c != errNotAuthorized {
-		t.Fatalf("listener setRating: error %d, want %d", c, errNotAuthorized)
-	}
+	// The web UI is the owner's.
 	if c := subsonicCode(t, e, "/rest/ping.view?u=ada&p="+acct.AppPassword, ""); c != errWrongCredential {
 		t.Fatalf("listener password sign-in: error %d, want %d", c, errWrongCredential)
 	}
