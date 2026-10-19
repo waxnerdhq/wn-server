@@ -398,7 +398,7 @@ wn-server rule: the relay package dials while `relay = true`, a server credentia
 
 ### In wn-cloud (WAX-981, WAX-986)
 
-WAX-981 adds `servers.relay_enabled`, `servers.relay_until`, `servers.relay_connected_at`, `servers.relay_session_id`, `servers.relay_last_seen_at`, `servers.relay_streams`, the table `relay_usage (server_id, month date, bytes bigint, primary key (server_id, month))`, and the table `server_members` with the owner rows. `POST /servers` inserts the owner row and answers the server object with the relay fields. The route is in `web/src/servers.ts`. WAX-986 adds the edge in `relay/`. It reads Postgres with the web service's `DATABASE_URL`, and writes `servers.relay_connected_at` and `servers.relay_last_seen_at`.
+WAX-981 adds `servers.relay_enabled`, `servers.relay_until`, `servers.relay_connected_at`, `servers.relay_session_id`, `servers.relay_last_seen_at`, `servers.relay_streams`, the table `relay_usage (server_id, month date, bytes bigint, primary key (server_id, month))`, and the table `server_members` with the owner rows. `POST /servers` inserts the owner row and answers the server object with the relay fields. The route is in `web/src/servers.ts`. WAX-986 adds the edge in `relay/`. It reads Postgres with the web service's `DATABASE_URL`, and writes `servers.relay_connected_at`, `servers.relay_session_id`, `servers.relay_last_seen_at`, `servers.relay_streams` and the table `relay_usage`.
 
 ## Members (WAX-936, WAX-992)
 
