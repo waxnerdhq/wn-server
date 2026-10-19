@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -13,6 +12,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/waxnerdhq/wn-server/internal/relayreq"
 	"github.com/waxnerdhq/wn-server/internal/store"
 	"github.com/waxnerdhq/wn-server/internal/wncloud"
 )
@@ -202,15 +202,15 @@ func (s *sessions) exchange(w http.ResponseWriter, r *http.Request) {
 	// The server sets only ReadHeaderTimeout. A slow body must not hold the
 	// handler.
 	_ = http.NewResponseController(w).SetReadDeadline(time.Now().Add(exchangeReadTimeout))
-	addr := remoteHost(r)
+	addr := relayreq.ClientAddr(r)
 	code, device, xerr := readExchange(w, r)
 	if xerr != nil {
 		s.limiter.fail(addr)
-		s.refuse(w, addr, xerr)
+		s.refuse(w, r, addr, xerr)
 		return
 	}
 	if !s.limiter.acquire(addr) {
-		s.refuse(w, addr, errLimited)
+		s.refuse(w, r, addr, errLimited)
 		return
 	}
 	failed := false
@@ -223,7 +223,7 @@ func (s *sessions) exchange(w http.ResponseWriter, r *http.Request) {
 	}
 	if xerr != nil {
 		failed = xerr.counted
-		s.refuse(w, addr, xerr)
+		s.refuse(w, r, addr, xerr)
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
@@ -254,12 +254,12 @@ func (s *sessions) exchangeCode(ctx context.Context, addr, code, device string) 
 		return "", store.Account{}, errNotLinked
 	}
 	if err != nil {
-		s.logger.Error("read server credential", "remote", addr, "error", err)
+		s.log(ctx).Error("read server credential", "remote", addr, "error", err)
 		return "", store.Account{}, errInternal
 	}
 	owner, err := s.store.Owner(ctx)
 	if err != nil {
-		s.logger.Error("read owner account", "remote", addr, "error", err)
+		s.log(ctx).Error("read owner account", "remote", addr, "error", err)
 		return "", store.Account{}, errInternal
 	}
 	if owner.WaxnerdUserID == "" {
@@ -285,7 +285,7 @@ func (s *sessions) exchangeCode(ctx context.Context, addr, code, device string) 
 		return "", store.Account{}, errCloudDown
 	default:
 		if ctx.Err() == nil {
-			s.logger.Error("wn-cloud refused the device code verification; if the server credential no longer works, run `wn-server logout`, then `wn-server login`",
+			s.log(ctx).Error("wn-cloud refused the device code verification; if the server credential no longer works, run `wn-server logout`, then `wn-server login`",
 				"server", cred.ServerID, "remote", addr, "error", err)
 		}
 		return "", store.Account{}, errCloud
@@ -296,21 +296,30 @@ func (s *sessions) exchangeCode(ctx context.Context, addr, code, device string) 
 
 	token, sess, err := s.store.CreateSession(ctx, owner.ID, device)
 	if err != nil {
-		s.logger.Error("create session", "remote", addr, "error", err)
+		s.log(ctx).Error("create session", "remote", addr, "error", err)
 		return "", store.Account{}, errInternal
 	}
-	s.logger.Info("session created", "session", sess.ID, "account", owner.ID, "device", device)
+	s.log(ctx).Info("session created", "session", sess.ID, "account", owner.ID, "device", device)
 	return token, owner, nil
+}
+
+// log returns the sessions' logger, with relay=true when ctx carries the
+// relayed mark.
+func (s *sessions) log(ctx context.Context) *slog.Logger {
+	if relayreq.IsRelayed(ctx) {
+		return s.logger.With("relay", true)
+	}
+	return s.logger
 }
 
 // refuse writes the error answer of a failed exchange and logs it. The log
 // line never carries the code.
-func (s *sessions) refuse(w http.ResponseWriter, addr string, e *exchangeError) {
+func (s *sessions) refuse(w http.ResponseWriter, r *http.Request, addr string, e *exchangeError) {
 	switch e {
 	case errCloudDown, errCloud, errInternal:
 		// Logged where they happen, with their cause.
 	default:
-		s.logger.Warn("session exchange failed", "reason", e.code, "remote", addr)
+		s.log(r.Context()).Warn("session exchange failed", "reason", e.code, "remote", addr)
 	}
 	writeAPIError(w, e.status, e.code, e.message)
 }
@@ -360,16 +369,6 @@ func validDevice(device string) bool {
 		}
 	}
 	return true
-}
-
-// remoteHost returns the request's remote address without the port.
-// Forwarded headers are not read.
-func remoteHost(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-	return host
 }
 
 type apiError struct {

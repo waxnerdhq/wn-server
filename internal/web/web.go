@@ -9,7 +9,6 @@ import (
 	"io/fs"
 	"log/slog"
 	"mime"
-	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -19,6 +18,7 @@ import (
 
 	"github.com/waxnerdhq/wn-server/internal/match"
 	"github.com/waxnerdhq/wn-server/internal/navidrome"
+	"github.com/waxnerdhq/wn-server/internal/relayreq"
 	"github.com/waxnerdhq/wn-server/internal/store"
 	"github.com/waxnerdhq/wn-server/internal/wncloud"
 )
@@ -277,7 +277,7 @@ func setCookie(w http.ResponseWriter, r *http.Request, token string) {
 		Path:     "/ui/",
 		MaxAge:   cookieMaxAge,
 		HttpOnly: true,
-		Secure:   r.TLS != nil,
+		Secure:   r.TLS != nil || relayreq.IsRelayed(r.Context()),
 		SameSite: http.SameSiteLaxMode,
 	})
 }
@@ -289,7 +289,7 @@ func clearCookie(w http.ResponseWriter, r *http.Request) {
 		Path:     "/ui/",
 		MaxAge:   -1,
 		HttpOnly: true,
-		Secure:   r.TLS != nil,
+		Secure:   r.TLS != nil || relayreq.IsRelayed(r.Context()),
 		SameSite: http.SameSiteLaxMode,
 	})
 }
@@ -361,12 +361,11 @@ func (s *server) internalError(w http.ResponseWriter, r *http.Request, what stri
 	http.Error(w, "internal error", http.StatusInternalServerError)
 }
 
-// remoteHost returns the request's remote address without the port.
-// Forwarded headers are not read.
-func remoteHost(r *http.Request) string {
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
+// requestLogger returns the logger with relay=true when r is a relayed
+// request.
+func (s *server) requestLogger(r *http.Request) *slog.Logger {
+	if relayreq.IsRelayed(r.Context()) {
+		return s.Logger.With("relay", true)
 	}
-	return host
+	return s.Logger
 }
