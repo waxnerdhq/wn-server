@@ -169,9 +169,9 @@ The web UI stays owner-only in the listener phase. A listener who opens `/ui/` s
 ### The cached member list and the outage rule
 
 - wn-server calls `GET /servers/:id/members` with the server credential every 5 minutes and at `serve` start, and persists the list with the time of the last successful call.
-- A member removed at wn-cloud is seen at the next refresh. wn-server ends that listener's sessions, keeps the account, and disables the Navidrome user. Re-adding the member re-enables it.
+- A member removed at wn-cloud is seen at the next refresh. wn-server disables the listener's account, ends its sessions, and stops forwarding requests for it. The Navidrome user stays, because Navidrome 0.64.2 has no disable flag for a user. Re-adding the member re-enables the account.
 - The owner is never refused because wn-cloud is unreachable. There is no cut-off for the owner.
-- A listener is served from the cached list for 30 days after the last successful refresh. After 30 days wn-server refuses listener sessions with 503 `cloud_unreachable` until a refresh succeeds. This is the bound of WAX-945, decision 2, unchanged.
+- A listener is served from the cached list for 30 days after the last successful refresh. After 30 days wn-server refuses listener sessions, new and existing, with 503 `cloud_unreachable` until a refresh succeeds. On `/rest/*` the refusal is Subsonic error 0. The owner's sessions are not affected. This is the bound of WAX-945, decision 2, unchanged.
 - New listener sessions need a verify call and fail while wn-cloud is unreachable, as owner sessions do today.
 
 ### Listener ratings

@@ -614,9 +614,9 @@ These restate decisions in `README.md` in terms of the routes above.
 
 ### Outage
 
-- Sessions already issued keep working. wn-server checks them against its own store and does not call wn-cloud.
+- Owner sessions already issued keep working. wn-server checks them against its own store and does not call wn-cloud.
 - The owner is never refused because wn-cloud is unreachable. There is no cut-off.
-- Listeners are served from the cached member list for 30 days after its last successful refresh. After that, new listener sessions are refused with 503 `cloud_unreachable` until a refresh succeeds. Sessions already issued keep working until a refresh removes the listener.
+- Listeners are served from the cached member list for 30 days after its last successful refresh. After that, listener sessions, new and existing, are refused with 503 `cloud_unreachable` until a refresh succeeds. A refresh that removes the listener ends its sessions.
 - `POST /api/v1/session` and `wn-server login` fail while wn-cloud is unreachable, because they need `POST /servers/:id/device-codes/verify` or `POST /cli/token`. The app password keeps working.
 - Rating writes go to the outbox.
 - wn-server records the time of the first unreachable answer after a successful call. The web UI shows a banner "wn-cloud unreachable since <time>" until a call succeeds.

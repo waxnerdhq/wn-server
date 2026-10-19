@@ -46,9 +46,27 @@ func hashSessionToken(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// ErrAccountDisabled is returned by CreateListenerSession when the account
+// is disabled or is no longer in the cached member list.
+var ErrAccountDisabled = errors.New("account disabled")
+
 // CreateSession creates a session for the account and returns its token.
 // The token is returned only here. The store keeps its hash.
 func (s *Store) CreateSession(ctx context.Context, accountID, device string) (string, Session, error) {
+	return s.createSession(ctx, accountID, device, false)
+}
+
+// CreateListenerSession creates a session for a listener account as
+// CreateSession does, but only when, in the same statement, the account is
+// enabled and its waxnerd user is in the cached member list. Otherwise it
+// returns ErrAccountDisabled and stores nothing. A refresh of the member
+// list that runs between the caller's checks and the insert cannot leave a
+// session behind for a removed listener.
+func (s *Store) CreateListenerSession(ctx context.Context, accountID, device string) (string, Session, error) {
+	return s.createSession(ctx, accountID, device, true)
+}
+
+func (s *Store) createSession(ctx context.Context, accountID, device string, listener bool) (string, Session, error) {
 	id, err := newID()
 	if err != nil {
 		return "", Session{}, err
@@ -59,11 +77,24 @@ func (s *Store) CreateSession(ctx context.Context, accountID, device string) (st
 	}
 	now := time.Now().UTC().Truncate(time.Second)
 	sess := Session{ID: id, AccountID: accountID, Device: device, CreatedAt: now, LastSeenAt: now}
-	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO sessions (id, account_id, token_hash, device, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?)`,
-		sess.ID, sess.AccountID, hashSessionToken(token), sess.Device, now.Format(time.RFC3339), now.Format(time.RFC3339))
+	ts := now.Format(time.RFC3339)
+	var res sql.Result
+	if listener {
+		res, err = s.db.ExecContext(ctx,
+			`INSERT INTO sessions (id, account_id, token_hash, device, created_at, last_seen_at)
+			SELECT ?, a.id, ?, ?, ?, ? FROM accounts a
+			WHERE a.id = ? AND a.disabled = 0 AND a.waxnerd_user_id IN (SELECT user_id FROM members)`,
+			sess.ID, hashSessionToken(token), sess.Device, ts, ts, accountID)
+	} else {
+		res, err = s.db.ExecContext(ctx,
+			`INSERT INTO sessions (id, account_id, token_hash, device, created_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?)`,
+			sess.ID, sess.AccountID, hashSessionToken(token), sess.Device, ts, ts)
+	}
 	if err != nil {
 		return "", Session{}, fmt.Errorf("create session: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return "", Session{}, ErrAccountDisabled
 	}
 	return token, sess, nil
 }

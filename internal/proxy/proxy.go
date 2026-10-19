@@ -31,6 +31,9 @@ type Store interface {
 	Owner(ctx context.Context) (store.Account, error)
 	ServerCredential(ctx context.Context) (store.ServerCredential, error)
 	CreateSession(ctx context.Context, accountID, device string) (string, store.Session, error)
+	// CreateListenerSession returns store.ErrAccountDisabled when the
+	// account is disabled or its user is not in the member list.
+	CreateListenerSession(ctx context.Context, accountID, device string) (string, store.Session, error)
 	// SessionByToken returns store.ErrSessionNotFound for an unknown token.
 	SessionByToken(ctx context.Context, token string) (store.Session, error)
 	TouchSession(ctx context.Context, id string, at time.Time) error

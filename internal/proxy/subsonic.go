@@ -79,6 +79,10 @@ func subsonicAuth(st Store, sess *sessions, lim *loginLimiter, logger *slog.Logg
 				if r.Context().Err() != nil {
 					return
 				}
+				if errors.Is(err, errMembersOutdated) {
+					writeSubsonicError(w, params, errGeneric, "wn-cloud has been unreachable for 30 days; listener sessions are refused until a refresh succeeds")
+					return
+				}
 				if !errors.Is(err, store.ErrSessionNotFound) {
 					logger.Error("look up session", "error", err)
 					writeSubsonicError(w, params, errGeneric, "internal error")

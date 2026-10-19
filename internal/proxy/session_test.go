@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"encoding/xml"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -408,4 +409,77 @@ func TestListenerSignInThroughRelay(t *testing.T) {
 		t.Fatalf("refresh with the listener back = %+v, %v", res, err)
 	}
 	e.relayedExchange(t, "203.0.113.9", e.cloud.IssueDeviceCode(serverID, listenerID), http.StatusOK, "")
+}
+
+func TestListenerSessionRefusedAfterMemberListBound(t *testing.T) {
+	const listenerID = "0192f1c4-3b7e-7d2a-9a10-5f4e2c1b8a71"
+	ctx := context.Background()
+	now := time.Date(2026, 11, 2, 10, 0, 0, 0, time.UTC)
+	nd := &userNavidrome{libraries: map[string][]int{}}
+	e := newEnvOpts(t, nd, true, func(e *env) []Option {
+		return []Option{WithNavidromeUsers(navidrome.NewClient(e.rt)), withNow(func() time.Time { return now })}
+	})
+	e.link(t)
+	e.cloud.AddUser(listenerID, "ada@example.com")
+	e.cloud.AddMember(serverID, listenerID, "listener")
+	members := []store.Member{{UserID: waxnerdID, Role: "owner"}, {UserID: listenerID, Role: "listener"}}
+	if _, err := e.st.ReplaceMembers(ctx, members, now); err != nil {
+		t.Fatal(err)
+	}
+	listener := e.exchange(t, e.cloud.IssueDeviceCode(serverID, listenerID), http.StatusOK, "").Token
+	owner := e.exchange(t, e.cloud.IssueDeviceCode(serverID, waxnerdID), http.StatusOK, "").Token
+
+	works := func(label string) {
+		t.Helper()
+		if c := subsonicCode(t, e, "/rest/ping.view?apiKey="+listener, ""); c != -1 {
+			t.Fatalf("%s: listener /rest/ping error %d", label, c)
+		}
+		if status, b := e.do(t, http.MethodGet, "/api/v1/nothing", listener, ""); status != http.StatusNotFound {
+			t.Fatalf("%s: listener /api/v1 status %d, body %s", label, status, b)
+		}
+	}
+	ownerWorks := func() {
+		t.Helper()
+		if c := subsonicCode(t, e, "/rest/ping.view?apiKey="+owner, ""); c != -1 {
+			t.Fatalf("owner /rest/ping error %d", c)
+		}
+		if status, b := e.do(t, http.MethodGet, "/api/v1/nothing", owner, ""); status != http.StatusNotFound {
+			t.Fatalf("owner /api/v1 status %d, body %s", status, b)
+		}
+	}
+	works("fresh")
+	ownerWorks()
+
+	now = now.Add(31 * 24 * time.Hour)
+	if c := subsonicCode(t, e, "/rest/ping.view?apiKey="+listener, ""); c != errGeneric {
+		t.Fatalf("stale listener /rest/ping: error %d, want %d", c, errGeneric)
+	}
+	status, b := e.do(t, http.MethodGet, "/api/v1/nothing", listener, "")
+	var eb apiError
+	if status != http.StatusServiceUnavailable || json.Unmarshal(b, &eb) != nil || eb.Code != "cloud_unreachable" {
+		t.Fatalf("stale listener /api/v1: status %d, body %s", status, b)
+	}
+	ownerWorks()
+
+	if _, err := e.st.ReplaceMembers(ctx, members, now); err != nil {
+		t.Fatal(err)
+	}
+	works("after a refresh")
+	ownerWorks()
+
+	// A refresh that removes the listener between the member check and the
+	// insert leaves no session.
+	if _, err := e.st.ReplaceMembers(ctx, members[:1], now); err != nil {
+		t.Fatal(err)
+	}
+	acct, err := e.st.ListenerByUserID(ctx, listenerID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := e.st.CreateListenerSession(ctx, acct.ID, "late"); !errors.Is(err, store.ErrAccountDisabled) {
+		t.Fatalf("CreateListenerSession for a disabled listener: %v", err)
+	}
+	if list, err := e.st.Sessions(ctx, acct.ID); err != nil || len(list) != 0 {
+		t.Fatalf("sessions of the disabled listener = %v, %v", list, err)
+	}
 }

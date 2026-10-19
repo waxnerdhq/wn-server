@@ -82,12 +82,29 @@ func newSessions(st Store, cloud Verifier, logger *slog.Logger, now func() time.
 	}
 }
 
+// errMembersOutdated is returned by check for a listener's session when the
+// last successful refresh of the member list is missing or older than
+// memberListMaxAge.
+var errMembersOutdated = errors.New("member list refreshed too long ago")
+
 // check returns the session for token and records its use. It returns
-// store.ErrSessionNotFound for an unknown or revoked token.
+// store.ErrSessionNotFound for an unknown or revoked token, and
+// errMembersOutdated for a listener's session while the member list is
+// older than memberListMaxAge. The owner's sessions are never refused for
+// the age of the member list.
 func (s *sessions) check(ctx context.Context, token string) (store.Session, error) {
 	sess, err := s.store.SessionByToken(ctx, token)
 	if err != nil {
 		return store.Session{}, err
+	}
+	if sess.AccountKind == store.KindListener {
+		at, ok, err := s.store.MembersRefreshedAt(ctx)
+		if err != nil {
+			return store.Session{}, err
+		}
+		if !ok || s.now().Sub(at) > memberListMaxAge {
+			return store.Session{}, errMembersOutdated
+		}
 	}
 	if now := s.now(); now.Sub(sess.LastSeenAt) >= touchInterval {
 		if err := s.store.TouchSession(ctx, sess.ID, now); err != nil && ctx.Err() == nil {
@@ -139,6 +156,10 @@ func (s *sessions) requireSession(next http.Handler) http.Handler {
 		sess, err := s.check(r.Context(), token)
 		if err != nil {
 			if r.Context().Err() != nil {
+				return
+			}
+			if errors.Is(err, errMembersOutdated) {
+				writeAPIError(w, errMembersStale.status, errMembersStale.code, errMembersStale.message)
 				return
 			}
 			if !errors.Is(err, store.ErrSessionNotFound) {
@@ -346,7 +367,19 @@ func (s *sessions) exchangeCode(ctx context.Context, addr, code, device string) 
 		}
 	}
 
-	token, sess, err := s.store.CreateSession(ctx, acct.ID, device)
+	var (
+		token string
+		sess  store.Session
+	)
+	if acct.Kind == store.KindListener {
+		token, sess, err = s.store.CreateListenerSession(ctx, acct.ID, device)
+	} else {
+		token, sess, err = s.store.CreateSession(ctx, acct.ID, device)
+	}
+	if errors.Is(err, store.ErrAccountDisabled) {
+		// A refresh removed the listener after the member check.
+		return "", store.Account{}, errNotMember
+	}
 	if err != nil {
 		s.log(ctx).Error("create session", "remote", addr, "error", err)
 		return "", store.Account{}, errInternal
