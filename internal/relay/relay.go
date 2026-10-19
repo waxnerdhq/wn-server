@@ -28,6 +28,7 @@ import (
 	"net/http"
 	"net/url"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/yamux"
@@ -37,6 +38,13 @@ import (
 
 // Protocol is the Upgrade token of the tunnel handshake.
 const Protocol = "wn-relay/1"
+
+// missedPongLimit is the number of pings in a row without a pong after which
+// the package closes the session. A ping is sent every config.keepAlive and
+// waits config.writeTimeout for the pong, so with the defaults a silent drop
+// is seen within about 110 seconds (docs/relay.md, section 3). The values are
+// not configuration keys.
+const missedPongLimit = 3
 
 // clientHeader carries the client's address from the edge.
 const clientHeader = "X-Relay-Client"
@@ -342,7 +350,9 @@ func (c *bufferedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
 // until the session ends or ctx ends. It answers why the session ended.
 func (r *Relay) serve(ctx context.Context, conn net.Conn) error {
 	ycfg := yamux.DefaultConfig()
-	ycfg.KeepAliveInterval = r.cfg.keepAlive
+	// yamux's own keepalive closes the session at the first missed pong.
+	// heartbeat tolerates missedPongLimit misses in a row instead.
+	ycfg.EnableKeepAlive = false
 	ycfg.ConnectionWriteTimeout = r.cfg.writeTimeout
 	ycfg.LogOutput = nil
 	ycfg.Logger = slog.NewLogLogger(r.log.Handler(), slog.LevelDebug)
@@ -361,6 +371,13 @@ func (r *Relay) serve(ctx context.Context, conn net.Conn) error {
 	}
 	done := make(chan error, 1)
 	go func() { done <- srv.Serve(ln) }()
+	var missed atomic.Pointer[error]
+	hbDone := make(chan struct{})
+	go func() {
+		defer close(hbDone)
+		r.heartbeat(ctx, sess, &missed)
+	}()
+	defer func() { <-hbDone }()
 
 	select {
 	case <-ctx.Done():
@@ -375,7 +392,47 @@ func (r *Relay) serve(ctx context.Context, conn net.Conn) error {
 	case err := <-done:
 		_ = srv.Close()
 		_ = sess.Close()
+		// heartbeat stores its error before it closes the session, so a
+		// session that heartbeat closed shows the missed pongs here and not
+		// the error of the closed listener.
+		if m := missed.Load(); m != nil {
+			return *m
+		}
 		return err
+	}
+}
+
+// heartbeat pings the peer every config.keepAlive. A ping that gets no pong
+// within config.writeTimeout, or that cannot be written, is a miss, and a pong
+// resets the count. After missedPongLimit misses in a row heartbeat stores an
+// error that names them in missed and closes sess. It returns when sess is
+// closed or ctx ends.
+func (r *Relay) heartbeat(ctx context.Context, sess *yamux.Session, missed *atomic.Pointer[error]) {
+	misses := 0
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sess.CloseChan():
+			return
+		case <-time.After(r.cfg.keepAlive):
+		}
+		_, err := sess.Ping()
+		switch {
+		case err == nil:
+			misses = 0
+		case errors.Is(err, yamux.ErrSessionShutdown):
+			return
+		default:
+			misses++
+			r.log.Debug("relay keepalive pong missed", "misses", misses, "err", err)
+			if misses >= missedPongLimit {
+				cause := fmt.Errorf("%d keepalive pongs missed", misses)
+				missed.Store(&cause)
+				_ = sess.Close()
+				return
+			}
+		}
 	}
 }
 
