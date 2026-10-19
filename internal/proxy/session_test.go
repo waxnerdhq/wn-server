@@ -1,17 +1,22 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"encoding/xml"
 	"io"
+	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/waxnerdhq/wn-server/internal/relayreq"
 	"github.com/waxnerdhq/wn-server/internal/store"
+	"github.com/waxnerdhq/wn-server/internal/wncloud"
 )
 
 // link stores the server credential, as wn-server login does, and registers
@@ -181,6 +186,62 @@ func TestSessionExchangeRateLimit(t *testing.T) {
 	code := e.cloud.IssueDeviceCode(serverID, waxnerdID)
 	e.exchange(t, code, http.StatusTooManyRequests, "rate_limited")
 	e.exchange(t, code, http.StatusTooManyRequests, "rate_limited")
+}
+
+func TestSessionExchangeRefusedThroughRelay(t *testing.T) {
+	e := newEnv(t, http.NotFoundHandler(), true)
+	e.link(t)
+	ready := make(chan struct{})
+	close(ready)
+	h := New(e.rt, ready, e.st, wncloud.New(e.cloudURL, "test"), slog.New(slog.DiscardHandler))
+	code := e.cloud.IssueDeviceCode(serverID, waxnerdID)
+	body, _ := json.Marshal(map[string]string{"code": code, "device": "test phone"})
+	// More requests than the limits allow: none counts.
+	for range 2 * exchangeMaxTotal {
+		req := httptest.NewRequest(http.MethodPost, "/api/v1/session", bytes.NewReader(body))
+		req.RemoteAddr = "192.168.1.5:40000"
+		req = req.WithContext(relayreq.WithRelay(req.Context(), "203.0.113.9"))
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		var eb apiError
+		if rec.Code != http.StatusForbidden || json.Unmarshal(rec.Body.Bytes(), &eb) != nil || eb.Code != "not_available" || eb.Error == "" {
+			t.Fatalf("relayed exchange: status %d, body %s", rec.Code, rec.Body)
+		}
+	}
+	// The code was not spent and the LAN limit was not used.
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/session", bytes.NewReader(body))
+	req.RemoteAddr = "192.168.1.5:40000"
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("LAN exchange after relayed refusals: status %d, body %s", rec.Code, rec.Body)
+	}
+}
+
+func TestLimiterCountsRelayedClientsSeparately(t *testing.T) {
+	// Two relayed clients share one TCP peer address, the relay edge's.
+	req := func(client string) *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "/api/v1/session", nil)
+		r.RemoteAddr = "192.168.1.5:40000"
+		if client != "" {
+			r = r.WithContext(relayreq.WithRelay(r.Context(), client))
+		}
+		return r
+	}
+	l := newLimiter(time.Now)
+	for range exchangeMaxPerAddr {
+		l.fail(relayreq.ClientAddr(req("203.0.113.9")))
+	}
+	if l.acquire(relayreq.ClientAddr(req("203.0.113.9"))) {
+		t.Fatal("a relayed client over the limit was allowed")
+	}
+	for _, client := range []string{"203.0.113.10", ""} {
+		addr := relayreq.ClientAddr(req(client))
+		if !l.acquire(addr) {
+			t.Fatalf("client %q was locked out by another relayed client", client)
+		}
+		l.release(addr, false)
+	}
 }
 
 func TestLimiter(t *testing.T) {

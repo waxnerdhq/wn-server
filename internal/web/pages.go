@@ -39,10 +39,11 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	name, password := r.PostForm.Get("name"), r.PostForm.Get("password")
 	addr := relayreq.ClientAddr(r)
+	relayed := relayreq.IsRelayed(r.Context())
 	logger := s.requestLogger(r)
 	data := loginData{page: page{Title: "Sign in"}, Name: name}
 
-	if !s.limiter.begin(addr) {
+	if !s.limiter.begin(addr, relayed) {
 		logger.Warn("web sign-in failed", "remote", addr, "reason", "rate_limited")
 		data.Message = "Too many failed sign-ins. Try again in a few minutes."
 		s.render(w, r, http.StatusTooManyRequests, "login", data)
@@ -50,7 +51,7 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	acct, err := s.Store.AccountByName(r.Context(), name)
 	if err != nil && !errors.Is(err, store.ErrNotFound) {
-		s.limiter.forget(addr)
+		s.limiter.forget(addr, relayed)
 		s.internalError(w, r, "look up account", err)
 		return
 	}
@@ -60,7 +61,7 @@ func (s *server) login(w http.ResponseWriter, r *http.Request) {
 		s.render(w, r, http.StatusUnauthorized, "login", data)
 		return
 	}
-	s.limiter.forget(addr)
+	s.limiter.forget(addr, relayed)
 
 	token, sess, err := s.Store.CreateSession(r.Context(), acct.ID, deviceLabel(r.UserAgent()))
 	if err != nil {

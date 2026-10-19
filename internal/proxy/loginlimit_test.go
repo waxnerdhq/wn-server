@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/waxnerdhq/wn-server/internal/relayreq"
 	"github.com/waxnerdhq/wn-server/internal/store"
 )
 
@@ -136,5 +137,40 @@ func TestSubsonicLoginLimit(t *testing.T) {
 	call("192.0.2.3:5000", good)
 	if len(lim.entries) > 1 {
 		t.Fatalf("%d entries after the idle time, want at most 1", len(lim.entries))
+	}
+}
+
+func TestSubsonicLoginLimitCountsRelayedClientsSeparately(t *testing.T) {
+	e := newEnv(t, http.NotFoundHandler(), true)
+	logger := slog.New(slog.DiscardHandler)
+	lim := newLoginLimiter(time.Now)
+	forwarded := 0
+	h := subsonicAuth(e.st, newSessions(e.st, nil, logger), lim, logger,
+		http.HandlerFunc(func(http.ResponseWriter, *http.Request) { forwarded++ }))
+	// Every request has the TCP peer address of the relay edge.
+	call := func(client, query string) bool {
+		t.Helper()
+		before := forwarded
+		r := httptest.NewRequest(http.MethodGet, "/rest/ping.view?"+query+"&f=json", nil)
+		r.RemoteAddr = "192.168.1.5:40000"
+		if client != "" {
+			r = r.WithContext(relayreq.WithRelay(r.Context(), client))
+		}
+		h.ServeHTTP(httptest.NewRecorder(), r)
+		return forwarded > before
+	}
+	bad := "u=owner&p=nope&v=1&c=x"
+	good := "u=owner&p=" + ownerPass + "&v=1&c=x"
+	for range loginMaxPerAddr {
+		call("203.0.113.9", bad)
+	}
+	if call("203.0.113.9", good) {
+		t.Fatal("a relayed client over the limit was allowed")
+	}
+	if !call("203.0.113.10", good) {
+		t.Fatal("another relayed client was locked out")
+	}
+	if !call("", good) {
+		t.Fatal("the TCP peer address was locked out by relayed clients")
 	}
 }
