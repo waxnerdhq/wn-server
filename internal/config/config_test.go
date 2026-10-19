@@ -157,3 +157,25 @@ func TestLoadRejectsSortedDirOverlap(t *testing.T) {
 		t.Fatalf("got %v, want a sorted_dir contains error", err)
 	}
 }
+
+func TestRelayMaxBitrate(t *testing.T) {
+	music := t.TempDir()
+	c, err := Load(writeConfig(t, t.TempDir(), "music_folders = ['"+music+"']\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RelayMaxBitrate != 0 {
+		t.Errorf("default %d, want 0", c.RelayMaxBitrate)
+	}
+	c, err = Load(writeConfig(t, t.TempDir(), "music_folders = ['"+music+"']\nrelay_max_bitrate = 128\n"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.RelayMaxBitrate != 128 {
+		t.Errorf("got %d, want 128", c.RelayMaxBitrate)
+	}
+	_, err = Load(writeConfig(t, t.TempDir(), "music_folders = ['"+music+"']\nrelay_max_bitrate = -1\n"))
+	if err == nil || !strings.Contains(err.Error(), "relay_max_bitrate") {
+		t.Errorf("negative value: err %v", err)
+	}
+}
