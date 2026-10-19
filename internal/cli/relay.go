@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -85,10 +86,12 @@ func (w *relayWiring) start(ctx context.Context, handler http.Handler) <-chan st
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
+		defer w.recoverRelay("relay settings loop")
 		w.fetchLoop(ctx, first)
 	}()
 	go func() {
 		defer wg.Done()
+		defer w.recoverRelay("relay package")
 		// The first call of GET /servers/:id runs before the first dial, so
 		// that a fresh store has an edge address without a wait.
 		select {
@@ -104,6 +107,15 @@ func (w *relayWiring) start(ctx context.Context, handler http.Handler) <-chan st
 		close(done)
 	}()
 	return done
+}
+
+// recoverRelay logs a panic in a relay goroutine and writes the state off,
+// so that a failure of the relay never stops serve. The LAN keeps working.
+func (w *relayWiring) recoverRelay(what string) {
+	if v := recover(); v != nil {
+		w.logger.Error("the "+what+" stopped after a panic; the LAN keeps working, restart serve to retry the relay", "panic", fmt.Sprint(v))
+		w.write(relay.State{Name: relay.Off, Since: w.now(), Err: "stopped after a panic"})
+	}
 }
 
 // write records a relay state in the holder and in the relay_state row.
@@ -207,6 +219,12 @@ func (w *relayWiring) fetch(ctx context.Context, cred store.ServerCredential) ti
 	}
 	w.cloudStatus.MarkReachable()
 	w.cloudStatus.SetCredentialRejected(false)
+	if srv.Relay.ConnectURL == "" {
+		// A server object without an edge address does not replace a stored
+		// one, so a stored address keeps the reconnects going.
+		w.logger.Warn("wn-cloud answered no relay connect_url; the stored relay settings are kept")
+		return relayFetchRetry
+	}
 	addrs := make([]store.RelayAddress, 0, len(srv.Addresses))
 	for _, a := range srv.Addresses {
 		addrs = append(addrs, store.RelayAddress{Kind: a.Kind, URL: a.URL})
